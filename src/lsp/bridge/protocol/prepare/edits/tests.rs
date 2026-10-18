@@ -158,15 +158,21 @@ fn emptied_gap() -> (String, PreparedMap) {
 }
 
 #[test]
-fn an_inserted_line_regains_its_indent_when_another_insertion_follows_it() {
-    let map = dedent_by_two("  a\n  c\n");
-    let mapped = map
-        .map_edits(
-            &[edit((0, 1), (0, 1), "\n"), edit((0, 1), (0, 1), "b")],
-            EditMode::Extent,
-        )
-        .unwrap();
-    assert_eq!(apply_to("  a\n  c\n", &mapped), "  a\n  b\n  c\n");
+fn touching_edits_are_refused() {
+    // How each regains a removed indent depends on the other's text: two
+    // insertions at one place, or an edit ending where another starts.
+    let (_, map) = dedented();
+    for edits in [
+        [edit((0, 1), (0, 1), "\n"), edit((0, 1), (0, 1), "b")],
+        [edit((0, 0), (0, 0), "a"), edit((0, 0), (0, 2), "if")],
+        [edit((0, 0), (1, 0), "z\n"), edit((1, 0), (2, 0), "")],
+        [edit((1, 0), (1, 1), "w"), edit((0, 0), (1, 0), "")],
+    ] {
+        assert_eq!(map.map_edits(&edits, EditMode::Extent), None, "{edits:?}");
+    }
+    // Apart, they map.
+    let edits = [edit((0, 0), (0, 2), "if"), edit((1, 0), (1, 1), "w")];
+    assert!(map.map_edits(&edits, EditMode::Extent).is_some());
 }
 
 #[test]
@@ -185,32 +191,6 @@ fn edits_overlapping_in_the_prepared_text_are_refused() {
         ),
         None
     );
-}
-
-#[test]
-fn edits_overlapping_once_mapped_are_refused() {
-    // Two edits meeting at a dedented line's start: the one ending there
-    // reaches past that line's removed indent, which the one replacing the
-    // line takes too.
-    let (_, map) = dedented();
-    let edits = [edit((0, 0), (1, 0), "z\n"), edit((1, 0), (2, 0), "")];
-    assert_eq!(map.map_edits(&edits, EditMode::Extent), None);
-}
-
-#[test]
-fn an_insertion_and_a_replacement_at_one_place_apply_in_either_order() {
-    let (virtual_text, map) = dedented();
-    let insert = edit((0, 0), (0, 0), "a");
-    let replace = edit((0, 0), (0, 2), "if");
-    let forward = map
-        .map_edits(&[insert.clone(), replace.clone()], EditMode::Extent)
-        .unwrap();
-    let backward = map.map_edits(&[replace, insert], EditMode::Extent).unwrap();
-    assert_eq!(
-        apply_to(&virtual_text, &forward),
-        apply_to(&virtual_text, &backward)
-    );
-    assert_eq!(apply_to(&virtual_text, &forward), "  aif x:\n    y\n");
 }
 
 #[test]
@@ -923,4 +903,512 @@ fn lone_cr_lines_regain_their_indent() {
         .map_one_with_extent(&edit((1, 1), (1, 1), "\rc"))
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[inserted]), "  a\r  b\r  c");
+}
+
+// =============================================================================
+// Property: mapped edits keep the host's text and the server's content
+// =============================================================================
+
+mod properties {
+    use super::super::super::{Run, is_line_start, splits_crlf};
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+    use std::cell::Cell;
+
+    /// One line of a generated virtual document.
+    #[derive(Debug, Clone)]
+    struct LineSpec {
+        indent: usize,
+        body: usize,
+        eol: usize,
+        /// 0: content only; 1: an interpolation (a gap) after the body; 2:
+        /// the whole line is host text (a gap such as a fence).
+        gap: usize,
+    }
+
+    const INDENTS: [&str; 4] = ["", "  ", "    ", "\t"];
+    const BODIES: [&str; 5] = ["", "a", "é", "𝄞x", "b c"];
+    const EOLS: [&str; 4] = ["\n", "\r\n", "\r", ""];
+    const PLACEHOLDERS: [Option<&str>; 6] = [
+        None,
+        Some(""),
+        Some("1"),
+        Some("x\n"),
+        Some("\r"),
+        Some("  "),
+    ];
+    const INSERTS: [&str; 10] = [
+        "", "z", "\n", "q\n", "\nw", "\r\n", "\r", "é𝄞", "  ", "\n\n",
+    ];
+
+    fn line_spec() -> impl Strategy<Value = LineSpec> {
+        (0..INDENTS.len(), 0..BODIES.len(), 0..EOLS.len(), 0..3usize).prop_map(
+            |(indent, body, eol, gap)| LineSpec {
+                indent,
+                body,
+                eol,
+                gap,
+            },
+        )
+    }
+
+    /// An edit to P: two char-boundary picks, a column overshoot, a text.
+    type EditSpec = (u16, u16, bool, usize);
+
+    fn edit_spec() -> impl Strategy<Value = EditSpec> {
+        (
+            any::<u16>(),
+            any::<u16>(),
+            prop::bool::weighted(0.1),
+            0..INSERTS.len(),
+        )
+    }
+
+    /// The virtual text and layout `lines` describe.
+    fn document(lines: &[LineSpec]) -> (String, VirtualLayout) {
+        let mut text = String::new();
+        let mut pieces = Vec::new();
+        let content = |text: &mut String, piece: &str| {
+            let start = text.len();
+            text.push_str(piece);
+            (SegmentKind::Content, start..text.len(), String::new())
+        };
+        for (index, line) in lines.iter().enumerate() {
+            let last = index + 1 == lines.len();
+            // Only the last line may end without a line break.
+            let eol = match EOLS[line.eol] {
+                "" if !last => "\n",
+                eol => eol,
+            };
+            if line.gap == 2 {
+                // Host lines masked by line breaks, as between two fences.
+                let start = text.len();
+                text.push('\n');
+                pieces.push((SegmentKind::Gap, start..text.len(), "```\n".to_string()));
+                continue;
+            }
+            let head = format!("{}{}", INDENTS[line.indent], BODIES[line.body]);
+            pieces.push(content(&mut text, &head));
+            if line.gap == 1 {
+                let start = text.len();
+                text.push_str("    ");
+                pieces.push((SegmentKind::Gap, start..text.len(), "${x}".to_string()));
+                pieces.push(content(&mut text, "y"));
+            }
+            pieces.push(content(&mut text, eol));
+        }
+        let layout = VirtualLayout::from_pieces(&text, pieces);
+        (text, layout)
+    }
+
+    /// An answer for `layout`: per content segment, the leading whitespace
+    /// of the lines `dedent` picks and the blank edge lines `edges` picks
+    /// deleted; per gap, a placeholder.
+    fn answer(
+        virtual_text: &str,
+        layout: &VirtualLayout,
+        dedent: &[bool],
+        edges: (bool, bool),
+        placeholders: &[usize],
+    ) -> serde_json::Value {
+        let segments = layout.segments();
+        let last = segments.len() - 1;
+        let mut picks = dedent.iter().cycle();
+        let mut gaps = placeholders.iter().cycle();
+        let answered: Vec<serde_json::Value> = segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| match segment.kind {
+                SegmentKind::Gap => match PLACEHOLDERS[*gaps.next().unwrap_or(&0)] {
+                    None => json!({"type": "gap"}),
+                    Some(content) => json!({"type": "gap", "content": content}),
+                },
+                SegmentKind::Content => {
+                    let range = segment.virtual_range.clone();
+                    let text = &virtual_text[range.clone()];
+                    let lines = LineMap::new(text.to_string());
+                    let change = |start: usize, end: usize| {
+                        json!({"range": {
+                            "start": lines.position(start),
+                            "end": lines.position(end)
+                        }, "newText": ""})
+                    };
+                    let line_starts: Vec<usize> = (0..text.len())
+                        .filter(|&at| {
+                            text.is_char_boundary(at)
+                                && is_line_start(virtual_text, range.start + at)
+                                && !splits_crlf(virtual_text, range.start + at)
+                        })
+                        .collect();
+                    let line_end = |at: usize| {
+                        text[at..].find(['\n', '\r']).map_or(text.len(), |end| {
+                            let end = at + end;
+                            end + if text[end..].starts_with("\r\n") {
+                                2
+                            } else {
+                                1
+                            }
+                        })
+                    };
+                    let blank = |at: usize| text[at..line_end(at)].trim().is_empty();
+                    let mut changes = Vec::new();
+                    let mut deleted_lines = Vec::new();
+                    if index == 0 && edges.0 {
+                        for &at in &line_starts {
+                            let end = line_end(at);
+                            if !blank(at) || !text[at..end].contains(['\n', '\r']) {
+                                break;
+                            }
+                            deleted_lines.push(at..end);
+                        }
+                    }
+                    if index == last && edges.1 {
+                        let mut trailing = Vec::new();
+                        for &at in line_starts.iter().rev() {
+                            let end = line_end(at);
+                            if !blank(at) {
+                                break;
+                            }
+                            if text[at..end].contains(['\n', '\r']) {
+                                trailing.push(at..end);
+                            }
+                        }
+                        deleted_lines.extend(trailing);
+                    }
+                    for line in &deleted_lines {
+                        changes.push(change(line.start, line.end));
+                    }
+                    for &at in &line_starts {
+                        if deleted_lines.iter().any(|line| line.contains(&at)) {
+                            continue;
+                        }
+                        let indent =
+                            text[at..].len() - text[at..].trim_start_matches([' ', '\t']).len();
+                        if indent > 0 && *picks.next().unwrap_or(&false) {
+                            changes.push(change(at, at + indent));
+                        }
+                    }
+                    json!({"type": "content", "changes": changes})
+                }
+            })
+            .collect();
+        json!({ "segments": answered })
+    }
+
+    /// P edits from their specs.
+    fn edits(map: &PreparedMap, specs: &[EditSpec]) -> Vec<TextEdit> {
+        let prepared = &map.prepared_lines.text;
+        let boundaries: Vec<usize> = (0..=prepared.len())
+            .filter(|&at| prepared.is_char_boundary(at))
+            .collect();
+        specs
+            .iter()
+            .map(|&(a, b, overshoot, text)| {
+                let a = boundaries[a as usize % boundaries.len()];
+                let b = boundaries[b as usize % boundaries.len()];
+                let start = map.prepared_lines.position(a.min(b));
+                let mut end = map.prepared_lines.position(a.max(b));
+                if overshoot {
+                    end.character += 3;
+                }
+                TextEdit {
+                    range: LspRange::new(start, end),
+                    new_text: INSERTS[text].to_string(),
+                }
+            })
+            .collect()
+    }
+
+    /// The host-owned runs: text V holds that P does not show as content.
+    fn host_owned(map: &PreparedMap) -> Vec<&Run> {
+        map.runs
+            .iter()
+            .enumerate()
+            .filter(|(index, run)| {
+                matches!(
+                    run.kind,
+                    RunKind::Gap | RunKind::LeadingLines | RunKind::TrailingLines
+                ) || (run.kind == RunKind::Deleted
+                    && index.checked_sub(1).is_some_and(|previous| {
+                        map.runs[previous].kind == RunKind::TrailingLines
+                            && map.runs[previous].virtual_.end == run.virtual_.start
+                    }))
+            })
+            .map(|(_, run)| run)
+            .filter(|run| !run.virtual_.is_empty())
+            .collect()
+    }
+
+    fn strip(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Where `offset`, outside every edit, lands once `ranges` (with the
+    /// lengths of their new texts) are applied: after the edits ending
+    /// before it, and those ending at it unless `after` says insertions
+    /// there go after it.
+    fn shifted(ranges: &[(Range<usize>, usize)], offset: usize, after: bool) -> usize {
+        ranges
+            .iter()
+            .filter(|(range, _)| {
+                range.end < offset || (range.end == offset && !(after && range.is_empty()))
+            })
+            .fold(offset, |at, (range, len)| at + len - range.len())
+    }
+
+    fn check(
+        virtual_text: &str,
+        map: &PreparedMap,
+        edits: &[TextEdit],
+        mapped: &[TextEdit],
+    ) -> Result<(), TestCaseError> {
+        let edited = apply_to(virtual_text, mapped);
+        let ranges: Vec<(Range<usize>, usize)> = mapped
+            .iter()
+            .map(|edit| {
+                (
+                    map.virtual_lines.offset_clamped(edit.range.start)
+                        ..map.virtual_lines.offset_clamped(edit.range.end),
+                    edit.new_text.len(),
+                )
+            })
+            .collect();
+        // (a) Host-owned runs survive byte for byte, still starting a line
+        // where they did, and no line break at their edges fuses with one
+        // beside it unless V or P already had them meet.
+        for run in host_owned(map) {
+            let text = &virtual_text[run.virtual_.clone()];
+            for (range, _) in &ranges {
+                let inside = if range.is_empty() {
+                    run.virtual_.start < range.start && range.start < run.virtual_.end
+                } else {
+                    range.start < run.virtual_.end && run.virtual_.start < range.end
+                };
+                prop_assert!(!inside, "an edit {range:?} reaches into {run:?}");
+            }
+            let start = shifted(&ranges, run.virtual_.start, false);
+            let end = start + text.len();
+            prop_assert_eq!(&edited[start..end], text, "{:?} moved or changed", run);
+            if is_line_start(virtual_text, run.virtual_.start)
+                && !splits_crlf(virtual_text, run.virtual_.start)
+            {
+                prop_assert!(
+                    is_line_start(&edited, start),
+                    "{:?} no longer starts a line",
+                    run
+                );
+            }
+            let shown = &map.prepared_lines.text[run.prepared.clone()];
+            prop_assert!(
+                !splits_crlf(&edited, start)
+                    || splits_crlf(virtual_text, run.virtual_.start)
+                    || shown.starts_with('\n'),
+                "a CR fused with {:?}'s LF",
+                run
+            );
+            prop_assert!(
+                !splits_crlf(&edited, end)
+                    || splits_crlf(virtual_text, run.virtual_.end)
+                    || shown.ends_with('\r'),
+                "{:?}'s CR fused with an LF",
+                run
+            );
+        }
+        // (b) Whitespace aside, the edited V's content between the gaps is
+        // the edited P's between them.
+        let prepared = &map.prepared_lines.text;
+        let edited_prepared = apply_to(prepared, edits);
+        let prepared_ranges: Vec<(Range<usize>, usize)> = edits
+            .iter()
+            .map(|edit| {
+                (
+                    map.prepared_lines.offset_clamped(edit.range.start)
+                        ..map.prepared_lines.offset_clamped(edit.range.end),
+                    edit.new_text.len(),
+                )
+            })
+            .collect();
+        let gaps: Vec<&Run> = map
+            .runs
+            .iter()
+            .filter(|run| run.kind == RunKind::Gap)
+            .collect();
+        let (mut virtual_cursor, mut prepared_cursor) = (0, 0);
+        for gap in gaps.iter().map(Some).chain([None]) {
+            let (virtual_split, prepared_split) = match gap {
+                Some(gap) => (
+                    (
+                        shifted(&ranges, gap.virtual_.start, false),
+                        shifted(&ranges, gap.virtual_.start, false) + gap.virtual_.len(),
+                    ),
+                    (
+                        shifted(&prepared_ranges, gap.prepared.start, false),
+                        shifted(&prepared_ranges, gap.prepared.end, !gap.prepared.is_empty()),
+                    ),
+                ),
+                None => (
+                    (edited.len(), edited.len()),
+                    (edited_prepared.len(), edited_prepared.len()),
+                ),
+            };
+            prop_assert_eq!(
+                strip(&edited[virtual_cursor..virtual_split.0]),
+                strip(&edited_prepared[prepared_cursor..prepared_split.0]),
+                "content before {:?}",
+                gap
+            );
+            (virtual_cursor, prepared_cursor) = (virtual_split.1, prepared_split.1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_edits_keep_host_text_and_the_servers_content() {
+        let mut runner = TestRunner::new(Config {
+            cases: 4000,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let (answered, mapped_sets) = (Cell::new(0), Cell::new(0));
+        let strategy = (
+            prop::collection::vec(line_spec(), 1..7),
+            prop::collection::vec(any::<bool>(), 1..8),
+            (any::<bool>(), any::<bool>()),
+            prop::collection::vec(0..PLACEHOLDERS.len(), 1..4),
+            prop::collection::vec(edit_spec(), 1..4),
+        );
+        runner
+            .run(&strategy, |(lines, dedent, edges, placeholders, specs)| {
+                let (virtual_text, layout) = document(&lines);
+                let answer = answer(&virtual_text, &layout, &dedent, edges, &placeholders);
+                let Ok(prepared) = apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    serde_json::from_value(answer).unwrap(),
+                ) else {
+                    return Ok(());
+                };
+                answered.set(answered.get() + 1);
+                let map = &prepared.map;
+                let edits = edits(map, &specs);
+                let Some(mapped) = map.map_edits(&edits, EditMode::Extent) else {
+                    return Ok(());
+                };
+                mapped_sets.set(mapped_sets.get() + 1);
+                prop_assert_eq!(mapped.len(), edits.len());
+                check(&virtual_text, map, &edits, &mapped)
+            })
+            .unwrap();
+        // Not vacuous: most documents are prepared, and many edit sets map.
+        assert!(answered.get() > 2000, "answered {}", answered.get());
+        assert!(mapped_sets.get() > 500, "mapped {}", mapped_sets.get());
+    }
+
+    /// Every non-empty line of `prepared` indented by `indent`.
+    fn indent_lines(prepared: &str, indent: &str) -> String {
+        let mut output = String::new();
+        let mut at_line_start = true;
+        let mut chars = prepared.chars().peekable();
+        while let Some(character) = chars.next() {
+            if at_line_start && character != '\n' && character != '\r' {
+                output.push_str(indent);
+            }
+            output.push(character);
+            at_line_start = character == '\n' || (character == '\r' && chars.peek() != Some(&'\n'));
+        }
+        output
+    }
+
+    #[test]
+    fn edits_to_a_uniformly_dedented_document_map_back_reindented() {
+        // A document whose every non-empty line the peer dedented by one
+        // indent: any edit set maps back to its result on P re-indented.
+        let mut runner = TestRunner::new(Config {
+            cases: 3000,
+            failure_persistence: None,
+            ..Config::default()
+        });
+        let mapped_sets = Cell::new(0);
+        let strategy = (
+            prop::collection::vec((1..BODIES.len(), any::<bool>(), 0..3usize), 1..6),
+            1..INDENTS.len(),
+            prop::collection::vec(edit_spec(), 1..4),
+        );
+        runner
+            .run(&strategy, |(lines, indent, specs)| {
+                let indent = INDENTS[indent];
+                let prepared: String = lines
+                    .iter()
+                    .map(|&(body, empty, eol)| {
+                        format!("{}{}", if empty { "" } else { BODIES[body] }, EOLS[eol])
+                    })
+                    .collect();
+                let virtual_text = indent_lines(&prepared, indent);
+                let lines = LineMap::new(virtual_text.clone());
+                let changes: Vec<_> = (0..virtual_text.len())
+                    .filter(|&at| {
+                        is_line_start(&virtual_text, at)
+                            && !splits_crlf(&virtual_text, at)
+                            && virtual_text[at..].starts_with(indent)
+                    })
+                    .map(|at| {
+                        json!({"range": {
+                            "start": lines.position(at),
+                            "end": lines.position(at + indent.len())
+                        }, "newText": ""})
+                    })
+                    .collect();
+                if changes.is_empty() {
+                    // No dedent to regain.
+                    return Ok(());
+                }
+                let Ok(document) = apply_prepare_result(
+                    &virtual_text,
+                    &VirtualLayout::single(&virtual_text),
+                    serde_json::from_value(
+                        json!({"segments": [{"type": "content", "changes": changes}]}),
+                    )
+                    .unwrap(),
+                ) else {
+                    return Ok(());
+                };
+                prop_assert_eq!(&document.text, &prepared);
+                let edits = edits(&document.map, &specs);
+                let Some(mapped) = document.map.map_edits(&edits, EditMode::Extent) else {
+                    return Ok(());
+                };
+                mapped_sets.set(mapped_sets.get() + 1);
+                prop_assert_eq!(
+                    apply_to(&virtual_text, &mapped),
+                    indent_lines(&apply_to(&prepared, &edits), indent),
+                    "{:?} on {:?}",
+                    edits,
+                    virtual_text
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(mapped_sets.get() > 600, "mapped {}", mapped_sets.get());
+    }
+}
+
+#[test]
+fn an_edit_ending_between_a_cr_and_a_gaps_lf_is_refused() {
+    // Content ending with a CR, then a gap whose masked text is the LF: no
+    // LSP position names the offset between them.
+    let virtual_text = "\r\n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..1, String::new()),
+            (SegmentKind::Gap, 1..2, "```\n".to_string()),
+        ],
+        json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}]}),
+    );
+    assert_eq!(prepared.text, "\r");
+    assert_eq!(
+        prepared.map.map_one_with_extent(&edit((0, 0), (1, 0), "q")),
+        None
+    );
 }

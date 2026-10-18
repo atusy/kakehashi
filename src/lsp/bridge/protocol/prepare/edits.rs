@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
 
 use super::{
     Bias, LineMap, PreparedMap, RunKind, Side, empty_run, is_line_start, map_offset,
-    map_offset_stopping,
+    map_offset_stopping, splits_crlf,
 };
 
 /// How a set of edits to P is read when mapped to V
@@ -46,37 +46,31 @@ impl PreparedMap {
     /// indentation the peer removed from lines it creates or replaces. The
     /// mapped set is then checked as a whole against the host text V holds
     /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
-    /// `None` — refuse the set — when an edit is reversed, edits overlap (in
-    /// P, or once mapped), an edit touches a gap, a line created in content
-    /// has no single indentation to regain, or the host text would not
-    /// survive.
+    /// `None` — refuse the set — when an edit is reversed, edits overlap or
+    /// touch in P (or overlap once mapped), an edit touches a gap, a line
+    /// created in content has no single indentation to regain, or the host
+    /// text would not survive.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
         let EditMode::Extent = mode;
         let prepared = &self.prepared_lines.text;
         let (ranges, order) = sorted_extents(&self.prepared_lines, edits)?;
-        // What follows an edit in the edited text: the next edit's inserted
-        // text when one goes right after it (a line one inserts is followed
-        // by what the next one inserts there), else P past every edit
-        // deleting from there.
-        let following = |at: usize| {
-            let mut position = ranges[order[at]].end;
-            for &next in &order[at + 1..] {
-                if ranges[next].start != position {
-                    break;
-                }
-                if let Some(first) = edits[next].new_text.chars().next() {
-                    return Some(first);
-                }
-                position = ranges[next].end;
-            }
-            prepared[position..].chars().next()
-        };
+        // Edits that touch — one ending where another starts, two inserting
+        // at one place — are refused: how each regains a removed indent, and
+        // on which side of the other it lands, depends on the other's text,
+        // which mapped one by one neither sees.
+        if order
+            .windows(2)
+            .any(|pair| ranges[pair[0]].end == ranges[pair[1]].start)
+        {
+            return None;
+        }
         let mut mapped = vec![None; edits.len()];
-        for (at, &index) in order.iter().enumerate() {
+        for &index in &order {
+            let following = prepared[ranges[index].end..].chars().next();
             mapped[index] = Some(self.hunk_to_virtual(
                 ranges[index].clone(),
                 &edits[index].new_text,
-                following(at),
+                following,
             )?);
         }
         let mapped: Vec<(Range<usize>, String)> = mapped
@@ -120,6 +114,13 @@ impl PreparedMap {
             .windows(2)
             .any(|pair| pair[0].0.end > pair[1].0.start)
         {
+            return false;
+        }
+        // An edge between a CR and an LF names no LSP position: one a gap's
+        // text opens with, after content ending with the CR, say.
+        if sorted.iter().any(|(range, _)| {
+            splits_crlf(virtual_text, range.start) || splits_crlf(virtual_text, range.end)
+        }) {
             return false;
         }
         let mut edited = String::with_capacity(virtual_text.len());
@@ -190,7 +191,7 @@ impl PreparedMap {
     }
 
     /// Map the replacement of P's `old` bytes by `new_text` onto V.
-    /// `following` is the character after the replacement in the edited P.
+    /// `following` is the character after the replacement in P.
     fn hunk_to_virtual(
         &self,
         old: Range<usize>,
