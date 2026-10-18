@@ -112,10 +112,19 @@ fn transform_folding_range_response_to_host(
                 Position::new(folding.end_line, folding.end_character.unwrap_or(u32::MAX)),
                 Bias::End,
             );
+            // A character given stays given, at its mapped column. One
+            // omitted (the line's end) stays omitted only while the mapped
+            // endpoint is still its virtual line's end: a prepared line may
+            // be part of a virtual one (a gap turned into a line break), and
+            // an omitted character there would read as that line's end.
+            let character = |given: Option<u32>, at: Position| {
+                (given.is_some() || at.character != prepared.virtual_line_length(at.line))
+                    .then_some(at.character)
+            };
+            folding.start_character = character(folding.start_character, start);
+            folding.end_character = character(folding.end_character, end);
             folding.start_line = start.line;
-            folding.start_character = folding.start_character.map(|_| start.character);
             folding.end_line = end.line;
-            folding.end_character = folding.end_character.map(|_| end.character);
         }
     }
 
@@ -267,6 +276,56 @@ mod tests {
             (ranges[1].start_line, ranges[1].start_character),
             (0, Some(1))
         );
+    }
+
+    /// A gap turned into a line break splits one virtual line into two
+    /// prepared ones: a fold over them given without characters starts
+    /// mid-line in the virtual document, so its start character is given
+    /// there (omitted would mean the line's end); its end, at the virtual
+    /// line's end, stays omitted.
+    #[test]
+    fn a_fold_over_a_split_line_gives_its_start_character() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "abc  def";
+        let gaps = [VirtualGap {
+            virtual_range: 3..5,
+            host_text: "--".to_string(),
+        }];
+        let answer = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": "\n"},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abc\ndef");
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"startLine": 0, "endLine": 1},
+            {"startLine": 0, "startCharacter": 1, "endLine": 1, "endCharacter": 2}
+        ]});
+        let ranges = transform_folding_range_response_to_host(
+            response,
+            &RegionOffset::new(10, 4).with_prepared(prepared.map),
+        )
+        .unwrap();
+        let fold = |range: &FoldingRange| {
+            (
+                range.start_line,
+                range.start_character,
+                range.end_line,
+                range.end_character,
+            )
+        };
+        // Host column = virtual column + the region's 4.
+        assert_eq!(fold(&ranges[0]), (10, Some(7), 10, None));
+        // Characters given are mapped: P (1, 2) is before "f", V column 7.
+        assert_eq!(fold(&ranges[1]), (10, Some(5), 10, Some(11)));
     }
 
     #[test]
