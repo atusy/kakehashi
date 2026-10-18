@@ -485,7 +485,7 @@ impl LanguageServerPool {
                             SentText::from(&*document.text),
                             change,
                         ),
-                        NotificationSendResult::Queued
+                        Some(NotificationSendResult::Queued)
                     )
                 {
                     return Err(io::Error::other("completion text sync was not queued"));

@@ -21,11 +21,13 @@ use super::super::pool::{
 };
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
+/// Enqueue a didSave unless the didChange it follows (`None`: none needed)
+/// was not queued: refused, its text revoked (`Some(None)`), or dropped.
 fn enqueue_did_save_if_content_synced(
-    did_change: Option<NotificationSendResult>,
+    did_change: Option<Option<NotificationSendResult>>,
     enqueue_did_save: impl FnOnce() -> NotificationSendResult,
 ) -> Option<NotificationSendResult> {
-    if did_change.is_some_and(|outcome| !matches!(outcome, NotificationSendResult::Queued)) {
+    if did_change.is_some_and(|outcome| !matches!(outcome, Some(NotificationSendResult::Queued))) {
         return None;
     }
     Some(enqueue_did_save())
@@ -217,11 +219,13 @@ mod tests {
     #[test]
     fn queue_full_did_change_suppresses_textless_did_save() {
         let did_save_enqueued = Cell::new(false);
-        let result =
-            enqueue_did_save_if_content_synced(Some(NotificationSendResult::QueueFull), || {
+        let result = enqueue_did_save_if_content_synced(
+            Some(Some(NotificationSendResult::QueueFull)),
+            || {
                 did_save_enqueued.set(true);
                 NotificationSendResult::Queued
-            });
+            },
+        );
 
         assert!(result.is_none());
         assert!(

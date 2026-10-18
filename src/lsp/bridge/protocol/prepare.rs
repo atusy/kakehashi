@@ -768,6 +768,29 @@ impl PreparedMap {
         self.revocation = Some(revocation);
     }
 
+    /// Whether `a` and `b` translate alike: built from the same texts with
+    /// the same runs (the maps' equality), whichever answers they came from.
+    /// What decides whether a server holding one needs the other's text sent
+    /// (it does not), or reads a reply computed on one through the other.
+    pub(crate) fn same_coordinates(a: Option<&PreparedMap>, b: Option<&PreparedMap>) -> bool {
+        a == b
+    }
+
+    /// Whether `a` and `b` are the same answer — one map, which one
+    /// revocation speaks for — not merely alike in coordinates. What
+    /// decides whether a record or a cache still holds the answer a
+    /// request was built on, and whether a holder moved to another.
+    pub(crate) fn same_answer(
+        a: Option<&std::sync::Arc<PreparedMap>>,
+        b: Option<&std::sync::Arc<PreparedMap>>,
+    ) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// Whether the peer failed this map's input since it was taken: an
     /// answer it no longer gives, through which no coordinates are read and
     /// no request is sent.

@@ -127,7 +127,7 @@ impl LanguageServerPool {
                     content,
                     change,
                 );
-                if !matches!(send_result, NotificationSendResult::Queued) {
+                if !matches!(send_result, Some(NotificationSendResult::Queued)) {
                     synchronized = false;
                 }
                 drop(transition_guard);
