@@ -202,9 +202,10 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 /// lines lost and keep off the host text the peer hid (gaps, deleted edge
 /// lines), so the set goes through [`PreparedMap::map_edits`]. An
 /// unprepared document's edits translate one by one, as ranges, allocating
-/// nothing.
+/// nothing. Mapped, the set may hold other edits than it came with (see
+/// [`EditMode`]): it is replaced whole.
 pub(crate) fn translate_virtual_text_edits_to_host(
-    edits: &mut [TextEdit],
+    edits: &mut Vec<TextEdit>,
     offset: &RegionOffset,
     mode: EditMode,
 ) -> bool {
@@ -214,14 +215,39 @@ pub(crate) fn translate_virtual_text_edits_to_host(
         }
         return true;
     };
-    let Some(mapped) = prepared.map_edits(edits, mode) else {
+    let Some(mut mapped) = prepared.map_edits(edits, mode) else {
         return false;
     };
-    for (edit, mut mapped) in edits.iter_mut().zip(mapped) {
-        translate_unprepared_virtual_position_to_host(&mut mapped.range.start, offset);
-        translate_unprepared_virtual_position_to_host(&mut mapped.range.end, offset);
-        *edit = mapped;
+    for edit in &mut mapped {
+        translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
     }
+    *edits = mapped;
+    true
+}
+
+/// [`translate_virtual_text_edits_to_host`] for one edit that must stay one
+/// (a completion's main edit, an edit probed for where it lands); `false`,
+/// with `edit` left as it came, when refused or mapped to another number of
+/// edits.
+pub(crate) fn translate_virtual_text_edit_to_host(
+    edit: &mut TextEdit,
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        translate_virtual_range_to_host(&mut edit.range, offset);
+        return true;
+    };
+    let Some(Ok([mut mapped])) = prepared
+        .map_edits(std::slice::from_ref(edit), mode)
+        .map(<[TextEdit; 1]>::try_from)
+    else {
+        return false;
+    };
+    translate_unprepared_virtual_position_to_host(&mut mapped.range.start, offset);
+    translate_unprepared_virtual_position_to_host(&mut mapped.range.end, offset);
+    *edit = mapped;
     true
 }
 
@@ -261,7 +287,7 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
         None => Vec::new(),
     };
     for main in mains.iter_mut() {
-        if !translate_virtual_text_edits_to_host(std::slice::from_mut(main), offset, mode) {
+        if !translate_virtual_text_edit_to_host(main, offset, mode) {
             return None;
         }
     }
@@ -538,7 +564,7 @@ mod tests {
     fn prepared_text_edits_restore_the_indent_in_host_coordinates() {
         let offset = prepared_offset();
         // A line inserted after `y` (P (1, 2)) regains the removed indent.
-        let mut edits = [TextEdit {
+        let mut edits = vec![TextEdit {
             range: Range::new(Position::new(1, 3), Position::new(1, 3)),
             new_text: "\n  z".to_string(),
         }];
@@ -557,7 +583,7 @@ mod tests {
             range: Range::new(Position::new(1, 3), Position::new(0, 0)),
             new_text: "x".to_string(),
         };
-        let mut edits = [reversed.clone()];
+        let mut edits = vec![reversed.clone()];
         assert!(!translate_virtual_text_edits_to_host(
             &mut edits,
             &offset,
@@ -568,7 +594,7 @@ mod tests {
 
     #[test]
     fn unprepared_text_edits_translate_as_ranges() {
-        let mut edits = [TextEdit {
+        let mut edits = vec![TextEdit {
             range: Range::new(Position::new(0, 1), Position::new(1, 0)),
             new_text: "\nz".to_string(),
         }];

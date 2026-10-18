@@ -1257,7 +1257,7 @@ mod tests {
         pool.note_host_settled(&uri, 1, 1);
         let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
         // What the edit would do through the request's map.
-        let mut edits = [TextEdit {
+        let mut edits = vec![TextEdit {
             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             new_text: "foo".to_string(),
         }];
