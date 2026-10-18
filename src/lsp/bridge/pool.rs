@@ -3299,13 +3299,6 @@ impl LanguageServerPool {
             })
     }
 
-    /// Whether the lifecycle pass holds `region_id` (under `language`) of
-    /// `host_uri`: a newer input for it is being prepared, or its peer
-    /// failed it — either way the host moved past what was last sent for it.
-    pub(crate) fn region_held(&self, host_uri: &Url, language: &str, region_id: &str) -> bool {
-        self.region_admission(host_uri, language, region_id).held
-    }
-
     /// Whether a text from `answer`'s map (`None`: a text as is) is refused
     /// for `region_id` (under `language`) of `host_uri`: a map its peer
     /// revoked since (see `PreparedMap::revoked`), or a text as is while the
@@ -3366,6 +3359,71 @@ impl LanguageServerPool {
     #[cfg(test)]
     pub(crate) fn prepare_failures_for_test(&self) -> &super::prepare_registry::PrepareFailures {
         self.prepare_failures.get_or_init(Default::default)
+    }
+
+    /// Whether [`RegionAdmission`] holds `region_id` (under `language`) of
+    /// `host_uri`, read under a reference to `host` (its entry in
+    /// `latest_virtual_contents`) already held: a withheld mark is for the
+    /// incarnation it was set under, read off `host` itself, where
+    /// [`Self::region_admission`] would look the host up again under that
+    /// reference.
+    fn host_withholds(
+        &self,
+        host_uri: &Url,
+        host: &HostVirtualContents,
+        language: &str,
+        region_id: &str,
+    ) -> bool {
+        self.prepare_failures.get().is_some_and(|failures| {
+            failures
+                .admission(host_uri, language, region_id, self.prepare_epoch())
+                .withheld
+                == Some(host.incarnation)
+        })
+    }
+
+    /// Whether the host text a prepared request's map describes is still
+    /// the region's current host text, read from the region's latest
+    /// recorded content in one step: its hold, then its map.
+    ///
+    /// - Held (a newer input's answer pending, or failed): the host moved,
+    ///   to a map not known yet — no.
+    /// - The latest map prepares the request's very text, yet differs: the
+    ///   host moved under a prepared text that stayed the same (indentation
+    ///   the peer removes was edited) — no.
+    /// - The latest text prepares to another text (typing), or went as is:
+    ///   the answer is stale as any LSP answer is when the document changed
+    ///   meanwhile, as on unprepared documents — yes.
+    /// - The same map, or nothing recorded — yes.
+    ///
+    /// The hold is read first: [`Self::record_latest_virtual_content`]
+    /// stores a text before it clears the hold, so with the hold read clear
+    /// the content read next is at least that text; one seen with the hold
+    /// still set is refused either way.
+    pub(crate) fn host_text_still_current(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        request_map: &super::protocol::PreparedMap,
+    ) -> bool {
+        let Some(host) = self.latest_virtual_contents.get(host_uri) else {
+            return true;
+        };
+        if self.host_withholds(host_uri, &host, language, region_id) {
+            return false;
+        }
+        let latest = host.contents.get(language).and_then(|regions| {
+            regions
+                .get(region_id)
+                .map(|latest| latest.value().map().cloned())
+        });
+        match latest {
+            Some(Some(latest)) => {
+                latest.prepared_text() != request_map.prepared_text() || *latest == *request_map
+            }
+            _ => true,
+        }
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
