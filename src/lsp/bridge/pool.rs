@@ -3436,7 +3436,10 @@ impl LanguageServerPool {
     ///   an inserted line joins), so no text but the request's is known to
     ///   place it alike. An answer overtaken by a later edit is dropped; the
     ///   client asks again for the latest text, whose answer is kept.
-    /// - Nothing recorded for the region: no text it moved to — yes.
+    /// - The region recorded under another language: rerouted — no.
+    /// - Nothing recorded for it: an open no pass recorded yet — yes. (A
+    ///   region forgotten since is no longer live, which the final check
+    ///   reads off the region tracker: see `Sourced::still_current`.)
     ///
     /// The hold is read first: [`Self::record_latest_virtual_content`]
     /// stores a text before it clears the hold, so with the hold read clear
@@ -3474,7 +3477,12 @@ impl LanguageServerPool {
             Some(latest) => {
                 super::protocol::PreparedMap::same_coordinates(latest.as_deref(), Some(request_map))
             }
-            None => true,
+            // Recorded under another language, the region was rerouted (a
+            // shebang edit, say): its text is no longer the request's.
+            // Recorded under none, it is open but no pass recorded it yet.
+            None => !host.contents.iter().any(|regions| {
+                regions.key().as_str() != language && regions.value().contains_key(region_id)
+            }),
         }
     }
 

@@ -60,8 +60,9 @@ impl Kakehashi {
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held.
         let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
         Ok(hints.map(|hints| {
-            let current = hints.still_current(pool);
+            let current = hints.still_current(pool, tracker);
             inlay_hints_still_current(hints.value, current)
         }))
     }
@@ -211,7 +212,8 @@ impl Kakehashi {
         let hints = result
             .handle(&self.notifier(), "inlay hint", None, Ok)
             .await?;
-        Ok(hints.map(|hints| Sourced::from_region(&ctx.document, hints)))
+        Ok(hints
+            .map(|hints| Sourced::from_region(&ctx.document, hints, self.bridge.node_tracker())))
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {

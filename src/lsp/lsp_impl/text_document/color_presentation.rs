@@ -46,8 +46,9 @@ impl Kakehashi {
         // The final answer chosen: a prepared part's edits checked once
         // more against the host text, which may have moved while it was held.
         let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
         Ok(answer.map_or_else(Vec::new, |answer| {
-            answer.still_current(|source| source.still_current(pool))
+            answer.still_current(|source| source.still_current(pool, tracker))
         }))
     }
 
@@ -100,7 +101,8 @@ impl Kakehashi {
                 Ok((!items.is_empty()).then_some(items))
             })
             .await?;
-        Ok(presentations.map(|items| Sourced::from_region(&ctx.document, items)))
+        Ok(presentations
+            .map(|items| Sourced::from_region(&ctx.document, items, self.bridge.node_tracker())))
     }
 
     async fn color_presentation_host_layer(
@@ -233,6 +235,7 @@ mod tests {
                     "css",
                     "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                     &map,
+                    1,
                 ),
             ))
         };

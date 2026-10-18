@@ -255,20 +255,30 @@ edited V. It is refused, and dropped like any unsafe set, when:
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
-An answer's edits are mapped only while the region's latest recorded
-content is the very text its request was built on, in the very same
-coordinates. This is read when the answer arrives, and once more when the
+An answer's edits are mapped only while they would land where the server
+meant them. This is read when the answer arrives, and once more when the
 final answer is chosen, since the servers' fan-in or the layer race can
-hold an answer while the host moves. The edits are dropped while the
-host's last edit has not been settled yet (its parse or lifecycle pass
-still running, so the recorded text may predate it), while the host's
-newer text waits for its prepare answer, once any other text is recorded
-(typed on, re-indented, sent as is), and once the peer failed the
-request's input (see Failure; a reply arriving after that is refused
-whole, and one the failure lands under keeps no edit). Then completion
-answers nothing (an empty incomplete list when it asked to re-query),
-color presentations answer nothing, and inlay hints stay shown without
-their edits.
+hold an answer while the host moves:
+
+- the region is no longer live (no longer tracked under the host
+  lifetime it was tracked under as the answer was made: deleted,
+  invalidated by an edit over it, its host closed or reopened) — dropped;
+- the host's last edit has not been settled yet (its parse or lifecycle
+  pass still running, so the recorded text may predate it), or the
+  host's newer text waits for its prepare answer — dropped;
+- the peer failed the request's input (see Failure; a reply arriving
+  after that is refused whole, and one the failure lands under keeps no
+  edit) — dropped;
+- live, and nothing recorded for the region yet (opened, no pass has
+  recorded its text) — kept;
+- recorded with the request's very text in the very same coordinates —
+  kept;
+- anything else recorded (typed on, re-indented, sent as is, or the
+  region rerouted to another language) — dropped.
+
+Dropped, completion answers nothing (an empty incomplete list when it
+asked to re-query), color presentations answer nothing, and inlay hints
+stay shown without their edits.
 
 Unlike on an unprepared document, an answer overtaken by typing is
 dropped, not kept stale. How an edit maps back depends on the whole text

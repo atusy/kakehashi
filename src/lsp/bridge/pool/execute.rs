@@ -1154,8 +1154,13 @@ mod tests {
         let after = prepare("x\n  ");
         let pool = Arc::new(LanguageServerPool::preparing());
         let uri = Url::parse("file:///test/indent-policy.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        let region = tracker
+            .get_or_create_for_incarnation(&uri, 0, 3, "block", 1)
+            .unwrap()
+            .to_string();
         pool.open_host_incarnation(&uri, 1).await;
-        pool.record_latest_prepared_for_test(&uri, 1, "lua", TEST_ULID_LUA_0, &before);
+        pool.record_latest_prepared_for_test(&uri, 1, "lua", &region, &before);
         let key = ConnectionKey::for_server("test-server");
         let handle = create_handle_with_key(ConnectionState::Ready, key).await;
         handle.set_server_capabilities(ServerCapabilities {
@@ -1170,6 +1175,7 @@ mod tests {
             let upstream = upstream.clone();
             let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
             let text = before.text.clone();
+            let region = region.clone();
             tokio::spawn(async move {
                 pool.send_inlay_hint_request(
                     "test-server",
@@ -1178,7 +1184,7 @@ mod tests {
                     Range::new(Position::new(0, 0), Position::new(1, 2)),
                     Position::new(1, 2),
                     "lua",
-                    TEST_ULID_LUA_0,
+                    &region,
                     offset,
                     &text,
                     crate::lsp::bridge::HostRevision {
@@ -1193,7 +1199,7 @@ mod tests {
         };
         let id = wait_for_sent_request(&handle, &upstream).await;
         pool.note_host_edited(&uri, 1, 1);
-        pool.record_latest_prepared_for_test(&uri, 1, "lua", TEST_ULID_LUA_0, &after);
+        pool.record_latest_prepared_for_test(&uri, 1, "lua", &region, &after);
         pool.note_host_settled(&uri, 1, 1);
         let _ = handle.router().route(serde_json::json!({
             "jsonrpc": "2.0", "id": id.as_i64(), "result": [{
@@ -1208,8 +1214,8 @@ mod tests {
         let hints = request.await.unwrap().unwrap().unwrap();
         assert_eq!(hints.len(), 1, "the hint stays shown");
         assert!(hints[0].text_edits.is_none());
-        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", TEST_ULID_LUA_0, &before.map);
-        assert!(!sourced.still_current(&pool));
+        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", &region, &before.map, 1);
+        assert!(!sourced.still_current(&pool, &tracker));
     }
 
     /// Typing that changed P as the indentation changed (`  f` to

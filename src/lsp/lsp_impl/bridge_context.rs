@@ -333,12 +333,29 @@ pub(crate) struct Sourced<T> {
     prepared: Option<PreparedSource>,
 }
 
-/// The region and request map a prepared answer was transformed through.
+/// The region and request map a prepared answer was transformed through,
+/// and the host lifetime the region was tracked under as it was (`None`:
+/// not tracked even then).
 struct PreparedSource {
     host_uri: Url,
     language: String,
     region_id: String,
     map: std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+    incarnation: Option<u64>,
+}
+
+/// The host lifetime `region_id` of `host_uri` is tracked under now, if it
+/// is tracked at all: a region deleted, invalidated by an edit, or of a
+/// closed host is not.
+fn tracked_region_incarnation(
+    tracker: &crate::language::NodeTracker,
+    host_uri: &Url,
+    region_id: &str,
+) -> Option<u64> {
+    let ulid = region_id.parse::<ulid::Ulid>().ok()?;
+    tracker
+        .lookup_position(host_uri, &ulid)
+        .map(|(_, _, _, incarnation)| incarnation)
 }
 
 impl<T> Sourced<T> {
@@ -360,6 +377,7 @@ impl<T> Sourced<T> {
         language: &str,
         region_id: &str,
         map: &std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+        incarnation: u64,
     ) -> Self {
         Self {
             value,
@@ -368,13 +386,18 @@ impl<T> Sourced<T> {
                 language: language.to_string(),
                 region_id: region_id.to_string(),
                 map: std::sync::Arc::clone(map),
+                incarnation: Some(incarnation),
             }),
         }
     }
 
     /// The virt layer's answer for `ctx`'s region: through its map, when
-    /// the region is prepared.
-    pub(crate) fn from_region(ctx: &DocumentRequestContext, value: T) -> Self {
+    /// the region is prepared, with the lifetime `tracker` tracks it under.
+    pub(crate) fn from_region(
+        ctx: &DocumentRequestContext,
+        value: T,
+        tracker: &crate::language::NodeTracker,
+    ) -> Self {
         Self {
             value,
             prepared: ctx.prepared.as_ref().map(|map| PreparedSource {
@@ -382,6 +405,11 @@ impl<T> Sourced<T> {
                 language: ctx.resolved.injection_language.clone(),
                 region_id: ctx.resolved.region.region_id.clone(),
                 map: std::sync::Arc::clone(map),
+                incarnation: tracked_region_incarnation(
+                    tracker,
+                    &ctx.uri,
+                    &ctx.resolved.region.region_id,
+                ),
             }),
         }
     }
@@ -404,14 +432,25 @@ impl<T> Sourced<T> {
     }
 
     /// Whether the edits mapped into the answer still land where they were
-    /// mapped: always so without a map, and otherwise as the executor read
-    /// it as the reply arrived (`LanguageServerPool::host_text_still_current`),
-    /// read again here because a fan-in or the layer race can hold a
-    /// transformed answer while the host moves. Read once, where the final
-    /// answer is chosen.
-    pub(crate) fn still_current(&self, pool: &crate::lsp::bridge::LanguageServerPool) -> bool {
+    /// mapped: always so without a map. Otherwise the region must be live —
+    /// still tracked under the lifetime it was tracked under as the answer
+    /// was made, which the host's store is open for (not deleted,
+    /// invalidated, nor its host closed or reopened) — and its recorded text
+    /// what the executor read as the reply arrived
+    /// (`LanguageServerPool::host_text_still_current`). Read again here
+    /// because a fan-in or the layer race can hold a transformed answer
+    /// while the host moves; read once, where the final answer is chosen.
+    pub(crate) fn still_current(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
         self.prepared.as_ref().is_none_or(|source| {
-            pool.host_text_still_current(
+            source.incarnation.is_some_and(|incarnation| {
+                tracked_region_incarnation(tracker, &source.host_uri, &source.region_id)
+                    == Some(incarnation)
+                    && pool.current_host_incarnation(&source.host_uri) == Some(incarnation)
+            }) && pool.host_text_still_current(
                 &source.host_uri,
                 &source.language,
                 &source.region_id,
@@ -2381,20 +2420,74 @@ mod tests {
         assert_eq!(before.text, after.text);
         let pool = crate::lsp::bridge::LanguageServerPool::preparing();
         let host = Url::parse("file:///test/held-reindent.md").unwrap();
-        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+            .unwrap()
+            .to_string();
         pool.open_host_incarnation(&host, 1).await;
-        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &before);
-        let held = Sourced::prepared_for_test((), &host, "lua", region, &before.map);
+        let held = Sourced::prepared_for_test((), &host, "lua", &region, &before.map, 1);
+        // Open, no pass recorded its text yet: live, kept.
+        assert!(held.still_current(&pool, &tracker));
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &before);
         assert!(
-            held.still_current(&pool),
+            held.still_current(&pool, &tracker),
             "current as its reply was transformed"
         );
         pool.note_host_edited(&host, 1, 1);
-        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &after);
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &after);
         pool.note_host_settled(&host, 1, 1);
-        assert!(!held.still_current(&pool));
+        assert!(!held.still_current(&pool, &tracker));
         // An answer through no map reads nothing.
-        assert!(Sourced::unprepared(()).still_current(&pool));
+        assert!(Sourced::unprepared(()).still_current(&pool, &tracker));
+    }
+
+    /// A region forgotten after its request was made is no place for the
+    /// answer's edits, however the store reads: rerouted to another
+    /// language, invalidated or deleted, or its host closed or reopened.
+    #[tokio::test]
+    async fn an_answer_for_a_region_forgotten_since_is_stale_when_chosen() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let prepared = apply_prepare_result("a\n", &VirtualLayout::single("a\n"), None).unwrap();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/forgotten.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 1)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+        let answer = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1);
+        assert!(answer.still_current(&pool, &tracker));
+        // Rerouted: the region's text recorded under another language only.
+        pool.clear_invalidated_virtual_contents(&host, &[region.parse().unwrap()]);
+        assert!(answer.still_current(&pool, &tracker), "open, not recorded");
+        pool.record_latest_prepared_for_test(&host, 1, "python", &region, &prepared);
+        assert!(!answer.still_current(&pool, &tracker));
+        pool.clear_invalidated_virtual_contents(&host, &[region.parse().unwrap()]);
+        // Invalidated by an edit over it (or deleted): no longer tracked.
+        let invalidated = tracker.apply_input_edits(
+            &host,
+            &[crate::language::node_tracker::EditInfo::new(0, 2, 0)],
+        );
+        assert!(invalidated.iter().any(|ulid| ulid.to_string() == region));
+        assert!(!answer.still_current(&pool, &tracker));
+        // Its host reopened: the region tracked anew under another lifetime.
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 1)
+            .unwrap()
+            .to_string();
+        let answer = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1);
+        assert!(answer.still_current(&pool, &tracker));
+        pool.close_host_incarnation(&host, 1).await;
+        assert!(!answer.still_current(&pool, &tracker), "closed");
+        pool.open_host_incarnation(&host, 2).await;
+        assert!(!answer.still_current(&pool, &tracker), "reopened");
     }
 
     /// A Kakehashi over a preparing pool whose markdown lua documents have
