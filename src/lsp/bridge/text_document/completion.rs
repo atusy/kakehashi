@@ -195,6 +195,15 @@ fn transform_completion_response_to_host(
             target: "kakehashi::bridge",
             "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence) or does not map back through its prepared document"
         );
+        // Every item the server offered was dropped here: the list is no
+        // answer of its own, yet an incomplete one would still count as a
+        // result (`completion_list_has_result`), winning over a lower-priority
+        // server's items or the host layer's. The re-ask an incomplete list
+        // asks for would only bring more items dropped alike. (A complete
+        // empty list already counts as none.)
+        if list.items.is_empty() && list.is_incomplete {
+            return None;
+        }
     }
 
     Some(list)
@@ -1392,6 +1401,44 @@ mod tests {
             },
             ClientInsertMode::default(),
         )
+    }
+
+    #[test]
+    fn a_list_whose_every_item_is_dropped_is_no_result() {
+        // An incomplete list would otherwise win over other servers' items.
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "isIncomplete": true,
+            "items": [{"label": "x", "insertText": "a\nb"}]
+        }});
+        let offset = RegionOffset::new(10, 0).with_prepared(dedented_map("  a\n"));
+        assert_eq!(
+            transform_completion_response_to_host(
+                response,
+                &offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                false,
+                &EnvelopeContext {
+                    server_name: "lua-ls",
+                    injection_language: "lua",
+                    incarnation: Some(1),
+                    host_uri: "file:///test.md",
+                    region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                    offset: &offset,
+                    region_end: Some(Position::new(11, 0)),
+                    host_layer: false,
+                },
+                ClientInsertMode::default(),
+            ),
+            None
+        );
+        // A server's own empty incomplete list stays an answer.
+        let response =
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"isIncomplete": true, "items": []}});
+        assert!(
+            transform_with_resolve_support(response, &offset, Position::new(11, 0), Some(0), false)
+                .is_some_and(|list| list.is_incomplete)
+        );
     }
 
     #[test]
