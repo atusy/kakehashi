@@ -2758,14 +2758,16 @@ impl LanguageServerPool {
         // with text as is (a request resolved before its pair gained the
         // peer), whether its own or the last forwarded.
         // Nothing is ever held without the prepare layer.
-        let region_held = self.prepares()
-            && self
-                .latest_virtual_contents
-                .get(host_uri)
-                .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()));
+        let region_held = || {
+            self.prepares()
+                && self
+                    .latest_virtual_contents
+                    .get(host_uri)
+                    .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()))
+        };
         if let VirtualOpenContent::LatestKnown(provided) = &content
             && provided.map.is_none()
-            && region_held
+            && region_held()
         {
             drop(transition_guard);
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
@@ -2864,6 +2866,29 @@ impl LanguageServerPool {
         self.document_tracker
             .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
+        // Asked again now that the document is registered: the lifecycle
+        // pass publishes a hold before its close sweep, which finds only
+        // registered documents. A hold published while this open awaited
+        // its claim, and swept past it, is seen here; one published after
+        // this read is followed by a sweep that finds the document and
+        // closes it.
+        let region_held = region_held();
+        if let VirtualOpenContent::LatestKnown(provided) = &content
+            && provided.map.is_none()
+            && region_held
+        {
+            self.document_tracker
+                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
+                .await;
+            claim_guard.disarm();
+            drop(claim_guard);
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "bridge: the region is held for its prepare peer",
+            ));
+        }
         // A deferred open refreshes from the forwarded-content cache as close
         // to enqueue as possible. A revision-guarded repair already owns newer
         // authoritative text: that cache can still trail the completed parse.
@@ -9573,6 +9598,55 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A region the lifecycle pass holds while a lazy open awaits its claim
+    /// is not opened as is: the pass's close sweep finds only registered
+    /// documents, and this one registers after the sweep ran.
+    #[tokio::test]
+    async fn a_region_held_while_its_open_awaits_its_claim_is_not_opened_as_is() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/lazy-open-held-late.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        let versions = pool
+            .document_tracker
+            .lock_document_versions_for_test()
+            .await;
+        let open = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                let mut sender = sender;
+                pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                    .await
+            })
+        };
+        // Past its first look, awaiting its claim.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !pool
+                .open_transition_locks
+                .contains_key(&(key.clone(), virtual_uri.to_uri_string()))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open takes its transition");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The pass holds the region; its sweep finds nothing registered.
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        drop(versions);
+        assert!(open.await.unwrap().is_err());
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        assert!(!pool.is_document_opened_on_connection(&virtual_uri, &key));
     }
 
     #[tokio::test]
