@@ -345,6 +345,14 @@ impl LanguageServerPool {
             self.unregister_upstream_request(id, connection_key);
         }
 
+        // A failure of its answer recorded since it was checked (between
+        // the check and the enqueue, or while it ran): its reply is read
+        // through no failed region, as no push is placed through one.
+        let response = response?;
+        if failed() {
+            return Err(request_text_not_held(connection_key));
+        }
+
         // Build context and transform response via caller-provided closure
         let context = BridgeResponseContext {
             virtual_uri_string: virtual_uri.to_uri_string(),
@@ -352,7 +360,7 @@ impl LanguageServerPool {
             offset,
         };
 
-        Ok(transform_response(response?, &context))
+        Ok(transform_response(response, &context))
     }
 
     /// Whether `connection_key` holds exactly the text a request built on
@@ -1124,6 +1132,177 @@ mod tests {
         assert!(!queue(Some(&other.map)));
     }
 
+    /// A failure of a request's answer recorded after the request was
+    /// checked — between the check and the enqueue here, or while it runs —
+    /// drops its reply: nothing is read through a failed region. (The
+    /// request itself may reach the server.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failure_recorded_after_a_request_was_checked_drops_its_reply() {
+        use crate::lsp::bridge::protocol::{AnswerOrigin, VirtualLayout, apply_prepare_result};
+        /// Records the failure as the request is serialized: after the
+        /// request's check, before its enqueue.
+        struct RecordFailure {
+            pool: Arc<LanguageServerPool>,
+            host: Url,
+            failure: AnswerOrigin,
+        }
+        impl serde::Serialize for RecordFailure {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.pool.prepare_failures_for_test().hold_for_test(
+                    &self.host,
+                    "lua",
+                    TEST_ULID_LUA_0,
+                    self.pool.prepare_epoch(),
+                    Some(self.failure),
+                );
+                serializer.serialize_unit()
+            }
+        }
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host = Url::parse("file:///test/failure-after-check.md").unwrap();
+        pool.open_host_incarnation(&host, 1).await;
+        let key = ConnectionKey::for_server("test-server");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &host,
+            &virtual_uri,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        let failure = AnswerOrigin {
+            taken: crate::lsp::bridge::protocol::next_presentation(),
+            input: prepared.map.origin().input,
+        };
+        let probe = Arc::new(std::sync::OnceLock::new());
+        let task = {
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            let host = host.clone();
+            let probe = Arc::clone(&probe);
+            let map = Arc::clone(&prepared.map);
+            let text = prepared.text.clone();
+            tokio::spawn(async move {
+                let params = RecordFailure {
+                    pool: Arc::clone(&pool),
+                    host: host.clone(),
+                    failure,
+                };
+                pool.execute_bridge_request_observed(
+                    handle,
+                    &host,
+                    "lua",
+                    TEST_ULID_LUA_0,
+                    &RegionOffset::new(0, 0).with_prepared(map),
+                    &text,
+                    None,
+                    None,
+                    |_, id| JsonRpcRequest::new(id.as_i64(), "test/failedAfterCheck", params),
+                    |response, _| response,
+                    Some(&probe),
+                )
+                .await
+            })
+        };
+        let id = wait_for_downstream_id(&probe).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !handle.router().is_sent(id) && !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request is sent or refused");
+        let _ = handle.router().route(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id.as_i64(),
+            "result": "computed on the failed text"
+        }));
+        assert!(task.await.unwrap().is_err(), "its reply is dropped");
+    }
+
+    /// A request on an answer the registry holds its region failed on is
+    /// refused at once, before the lifecycle pass re-syncs the host: the
+    /// failure is read where it is recorded.
+    #[tokio::test]
+    async fn a_failure_the_registry_holds_refuses_a_request_before_any_resync() {
+        use crate::lsp::bridge::prepare_registry::{Answer, PrepareInput, PrepareTarget};
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = crate::lsp::bridge::BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            crate::lsp::request_id::CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let host = Url::parse("file:///test/failure-before-resync.md").unwrap();
+        pool.open_host_incarnation(&host, 1).await;
+        let key = ConnectionKey::for_server("test-server");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        // The request's answer, taken before the failure.
+        let mut prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(dedent_answer()))
+                .unwrap();
+        let target = PrepareTarget {
+            candidates: Arc::from([]),
+            epoch: pool.prepare_epoch(),
+        };
+        coordinator.answer_prepare_for_test(
+            &target,
+            PrepareInput {
+                host_uri: &host,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: TEST_ULID_LUA_0,
+                virtual_text: "  a",
+                gaps: &[],
+            },
+            Answer::Unusable,
+            true,
+        );
+        let failure = coordinator
+            .prepare_failed_at(&host, "lua", TEST_ULID_LUA_0)
+            .unwrap();
+        // The same input as the failure's, answered before it.
+        Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_input(failure.input);
+        assert!(prepared.map.origin().revoked_by(failure));
+        let probe = std::sync::OnceLock::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.execute_bridge_request_observed(
+                Arc::clone(&handle),
+                &host,
+                "lua",
+                TEST_ULID_LUA_0,
+                &RegionOffset::new(0, 0).with_prepared(Arc::clone(&prepared.map)),
+                &prepared.text,
+                None,
+                None,
+                |_, id| JsonRpcRequest::new(id.as_i64(), "test/failedInRegistry", ()),
+                |response, _| response,
+                Some(&probe),
+            ),
+        )
+        .await
+        .expect("refused at once, not sent and waited on");
+        assert!(result.is_err());
+        assert!(probe.get().is_none(), "nothing was sent");
+    }
+
     /// A request built on an answer its region's peer no longer gives (it
     /// failed the region since, under a new epoch, say) is not queued, though
     /// its connection still holds that answer's text: no coordinates are read
@@ -1164,7 +1343,7 @@ mod tests {
         let answer = prepared.map.origin();
         let failed = || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(answer));
         assert!(!failed());
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, None);
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         assert!(!failed(), "pending");
         // The same input asked again (under a new epoch, say), taken after
         // the request's, and failed.
@@ -1173,7 +1352,13 @@ mod tests {
             input,
         };
         let first = failure(answer.input);
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(first),
+        );
         assert!(
             failed(),
             "an answer for the failed input taken before it failed"
@@ -1190,21 +1375,52 @@ mod tests {
                 .unwrap();
         let newer_failed =
             || pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, Some(newer.map.origin()));
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(first));
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(first),
+        );
         assert!(!newer_failed());
         // ...but is by a later failure of its input (another epoch's, say).
         let later = failure(newer.map.origin().input);
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(later));
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(later),
+        );
         assert!(newer_failed());
         // A failure of another text revokes no answer for this one, however
         // old (an undo back to a text answered before the edit that failed).
         let other = failure(answer.input.wrapping_add(1));
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, Some(other));
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(other),
+        );
         assert!(!failed());
         assert!(
             pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None),
             "a text as is still is"
         );
+        // Once the epoch moves, before the lifecycle pass holds the region
+        // on another input: the failure revokes the answers it did, but no
+        // longer says the region is not bridged.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(first),
+        );
+        pool.advance_prepare_epoch();
+        assert!(failed());
+        assert!(!pool.prepare_failed(&host_uri, "lua", TEST_ULID_LUA_0, None));
     }
 
     #[tokio::test]

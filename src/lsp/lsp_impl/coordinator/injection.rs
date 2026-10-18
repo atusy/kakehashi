@@ -540,10 +540,9 @@ impl InjectionCoordinator {
     }
 
     /// Hold `uri`'s held injections whose pair a peer is known to prepare
-    /// (see `LanguageServerPool::hold_latest_virtual_content`), each marked
-    /// with when its failed input was taken if its peer failed it: no request
-    /// opens one with text as is, nor reads coordinates through a failed one
-    /// from an answer taken before, as no push is placed through it. By
+    /// (see `LanguageServerPool::hold_latest_virtual_content`): no request
+    /// opens one with text as is (whether its peer failed one is read from
+    /// the registry, see `LanguageServerPool::prepare_failed`). By
     /// whoever holds the documents on their inputs (the lifecycle pass, a
     /// save at the saved version), under the edit lock. Returns the held
     /// regions, for [`Self::close_unprepared_held`]. Nothing is held
@@ -569,13 +568,9 @@ impl InjectionCoordinator {
             .map(|injection| (injection.language.as_str(), injection.region_id.as_str()))
             .collect();
         for (language, region_id) in &held {
-            self.bridge.pool().hold_latest_virtual_content(
-                uri,
-                incarnation,
-                language,
-                region_id,
-                self.bridge.prepare_failed_at(uri, language, region_id),
-            );
+            self.bridge
+                .pool()
+                .hold_latest_virtual_content(uri, incarnation, language, region_id);
         }
         held
     }
