@@ -1083,12 +1083,9 @@ fn region_hash(host_uri: &str, injection_language: &str, region_id: &str) -> u64
     hasher.finish()
 }
 
-/// The input's identity: its text and gaps, the host language and the
-/// candidates (by name and launch config), under the epoch the target was
-/// resolved in.
 /// An input's identity apart from the epoch and candidates it is asked
-/// under (see `protocol::AnswerOrigin`): the same text, asked again after
-/// the epoch moved, has the same one.
+/// under: the same text, asked again after the epoch moved, has the same
+/// one (what a `protocol::Revocation` record is kept per).
 fn input_identity(input: PrepareInput<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     input.host_language.hash(&mut hasher);
@@ -1097,6 +1094,9 @@ fn input_identity(input: PrepareInput<'_>) -> u64 {
     hasher.finish()
 }
 
+/// The input's key among a region's answers: its text and gaps, the host
+/// language and the candidates (by name and launch config), under the
+/// epoch the target was resolved in.
 fn input_key(target: &PrepareTarget, input: PrepareInput<'_>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     target.epoch.hash(&mut hasher);
