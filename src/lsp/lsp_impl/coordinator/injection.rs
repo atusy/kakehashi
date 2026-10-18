@@ -2951,41 +2951,27 @@ mod tests {
         };
         let injection = server.injection_coordinator();
         let failed = || pool.prepare_failed(&uri, "rust", &region.region_id, None);
+        let revoked = |prepared: &crate::lsp::bridge::PreparedDocument| {
+            pool.prepare_failed(&uri, "rust", &region.region_id, Some(&prepared.map))
+        };
+        // An answer for the input taken before it was asked again and failed.
+        let before = pool.prepare_failures_for_test().answered_for_test(input, 0);
         server.bridge.answer_prepare_for_test(
             &target,
             input,
             crate::lsp::bridge::PrepareAnswer::Unusable,
             true,
         );
-        // An answer taken after the failed input, before the pass found it.
-        let after = crate::lsp::bridge::apply_prepare_result(
-            "a",
-            &crate::lsp::bridge::VirtualLayout::single("a"),
-            None,
-        )
-        .unwrap()
-        .map
-        .origin()
-        .taken;
+        // An answer for it taken after the failure, before the pass found it.
+        let after = pool
+            .prepare_failures_for_test()
+            .answered_for_test(input, u64::MAX);
         injection.process_injections_for_resync(&uri).await;
         assert!(failed());
         // The failure is the input's, not the pass's: an answer for that
         // input taken after it is not refused by it, one taken before is.
-        let failure = server
-            .bridge
-            .prepare_failed_at(&uri, "rust", &region.region_id)
-            .unwrap();
-        let answer = |taken| crate::lsp::bridge::AnswerOrigin {
-            taken,
-            input: failure.input,
-        };
-        assert!(!pool.prepare_failed(&uri, "rust", &region.region_id, Some(answer(after))));
-        assert!(pool.prepare_failed(
-            &uri,
-            "rust",
-            &region.region_id,
-            Some(answer(failure.taken - 1))
-        ));
+        assert!(!revoked(&after));
+        assert!(revoked(&before));
     }
 
     /// A probe that finds no prepare target leaves the region's lookups be:

@@ -2820,7 +2820,7 @@ impl LanguageServerPool {
                     host_uri,
                     virtual_uri.language(),
                     virtual_uri.region_id(),
-                    provided.map.map(|map| map.origin()),
+                    provided.map.map(|map| &**map),
                 ) || provided.map.is_none() && held)
         };
         if refused(&content, region_held()) {
@@ -2987,7 +2987,7 @@ impl LanguageServerPool {
                 host_uri,
                 virtual_uri.language(),
                 virtual_uri.region_id(),
-                virtual_content.map.map(|map| map.origin()),
+                virtual_content.map.map(|map| &**map),
             )
         {
             self.document_tracker
@@ -3236,24 +3236,26 @@ impl LanguageServerPool {
             })
     }
 
-    /// Whether the lifecycle pass holds `region_id` (under `language`) of
-    /// `host_uri` as failed by its peer in a way that revokes a request's
-    /// `answer` (`None` for a request as is; see
-    /// `PrepareFailures::revokes`): that request reads no coordinates
-    /// through it, as no push is placed through it. A request on another
-    /// text, or answered after the failure, is not refused by it. Read from
-    /// the registry as the answer is recorded; never without the prepare
-    /// layer.
+    /// Whether a text from `answer`'s map (`None`: a text as is) is refused
+    /// for `region_id` (under `language`) of `host_uri`: a map its peer
+    /// revoked since (see `PreparedMap::revoked`), or a text as is while the
+    /// failure the lifecycle pass holds the region on stands (see
+    /// `PrepareFailures::region_failed`). Such a request reads no
+    /// coordinates through it, as no push is placed through it. Read as the
+    /// failure is recorded; never without the prepare layer.
     pub(crate) fn prepare_failed(
         &self,
         host_uri: &Url,
         language: &str,
         region_id: &str,
-        answer: Option<super::protocol::AnswerOrigin>,
+        answer: Option<&super::protocol::PreparedMap>,
     ) -> bool {
-        self.prepare_failures.get().is_some_and(|failures| {
-            failures.revokes(host_uri, language, region_id, self.prepare_epoch(), answer)
-        })
+        match answer {
+            Some(map) => map.revoked(),
+            None => self.prepare_failures.get().is_some_and(|failures| {
+                failures.region_failed(host_uri, language, region_id, self.prepare_epoch())
+            }),
+        }
     }
 
     /// Read the failures the prepare registry holds regions on (see
@@ -9690,6 +9692,22 @@ mod tests {
         .map
     }
 
+    /// [`dedent_map`] for `input` of the lua region of `host_uri`, as the
+    /// registry gives it out: what revokes it is shared with every answer
+    /// for that input.
+    fn answered_map(
+        pool: &LanguageServerPool,
+        host_uri: &Url,
+        input: u64,
+    ) -> Arc<crate::lsp::bridge::protocol::PreparedMap> {
+        let mut map = dedent_map("  x = 1");
+        let fresh = Arc::get_mut(&mut map).unwrap();
+        fresh.set_input(input);
+        pool.prepare_failures_for_test()
+            .share_for_test(host_uri, "lua", TEST_ULID_LUA_0, fresh);
+        map
+    }
+
     #[tokio::test]
     async fn a_lazy_open_sends_a_newer_prepared_text_and_otherwise_the_forwarded_one() {
         let pool = LanguageServerPool::preparing();
@@ -9851,7 +9869,7 @@ mod tests {
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
         // The request's answer, taken before its peer failed the region.
-        let map = dedent_map("  x = 1");
+        let map = answered_map(&pool, &host_uri, 1);
         pool.prepare_failures_for_test().hold_for_test(
             &host_uri,
             "lua",
@@ -9859,7 +9877,7 @@ mod tests {
             pool.prepare_epoch(),
             Some(crate::lsp::bridge::protocol::AnswerOrigin {
                 taken: crate::lsp::bridge::protocol::next_presentation(),
-                input: map.origin().input,
+                input: 1,
             }),
         );
         let prepared = SentText {
@@ -9873,8 +9891,8 @@ mod tests {
                 .is_err()
         );
         assert!(rx.try_recv().is_err(), "nothing was sent");
-        // Pending again (a new epoch's attempt): the prepared text opens it.
-        // (So would an answer taken after the failure, a newer text's.)
+        // Pending again (a new epoch's attempt): an answer taken after the
+        // failure opens it.
         pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         pool.prepare_failures_for_test().hold_for_test(
             &host_uri,
@@ -9883,6 +9901,11 @@ mod tests {
             pool.prepare_epoch(),
             None,
         );
+        let newer = answered_map(&pool, &host_uri, 1);
+        let prepared = SentText {
+            text: "x = 1",
+            map: Some(&newer),
+        };
         pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
             .await
             .unwrap();
@@ -9900,11 +9923,9 @@ mod tests {
         let key = ConnectionKey::for_server("lua");
         pool.open_host_incarnation(&host_uri, 1).await;
         // The request's answer, for one input.
-        let mut request = dedent_map("  x = 1");
-        Arc::get_mut(&mut request).unwrap().set_input(1);
+        let request = answered_map(&pool, &host_uri, 1);
         // A newer answer, for another input, cached by the lifecycle pass.
-        let mut cached = dedent_map("  x = 1");
-        Arc::get_mut(&mut cached).unwrap().set_input(2);
+        let cached = answered_map(&pool, &host_uri, 2);
         pool.record_latest_virtual_content(
             &host_uri,
             1,

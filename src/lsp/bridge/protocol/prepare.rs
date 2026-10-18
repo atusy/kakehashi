@@ -452,7 +452,9 @@ fn build_prepared(
         runs,
         fingerprint,
         built: taken,
+        #[cfg(test)]
         input: 0,
+        revocation: None,
     };
     Ok(PreparedDocument {
         text,
@@ -677,27 +679,48 @@ pub(crate) struct PreparedMap {
     /// order (see [`apply_prepare_result_at`]); not part of its equality.
     built: u64,
     /// That input's identity apart from the epoch it was asked under (see
-    /// [`AnswerOrigin`]); set by the registry, not part of its equality.
+    /// [`AnswerOrigin`]), named by tests.
+    #[cfg(test)]
     input: u64,
+    /// What revokes it (see [`Revocation`]): set by the registry, shared with
+    /// every map answered for the same input of the same region, not part
+    /// of its equality. `None` for a map no registry gave out.
+    revocation: Option<std::sync::Arc<Revocation>>,
+}
+
+/// When the peer last failed one input of one region — its text and gaps
+/// and host language, whatever the epoch it was asked under: the answers
+/// given for that input taken before then are ones it no longer gives.
+/// Shared by every map answered for the input, and marked by the registry
+/// as each such failure is recorded, before the failure is
+/// published: whether a map is revoked is read off the map, for as long as
+/// it lives, however the registry's answers are evicted meanwhile.
+#[derive(Debug, Default)]
+pub(crate) struct Revocation(std::sync::atomic::AtomicU64);
+
+impl Revocation {
+    /// Record a failure of the input taken at `taken` in the presentation
+    /// order (see [`next_presentation`]).
+    pub(crate) fn revoke(&self, taken: u64) {
+        self.0.fetch_max(taken, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether a failure taken after `taken` was recorded.
+    fn revokes(&self, taken: u64) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire) > taken
+    }
 }
 
 /// Which answer a prepared text came from: when its input was taken, in the
 /// presentation order (one per registry cell), and the input's identity
 /// apart from the epoch and candidates it was asked under — the same text
-/// asked again after an epoch move has the same `input`.
+/// asked again after an epoch move has the same `input`. What a
+/// [`Revocation`] tracks per map, named by tests.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AnswerOrigin {
     pub(crate) taken: u64,
     pub(crate) input: u64,
-}
-
-impl AnswerOrigin {
-    /// Whether an answer from `self` is one `failure` revokes: an answer for
-    /// the same input taken before that input failed. An answer for another
-    /// text, or taken after, is left to the held-text check.
-    pub(crate) fn revoked_by(self, failure: AnswerOrigin) -> bool {
-        self.input == failure.input && self.taken < failure.taken
-    }
 }
 
 /// A process-wide order of the decisions about what a virtual document's
@@ -724,6 +747,7 @@ impl PreparedMap {
     }
 
     /// Which answer this map came from (see [`AnswerOrigin`]).
+    #[cfg(test)]
     pub(crate) fn origin(&self) -> AnswerOrigin {
         AnswerOrigin {
             taken: self.built,
@@ -732,9 +756,25 @@ impl PreparedMap {
     }
 
     /// Name the input this map's answer was given for (see
-    /// [`AnswerOrigin::input`]), as the registry applies the answer.
+    /// [`AnswerOrigin::input`]).
+    #[cfg(test)]
     pub(crate) fn set_input(&mut self, input: u64) {
         self.input = input;
+    }
+
+    /// Share `revocation` (see [`Revocation`]), as the registry applies the
+    /// answer.
+    pub(crate) fn set_revocation(&mut self, revocation: std::sync::Arc<Revocation>) {
+        self.revocation = Some(revocation);
+    }
+
+    /// Whether the peer failed this map's input since it was taken: an
+    /// answer it no longer gives, through which no coordinates are read and
+    /// no request is sent.
+    pub(crate) fn revoked(&self) -> bool {
+        self.revocation
+            .as_ref()
+            .is_some_and(|revocation| revocation.revokes(self.built))
     }
 
     /// The length (in UTF-16 units, its line break excluded) of the virtual

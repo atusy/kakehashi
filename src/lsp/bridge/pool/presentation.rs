@@ -154,7 +154,11 @@ pub(super) fn presentation(
     match held.and_then(|held| held.map.as_ref()) {
         None if region.prepared => Presentation::Unavailable,
         None => Presentation::AsIs,
-        Some(map) if map.virtual_text() == virtual_text => Presentation::Prepared(Arc::clone(map)),
+        // Revoked: its peer failed its input since (see
+        // `PreparedMap::revoked`), and no longer gives that answer.
+        Some(map) if map.virtual_text() == virtual_text && !map.revoked() => {
+            Presentation::Prepared(Arc::clone(map))
+        }
         Some(_) => Presentation::Unavailable,
     }
 }
@@ -205,6 +209,33 @@ mod tests {
         prepared: false,
         failed: false,
     };
+
+    /// A prepared text its peer revoked since (it failed the text's input
+    /// again, under a new epoch, say) translates nothing: a push, a
+    /// showDocument selection, an edit read through it places nowhere, and
+    /// no request is sent through it.
+    #[test]
+    fn a_revoked_prepared_text_translates_nothing() {
+        let revocation = Arc::new(crate::lsp::bridge::protocol::Revocation::default());
+        let mut revoked = map("v");
+        Arc::get_mut(&mut revoked)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        let prepared = held(3, Some(revoked));
+        for observed in [read(3, true), Observed::Now] {
+            assert!(matches!(
+                presentation(Some(&prepared), true, observed, PREPARED, "v"),
+                Presentation::Prepared(_)
+            ));
+        }
+        revocation.revoke(u64::MAX);
+        for observed in [read(3, true), Observed::Now] {
+            assert!(matches!(
+                presentation(Some(&prepared), true, observed, PREPARED, "v"),
+                Presentation::Unavailable
+            ));
+        }
+    }
 
     #[test]
     fn a_text_held_as_is_translates_through_the_offset_unless_the_region_is_prepared() {
