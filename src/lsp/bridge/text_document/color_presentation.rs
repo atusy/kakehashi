@@ -158,7 +158,7 @@ fn transform_color_presentation_response_to_host(
             new_text: "#".to_string(),
         };
         translate_host_range_to_virtual(&mut probe.range, offset);
-        if !translate_virtual_text_edit_to_host(&mut probe, offset, EditMode::Extent)
+        if !translate_virtual_text_edit_to_host(&mut probe, offset)
             || probe.range != host_request_range
         {
             return vec![];
@@ -215,7 +215,6 @@ fn transform_color_presentation_response_to_host(
             presentation.text_edit.as_mut_slice(),
             presentation.additional_text_edits.as_mut().filter(|_| prepared),
             offset,
-            EditMode::Extent,
         ) else {
             return false;
         };
