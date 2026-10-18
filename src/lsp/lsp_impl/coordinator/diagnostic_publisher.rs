@@ -1038,23 +1038,21 @@ impl DiagnosticPublisher {
         // no longer holds (another version named, or another text recorded
         // since): it would place nowhere, and recorded it would replace the
         // slot of the push for the text held, dropping those diagnostics.
-        if let Some(HeldStamp {
-            connection,
-            observed:
-                crate::lsp::bridge::Observed::Read {
-                    generation,
-                    prepared: true,
-                    stale_version,
-                },
-            ..
-        }) = &held
-            && (*stale_version
-                || self
-                    .bridge
-                    .pool()
-                    .held_text(virtual_uri, connection)
-                    .map(|held| held.generation)
-                    != *generation)
+        if let Some(stamp) = &held
+            && (stamp.names_stale_version()
+                || matches!(
+                    stamp.observed,
+                    crate::lsp::bridge::Observed::Read {
+                        generation,
+                        prepared: true,
+                        ..
+                    } if self
+                        .bridge
+                        .pool()
+                        .held_text(virtual_uri, &stamp.connection)
+                        .map(|held| held.generation)
+                        != generation
+                ))
         {
             log::debug!(
                 target: LOG_TARGET,

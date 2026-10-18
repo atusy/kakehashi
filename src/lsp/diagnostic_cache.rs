@@ -128,6 +128,42 @@ pub(crate) struct HeldStamp {
 
 /// `server name → slot`. Several servers can attach to one source.
 pub(crate) type ServerSlots = HashMap<String, SlotEntry>;
+impl HeldStamp {
+    /// Whether a push stamped so is known stale from the stamp alone: read
+    /// under a prepared text, it names another document version than the
+    /// one sent. It would place nowhere; every stage a push goes through
+    /// (coalescing, the publisher's guard) drops it before it can displace
+    /// a valid one.
+    pub(crate) fn names_stale_version(&self) -> bool {
+        matches!(
+            self.observed,
+            crate::lsp::bridge::Observed::Read {
+                prepared: true,
+                stale_version: true,
+                ..
+            }
+        )
+    }
+
+    /// Whether a push stamped so was read under an older text than one
+    /// stamped `kept` by the same connection: generations only grow, so it
+    /// must not replace that one, whatever order the two arrive or are
+    /// recorded in.
+    pub(crate) fn read_before(&self, kept: &HeldStamp) -> bool {
+        let generation = |stamp: &HeldStamp| match stamp.observed {
+            crate::lsp::bridge::Observed::Read {
+                generation: Some(generation),
+                ..
+            } => Some(generation),
+            _ => None,
+        };
+        self.connection == kept.connection
+            && generation(self)
+                .zip(generation(kept))
+                .is_some_and(|(incoming, kept)| incoming < kept)
+    }
+}
+
 /// `source → server slots` under one host.
 pub(crate) type SourceSlots = HashMap<DiagnosticSource, ServerSlots>;
 
@@ -1117,36 +1153,23 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        let existing = source_slots
+            .get(&source)
+            .and_then(|servers| servers.get(&server));
         // Monotonic per connection: a push read under an older text than the
         // slot's (recorded later, past the check that would have dropped it)
         // never replaces it — it would place nowhere, and take the newer
-        // push's diagnostics with it.
-        let read = |stamp: &HeldStamp| match stamp.observed {
-            crate::lsp::bridge::Observed::Read {
-                generation: Some(generation),
-                ..
-            } => Some(generation),
-            _ => None,
-        };
-        let older = source_slots
-            .get(&source)
-            .and_then(|servers| servers.get(&server))
-            .and_then(|slot| slot.held.as_ref())
-            .zip(held.as_ref())
-            .is_some_and(|(existing, incoming)| {
-                existing.connection == incoming.connection
-                    && read(existing)
-                        .zip(read(incoming))
-                        .is_some_and(|(existing, incoming)| existing > incoming)
-            });
-        if older {
+        // push's diagnostics with it. Only stamped pushes are compared.
+        if let Some(incoming) = &held
+            && existing
+                .and_then(|slot| slot.held.as_ref())
+                .is_some_and(|kept| incoming.read_before(kept))
+        {
             return false;
         }
-        let changed = source_slots
-            .get(&source)
-            .and_then(|servers| servers.get(&server))
-            // A new stamp can change how the same diagnostics place.
-            .is_none_or(|slot| slot.diagnostics != diagnostics || slot.held != held);
+        // A new stamp can change how the same diagnostics place.
+        let changed =
+            existing.is_none_or(|slot| slot.diagnostics != diagnostics || slot.held != held);
         source_slots.entry(source).or_default().insert(
             server,
             SlotEntry {

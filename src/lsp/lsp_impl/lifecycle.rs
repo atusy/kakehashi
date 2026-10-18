@@ -1429,6 +1429,7 @@ fn coalesce_upstream_batch(
     batch: Vec<crate::lsp::bridge::UpstreamNotification>,
 ) -> Vec<crate::lsp::bridge::UpstreamNotification> {
     use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
+    use crate::lsp::diagnostic_cache::HeldStamp;
     use std::collections::HashMap;
 
     // Common case — a lone notification (no burst queued): nothing to coalesce, so
@@ -1454,9 +1455,27 @@ fn coalesce_upstream_batch(
                 held,
                 diagnostics,
             } => {
+                // A push known stale from its stamp (see
+                // `HeldStamp::names_stale_version`) is dropped here, before it
+                // could supersede a valid one the publisher would keep.
+                if held.as_ref().is_some_and(HeldStamp::names_stale_version) {
+                    continue;
+                }
                 let idx = output.len();
                 let by_uri = pending.entry(connection_id).or_default();
                 if let Some(prev) = by_uri.get_mut(&uri) {
+                    // A push read under an older text than the pending one
+                    // (see `HeldStamp::read_before`) does not supersede it.
+                    if let Some(Some(UpstreamNotification::PublishDiagnostics {
+                        held: Some(kept),
+                        ..
+                    })) = output.get(*prev)
+                        && held
+                            .as_ref()
+                            .is_some_and(|incoming| incoming.read_before(kept))
+                    {
+                        continue;
+                    }
                     // Tombstone the earlier occurrence so only the latest survives, at
                     // its own later position (no `uri` clone on this hot repeat path).
                     output[*prev] = None;
@@ -3829,6 +3848,54 @@ mod tests {
                 }
                 other => panic!("expected PublishDiagnostics at {idx}, got {other:?}"),
             }
+        }
+
+        fn stamped(msg: &str, generation: u64, stale_version: bool) -> UpstreamNotification {
+            UpstreamNotification::PublishDiagnostics {
+                uri: "u".to_string(),
+                server: "srv".to_string(),
+                connection_id: ProgressConnectionId::for_test(1),
+                held: Some(crate::lsp::diagnostic_cache::HeldStamp {
+                    connection: crate::lsp::bridge::ConnectionKey::for_server("srv"),
+                    observed: crate::lsp::bridge::Observed::Read {
+                        generation: Some(generation),
+                        prepared: true,
+                        stale_version,
+                    },
+                    origin: None,
+                }),
+                diagnostics: vec![Diagnostic {
+                    message: msg.to_string(),
+                    ..Default::default()
+                }],
+            }
+        }
+
+        /// A push for the prepared text held, then in the same batch one
+        /// known stale (naming the version before, or read under an older
+        /// text): the stale one supersedes nothing, so the valid one reaches
+        /// the publisher rather than neither.
+        #[test]
+        fn a_stale_push_does_not_supersede_a_valid_one() {
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("stale version", 2, true),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "current");
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("older text", 1, false),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "current");
+            // A newer one still supersedes it.
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("newer", 3, false),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "newer");
         }
 
         #[test]
