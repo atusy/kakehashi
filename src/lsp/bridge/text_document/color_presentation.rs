@@ -19,8 +19,8 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     host_range_in_prepared_gap, response_has_jsonrpc_error, text_edit_safe_in_region,
-    translate_host_range_to_virtual, translate_virtual_additional_edits_to_host,
-    translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
+    translate_host_range_to_virtual, translate_virtual_main_and_additional_edits_to_host,
+    virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -184,20 +184,16 @@ fn transform_color_presentation_response_to_host(
                 }
             }
         }
-        // The main edit as the server sent it, which a prepared document's
-        // additional edits are mapped together with below.
-        let sent_main: Vec<_> =
-            if offset.prepared().is_some() && presentation.additional_text_edits.is_some() {
-                presentation.text_edit.iter().cloned().collect()
-            } else {
-                Vec::new()
-            };
-        if let Some(text_edit) = &mut presentation.text_edit
-            && (!translate_virtual_text_edits_to_host(
-                std::slice::from_mut(text_edit),
-                offset,
-                EditMode::Extent,
-            ) || !text_edit_safe_in_region(text_edit, offset, region_end)
+        let Some(additional_kept) = translate_virtual_main_and_additional_edits_to_host(
+            presentation.text_edit.as_mut_slice(),
+            presentation.additional_text_edits.as_mut(),
+            offset,
+            EditMode::Extent,
+        ) else {
+            return false;
+        };
+        if let Some(text_edit) = &presentation.text_edit
+            && (!text_edit_safe_in_region(text_edit, offset, region_end)
                 // The label replaces the request range: mapped elsewhere (an
                 // empty range at an emptied gap's end maps before the gap's
                 // host text), it would not land where the client asked.
@@ -211,25 +207,18 @@ fn transform_color_presentation_response_to_host(
         // whole array rather than half-applying it. The presentation is kept:
         // its textEdit still applies, though possibly semantically incomplete
         // — availability over fidelity, never corruption.
-        if let Some(additional_edits) = &mut presentation.additional_text_edits {
-            let translated = translate_virtual_additional_edits_to_host(
-                sent_main.as_slice(),
-                additional_edits,
-                offset,
-                EditMode::Extent,
+        if let Some(additional_edits) = &presentation.additional_text_edits
+            && (!additional_kept
+            || !additional_edits
+                .iter()
+                .all(|edit| text_edit_safe_in_region(edit, offset, region_end)))
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "colorPresentation: dropped a presentation's additionalTextEdits ({}): a member is unsafe for the injection region",
+                additional_edits.len()
             );
-            if !translated
-                || !additional_edits
-                    .iter()
-                    .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-            {
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "colorPresentation: dropped a presentation's additionalTextEdits ({}): a member is unsafe for the injection region",
-                    additional_edits.len()
-                );
-                presentation.additional_text_edits = None;
-            }
+            presentation.additional_text_edits = None;
         }
         true
     });
