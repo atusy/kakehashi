@@ -2335,6 +2335,15 @@ mod tests {
     /// `virtual_text` at host line 0, column 0, every line starting with
     /// two spaces dedented by them: the offset, and the prepared text.
     fn prepared_region(virtual_text: &str, removed: &[u32]) -> (RegionOffset, String) {
+        prepared_region_at(virtual_text, removed, 0)
+    }
+
+    /// [`prepared_region`] opening at host column `column` of line 0.
+    fn prepared_region_at(
+        virtual_text: &str,
+        removed: &[u32],
+        column: u32,
+    ) -> (RegionOffset, String) {
         let changes: Vec<_> = removed
             .iter()
             .enumerate()
@@ -2355,7 +2364,7 @@ mod tests {
         )
         .unwrap();
         (
-            RegionOffset::new(0, 0).with_prepared(prepared.map),
+            RegionOffset::new(0, column).with_prepared(prepared.map),
             prepared.text,
         )
     }
@@ -2391,6 +2400,32 @@ mod tests {
             None
         );
         assert_eq!(failures(&failures_sink), 0);
+    }
+
+    #[test]
+    fn a_prepared_pipeline_result_keeps_a_delimiters_line_break_as_layout() {
+        // A Nix `''` string's JSON, dedented by the peer: the pipeline's
+        // result drops the line break after the delimiter and the closing
+        // indent, both the region's layout, which come back.
+        let host = "x = ''\n    {\"a\":1}\n  '';\n";
+        let virtual_text = "\n    {\"a\":1}\n  ";
+        let (offset, prepared) = prepared_region_at(virtual_text, &[0, 4], 6);
+        assert_eq!(prepared, "\n{\"a\":1}\n  ");
+        let uri = url::Url::parse("file:///doc.nix").unwrap();
+        let prefixes = ["x = ''".to_string(), String::new(), String::new()];
+        let edits = prepared_pipeline_edits(
+            &prepared,
+            "{\n  \"a\": 1\n}",
+            &offset,
+            &prefixes,
+            &uri,
+            &sink(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "x = ''\n    {\n      \"a\": 1\n    }\n  '';\n"
+        );
     }
 
     #[test]
