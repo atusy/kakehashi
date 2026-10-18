@@ -1210,6 +1210,15 @@ mod tests {
             ))),
             ClientInsertMode::AdjustsIndentation
         );
+        // Support for adjusting only is no way to ask for as is.
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                json!({"textDocument": {"completion": {
+                    "completionItem": {"insertTextModeSupport": {"valueSet": [2]}}
+                }}})
+            ))),
+            ClientInsertMode::AsIs
+        );
     }
 
     #[rstest]
@@ -1316,6 +1325,84 @@ mod tests {
             region_end,
             Some(Position::new(10, 3)),
             ClientInsertMode::default()
+        ));
+    }
+
+    /// `foo${x}bar` at host line 10, the interpolation emptied: `foobar`.
+    fn emptied_gap_offset() -> RegionOffset {
+        use crate::lsp::bridge::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let virtual_text = "foo    bar\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..11, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let map = apply_prepare_result(virtual_text, &layout, Some(result))
+            .unwrap()
+            .map;
+        RegionOffset::new(10, 0).with_prepared(map)
+    }
+
+    #[test]
+    fn insert_replace_ranges_mapped_to_different_starts_are_dropped() {
+        // At the emptied interpolation: the insert range maps before its
+        // host text, the replace range over `bar` after it. Realigned, the
+        // replace range would swallow `${x}`.
+        let mut completed = item(json!({
+            "label": "X",
+            "textEdit": {
+                "insert": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "replace": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}},
+                "newText": "X"
+            }
+        }));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn insert_replace_ranges_must_contain_the_caret_once_mapped() {
+        // Both ranges empty at the emptied interpolation map before its host
+        // text, short of a caret after it.
+        let mut completed = item(json!({
+            "label": "X",
+            "textEdit": {
+                "insert": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "replace": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "newText": "X"
+            }
+        }));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn a_prepared_snippet_label_is_checked_when_it_is_the_text() {
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x$1", "insertTextFormat": 2}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
         ));
     }
 
