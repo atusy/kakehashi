@@ -66,13 +66,10 @@ pub(crate) enum Observed {
         prepared: bool,
         stale_version: bool,
     },
-    /// Read when no text newer than `generation` was held by any connection
-    /// (see `DocumentTracker::held_through`): for coordinates about several
-    /// documents, whose records are read later. `prepared`: the connection
-    /// had held a prepared text, so a document it has no record of by then
-    /// (the connection retired, its records purged) is no proof of a text as
-    /// is, and places nowhere.
-    Through { generation: u64, prepared: bool },
+    /// Read when no text newer than this generation was held by any
+    /// connection (see `DocumentTracker::held_through`): for coordinates
+    /// about several documents, whose records are read later.
+    Through(u64),
     /// A request about to be sent: the coordinates it will get are computed
     /// for whatever the connection holds now.
     Now,
@@ -119,9 +116,6 @@ pub(super) fn presentation(
     if region.failed {
         return Presentation::Unavailable;
     }
-    if held.is_none() && matches!(observed, Observed::Through { prepared: true, .. }) {
-        return Presentation::Unavailable;
-    }
     let involved = region.prepared
         || history
         || held.is_some_and(|held| held.map.is_some())
@@ -140,7 +134,7 @@ pub(super) fn presentation(
                 // Also held as is since, the same text having been held
                 // prepared when it was read: placed as is, an edit read
                 // through a prepared text would escape its refusal.
-                Observed::Through { generation, .. } => held.is_none_or(|held| {
+                Observed::Through(generation) => held.is_none_or(|held| {
                     held.generation > generation || held.as_is_since > generation
                 }),
                 Observed::Now => false,
@@ -245,10 +239,7 @@ mod tests {
                 prepared: false,
                 stale_version: true,
             },
-            Observed::Through {
-                generation: 3,
-                prepared: false,
-            },
+            Observed::Through(3),
             Observed::AsIsThen,
         ] {
             assert!(
@@ -270,16 +261,7 @@ mod tests {
             Presentation::Unavailable
         ));
         assert!(matches!(
-            presentation(
-                Some(&prepared),
-                true,
-                Observed::Through {
-                    generation: 3,
-                    prepared: false
-                },
-                PREPARED,
-                "v"
-            ),
+            presentation(Some(&prepared), true, Observed::Through(3), PREPARED, "v"),
             Presentation::Unavailable
         ));
         assert!(matches!(
@@ -307,29 +289,11 @@ mod tests {
         // document it was once sent a prepared text of: that history alone
         // involves preparation.
         assert!(matches!(
-            presentation(
-                Some(&as_is),
-                true,
-                Observed::Through {
-                    generation: 4,
-                    prepared: false
-                },
-                AS_IS,
-                "v"
-            ),
+            presentation(Some(&as_is), true, Observed::Through(4), AS_IS, "v"),
             Presentation::Unavailable
         ));
         assert!(matches!(
-            presentation(
-                Some(&as_is),
-                false,
-                Observed::Through {
-                    generation: 4,
-                    prepared: false
-                },
-                AS_IS,
-                "v"
-            ),
+            presentation(Some(&as_is), false, Observed::Through(4), AS_IS, "v"),
             Presentation::AsIs
         ));
         // Closed since: nothing on record now.

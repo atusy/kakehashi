@@ -366,7 +366,7 @@ impl ServerRequestDeps {
             .as_ref()
             .map(|tracker| crate::lsp::diagnostic_cache::HeldStamp {
                 connection: self.connection_key.clone(),
-                observed: tracker.observe_through(&self.connection_key),
+                observed: tracker.observe_through(),
                 origin: None,
             })
     }
@@ -3743,13 +3743,7 @@ mod tests {
                 1,
             );
         }
-        assert_eq!(
-            observed(),
-            Some(Observed::Through {
-                generation: 2,
-                prepared: true
-            })
-        );
+        assert_eq!(observed(), Some(Observed::Through(2)));
     }
 
     /// A non-virtual (real host URI) push is now routed up too — the publisher
