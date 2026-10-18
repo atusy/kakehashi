@@ -246,6 +246,8 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
     offset: &RegionOffset,
     mode: EditMode,
 ) -> Option<bool> {
+    // No additional edits is nothing to check or drop.
+    let additional = additional.filter(|additional| !additional.is_empty());
     // The main edits as sent, to map with the additional ones: cloned only
     // on a prepared document that has any.
     let sent: Vec<TextEdit> = match &additional {

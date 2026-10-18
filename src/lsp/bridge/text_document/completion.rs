@@ -978,6 +978,21 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_additional_edits_list_is_kept_as_it_came() {
+        // Nothing to check, even with no main edit to check it with.
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x", "additionalTextEdits": []}));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(completed.additional_text_edits, Some(vec![]));
+    }
+
+    #[test]
     fn a_prepared_item_inserting_lines_at_the_caret_is_dropped() {
         // Without a textEdit the client inserts it as is: its second line
         // would not regain the removed indent.
