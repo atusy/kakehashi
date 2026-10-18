@@ -76,7 +76,7 @@ impl LanguageServerPool {
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
         let origin = std::sync::Arc::clone(&handle);
-        let insert_mode = ClientInsertMode::from_capabilities(self.client_capabilities().as_ref());
+        let insert_mode = ClientInsertMode::from_capabilities(self.client_capabilities_ref());
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -458,11 +458,12 @@ fn translate_insert_replace_edit_to_host(
     }
     edit.insert = insert.range;
     edit.replace = replace.range;
-    // The two ranges must share their start (LSP). Clearing a dedented
-    // line's content maps the replace range over the removed indent, which
-    // the (empty) insert range does not cover: start both after it, as the
-    // shared text was re-indented for.
-    if edit.replace.start != edit.insert.start {
+    // Mapped, the two ranges must still share their start (LSP), as sent.
+    // Clearing a dedented line's content maps the replace range over the
+    // removed indent, which the (empty) insert range does not cover: start
+    // both after it, as the shared text was re-indented for. Ranges as is
+    // stay as the server sent them.
+    if prepared && edit.replace.start != edit.insert.start {
         if edit.replace.start < edit.insert.start && edit.insert.start <= edit.replace.end {
             edit.replace.start = edit.insert.start;
         } else {
@@ -475,7 +476,7 @@ fn translate_insert_replace_edit_to_host(
 /// How the client inserts a completion's multi-line text (LSP
 /// `insertTextMode`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ClientInsertMode {
+pub(super) enum ClientInsertMode {
     /// As is, by default, with no way to tell it otherwise declared.
     #[default]
     AsIs,
@@ -488,7 +489,7 @@ pub(crate) enum ClientInsertMode {
 
 impl ClientInsertMode {
     /// From the client's completion capabilities.
-    pub(crate) fn from_capabilities(
+    pub(super) fn from_capabilities(
         caps: Option<&tower_lsp_server::ls_types::ClientCapabilities>,
     ) -> Self {
         use tower_lsp_server::ls_types::InsertTextMode;
@@ -1213,6 +1214,35 @@ mod tests {
         assert_eq!(edit.insert.start, Position::new(11, 4));
         assert_eq!(edit.replace.end, Position::new(11, 5));
         assert_eq!(edit.new_text, "yes\n    z");
+    }
+
+    #[test]
+    fn unprepared_insert_replace_ranges_stay_as_sent() {
+        // Unequal starts, as a server may send them: only translated.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "x".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 2),
+                Position::new(0, 3),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 5),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(&mut edit, None, &RegionOffset::new(10, 4)),
+            Some(true)
+        );
+        assert_eq!(
+            edit.insert,
+            tower_lsp_server::ls_types::Range::new(Position::new(10, 6), Position::new(10, 7))
+        );
+        assert_eq!(
+            edit.replace,
+            tower_lsp_server::ls_types::Range::new(Position::new(10, 4), Position::new(10, 9))
+        );
+        assert_eq!(edit.new_text, "x");
     }
 
     #[test]
