@@ -610,10 +610,18 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
     // host path on the client's NEXT resolve of it.
     let mut offset = super::completion::EnvelopeOffset::from(&RegionOffset::from(&envelope.offset));
     offset.prepared = envelope.offset.prepared;
+    // Field by field: `..envelope.clone()` would clone `inner`, the
+    // server's whole data payload, only to drop it.
     let rebuilt = KakehashiEnvelope {
-        offset,
+        origin: envelope.origin.clone(),
+        injection_language: envelope.injection_language.clone(),
+        incarnation: envelope.incarnation,
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
         inner: None,
-        ..envelope.clone()
+        offset,
+        region_end: envelope.region_end,
+        host_layer: envelope.host_layer,
     };
     let inner = item.data.take();
     item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
