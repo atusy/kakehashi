@@ -3547,6 +3547,7 @@ mod tests {
                     generation: Some(generation),
                     prepared: true,
                     stale_version: false,
+                    incarnation: 0,
                 },
                 origin: None,
             })
@@ -3585,6 +3586,7 @@ mod tests {
                     generation: Some(generation),
                     prepared: true,
                     stale_version: false,
+                    incarnation: 0,
                 },
                 origin: None,
             })

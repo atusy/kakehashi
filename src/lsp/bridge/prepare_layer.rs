@@ -652,6 +652,7 @@ mod tests {
                 generation: Some(generation),
                 prepared: true,
                 stale_version: false,
+                incarnation: 0,
             },
             origin: Some(virtual_uri.to_uri_string()),
         };

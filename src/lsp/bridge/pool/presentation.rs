@@ -61,15 +61,22 @@ pub(crate) enum Observed {
     /// text of the document before (`prepared`). `stale_version`: the
     /// coordinates name another document version than that text's (a push
     /// computed for an earlier text).
+    ///
+    /// `incarnation`, here and in `Through`: the process that sent them,
+    /// as the count of its connection's purges when it was spawned (see
+    /// `DocumentTracker::connection_generation`). A replacement spawned under
+    /// the same connection records texts of its own; the retired process's
+    /// coordinates are about none of them.
     Read {
         generation: Option<u64>,
         prepared: bool,
         stale_version: bool,
+        incarnation: u64,
     },
-    /// Read when no text newer than this generation was held by any
-    /// connection (see `DocumentTracker::held_through`): for coordinates
-    /// about several documents, whose records are read later.
-    Through(u64),
+    /// Read when no text newer than `generation` was held by any connection
+    /// (see `DocumentTracker::held_through`): for coordinates about several
+    /// documents, whose records are read later.
+    Through { generation: u64, incarnation: u64 },
     /// A request about to be sent: the coordinates it will get are computed
     /// for whatever the connection holds now.
     Now,
@@ -122,7 +129,8 @@ pub(super) fn presentation(
         || matches!(observed, Observed::Read { prepared: true, .. });
     if involved {
         // Nothing on record: the document was closed since (every send is
-        // recorded before it is queued).
+        // recorded before it is queued), or the process that sent them
+        // retired (see `DocumentTracker::sent_by_retired`).
         let newer = held.is_none() && observed != Observed::Now
             || match observed {
                 Observed::AsIsThen => held.is_none_or(|held| held.map.is_some()),
@@ -134,7 +142,7 @@ pub(super) fn presentation(
                 // Also held as is since, the same text having been held
                 // prepared when it was read: placed as is, an edit read
                 // through a prepared text would escape its refusal.
-                Observed::Through(generation) => held.is_none_or(|held| {
+                Observed::Through { generation, .. } => held.is_none_or(|held| {
                     held.generation > generation || held.as_is_since > generation
                 }),
                 Observed::Now => false,
@@ -182,6 +190,14 @@ mod tests {
             generation: Some(generation),
             prepared,
             stale_version: false,
+            incarnation: 0,
+        }
+    }
+
+    fn through(generation: u64) -> Observed {
+        Observed::Through {
+            generation,
+            incarnation: 0,
         }
     }
 
@@ -238,8 +254,9 @@ mod tests {
                 generation: Some(4),
                 prepared: false,
                 stale_version: true,
+                incarnation: 0,
             },
-            Observed::Through(3),
+            through(3),
             Observed::AsIsThen,
         ] {
             assert!(
@@ -261,7 +278,7 @@ mod tests {
             Presentation::Unavailable
         ));
         assert!(matches!(
-            presentation(Some(&prepared), true, Observed::Through(3), PREPARED, "v"),
+            presentation(Some(&prepared), true, through(3), PREPARED, "v"),
             Presentation::Unavailable
         ));
         assert!(matches!(
@@ -273,6 +290,7 @@ mod tests {
             generation: Some(4),
             prepared: true,
             stale_version: true,
+            incarnation: 0,
         };
         assert!(matches!(
             presentation(Some(&prepared), true, stale, PREPARED, "v"),
@@ -289,11 +307,11 @@ mod tests {
         // document it was once sent a prepared text of: that history alone
         // involves preparation.
         assert!(matches!(
-            presentation(Some(&as_is), true, Observed::Through(4), AS_IS, "v"),
+            presentation(Some(&as_is), true, through(4), AS_IS, "v"),
             Presentation::Unavailable
         ));
         assert!(matches!(
-            presentation(Some(&as_is), false, Observed::Through(4), AS_IS, "v"),
+            presentation(Some(&as_is), false, through(4), AS_IS, "v"),
             Presentation::AsIs
         ));
         // Closed since: nothing on record now.

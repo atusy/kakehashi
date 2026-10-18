@@ -721,6 +721,16 @@ impl BridgeCoordinator {
             .record_sent_for_test(virtual_uri, connection_key, text.into());
     }
 
+    /// Purge `connection_key`'s document records, as retiring its process
+    /// does.
+    #[cfg(test)]
+    pub(crate) async fn purge_connection_for_test(
+        &self,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) {
+        self.pool.purge_connection_for_test(connection_key).await;
+    }
+
     /// Bump a virtual document's tracked version, as a content-changing
     /// `didChange` forward would (test helper for the applyEdit version
     /// validation).

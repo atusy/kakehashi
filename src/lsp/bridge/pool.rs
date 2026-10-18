@@ -3465,6 +3465,17 @@ impl LanguageServerPool {
         )
     }
 
+    /// Whether coordinates `connection_key` sent, read as `observed`, came
+    /// from a process retired since (see `DocumentTracker::sent_by_retired`).
+    pub(crate) fn sent_by_retired(
+        &self,
+        connection_key: &ConnectionKey,
+        observed: Observed,
+    ) -> bool {
+        self.document_tracker
+            .sent_by_retired(connection_key, observed)
+    }
+
     /// How coordinates of a connection whose text is not on record — read
     /// while the pool stamped nothing — translate, by the one rule (see
     /// `DocumentTracker::presentation`): as is, unless `region` is bridged
@@ -3500,6 +3511,13 @@ impl LanguageServerPool {
     ) {
         self.document_tracker
             .record_sent_for_test(virtual_uri, connection_key, content, 1);
+    }
+
+    /// Purge this connection's document records, as retiring its process
+    /// does.
+    #[cfg(test)]
+    pub(super) async fn purge_connection_for_test(&self, connection_key: &ConnectionKey) {
+        self.document_tracker.purge_connection(connection_key).await;
     }
 
     /// Get or create a connection for the specified server, spawning the server
@@ -4823,6 +4841,7 @@ impl LanguageServerPool {
                 progress_connection_id,
                 settings: Arc::clone(&settings_cell),
                 document_tracker: self.prepares().then(|| Arc::clone(&self.document_tracker)),
+                incarnation: self.document_connection_generation(&connection_key),
             },
         );
 
