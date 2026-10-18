@@ -366,8 +366,9 @@ pub(crate) struct HostVirtualContents {
     /// (language, region id) of the regions the lifecycle pass holds for a
     /// prepare peer known to prepare them (see
     /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
-    /// one with text as is.
-    held: DashSet<(String, String)>,
+    /// one with text as is. `None` for a pool that prepares nothing, which
+    /// holds nothing: no set is allocated for each host it opens.
+    held: Option<DashSet<(String, String)>>,
     /// How many entries `held` has: read in place of `held`'s emptiness,
     /// which locks every shard, on every lazy open and every recorded text.
     held_count: std::sync::atomic::AtomicUsize,
@@ -379,7 +380,8 @@ impl HostVirtualContents {
         self.held_count.load(Ordering::Acquire) > 0
             && self
                 .held
-                .contains(&(language.to_string(), region_id.to_string()))
+                .as_ref()
+                .is_some_and(|held| held.contains(&(language.to_string(), region_id.to_string())))
     }
 }
 
@@ -3101,10 +3103,10 @@ impl LanguageServerPool {
         // Only once the text to open with is in: a request checking the hold
         // in between would open the text it replaces.
         if host.held_count.load(Ordering::Acquire) > 0
-            && host
-                .held
-                .remove(&(language.to_string(), region_id.to_string()))
-                .is_some()
+            && host.held.as_ref().is_some_and(|held| {
+                held.remove(&(language.to_string(), region_id.to_string()))
+                    .is_some()
+            })
         {
             host.held_count.fetch_sub(1, Ordering::AcqRel);
         }
@@ -3124,15 +3126,13 @@ impl LanguageServerPool {
     ) {
         if let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
+            && let Some(held) = &host.held
         {
             // Counted before it is held, undone if it was held already: the
             // count never reads below what `held` holds (removals take the
             // entry out first), so no open sees a held region as free.
             host.held_count.fetch_add(1, Ordering::AcqRel);
-            if !host
-                .held
-                .insert((language.to_string(), region_id.to_string()))
-            {
+            if !held.insert((language.to_string(), region_id.to_string())) {
                 host.held_count.fetch_sub(1, Ordering::AcqRel);
             }
         }
@@ -3217,7 +3217,7 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
-                held: DashSet::new(),
+                held: self.prepares().then(DashSet::new),
                 held_count: std::sync::atomic::AtomicUsize::new(0),
             },
         );
@@ -9773,8 +9773,30 @@ mod tests {
                 .get(&host_uri)
                 .unwrap()
                 .held
+                .as_ref()
+                .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A pool that prepares nothing holds nothing, and allocates no set of
+    /// held regions for each host it opens.
+    #[tokio::test]
+    async fn a_pool_that_prepares_nothing_allocates_no_held_set() {
+        let host_uri = Url::parse("file:///test/no-held-set.md").unwrap();
+        let held_set = |pool: &LanguageServerPool| {
+            pool.latest_virtual_contents
+                .get(&host_uri)
+                .unwrap()
+                .held
+                .is_some()
+        };
+        let plain = LanguageServerPool::new();
+        plain.open_host_incarnation(&host_uri, 1).await;
+        assert!(!held_set(&plain));
+        let preparing = LanguageServerPool::preparing();
+        preparing.open_host_incarnation(&host_uri, 1).await;
+        assert!(held_set(&preparing));
     }
 
     #[tokio::test]
