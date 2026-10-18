@@ -97,10 +97,15 @@ fn transform_folding_range_response_to_host(
         // A prepared document's lines need not match the virtual document's
         // (a gap may have grown or shrunk, edge lines gone), so each
         // endpoint maps as a position first; the arithmetic below then works
-        // in the virtual document.
+        // in the virtual document. An omitted character is the line's
+        // length (LSP), for the start as for the end: a prepared line can
+        // join several virtual ones, and the fold starts on the last.
         for folding in &mut ranges {
             let start = prepared.to_virtual(
-                Position::new(folding.start_line, folding.start_character.unwrap_or(0)),
+                Position::new(
+                    folding.start_line,
+                    folding.start_character.unwrap_or(u32::MAX),
+                ),
                 Bias::Start,
             );
             let end = prepared.to_virtual(
@@ -185,8 +190,9 @@ mod tests {
     }
 
     /// A gap emptied by its placeholder joins two virtual lines into one
-    /// prepared line: a fold to that line's end, given without a character,
-    /// ends on the virtual line the joined line ends on.
+    /// prepared line: a fold given without characters starts and ends at
+    /// that line's end (LSP: an omitted character is the line's length),
+    /// on the virtual line the joined line ends on.
     #[test]
     fn a_fold_without_an_end_character_ends_where_its_prepared_line_does() {
         use crate::language::injection::VirtualGap;
@@ -217,7 +223,50 @@ mod tests {
             &RegionOffset::new(10, 0).with_prepared(prepared.map),
         )
         .unwrap();
-        assert_eq!((ranges[0].start_line, ranges[0].end_line), (10, 12));
+        assert_eq!((ranges[0].start_line, ranges[0].end_line), (12, 12));
+    }
+
+    /// A fold over a prepared line joining several virtual ones starts where
+    /// that line ends — on the last virtual line it joins — not on its
+    /// first: starting there would fold host lines the fold leaves out.
+    #[test]
+    fn a_fold_without_a_start_character_starts_where_its_prepared_line_ends() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "ab\n  \ncd\nend";
+        let gaps = [VirtualGap {
+            virtual_range: 2..6,
+            host_text: "\n  \n".to_string(),
+        }];
+        let answer = serde_json::from_value(serde_json::json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd\nend");
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": [
+            {"startLine": 0, "endLine": 1},
+            {"startLine": 0, "startCharacter": 1, "endLine": 1}
+        ]});
+        let ranges = transform_folding_range_response_to_host(
+            response,
+            &RegionOffset::new(0, 0).with_prepared(prepared.map),
+        )
+        .unwrap();
+        assert_eq!((ranges[0].start_line, ranges[0].end_line), (2, 3));
+        assert_eq!(ranges[0].start_character, None);
+        // A start character given is mapped as is: "b" is on line 0.
+        assert_eq!(
+            (ranges[1].start_line, ranges[1].start_character),
+            (0, Some(1))
+        );
     }
 
     #[test]
