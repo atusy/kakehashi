@@ -290,27 +290,19 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                // The document as its servers see it (see `formatting`).
-                // One left unformatted because its peer failed is not counted
-                // as `formatting` counts it: no one-shot run range-formats,
-                // so no failure count reads it.
-                let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                // The document as its servers see it, the method closed to it
+                // as its shape says (see `formatting`). One left unformatted
+                // because its peer failed is not counted as `formatting`
+                // counts it: no one-shot run range-formats, so no failure
+                // count reads it.
+                let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
                     &self.bridge,
                     &language_name,
                     region_ctx,
+                    "textDocument/rangeFormatting",
                 )
-                .await
-                .ok();
-                // Closed as a non-contiguous region is, the document's shape
-                // read again with the context in; a prepared one stays open,
-                // its edits mapped back through its map.
-                let Some(region_ctx) = spans.admit(span, region_ctx, |ctx| {
-                    !crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                        &ctx.resolved,
-                        "textDocument/rangeFormatting",
-                        ctx.prepared.is_some(),
-                    )
-                }) else {
+                .await;
+                let Some(region_ctx) = spans.admit(span, region_ctx) else {
                     continue;
                 };
                 if region_ctx.prepared.is_some() {

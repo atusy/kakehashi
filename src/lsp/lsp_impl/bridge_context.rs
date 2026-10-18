@@ -108,20 +108,18 @@ fn method_closed_to_with(
         && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
 }
 
-/// [`prepare_request_context`] for a `method` request: `None` when the
-/// document could not be prepared, or when `method` is closed to it as
-/// prepared — checked again with the answer in, since the lifecycle pass may
-/// not have looked the region up yet.
+/// [`prepare_request_context`] for a `method` request: `Err` when the
+/// document could not be prepared, `Ok(None)` when `method` is closed to it
+/// as prepared — checked again with the answer in, since the lifecycle pass
+/// may not have looked the region up yet.
 pub(crate) async fn prepare_request_context_for(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     host_language: &str,
     ctx: DocumentRequestContext,
     method: &str,
-) -> Option<DocumentRequestContext> {
-    let ctx = prepare_request_context(bridge, host_language, ctx)
-        .await
-        .ok()?;
-    (!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx)
+) -> Result<Option<DocumentRequestContext>, crate::lsp::bridge::PrepareMiss> {
+    let ctx = prepare_request_context(bridge, host_language, ctx).await?;
+    Ok((!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx))
 }
 
 /// Start the prepare attempts of every region `regions` names (of a host in
@@ -1703,7 +1701,10 @@ impl Kakehashi {
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
         };
-        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
+        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Whether the lifecycle pass prepares a region's current document (or
@@ -2740,8 +2741,12 @@ mod tests {
             max_fan_out: None,
             client_progress_token: None,
         };
-        let for_method =
-            |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
+        let for_method = |method| async move {
+            prepare_request_context_for(&server.bridge, "markdown", ctx(), method)
+                .await
+                .ok()
+                .flatten()
+        };
         for method in ["textDocument/rename", "textDocument/codeAction"] {
             assert!(for_method(method).await.is_none(), "{method} closes");
         }
@@ -2847,6 +2852,8 @@ mod tests {
                 method,
             )
             .await
+            .ok()
+            .flatten()
             .unwrap_or_else(|| panic!("a document sent as is takes {method}"));
             assert!(ctx.prepared.is_none());
         }
