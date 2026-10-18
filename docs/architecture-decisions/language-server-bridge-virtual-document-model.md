@@ -114,8 +114,8 @@ validate the individual allowed host spans rather than only the combined
 document's outer range; this prevents masked gaps from becoming edits over
 real host text. A document prepared through virtual-document-prepare-protocol
 is closed to edit-producing methods as well, contiguous or not, but for
-inlay hints: they stay available on a contiguous prepared document, their
-edits mapped back through its prepared map.
+inlay hints and color presentations: they stay available on a contiguous
+prepared document, their edits mapped back through its prepared map.
 
 #### Feature-Specific Isolation Overrides
 

@@ -968,6 +968,15 @@ impl PreparedMap {
             .take_while(move |run| run.virtual_.start <= offset)
     }
 
+    /// Whether the V range reaches inside a gap's host text (an empty range:
+    /// whether it sits strictly inside one).
+    pub(crate) fn virtual_range_in_gap(&self, range: tower_lsp_server::ls_types::Range) -> bool {
+        self.virtual_range_touches_gap(
+            self.virtual_lines.offset_clamped(range.start),
+            self.virtual_lines.offset_clamped(range.end),
+        )
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {

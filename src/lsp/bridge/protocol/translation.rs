@@ -277,6 +277,20 @@ pub(crate) fn host_position_hidden_by_prepare(
         || prepared.virtual_position_in_removed_lines(position)
 }
 
+/// Whether the host range reaches into a gap of the prepared document
+/// `offset` maps to: host-owned text a downstream answer keyed to that range
+/// (a color presentation's label) would overwrite — the prepared range may
+/// even be empty there, where an edit would only insert beside it.
+pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut range = host_range;
+    translate_host_position_to_unprepared_virtual(&mut range.start, offset);
+    translate_host_position_to_unprepared_virtual(&mut range.end, offset);
+    prepared.virtual_range_in_gap(range)
+}
+
 /// [`host_position_within_region`] plus the trailing bound: the position must
 /// also not lie past `region_end` — the region's end-of-content mapped to host
 /// coordinates (`region_host_end(virtual_content, offset)`).

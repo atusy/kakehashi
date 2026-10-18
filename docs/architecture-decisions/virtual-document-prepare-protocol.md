@@ -193,8 +193,9 @@ The methods closed to a non-contiguous combined document — codeAction,
 colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
 onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
 prepared one too, as is an inbound `workspace/applyEdit` computed for a
-prepared text, but for inlay hints: they stay available on a contiguous
-prepared document, each hint's `textEdits` mapped as Edits describes.
+prepared text, but for inlay hints and color presentations: they stay
+available on a contiguous prepared document, their edits mapped as Edits
+describes.
 A `*/resolve` envelope minted from a prepared document never resolves,
 nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
@@ -214,9 +215,10 @@ peer removed the same indentation from every line of that segment;
 otherwise an edit creating a line there is refused, since no single
 indentation is right.
 
-A set of edits the client applies together (a hint's `textEdits`) is mapped
-one by one and checked as a whole on the edited V. It is refused, and
-dropped like any unsafe set, when:
+A set of edits the client applies together (a hint's `textEdits`, a color
+presentation's main edit with its `additionalTextEdits`) is mapped one by
+one and checked as a whole on the edited V. It is refused, and dropped like
+any unsafe set, when:
 
 - an edit is reversed; edits overlap in P or once mapped; or edits touch
   (one ending where another starts, or two inserting at one place) at a
@@ -238,6 +240,14 @@ dropped like any unsafe set, when:
 
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
+
+A color presentation without a `textEdit` replaces the request range with
+its label; on a prepared document that edit is made explicit and mapped
+like any other. A request range reaching into a gap stands for host text no
+presentation may replace (with the gap emptied, its prepared range is even
+empty, and an edit there would only insert beside it): no presentation is
+returned. Additional edits refused with the main edit are dropped, the main
+edit kept as it maps alone.
 
 ### Failure
 
