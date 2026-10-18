@@ -3095,6 +3095,37 @@ mod formatting {
     }
 
     #[test]
+    fn pairing_blank_lines_past_its_table_size_refuses() {
+        // Blank lines in one run, too many to pair in the table's bound:
+        // refused at once, not held in memory.
+        let keys = |count: usize| -> [Vec<String>; 2] {
+            let lines = vec![String::new(); count];
+            [lines.clone(), lines]
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let small = (keys(3), keys(2));
+        assert_eq!(
+            blank_lines(&small.0, &small.1, &(0..3), &(0..2), deadline),
+            Some(vec![(0, 0), (1, 1)])
+        );
+        let side = 1 << 11;
+        let large = keys(side);
+        assert_eq!(
+            blank_lines(&large, &large, &(0..side), &(0..side), deadline),
+            None
+        );
+        // And so the whole answer, however much time it has.
+        let virtual_text = format!("  a\n{}", "\n".repeat(side));
+        let map = dedent_lines(&virtual_text, &[2]);
+        let formatted = format!("b\n{}", "\n".repeat(side));
+        let answer = [edit((0, 0), (side as u32 + 1, 0), &formatted)];
+        assert_eq!(
+            map.map_edits_within(&answer, EditMode::Formatting, Duration::from_secs(10)),
+            None
+        );
+    }
+
+    #[test]
     fn lines_broken_by_a_lone_cr_are_paired_as_lines() {
         // A kept ` ` joined onto `a` (dedented), lines broken by a lone CR:
         // the joined line is `a`'s, its removed indent back.
