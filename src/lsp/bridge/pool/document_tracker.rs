@@ -818,8 +818,12 @@ impl DocumentTracker {
                 .filter(|held| held.fingerprint == fp)
             {
                 // A map revoked since its text was admitted (across an
-                // await) is held through no path: the record stays.
-                if content.map.is_some_and(|map| map.revoked()) {
+                // await), or an answer taken before the one held (a stale
+                // pass or repair carrying it), is held through no path: the
+                // record stays.
+                if content.map.is_some_and(|map| map.revoked())
+                    || PreparedMap::taken_before(content.map, held.map.as_ref())
+                {
                     return None;
                 }
                 // Another answer, however alike in coordinates (the same text
@@ -1106,7 +1110,10 @@ impl DocumentTracker {
             // The same text: what the server computed stays in the same
             // coordinates, even when it maps back differently now.
             let previous = held.clone();
-            self.rehold_locked(held, map);
+            // An answer never moves backwards (see `PreparedMap::taken_before`).
+            if !PreparedMap::taken_before(map.as_ref(), held.map.as_ref()) {
+                self.rehold_locked(held, map);
+            }
             held.version = change.version;
             self.notify_held_changed();
             return Some(previous);
@@ -2618,6 +2625,89 @@ mod tests {
             .held_text(&virtual_uri.to_uri_string(), &conn)
             .unwrap();
         assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &second));
+    }
+
+    /// An older answer alike in coordinates is never held again over a
+    /// newer one (a stale pass or a snapshot repair carrying it): revoked
+    /// alone later, it would leave the connection presenting nothing though
+    /// the newer answer still stands.
+    #[tokio::test]
+    async fn an_older_alike_answer_is_never_held_over_a_newer_one() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result_at};
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        tracker
+            .register_opened_document(&host_uri, &virtual_uri, &conn)
+            .await;
+        let revocation: Arc<crate::lsp::bridge::protocol::Revocation> = Arc::default();
+        let at = |taken| {
+            let mut map = apply_prepare_result_at("a", &VirtualLayout::single("a"), None, taken)
+                .unwrap()
+                .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            map
+        };
+        let older = at(10); // epoch e1 answer, carried by a stale pass/snapshot
+        let newer = at(30); // epoch e3 answer, the one that stands
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&newer),
+            },
+            1,
+        );
+        // The stale sender (a lifecycle pass parked on an await, or a
+        // request's snapshot repair) re-holds the same text under the older map.
+        assert!(
+            tracker
+                .increment_version_if_content_changed(
+                    &virtual_uri,
+                    &conn,
+                    SentText {
+                        text: "a",
+                        map: Some(&older)
+                    },
+                )
+                .await
+                .is_none()
+        );
+        // Nor when the same text is sent again under it.
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &conn,
+            SentText {
+                text: "a",
+                map: Some(&older),
+            },
+            2,
+        );
+        let held = tracker.held_text(&uri, &conn).unwrap();
+        assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &newer));
+        assert_eq!(held.version, 2);
+        // An e2 attempt taken at 20 now publishes its failure.
+        revocation.revoke(20);
+        assert!(!newer.revoked());
+        let shown = tracker.presentation(
+            &uri,
+            &conn,
+            super::super::Observed::Now,
+            RegionPrepare {
+                prepared: true,
+                failed: false,
+            },
+            "a",
+        );
+        assert!(
+            matches!(shown, super::super::Presentation::Prepared(_)),
+            "the connection holds text the standing answer describes, got {shown:?}"
+        );
     }
 
     /// A text from an answer revoked since it was admitted (across an

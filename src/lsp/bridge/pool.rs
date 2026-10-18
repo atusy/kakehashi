@@ -441,14 +441,17 @@ impl LatestText {
         }
     }
 
-    /// Whether this is `content`: the same text from the same answer. One
-    /// alike in coordinates from another answer (the same text prepared
-    /// again under a new epoch) replaces it: the cache must hand out the
-    /// answer that stands, not one revoked since.
+    /// Whether recording `content` changes nothing but when it was recorded:
+    /// the same text from the same answer, or from one taken before (an
+    /// answer never moves backwards: see `PreparedMap::taken_before`). One
+    /// from a newer answer replaces it, however alike in coordinates (the
+    /// same text prepared again under a new epoch): the cache must hand out
+    /// the answer that stands, not one revoked since.
     fn is(&self, content: SentText<'_>) -> bool {
         let held = self.as_sent();
         held.text == content.text
-            && super::protocol::PreparedMap::same_answer(held.map, content.map)
+            && (super::protocol::PreparedMap::same_answer(held.map, content.map)
+                || super::protocol::PreparedMap::taken_before(content.map, held.map))
     }
 }
 
@@ -10032,6 +10035,61 @@ mod tests {
             SentText {
                 text: "x = 1",
                 map: Some(&second),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// The lazy-open cache never moves back to an older answer alike in
+    /// coordinates (one a stale pass records): revoked alone later, it
+    /// would refuse a request on the newer answer that stands.
+    #[tokio::test]
+    async fn the_cache_keeps_a_newer_answer_over_an_older_alike_one() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&newer);
+        record(&older);
+        // A failure taken between the two answers revokes the older only.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: older.built() + 1,
+                input: 1,
+            }),
+        );
+        assert!(older.revoked());
+        assert!(!newer.revoked());
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&newer),
             },
             &key,
         )

@@ -791,6 +791,16 @@ impl PreparedMap {
         }
     }
 
+    /// Whether `incoming` was taken before `held`: holding it in its place
+    /// would move an answer backwards, and once a failure taken between the
+    /// two revoked it alone, hold a revoked text where a standing one was.
+    pub(crate) fn taken_before(
+        incoming: Option<&std::sync::Arc<PreparedMap>>,
+        held: Option<&std::sync::Arc<PreparedMap>>,
+    ) -> bool {
+        matches!((incoming, held), (Some(incoming), Some(held)) if incoming.built < held.built)
+    }
+
     /// Whether the peer failed this map's input since it was taken: an
     /// answer it no longer gives, through which no coordinates are read and
     /// no request is sent.
