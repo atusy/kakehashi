@@ -191,7 +191,8 @@ impl ApplyEditTranslator {
         };
         ensure_editable_region(contiguous)?;
         if offset.prepared().is_some() {
-            // No edit is mapped back through a prepared document.
+            // An inbound edit is not mapped back through a prepared
+            // document: its WorkspaceEdit shapes go through no edit seam.
             return Err(
                 "kakehashi: the edit targets a prepared virtual document; it cannot be \
                  applied to the host document"
