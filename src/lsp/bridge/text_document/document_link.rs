@@ -606,7 +606,16 @@ mod tests {
                 },
             );
         };
-        for sent in [None, Some("before"), Some("after")] {
+        // When a prepared text is sent: never, before the resolve is queued,
+        // after, or before and closed again (the server may still answer
+        // from it); "closed as is" closes a document only ever held as is.
+        for sent in [
+            None,
+            Some("before"),
+            Some("after"),
+            Some("closed"),
+            Some("closed as is"),
+        ] {
             let pool = Arc::new(LanguageServerPool::preparing());
             let key = ConnectionKey::for_server("lua-ls");
             let handle = create_handle_advertising_resolve_methods(key.clone()).await;
@@ -620,8 +629,11 @@ mod tests {
                 region_id,
             );
             pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
-            if sent == Some("before") {
+            if matches!(sent, Some("before" | "closed")) {
                 record_prepared(&pool, &virtual_uri);
+            }
+            if matches!(sent, Some("closed" | "closed as is")) {
+                pool.untrack_document(&virtual_uri, &key).await;
             }
             let envelope = DocumentLinkEnvelope {
                 origin: "lua-ls".into(),
@@ -663,7 +675,8 @@ mod tests {
                 }
             }));
             let result = request.await.unwrap();
-            assert_eq!(result.target.is_some(), sent.is_none(), "{sent:?}");
+            let surfaces = matches!(sent, None | Some("closed as is"));
+            assert_eq!(result.target.is_some(), surfaces, "{sent:?}");
         }
     }
 
