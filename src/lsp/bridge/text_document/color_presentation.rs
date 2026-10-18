@@ -20,7 +20,7 @@ use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     host_range_in_prepared_gap, response_has_jsonrpc_error, text_edit_safe_in_region,
     translate_host_range_to_virtual, translate_virtual_main_and_additional_edits_to_host,
-    virtual_uri_to_lsp_uri,
+    translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -140,6 +140,24 @@ fn transform_color_presentation_response_to_host(
     if host_range_in_prepared_gap(host_request_range, offset) {
         return vec![];
     }
+    // Nor may the request range map, as the edit replacing it, elsewhere
+    // than where the client asked: a range empty right after a gap the peer
+    // emptied reaches the server where the gap's start does, and an edit
+    // there (the label's, or one the server keys to the range it got) maps
+    // back before the gap's host text.
+    if offset.prepared().is_some() {
+        // A color's text: within one line, never clearing it.
+        let mut probe = [tower_lsp_server::ls_types::TextEdit {
+            range: host_request_range,
+            new_text: "#".to_string(),
+        }];
+        translate_host_range_to_virtual(&mut probe[0].range, offset);
+        if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent)
+            || probe[0].range != host_request_range
+        {
+            return vec![];
+        }
+    }
 
     // Parse into typed Vec<ColorPresentation>
     let mut presentations: Vec<ColorPresentation> = match serde_json::from_value(result) {
@@ -165,8 +183,7 @@ fn transform_color_presentation_response_to_host(
         // On a prepared document the label must also map through it like
         // any edit (a removed indent, a hidden line break beside it): the
         // implicit edit is made explicit, in prepared coordinates.
-        let implicit = presentation.text_edit.is_none();
-        if implicit {
+        if presentation.text_edit.is_none() {
             if offset.prepared().is_some() {
                 let mut range = host_request_range;
                 translate_host_range_to_virtual(&mut range, offset);
@@ -193,11 +210,7 @@ fn transform_color_presentation_response_to_host(
             return false;
         };
         if let Some(text_edit) = &presentation.text_edit
-            && (!text_edit_safe_in_region(text_edit, offset, region_end)
-                // The label replaces the request range: mapped elsewhere (an
-                // empty range at an emptied gap's end maps before the gap's
-                // host text), it would not land where the client asked.
-                || implicit && text_edit.range != host_request_range)
+            && !text_edit_safe_in_region(text_edit, offset, region_end)
         {
             return false;
         }
@@ -844,6 +857,18 @@ mod tests {
         let at_gap_end = Range::new(Position::new(0, 12), Position::new(0, 12));
         let kept = transform_color_presentation_response_to_host(
             response.clone(),
+            &offset,
+            Position::new(0, 13),
+            at_gap_end,
+        );
+        assert!(kept.is_empty(), "{kept:?}");
+        // So is an edit the server keys to the range it got.
+        let keyed = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "#00ff00", "textEdit": {
+            "range": {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 8}},
+            "newText": "#00ff00"
+        }}]});
+        let kept = transform_color_presentation_response_to_host(
+            keyed,
             &offset,
             Position::new(0, 13),
             at_gap_end,

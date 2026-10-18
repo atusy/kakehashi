@@ -217,8 +217,8 @@ indentation is right.
 
 A set of edits the client applies together (a hint's `textEdits`, a
 completion item's or color presentation's main edit with its
-`additionalTextEdits`) is mapped one by one and checked as a whole on the edited V. It is refused, and dropped like
-any unsafe set, when:
+`additionalTextEdits`) is mapped one by one and checked as a whole on the
+edited V. It is refused, and dropped like any unsafe set, when:
 
 - an edit is reversed; edits overlap in P or once mapped; or edits touch
   (one ending where another starts, or two inserting at one place) at a
@@ -245,8 +245,9 @@ A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
 like any other. A request range reaching into a gap stands for host text no
 presentation may replace (with the gap emptied, its prepared range is even
-empty, and an edit there would only insert beside it): no presentation is
-returned. Additional edits refused with the main edit are dropped, the main
+empty, and an edit there would only insert beside it), and one right after
+an emptied gap reaches the server where the gap's start does, an edit there
+mapping back before the gap: for either, no presentation is returned. Additional edits refused with the main edit are dropped, the main
 edit kept as it maps alone.
 
 Completion keeps to what the client inserts where it asked:
