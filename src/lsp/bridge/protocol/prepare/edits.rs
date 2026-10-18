@@ -33,10 +33,12 @@ pub(crate) enum EditMode {
     Formatting,
 }
 
-/// How long diffing a formatting answer may take (see
-/// [`EditMode::Formatting`]). A diff out of time gives coarser stretches:
-/// each still maps as an edit would, or is refused, so the budget bears on
-/// which answers are refused, never on what an accepted one does.
+/// How long the diff of a formatting answer may search for the fewest
+/// changes (see [`EditMode::Formatting`]). An answer whose diff runs out of
+/// time is refused: the diff then falls back to coarser stretches, which can
+/// span lines the formatter left alone, and a stretch maps every line it
+/// spans as one it wrote, with the segment's indent rather than the line's
+/// own. So the budget bears only on which answers are refused.
 const FORMATTING_DIFF_BUDGET: Duration = Duration::from_millis(200);
 
 /// The indentation a mapped edit's first line regains.
@@ -109,9 +111,20 @@ impl PreparedMap {
             cursor = ranges[index].end;
         }
         edited.push_str(&prepared[cursor..]);
+        if edited == *prepared {
+            return Some(Vec::new());
+        }
+        let deadline = Instant::now() + budget;
+        let hunks = diff_hunks(prepared, &edited, deadline);
+        // The diff gives up only once it has seen the deadline pass: a diff
+        // finishing past it may have, and is not trusted (see
+        // `FORMATTING_DIFF_BUDGET`).
+        if Instant::now() >= deadline {
+            return None;
+        }
         // Stretches the diff keeps apart are apart by unchanged text: none
         // touches another, so each maps on its own as an edit does.
-        let mapped = diff_hunks(prepared, &edited, Instant::now() + budget)
+        let mapped = hunks
             .into_iter()
             .map(|hunk| {
                 let following = prepared[hunk.old.end..].chars().next();
@@ -823,7 +836,8 @@ struct Hunk {
 }
 
 /// The stretches `new` differs from `old` in, by a character diff given
-/// until `deadline`; past it the diff gives coarser stretches, still exact.
+/// until `deadline`; past it the diff gives coarser stretches, which still
+/// turn `old` into `new` (see `FORMATTING_DIFF_BUDGET`).
 /// A stretch never starts or ends between a CR and its LF in either text
 /// (no LSP position names that place): it widens over the unchanged
 /// character beside it. Stretches left touching merge.
