@@ -3511,7 +3511,12 @@ mod formatting_reference {
             // as a new one; and with other blank lines about, which blank
             // line went, or took other whitespace or text, is not to be told
             // (blank lines carry nothing of their own to pair them by).
-            let created_before = output.last().is_some_and(|(_, _, origin)| origin.is_none());
+            // (Blank lines kept between them hide nothing of which is which.)
+            let created_before = output
+                .iter()
+                .rev()
+                .find(|(text, _, origin)| !(text.trim().is_empty() && origin.is_some()))
+                .is_some_and(|(_, _, origin)| origin.is_none());
             let is_blank = |at: usize| {
                 lines
                     .get(at)
@@ -3531,15 +3536,18 @@ mod formatting_reference {
                     rewrite,
                     Rewrite::Reindent(_) | Rewrite::TrailingSpace | Rewrite::Write(_)
                 );
+            let creates_beside_blank =
+                is_blank(index) && matches!(rewrite, Rewrite::LineAfter(_) | Rewrite::BlankAfter);
             if (created_before && (removed.is_some() || rewrites_blank))
-                || (removed_before && rewrites_blank)
+                || (removed_before && (rewrites_blank || creates_beside_blank))
                 || removed.is_some_and(|at| is_blank(at) && other_blank(at))
                 || (rewrites_blank && other_blank(index))
             {
                 rewrite = Rewrite::Keep;
             }
             removed_before = matches!(rewrite, Rewrite::JoinNext if index + 1 < lines.len())
-                || matches!(rewrite, Rewrite::Delete if lines.len() > 1);
+                || matches!(rewrite, Rewrite::Delete if lines.len() > 1)
+                || (removed_before && is_blank(index));
             match rewrite {
                 Rewrite::Keep => output.push((text, line_break, origin)),
                 // A formatter leaves no whitespace on a line it rewrites
