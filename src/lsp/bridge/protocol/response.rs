@@ -7,7 +7,9 @@
 //! are unsafe). Used by goto definition/type_definition/implementation/declaration.
 
 use super::jsonrpc::response_has_jsonrpc_error;
-use super::translation::{RegionOffset, translate_virtual_range_to_host};
+use super::translation::{
+    RegionOffset, translate_contained_ranges_to_host, translate_virtual_range_to_host,
+};
 use super::virtual_uri::VirtualDocumentUri;
 use tower_lsp_server::ls_types::{Location, LocationLink, Uri};
 
@@ -180,8 +182,11 @@ fn transform_location_link_for_goto(
     // Case 2: Same virtual URI as request → use request's context
     if uri_str == request_virtual_uri {
         link.target_uri = host_uri.clone();
-        translate_virtual_range_to_host(&mut link.target_range, offset);
-        translate_virtual_range_to_host(&mut link.target_selection_range, offset);
+        translate_contained_ranges_to_host(
+            &mut link.target_range,
+            &mut link.target_selection_range,
+            offset,
+        );
         return Some(link);
     }
 
@@ -196,6 +201,50 @@ mod tests {
     use crate::lsp::bridge::test_logging::captured_warnings_for;
 
     use super::*;
+
+    /// Through a prepared document whose lines are dedented, a target range
+    /// ending at a line's start maps before its indentation, while an empty
+    /// selection there maps after it: the selection is clamped back into the
+    /// target range, as LSP requires.
+    #[test]
+    fn a_prepared_links_target_selection_stays_inside_its_target_range() {
+        let virtual_text = "  a\n  b\n";
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = crate::lsp::bridge::protocol::apply_prepare_result(
+            virtual_text,
+            &crate::lsp::bridge::protocol::VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(0, 0).with_prepared(map);
+        let virtual_uri = "file:///project/kakehashi-virtual-uri-region-0.lua";
+        let response = json!({ "jsonrpc": "2.0", "id": 1, "result": [{
+            "targetUri": virtual_uri,
+            "targetRange": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "targetSelectionRange": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+        }]});
+        let links = transform_goto_response_to_host(
+            response,
+            virtual_uri,
+            &"file:///project/host.md".parse().unwrap(),
+            &offset,
+        )
+        .unwrap();
+        let link = &links[0];
+        assert!(
+            link.target_selection_range.start >= link.target_range.start,
+            "{link:?}"
+        );
+        assert!(
+            link.target_selection_range.end <= link.target_range.end,
+            "{link:?}"
+        );
+    }
 
     #[test]
     fn goto_response_warns_on_malformed_success_result() {

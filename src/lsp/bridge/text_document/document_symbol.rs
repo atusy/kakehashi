@@ -17,11 +17,11 @@ use tower_lsp_server::ls_types::{DocumentSymbol, NumberOrString, SymbolInformati
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
 };
+use super::super::protocol::{translate_contained_ranges_to_host, translate_virtual_range_to_host};
 
 impl LanguageServerPool {
     /// Send a document symbol request and wait for the response.
@@ -224,14 +224,7 @@ fn transform_document_symbol_nested_response(
 ///
 /// Uses saturating_add to prevent overflow for large line numbers.
 fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &RegionOffset) {
-    translate_virtual_range_to_host(&mut symbol.range, offset);
-    translate_virtual_range_to_host(&mut symbol.selection_range, offset);
-    if offset.prepared().is_some() {
-        // Mapped on its own, a selection at a dedented line's start or an
-        // emptied gap can land outside its symbol's range, which LSP
-        // requires to contain it.
-        clamp_into(&mut symbol.selection_range, symbol.range);
-    }
+    translate_contained_ranges_to_host(&mut symbol.range, &mut symbol.selection_range, offset);
 
     if let Some(children) = &mut symbol.children {
         for child in children {
@@ -240,21 +233,9 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &Region
     }
 }
 
-/// Clamp `inner` into `outer`; an inverted `outer` (a malformed answer)
-/// leaves it as is.
-fn clamp_into(
-    inner: &mut tower_lsp_server::ls_types::Range,
-    outer: tower_lsp_server::ls_types::Range,
-) {
-    if outer.start > outer.end {
-        return;
-    }
-    inner.start = inner.start.clamp(outer.start, outer.end);
-    inner.end = inner.end.clamp(inner.start, outer.end);
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::super::protocol::clamp_range_into;
     use super::super::test_helpers::*;
     use super::*;
 
@@ -307,20 +288,20 @@ mod tests {
         };
         let outer = range((3, 2), (5, 0));
         let mut before = range((3, 0), (3, 4));
-        clamp_into(&mut before, outer);
+        clamp_range_into(&mut before, outer);
         assert_eq!(before, range((3, 2), (3, 4)));
         let mut after = range((4, 0), (6, 1));
-        clamp_into(&mut after, outer);
+        clamp_range_into(&mut after, outer);
         assert_eq!(after, range((4, 0), (5, 0)));
         let mut outside = range((6, 0), (6, 1));
-        clamp_into(&mut outside, outer);
+        clamp_range_into(&mut outside, outer);
         assert_eq!(outside, range((5, 0), (5, 0)));
         let mut inside = range((4, 1), (4, 2));
-        clamp_into(&mut inside, outer);
+        clamp_range_into(&mut inside, outer);
         assert_eq!(inside, range((4, 1), (4, 2)));
         // A malformed, inverted range: no panic, nothing clamped.
         let mut any = range((1, 0), (9, 0));
-        clamp_into(&mut any, range((5, 0), (3, 2)));
+        clamp_range_into(&mut any, range((5, 0), (3, 2)));
         assert_eq!(any, range((1, 0), (9, 0)));
     }
     use rstest::rstest;

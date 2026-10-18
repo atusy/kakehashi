@@ -138,6 +138,33 @@ fn translate_virtual_position_to_host_biased(
         .saturating_add(offset.column_for_line(virtual_line));
 }
 
+/// Translate a range and one LSP requires it to contain (a symbol's
+/// selection, a link's target selection) to host coordinates. Mapped on its
+/// own through a prepared map, the inner one can land outside the outer (a
+/// selection at a dedented line's start, or at an emptied gap): it is then
+/// clamped back into it.
+pub(crate) fn translate_contained_ranges_to_host(
+    outer: &mut Range,
+    inner: &mut Range,
+    offset: &RegionOffset,
+) {
+    translate_virtual_range_to_host(outer, offset);
+    translate_virtual_range_to_host(inner, offset);
+    if offset.prepared().is_some() {
+        clamp_range_into(inner, *outer);
+    }
+}
+
+/// Clamp `inner` into `outer`; an inverted `outer` (a malformed answer)
+/// leaves it as is.
+pub(crate) fn clamp_range_into(inner: &mut Range, outer: Range) {
+    if outer.start > outer.end {
+        return;
+    }
+    inner.start = inner.start.clamp(outer.start, outer.end);
+    inner.end = inner.end.clamp(inner.start, outer.end);
+}
+
 /// Translate a virtual range to host coordinates.
 ///
 /// Applies position translation to both start and end. Through a prepared
