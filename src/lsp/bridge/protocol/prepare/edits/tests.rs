@@ -1613,9 +1613,8 @@ fn a_cr_an_edit_inserts_before_an_lf_both_documents_show_joins_alike() {
 
 #[test]
 fn an_empty_insertion_inserts_no_indent() {
-    // A whitespace-only line the peer kept, at the start of which a line
-    // starts in both documents with text after it.
-    let virtual_text = "  a\n \n";
+    // An empty line, where text typed starts a line of the content.
+    let virtual_text = "  a\n\n";
     let map = prepare(
         virtual_text,
         json!([
@@ -1627,6 +1626,22 @@ fn an_empty_insertion_inserts_no_indent() {
     // Text there regains the indent.
     let mapped = map.map_one_with_extent(&edit((1, 0), (1, 0), "x")).unwrap();
     assert_eq!(mapped.new_text, "  x");
+}
+
+#[test]
+fn text_typed_on_a_whitespace_line_the_peer_kept_regains_nothing() {
+    // The peer left `   ` alone, as it may leave any line: typed at its
+    // start, text joins it as on a line left alone.
+    let virtual_text = "  a\n   \n  b\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let typed = map.map_one_with_extent(&edit((1, 0), (1, 0), "x")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[typed]), "  a\nx   \n  b\n");
 }
 
 #[test]
@@ -2407,4 +2422,43 @@ fn text_joining_an_existing_line_takes_that_lines_indent() {
         .map_one_with_extent(&edit((2, 0), (2, 0), "\r\nw"))
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[joined]), "\t \n\tb c\n\r\n w");
+}
+
+#[test]
+fn lines_inserted_before_a_shallower_closing_indent_are_content_lines() {
+    // The nixfmt layout: a line inserted at the closing line's start is a
+    // content line; the closing line keeps its own indent after it.
+    let virtual_text = "\n    foo\n  ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let inserted = map
+        .map_one_with_extent(&edit((1, 0), (1, 0), "baz\n"))
+        .unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &[inserted]),
+        "\n    foo\n    baz\n  "
+    );
+}
+
+#[test]
+fn a_closing_indent_after_content_left_alone_is_no_indent_to_regain() {
+    // `a` at column 0, only the closing indent deleted: a line created after
+    // `a` regains no indent.
+    let virtual_text = "a\n  ";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let inserted = map
+        .map_one_with_extent(&edit((0, 1), (0, 1), "\nz"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[inserted]), "a\nz\n  ");
 }

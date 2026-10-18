@@ -419,10 +419,10 @@ fn build_prepared(
                     // indent before a closing `''`, with the closing lines or
                     // right after content, where nixfmt puts it shallower
                     // than the content) does not outvote the content's
-                    // dedent: new lines regain the content's. With closing
-                    // lines deleted it says nothing at all; without, and no
-                    // content line dedented, it is the only indent the
-                    // segment's lines (that last one among them) have.
+                    // dedent: new lines regain the content's, and with content
+                    // left alone, none. Only in a segment with no content at
+                    // all, and no closing lines deleted with it, is it the
+                    // indent new lines regain.
                     let closing_indent = kind == RunKind::Deleted
                         && index == last_index
                         && deletion.end == segment.virtual_range.end;
@@ -443,6 +443,9 @@ fn build_prepared(
                 );
                 if deleted.is_empty()
                     && !deletes_closing_lines
+                    && virtual_segment
+                        .chars()
+                        .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
                     && let Some(closing) = closing
                 {
                     deleted.push(closing);

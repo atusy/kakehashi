@@ -328,10 +328,21 @@ impl PreparedMap {
         };
         // The removed indent right before where the start plainly maps — not
         // one beyond a gap the peer emptied at the same P offset.
-        let start_indent = whole_lines
-            .then(|| empty_run(&self.runs, old.start, |kind| kind == RunKind::Deleted))
-            .flatten()
+        let removed_at_start = empty_run(&self.runs, old.start, |kind| kind == RunKind::Deleted)
             .filter(|run| run.virtual_.end == plain_start);
+        // Lines inserted at a line start whose removed indent is not the
+        // content's (the indentation-only last line's, shallower than the
+        // content in the nixfmt layout) are lines of the content: they go
+        // before that indent, which the existing line gets back after them.
+        let lines_before_own_indent = old.is_empty()
+            && new_text.ends_with(['\n', '\r'])
+            && removed_at_start.is_some_and(|run| {
+                Some(&self.virtual_lines.text[run.virtual_.clone()])
+                    != self.uniform_indent_at(plain_start)
+            });
+        let start_indent = (whole_lines || lines_before_own_indent)
+            .then_some(removed_at_start)
+            .flatten();
         let virtual_start = start_indent.map_or(plain_start, |run| run.virtual_.start);
         // The end maps after a removed indent at a line start, unlike a range
         // end: the change takes that indent along, and `reindent` restores
@@ -384,6 +395,7 @@ impl PreparedMap {
                 .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
         };
         let first = match start_indent {
+            _ if lines_before_own_indent => FirstIndent::Uniform,
             // Whole lines deleted before an existing line, or replaced by
             // text without a line break before a non-blank one: what remains
             // is that line, which keeps its own indent (deleting a line must
@@ -406,7 +418,7 @@ impl PreparedMap {
             // that line, which has no indent to restore.
             None if is_line_start(virtual_text, virtual_start)
                 && (is_line_start(prepared, old.start) || after_gap)
-                && (is_blank_from(virtual_text, virtual_start)
+                && (is_line_end(virtual_text, virtual_start)
                     || new_text.contains(['\n', '\r'])) =>
             {
                 FirstIndent::Uniform
@@ -456,6 +468,19 @@ impl PreparedMap {
             return None;
         }
         Some((virtual_start..virtual_end, inserted))
+    }
+
+    /// The indent lines created at V `virtual_start` regain: their segment's
+    /// uniform one (`None` when its removed indents differ; none at all
+    /// outside every content segment).
+    fn uniform_indent_at(&self, virtual_start: usize) -> Option<&str> {
+        let candidate = self
+            .indents
+            .partition_point(|indent| indent.virtual_range.end < virtual_start);
+        self.indents
+            .get(candidate)
+            .filter(|indent| indent.virtual_range.start <= virtual_start)
+            .map_or(Some(""), |indent| indent.uniform.as_deref())
     }
 
     /// Whether replacing P's `old` bytes reaches into a gap's text in P (a
@@ -509,15 +534,7 @@ impl PreparedMap {
         if matches!(first, FirstIndent::None) && !breaks_line {
             return Some(text.to_string());
         }
-        let uniform = || {
-            let candidate = self
-                .indents
-                .partition_point(|indent| indent.virtual_range.end < virtual_start);
-            self.indents
-                .get(candidate)
-                .filter(|indent| indent.virtual_range.start <= virtual_start)
-                .map_or(Some(""), |indent| indent.uniform.as_deref())
-        };
+        let uniform = || self.uniform_indent_at(virtual_start);
         let first_indent = match first {
             FirstIndent::None => "",
             FirstIndent::Exact(indent) | FirstIndent::Existing(indent) => indent,
@@ -601,15 +618,6 @@ fn begins_line(next: Option<char>) -> bool {
 
 fn is_line_end(text: &str, offset: usize) -> bool {
     offset == text.len() || matches!(text.as_bytes().get(offset), Some(b'\n' | b'\r'))
-}
-
-/// Whether `text` holds only spaces and tabs from `offset` to its line's
-/// end: the blanks a peer may delete (another whitespace character is text).
-fn is_blank_from(text: &str, offset: usize) -> bool {
-    text[offset..]
-        .split(['\n', '\r'])
-        .next()
-        .is_none_or(|rest| rest.trim_matches([' ', '\t']).is_empty())
 }
 
 #[cfg(test)]
