@@ -225,6 +225,56 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     true
 }
 
+/// Translate, in place, the additional edits a client applies together with
+/// a main edit, as `mode` reads them; `false` — the caller drops them — when
+/// they are refused, with `additional` left as it came. `sent_mains` are the
+/// main edit as the server sent it, once per range the client may apply it
+/// through (an insert/replace edit has two); the caller translates the main
+/// edit itself.
+///
+/// A prepared document maps each main edit with the additional ones as the
+/// one set the client applies: edits harmless one by one can together
+/// corrupt host text the document hides. The additional edits are kept only
+/// when every set maps, with its main edit mapping as it does alone (so the
+/// edits sent are the set checked), and the additional edits mapping alike
+/// in every set. With no main edit there is no set to check: refused. An
+/// unprepared document's edits translate as ranges, `sent_mains` unread.
+pub(crate) fn translate_virtual_additional_edits_to_host(
+    sent_mains: &[TextEdit],
+    additional: &mut Vec<TextEdit>,
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> bool {
+    if offset.prepared().is_none() {
+        return translate_virtual_text_edits_to_host(additional, offset, mode);
+    }
+    let mut agreed: Option<Vec<TextEdit>> = None;
+    for main in sent_mains {
+        let mut alone = [main.clone()];
+        if !translate_virtual_text_edits_to_host(&mut alone, offset, mode) {
+            return false;
+        }
+        let mut set = Vec::with_capacity(additional.len() + 1);
+        set.push(main.clone());
+        set.extend(additional.iter().cloned());
+        if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != alone[0] {
+            return false;
+        }
+        let mapped = set.split_off(1);
+        if agreed.as_ref().is_some_and(|agreed| *agreed != mapped) {
+            return false;
+        }
+        agreed = Some(mapped);
+    }
+    match agreed {
+        Some(mapped) => {
+            *additional = mapped;
+            true
+        }
+        None => false,
+    }
+}
+
 // =============================================================================
 // Host -> Virtual (request direction)
 // =============================================================================

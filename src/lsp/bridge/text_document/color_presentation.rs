@@ -19,7 +19,8 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     host_range_in_prepared_gap, response_has_jsonrpc_error, text_edit_safe_in_region,
-    translate_host_range_to_virtual, translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
+    translate_host_range_to_virtual, translate_virtual_additional_edits_to_host,
+    translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
 };
 
 impl LanguageServerPool {
@@ -184,11 +185,12 @@ fn transform_color_presentation_response_to_host(
         }
         // The main edit as the server sent it, which a prepared document's
         // additional edits are mapped together with below.
-        let sent_main = if offset.prepared().is_some() && presentation.additional_text_edits.is_some() {
-            presentation.text_edit.clone()
-        } else {
-            None
-        };
+        let sent_main: Vec<_> =
+            if offset.prepared().is_some() && presentation.additional_text_edits.is_some() {
+                presentation.text_edit.iter().cloned().collect()
+            } else {
+                Vec::new()
+            };
         if let Some(text_edit) = &mut presentation.text_edit
             && (!translate_virtual_text_edits_to_host(
                 std::slice::from_mut(text_edit),
@@ -205,23 +207,12 @@ fn transform_color_presentation_response_to_host(
         // its textEdit still applies, though possibly semantically incomplete
         // — availability over fidelity, never corruption.
         if let Some(additional_edits) = &mut presentation.additional_text_edits {
-            let translated = match sent_main {
-                // Mapped with the main edit, as the one set the client
-                // applies: edits harmless one by one can together corrupt
-                // host text the prepared document hides, and what follows an
-                // edit in the set can change how it regains a removed indent,
-                // so the main edit must map in the set as it went out alone.
-                Some(main) => {
-                    let mut set = Vec::with_capacity(additional_edits.len() + 1);
-                    set.push(main);
-                    set.append(additional_edits);
-                    let mapped = translate_virtual_text_edits_to_host(&mut set, offset, EditMode::Extent)
-                        && presentation.text_edit.as_ref() == Some(&set[0]);
-                    *additional_edits = set.split_off(1);
-                    mapped
-                }
-                None => translate_virtual_text_edits_to_host(additional_edits, offset, EditMode::Extent),
-            };
+            let translated = translate_virtual_additional_edits_to_host(
+                sent_main.as_slice(),
+                additional_edits,
+                offset,
+                EditMode::Extent,
+            );
             if !translated
                 || !additional_edits
                     .iter()
