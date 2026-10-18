@@ -642,6 +642,12 @@ fn transform_code_lens_response_to_host(
 
     for lens in &mut lenses {
         translate_virtual_range_to_host(&mut lens.range, offset);
+        // A code lens should span one line (LSP 3.18 `CodeLens.range`); one
+        // on a prepared line that joins several host lines is kept where it
+        // starts.
+        if offset.prepared().is_some() && lens.range.end.line != lens.range.start.line {
+            lens.range.end = lens.range.start;
+        }
         if should_envelope(lens.data.as_ref(), server_resolves) {
             envelope_lens_data(lens, envelope_ctx);
         }
@@ -800,6 +806,56 @@ mod tests {
             offset,
             host_layer: false,
         }
+    }
+
+    /// A lens on a prepared line joining several virtual ones is kept on
+    /// one host line, where it starts: a code lens should span one line
+    /// (LSP 3.18 `CodeLens.range`). Without a prepared text, a lens is
+    /// translated as it was sent.
+    #[test]
+    fn a_lens_over_joined_prepared_lines_stays_on_its_start_line() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::{Position, Range};
+        let virtual_text = "ab\n  \ncd";
+        let gaps = [VirtualGap {
+            virtual_range: 2..6,
+            host_text: "\n  \n".to_string(),
+        }];
+        let answer = serde_json::from_value(json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        let response = |end_line| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": end_line, "character": 4}
+                }
+            }]})
+        };
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let lenses = transform_with_resolve_support(response(0), &offset, false).unwrap();
+        assert_eq!(
+            lenses[0].range,
+            Range::new(Position::new(10, 0), Position::new(10, 0))
+        );
+
+        let lenses =
+            transform_with_resolve_support(response(2), &RegionOffset::new(10, 0), false).unwrap();
+        assert_eq!(
+            lenses[0].range,
+            Range::new(Position::new(10, 0), Position::new(12, 4))
+        );
     }
 
     #[tokio::test]
