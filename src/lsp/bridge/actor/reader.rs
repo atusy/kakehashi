@@ -367,6 +367,7 @@ impl ServerRequestDeps {
             .map(|tracker| crate::lsp::diagnostic_cache::HeldStamp {
                 connection: self.connection_key.clone(),
                 observed: tracker.observe_through(),
+                origin: None,
             })
     }
 }
@@ -3680,6 +3681,7 @@ mod tests {
                 prepared: true,
                 stale_version,
             },
+            origin: Some(virtual_uri.to_uri_string()),
         };
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 3), Some(stamp(false)));
         assert_eq!(held_of(Some(Arc::clone(&tracker)), 2), Some(stamp(true)));
