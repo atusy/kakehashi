@@ -82,17 +82,16 @@ impl LanguageServerPool {
 }
 
 /// [`transform_color_presentation_response_to_host`] for a response as the
-/// executor hands it over: nothing when the request's map no longer
-/// describes the region's current host text (see `BridgeResponseContext`).
+/// executor hands it over. Whether the host moved under a prepared request's
+/// map is read once, as the final answer is chosen (`Sourced::still_current`,
+/// dropping the prepared part), not here, where an empty answer would let a
+/// server ranked below win once the host settled.
 fn color_presentation_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
     region_end: Position,
     host_request_range: Range,
 ) -> Vec<ColorPresentation> {
-    if !ctx.request_map_current {
-        return Vec::new();
-    }
     transform_color_presentation_response_to_host(
         response,
         ctx.offset,
@@ -923,32 +922,6 @@ mod tests {
             kept[0].text_edit.as_ref().map(|edit| edit.range),
             Some(after_gap)
         );
-    }
-
-    #[test]
-    fn an_answer_whose_map_is_no_longer_current_is_dropped() {
-        let offset = dedented_offset();
-        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
-        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": "x", "textEdit": {
-            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}},
-            "newText": "c"
-        }}]});
-        let answer = |current: bool| {
-            let ctx = super::super::super::pool::BridgeResponseContext {
-                virtual_uri_string: "file:///test.md/v.lua".to_string(),
-                host_uri_lsp: &host_uri,
-                offset: &offset,
-                request_map_current: current,
-            };
-            color_presentation_response_to_host(
-                response.clone(),
-                &ctx,
-                Position::new(2, 0),
-                Range::new(Position::new(1, 2), Position::new(1, 3)),
-            )
-        };
-        assert_eq!(answer(true).len(), 1);
-        assert!(answer(false).is_empty());
     }
 
     /// `  a\n  b\n`, dedented by two.

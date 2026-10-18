@@ -785,10 +785,10 @@ fn build_inlay_hint_request(
 }
 
 /// [`transform_inlay_hint_response_to_host_and_envelope`] for a response as
-/// the executor hands it over: when the request's map no longer describes
-/// the region's current host text (see `BridgeResponseContext`), the hints'
-/// edits, made for host coordinates that moved since, are not offered; the
-/// hints stay shown, as a position is.
+/// the executor hands it over. Whether the host moved under a prepared
+/// request's map is read once, as the final answer is chosen
+/// (`Sourced::still_current`, which strips the hints' edits then), not per
+/// reply.
 fn inlay_hint_response_to_host(
     response: serde_json::Value,
     ctx: &super::super::pool::BridgeResponseContext<'_>,
@@ -796,7 +796,7 @@ fn inlay_hint_response_to_host(
     envelope_ctx: &InlayHintEnvelopeContext<'_>,
     server_resolves: bool,
 ) -> Option<Vec<InlayHint>> {
-    let mut hints = transform_inlay_hint_response_to_host_and_envelope(
+    transform_inlay_hint_response_to_host_and_envelope(
         response,
         &ctx.virtual_uri_string,
         ctx.host_uri_lsp,
@@ -804,13 +804,7 @@ fn inlay_hint_response_to_host(
         region_end,
         envelope_ctx,
         server_resolves,
-    );
-    if !ctx.request_map_current {
-        for hint in hints.iter_mut().flatten() {
-            hint.text_edits = None;
-        }
-    }
-    hints
+    )
 }
 
 /// Translate inlay-hint response items from virtual to host coordinates:
@@ -1110,62 +1104,6 @@ mod tests {
         let result = request.await.unwrap();
         assert!(result.text_edits.is_some());
         assert!(extract_inlay_hint_envelope(&result).is_some());
-    }
-
-    /// A response whose request's map no longer describes the region's
-    /// current host text keeps its hints shown, without their edits.
-    #[test]
-    fn hints_whose_map_is_no_longer_current_lose_their_edits() {
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
-        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
-            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
-        ]}]}))
-        .unwrap();
-        let map = apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
-            .unwrap()
-            .map;
-        let offset = RegionOffset::new(3, 0).with_prepared(map);
-        let host_uri: Uri = "file:///test.md".parse().unwrap();
-        let key = ConnectionKey::shared("test");
-        let response = json!({"jsonrpc": "2.0", "id": 1, "result": [{
-            "position": {"line": 0, "character": 1},
-            "label": ": x",
-            "textEdits": [{
-                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
-                "newText": ": x"
-            }]
-        }]});
-        let answer = |current: bool| {
-            let ctx = super::super::super::pool::BridgeResponseContext {
-                virtual_uri_string: "file:///test.md/v.lua".to_string(),
-                host_uri_lsp: &host_uri,
-                offset: &offset,
-                request_map_current: current,
-            };
-            inlay_hint_response_to_host(
-                response.clone(),
-                &ctx,
-                Position::new(10, 0),
-                &InlayHintEnvelopeContext {
-                    server_name: "test",
-                    host_uri: host_uri.as_str(),
-                    region_id: "test-region",
-                    injection_language: "test",
-                    incarnation: Some(1),
-                    content_version: Some(1),
-                    connection_generation: 1,
-                    connection_key: &key,
-                    offset: &offset,
-                    host_layer: false,
-                },
-                false,
-            )
-            .unwrap()
-        };
-        assert!(answer(true)[0].text_edits.is_some());
-        let stale = answer(false);
-        assert_eq!(stale.len(), 1, "the hint stays shown");
-        assert!(stale[0].text_edits.is_none());
     }
 
     /// A hint from a prepared document is placed through its map, and its

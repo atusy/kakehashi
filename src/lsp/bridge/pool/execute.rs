@@ -48,16 +48,12 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// URIs back to the host URI in goto responses).
     pub host_uri_lsp: &'a Uri,
     /// The injection region offset for coordinate translation back to host space.
+    /// Whether the host moved under a prepared one since the request is not
+    /// read per response: the carriers mapping prepared edits read it once,
+    /// as the final answer is chosen (`Sourced::still_current`). Refused per
+    /// reply instead, a reply would count as no answer and a server ranked
+    /// below it, replying once the host settled, would win.
     pub offset: &'a RegionOffset,
-    /// Whether the host text the request's map describes was still the
-    /// region's current host text when the response arrived, as the
-    /// region's latest recorded content tells (see
-    /// `LanguageServerPool::host_text_still_current`). Always so as is.
-    /// When not, the host moved, possibly under a prepared text that stayed
-    /// the same (an edit to indentation the peer removes leaves it as it
-    /// was), and edits mapped through the request's map would land
-    /// elsewhere.
-    pub request_map_current: bool,
 }
 
 pub(crate) struct RequestHostLifecycle<'a> {
@@ -363,33 +359,32 @@ impl LanguageServerPool {
         }
 
         // Build context and transform response via caller-provided closure
-        let context = self.response_context(
-            &uri_string,
-            &host_uri_lsp,
-            (host_uri, injection_language, region_id),
-            offset,
-        );
+        let context = Self::response_context(&uri_string, &host_uri_lsp, offset);
 
         Ok(transform_response(response, &context))
     }
 
-    /// The context a response about `region_id` of `host_uri` is
-    /// transformed in, read as it arrives.
-    fn response_context<'a>(
+    /// [`Self::response_context`], for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn response_context_for_test<'a>(
         &self,
-        uri_string: &str,
         host_uri_lsp: &'a Uri,
-        region: (&Url, &str, &str),
+        _region: (&Url, &str, &str),
         offset: &'a RegionOffset,
     ) -> BridgeResponseContext<'a> {
-        let (host_uri, language, region_id) = region;
+        Self::response_context("virtual", host_uri_lsp, offset)
+    }
+
+    /// The context a response is transformed in.
+    fn response_context<'a>(
+        uri_string: &str,
+        host_uri_lsp: &'a Uri,
+        offset: &'a RegionOffset,
+    ) -> BridgeResponseContext<'a> {
         BridgeResponseContext {
             virtual_uri_string: uri_string.to_string(),
             host_uri_lsp,
             offset,
-            request_map_current: offset.prepared().is_none_or(|request_map| {
-                self.host_text_still_current(host_uri, language, region_id, request_map)
-            }),
         }
     }
 
@@ -716,7 +711,6 @@ impl LanguageServerPool {
                 virtual_uri_string: virtual_uri.to_uri_string(),
                 host_uri_lsp: &host_uri_lsp,
                 offset,
-                request_map_current: true,
             };
             return Ok(transform_response(
                 serde_json::json!({ "result": null }),
@@ -1133,7 +1127,8 @@ mod tests {
     /// region (`\n  `: they take it) and one typed on at column 0 (`x\n  `:
     /// they do not), with the same indentation removed from the same line.
     /// A hint whose edit was made on the first and answered after the second
-    /// was recorded loses its edits, at the carrier and when chosen.
+    /// was recorded is mapped as it arrives, and loses its edits when the
+    /// final answer is chosen.
     #[tokio::test]
     async fn an_edit_answered_after_typing_reaches_no_hint() {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
@@ -1213,7 +1208,7 @@ mod tests {
         }));
         let hints = request.await.unwrap().unwrap().unwrap();
         assert_eq!(hints.len(), 1, "the hint stays shown");
-        assert!(hints[0].text_edits.is_none());
+        assert!(hints[0].text_edits.is_some(), "mapped as it arrives");
         let sourced = Sourced::prepared_for_test(hints, &uri, "lua", &region, &before.map, 1, 0);
         // Dropped by the store alone, before the host version is read.
         assert!(!sourced.still_current(&pool, &tracker, || Some(0)));
@@ -1261,9 +1256,6 @@ mod tests {
         record(&after);
         pool.note_host_settled(&uri, 1, 1);
         let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
-        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
-        let ctx =
-            pool.response_context("virtual", &lsp_uri, (&uri, "lua", TEST_ULID_LUA_0), &offset);
         // What the edit would do through the request's map.
         let mut edits = [TextEdit {
             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
@@ -1271,14 +1263,14 @@ mod tests {
         }];
         assert!(translate_virtual_text_edits_to_host(
             &mut edits,
-            ctx.offset,
+            &offset,
             EditMode::Extent
         ));
         assert_eq!(
             edits[0].range,
             Range::new(Position::new(0, 2), Position::new(0, 3))
         );
-        assert!(!ctx.request_map_current);
+        assert!(!pool.host_text_still_current(&uri, "lua", TEST_ULID_LUA_0, &before.map));
     }
 
     /// A response is placed through its request's map only while the
@@ -1335,7 +1327,6 @@ mod tests {
         // The prepare layer's table, which holds are kept in.
         pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/reindent.md").unwrap();
-        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         pool.open_host_incarnation(&host_uri, 1).await;
         let record = |prepared: &crate::lsp::bridge::protocol::PreparedDocument| {
             pool.record_latest_virtual_content(
@@ -1352,13 +1343,9 @@ mod tests {
         record(&before);
         let request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
         let current = |offset: &RegionOffset| {
-            pool.response_context(
-                "uri",
-                &host_uri_lsp,
-                (&host_uri, "lua", TEST_ULID_LUA_0),
-                offset,
-            )
-            .request_map_current
+            offset.prepared().is_none_or(|request_map| {
+                pool.host_text_still_current(&host_uri, "lua", TEST_ULID_LUA_0, request_map)
+            })
         };
         assert!(current(&request));
         // The host's newer text waits for its answer: held.
@@ -2211,7 +2198,6 @@ mod tests {
             virtual_uri_string: "file:///project/virtual.lua".to_string(),
             host_uri_lsp: &host_uri,
             offset: &offset,
-            request_map_current: true,
         };
         assert_eq!(ctx.virtual_uri_string, "file:///project/virtual.lua");
         assert_eq!(ctx.host_uri_lsp, &host_uri);

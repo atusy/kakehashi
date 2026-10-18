@@ -257,9 +257,14 @@ No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
 An answer's edits are mapped only while they would land where the server
-meant them. This is read when the answer arrives, and once more when the
-final answer is chosen, since the servers' fan-in or the layer race can
-hold an answer while the host moves:
+meant them. This is read once, when the final answer is chosen, not as
+each reply arrives: the servers' fan-in or the layer race can hold an
+answer while the host moves, and a reply refused on arrival would count
+as no answer, so a server ranked below it whose reply came once the host
+settled (with the region's content unchanged, after an edit to another
+fence or a hold clearing) would win against the configured order. A
+reply is mapped through its request's map whatever happened since; only
+the answer chosen is checked:
 
 - the host was edited since the request's text was read (anywhere: an
   edit above the region moves the host coordinates its edits were
