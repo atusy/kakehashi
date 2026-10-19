@@ -3051,16 +3051,44 @@ mod formatting {
     }
 
     #[test]
-    fn text_written_on_a_kept_whitespace_line_gains_no_indent() {
-        // The peer removed nothing from ` `: a line left alone, which text
-        // written on keeps so. An empty line had nothing to remove: text
-        // there is the content's, indented as it is.
+    fn text_where_blank_lines_were_takes_the_contents_indent_or_is_refused() {
+        // An empty line had nothing to remove: text written where it was
+        // is the content's, indented as it is. Text where the kept ` ` was
+        // (typed after its whitespace or not) is refused: typed on it or
+        // written in its place, a whole-text answer does not tell.
+        let virtual_text = "  a\n\n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\ny\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  y\n  b\n")
+        );
         let virtual_text = "  a\n \n\n  b\n";
         let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
         let answer = [edit((0, 0), (4, 0), "a\n x\ny\nb\n")];
         assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  a\n x\n  y\n  b\n")
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+    }
+
+    #[rstest::rstest]
+    // Seeds of a provenance oracle: text typed right after a kept
+    // whitespace line's whitespace, a line inserted in its place as well.
+    #[case("  1,\r   \r  \r ", &[2, 0, 2, 1], "1,\r\n   }\r\n")]
+    #[case("\t\t)\n\t\t\n", &[2, 0], ")\r\n\t\t}\r\n")]
+    #[case("    f(a,b,c)\t\r    \t\n", &[4, 0], "f(a,b,c)\r    \t}\n")]
+    fn text_typed_after_a_kept_whitespace_line_is_refused(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split(['\n', '\r']).count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
         );
     }
 
@@ -3201,16 +3229,17 @@ mod formatting {
     }
 
     #[test]
-    fn text_written_on_a_kept_whitespace_line_beside_lines_moved_stays_its() {
-        // `1a1` moved after `2a2` lands beside the kept ` `, and ` w3` is
-        // written on it, after its whitespace: more lines than blank lines
-        // there, the kept line still keeps the one written on it.
+    fn text_typed_after_a_kept_whitespace_line_beside_lines_moved_is_refused() {
+        // `1a1` moved after `2a2` lands beside the kept ` `, and ` w3`
+        // starts with its whitespace: more lines than blank lines there,
+        // whether ` w3` was typed on it or written in its place no answer
+        // tells.
         let virtual_text = "0a0\n  1a1\n  2a2\n \n";
         let map = dedent_lines(virtual_text, &[0, 2, 2, 0]);
         let answer = [edit((0, 0), (4, 0), "0a0\n2a2\n1a1\n w3\n")];
         assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("0a0\n  2a2\n  1a1\n w3\n")
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
         );
     }
 
@@ -3260,7 +3289,7 @@ mod formatting {
     }
 
     #[test]
-    fn text_where_a_kept_whitespace_line_was_is_refused_unless_written_after_it() {
+    fn text_where_a_kept_whitespace_line_was_is_refused() {
         // A line split, its second half joined onto the next across a kept
         // `  \t` the answer replaced: written on it (no indent) or in its
         // place (the content's), no answer tells. Refused, not guessed.
@@ -3271,13 +3300,14 @@ mod formatting {
             map.map_formatting_answer(&answer),
             Err(FormattingRefusal::Shape)
         );
-        // Written after the kept whitespace, it is that line's.
+        // Typed right after the kept whitespace too: a whole-text answer
+        // does not tell that from a line written in the kept line's place.
         let virtual_text = "  a\n \n  b\n";
         let map = dedent_lines(virtual_text, &[2, 0, 2]);
         let answer = [edit((0, 0), (3, 0), "a\n x\nb\n")];
         assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  a\n x\n  b\n")
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
         );
     }
 
@@ -3946,15 +3976,15 @@ mod formatting {
 
     #[test]
     fn a_line_break_changed_before_text_written_on_a_line_keeps_them_apart() {
-        // CRLF turned to LF on `a`, text written on the kept ` ` below it
-        // (after its whitespace):
-        // that text is the line's, not one after the changed break.
-        let virtual_text = "\ta\r\n \r\n";
+        // CRLF turned to LF on `a`, text written where the empty line below
+        // it was: that text is a line of the content, not one the changed
+        // break writes anew.
+        let virtual_text = "\ta\r\n\r\n";
         let map = dedent_lines(virtual_text, &[1, 0]);
-        let answer = [edit((0, 0), (2, 0), "a\n w\r\n")];
+        let answer = [edit((0, 0), (2, 0), "a\nw\r\n")];
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("\ta\n w\r\n")
+            Some("\ta\n\tw\r\n")
         );
     }
 
@@ -4458,17 +4488,13 @@ mod formatting_reference {
                     ));
                 }
                 Rewrite::TrailingSpace => output.push((format!("{text} "), line_break, origin)),
-                // Text written on a whitespace line the peer kept, after
-                // that whitespace, is that line's; text written where an
-                // empty line was is a line of the content. Other text where
-                // a kept whitespace line was is ambiguous (written on it, or
-                // in its place), and refused.
+                // Text written where an empty line was is a line of the
+                // content. Text where a kept whitespace line was, typed
+                // after its whitespace or not, is ambiguous in a whole-text
+                // answer (written on it, or in its place), and refused.
                 Rewrite::Write(spaces) if is_blank(index) => {
                     let written = format!("{}w{index}", " ".repeat(spaces));
-                    let typed_after = written
-                        .strip_prefix(text.as_str())
-                        .is_some_and(|rest| !rest.starts_with([' ', '\t']));
-                    let origin = if text.is_empty() || typed_after {
+                    let origin = if text.is_empty() {
                         origin
                     } else {
                         origin.map(|line| AMBIGUOUS + line)

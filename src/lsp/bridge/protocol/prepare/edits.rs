@@ -1449,19 +1449,16 @@ fn runs_to_diff(
     } else if old_range.len() == new_range.len()
         && (breaks(old_lines, &old_range) || !breaks(new_lines, &new_range))
     {
-        // Line for line: a blank line for a blank line, text written on a
-        // whitespace line the peer kept after its whitespace; other text in
-        // place of an empty line is a line of the content. Other text where
-        // a kept whitespace line was is refused: written on it (keeping no
-        // indent) or in place of it removed (taking the content's), no
-        // answer tells.
+        // Line for line: a blank line for a blank line; text in place of
+        // an empty line is a line of the content. Text where a kept
+        // whitespace line was is refused, even typed right after its
+        // whitespace: written on it (keeping no indent) or in its place
+        // (taking the content's), a whole-text answer does not tell.
         let mut runs = Vec::new();
         for (old_line, new_line) in old_range.zip(new_range) {
             let kept = &old_keys[0][old_line];
             let written = new_lines[new_line].1;
-            if written.trim_matches([' ', '\t', '\r', '\n']).is_empty()
-                || written_after(kept, written)
-            {
+            if written.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
                 runs.push((old_line..old_line + 1, new_line..new_line + 1, false));
             } else if kept.is_empty() {
                 runs.push((old_line..old_line, new_line..new_line + 1, false));
@@ -1472,58 +1469,34 @@ fn runs_to_diff(
         }
         runs
     } else {
-        // More or fewer lines than the blank lines: each kept whitespace
-        // line keeps the first line written on it, after its whitespace,
-        // in order; the other blank lines went, and the other lines are
-        // the content's, in their places.
-        // Text typed right after a kept line's whitespace starts with
-        // exactly that whitespace: the new lines are indexed by theirs, and
-        // each kept line looks its own up, past the lines taken before.
+        // More or fewer lines than the blank lines: the blank lines went,
+        // and the other lines are the content's, before them. Text that
+        // may have been typed right after a kept line's whitespace (it
+        // starts with exactly that whitespace) is refused, as line for
+        // line: the new lines' leading whitespace is gathered once, and
+        // each kept line looks its own up.
         work.spend(old_range.len() + new_range.len())
             .ok_or(FormattingRefusal::OutOfWork)?;
-        let mut typed_after: HashMap<&str, Vec<usize>> = HashMap::new();
-        for new_line in new_range.clone() {
-            let line = new_lines[new_line].1;
-            let whitespace = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
-            if !whitespace.is_empty() {
-                typed_after.entry(whitespace).or_default().push(new_line);
-            }
+        let leading: std::collections::HashSet<&str> = new_range
+            .clone()
+            .map(|new_line| {
+                let line = new_lines[new_line].1;
+                &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
+            })
+            .filter(|whitespace| !whitespace.is_empty())
+            .collect();
+        if old_range
+            .clone()
+            .any(|old_line| leading.contains(old_keys[0][old_line].as_str()))
+        {
+            return Err(FormattingRefusal::Shape);
         }
-        let mut runs = Vec::new();
-        let mut next = new_range.start;
-        for old_line in old_range.clone() {
-            let kept = old_keys[0][old_line].as_str();
-            let written_on = typed_after.get(kept).and_then(|lines| {
-                lines
-                    .get(lines.partition_point(|&line| line < next))
-                    .copied()
-            });
-            match written_on {
-                Some(new_line) => {
-                    if new_line > next {
-                        runs.push((old_line..old_line, next..new_line, false));
-                    }
-                    runs.push((old_line..old_line + 1, new_line..new_line + 1, false));
-                    next = new_line + 1;
-                }
-                None => runs.push((old_line..old_line + 1, next..next, false)),
-            }
-        }
-        if next < new_range.end {
-            runs.push((old_range.end..old_range.end, next..new_range.end, false));
-        }
-        runs
+        let (start, end) = (old_range.start, new_range.end);
+        vec![
+            (start..start, new_range, false),
+            (old_range, end..end, false),
+        ]
     })
-}
-
-/// Whether `written` is text typed on a whitespace line holding `kept`,
-/// after that whitespace: it starts with it, and its text right after (a
-/// line indented further reads as well as a line of the content).
-fn written_after(kept: &str, written: &str) -> bool {
-    !kept.is_empty()
-        && written
-            .strip_prefix(kept)
-            .is_some_and(|rest| !rest.starts_with([' ', '\t']))
 }
 
 /// Pair the lines of `old_range` with those of `new_range` at

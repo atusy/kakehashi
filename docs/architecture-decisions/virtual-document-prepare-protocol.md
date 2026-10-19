@@ -293,14 +293,16 @@ go whole: its new text is that text rewritten, never text written on a
 blank line the answer removed (which would take that line's indentation,
 not the content's). A run of blank lines takes the answer's lines line
 for line where it holds as many there (not ending with a line break P
-lacks); with more or fewer, each kept whitespace line keeps the first line
-typed on it, in order, the other blank lines went, and the other lines are
-the content's. Line
-for line, text typed on a whitespace line the peer kept, right after that
-whitespace, is that line's (no indentation added); text where an empty
-line was, or one the peer emptied, takes the content's indentation; other
-text where a kept whitespace line was is refused: written on it, or in its
-place, no answer tells. Every stretch the
+lacks); with more or fewer, the blank lines went and the other lines are
+the content's. Text where an empty line was, or one the peer emptied,
+takes the content's indentation. Text where a whitespace line the peer
+kept was is refused, even typed right after that whitespace: in a
+whole-text answer, "typed on that line" is only how the diff aligned the
+text, which reads as well as a line written in its place, the kept line
+removed, and the two readings give different host text. (Edits that keep
+their extents, a completion's say, state where they go: text inserted
+after a kept line's whitespace is typed on that line, gaining no
+indentation.) Every stretch the
 result differs from P in maps as one edit does above; stretches touching at
 a line start stay apart where the later replaces some of that line's start
 with text, or where the earlier ends with a line break of P and the later
@@ -680,13 +682,12 @@ a hook per kind of change.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
-- Text a formatter writes on a whitespace-only line the peer kept, right
-  after its whitespace, regains no indentation, the rule set for typing there; where
-  an answer reads as well as a line of its own beside the blank lines, that
-  reading is taken. Text replacing a kept whitespace line's own whitespace,
-  or only indented further than it, is refused, the answer not telling whether it was written there or in
-  the line's place: some 0.2% of the answers the exact-text property
-  generates, all of them answers no reading places for sure.
+- Text a formatter writes where a whitespace-only line the peer kept was is
+  refused, typed after its whitespace or not: a whole-text answer does not
+  tell text typed on that line from a line written in its place. Where an
+  answer reads as well as a line of its own beside the blank lines, that
+  reading is taken. On documents with kept whitespace lines, a geometry
+  sweep sees some 6 such refusals per 20,000 answers (about 0.03%).
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
