@@ -7,6 +7,7 @@
 //! a whole against the host text V holds and P does not show, so edits that
 //! are fine one by one cannot combine into a corruption of it.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
@@ -915,13 +916,17 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
     let line_start = |lines: &[(usize, &str)], text: &str, index: usize| {
         lines.get(index).map_or(text.len(), |&(start, _)| start)
     };
-    let line_keys = |lines: &[(usize, &str)]| -> [Vec<String>; 2] {
+    let line_keys = |lines: &[(usize, &str)]| -> LineKeys {
         let content = |line: &str| line.trim_end_matches(['\r', '\n']).to_string();
         [
             lines.iter().map(|&(_, line)| content(line)).collect(),
             lines
                 .iter()
                 .map(|&(_, line)| content(line).trim_matches([' ', '\t']).to_string())
+                .collect(),
+            lines
+                .iter()
+                .map(|&(_, line)| content(line).replace([' ', '\t'], ""))
                 .collect(),
         ]
     };
@@ -1017,12 +1022,15 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
     Some(hunks)
 }
 
+/// Each line's text without its break (0), that trimmed of whitespace at
+/// its edges (1), and with no whitespace at all (2).
+type LineKeys = [Vec<String>; 3];
+
 /// One way [`align_lines`] pairs lines.
 #[derive(Clone, Copy)]
 enum Alignment {
-    /// Lines whose keys (0: the text without its break; 1: that trimmed of
-    /// whitespace) a patience diff finds alike, among the lines whose key
-    /// passes.
+    /// Lines whose keys (see [`LineKeys`]) a patience diff finds alike,
+    /// among the lines whose key passes.
     Diff(usize, fn(&str) -> bool),
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
@@ -1038,6 +1046,9 @@ enum Alignment {
 /// - Lines of text alike but for the whitespace around it, a line found
 ///   once in each text anchoring the rest (patience): a reindented line is
 ///   the line it was, and a blank line cannot pair with it instead.
+/// - Lines of text alike but for whitespace anywhere in them, the same
+///   way: a line a formatter respaced (`x=1` to `x = 1`) is the line it
+///   was, diffed by character on its own.
 /// - Lines of text other lines were joined onto.
 /// - Blank lines among themselves: as many as can pair, so that text the
 ///   formatter writes beside blank lines is never read as written on one
@@ -1050,8 +1061,9 @@ enum Alignment {
 /// lines alike a line was written on, or which went, no answer tells; text
 /// the run's diff writes on a whitespace line the peer kept gains no
 /// indent, as typed text there does.
-const ALIGNMENTS: [Alignment; 3] = [
+const ALIGNMENTS: [Alignment; 4] = [
     Alignment::Diff(1, |key| !key.is_empty()),
+    Alignment::Diff(2, |key| !key.is_empty()),
     Alignment::Joined,
     Alignment::Blanks,
 ];
@@ -1063,13 +1075,13 @@ const ALIGNMENTS: [Alignment; 3] = [
 /// `work` before it is taken: `None`, to refuse the answer, when there is
 /// not as much.
 fn blank_lines(
-    old_keys: &[Vec<String>; 2],
-    new_keys: &[Vec<String>; 2],
+    old_keys: &LineKeys,
+    new_keys: &LineKeys,
     old_range: &Range<usize>,
     new_range: &Range<usize>,
     work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
-    let blanks = |keys: &[Vec<String>; 2], range: &Range<usize>| -> Vec<usize> {
+    let blanks = |keys: &LineKeys, range: &Range<usize>| -> Vec<usize> {
         range
             .clone()
             .filter(|&index| keys[1][index].is_empty())
@@ -1118,31 +1130,52 @@ fn blank_lines(
 /// after it, in order: the first such old line for each new line, past the
 /// one paired before.
 ///
-/// The search is quadratic in the lines left unpaired, each comparison
-/// spent from `work`: `None`, to refuse the answer, when it runs out.
+/// The old lines' texts are indexed: each new line looks up its own
+/// prefixes of the lengths old texts have, each lookup spent from `work`,
+/// rather than comparing itself with every old line. `None`, to refuse the
+/// answer, when the work runs out.
 fn joined_lines(
-    old_keys: &[Vec<String>; 2],
-    new_keys: &[Vec<String>; 2],
+    old_keys: &LineKeys,
+    new_keys: &LineKeys,
     old_range: &Range<usize>,
     new_range: &Range<usize>,
     work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
+    work.spend(old_range.len())?;
+    // Each text an old line holds, and where, in order.
+    let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for old_line in old_range.clone() {
+        let text = old_keys[1][old_line].as_str();
+        if !text.is_empty() {
+            index.entry(text).or_default().push(old_line);
+        }
+    }
+    let mut lengths: Vec<usize> = index.keys().map(|text| text.len()).collect();
+    lengths.sort_unstable();
+    lengths.dedup();
     let mut pairs = Vec::new();
     let mut old_from = old_range.start;
     for new_line in new_range.clone() {
-        let written = &new_keys[1][new_line];
-        for (old_line, text) in old_keys[1]
+        let written = new_keys[1][new_line].as_str();
+        let mut first: Option<usize> = None;
+        for &length in lengths
             .iter()
-            .enumerate()
-            .take(old_range.end)
-            .skip(old_from)
+            .take_while(|&&length| length <= written.len())
         {
-            work.spend(1)?;
-            if !text.is_empty() && written.starts_with(text.as_str()) {
-                pairs.push((old_line, new_line));
-                old_from = old_line + 1;
-                break;
+            if !written.is_char_boundary(length) {
+                continue;
             }
+            work.spend(1)?;
+            if let Some(lines) = index.get(&written[..length]) {
+                let at = lines.partition_point(|&line| line < old_from);
+                if let Some(&line) = lines.get(at) {
+                    first = Some(first.map_or(line, |first| first.min(line)));
+                }
+            }
+        }
+        if let Some(old_line) = first {
+            pairs.push((old_line, new_line));
+            old_from = old_line + 1;
         }
     }
     Some(pairs)
@@ -1157,8 +1190,8 @@ fn joined_lines(
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
 fn align_lines(
-    old_keys: &[Vec<String>; 2],
-    new_keys: &[Vec<String>; 2],
+    old_keys: &LineKeys,
+    new_keys: &LineKeys,
     level: usize,
     old_range: Range<usize>,
     new_range: Range<usize>,

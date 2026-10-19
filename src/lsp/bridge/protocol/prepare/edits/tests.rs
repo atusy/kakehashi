@@ -3170,6 +3170,89 @@ mod formatting {
         }
     }
 
+    /// `count` assignments written tight, and as a formatter spacing every
+    /// one: the same text but for whitespace inside each line.
+    fn spaced_assignments(count: usize) -> (String, String) {
+        (
+            (0..count).map(|index| format!("x{index}=1\n")).collect(),
+            (0..count).map(|index| format!("x{index} = 1\n")).collect(),
+        )
+    }
+
+    #[rstest::rstest]
+    #[case(1_500)]
+    #[case(20_000)]
+    fn every_line_respaced_maps(#[case] count: usize) {
+        // No line is alike to another but for its edges, and none starts
+        // with an old one: lines alike but for whitespace anywhere pair
+        // first, each diffed by character on its own.
+        let (old, new) = spaced_assignments(count);
+        let map = dedent_lines(&old, &[]);
+        let answer = [edit((0, 0), (count as u32, 0), &new)];
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&old, &mapped)),
+            Ok(new)
+        );
+    }
+
+    #[test]
+    fn respacing_costs_work_linear_in_the_lines_and_decides_alike() {
+        let (old, new) = spaced_assignments(5_000);
+        let map = dedent_lines(&old, &[]);
+        let answer = [edit((0, 0), (5_000, 0), &new)];
+        let budget = 4 * (old.len() + new.len());
+        let first = map.map_formatting(&answer, budget);
+        assert!(first.is_ok());
+        for _ in 0..3 {
+            assert_eq!(map.map_formatting(&answer, budget), first);
+        }
+    }
+
+    #[test]
+    fn lines_rewritten_with_whitespace_lines_between_cost_no_pairwise_search() {
+        // Every text line changed (no two alike, none joined), whitespace
+        // lines between: looking for joins costs a lookup for each line
+        // and length, not a comparison with every other line.
+        let texts = |count: usize, letter: char| -> String {
+            (0..count)
+                .map(|index| format!("{letter}{index}\n \n"))
+                .collect()
+        };
+        let count = 3_000;
+        let (old, new) = (texts(count, 'a'), texts(count, 'b'));
+        let mut work = Work::new(20 * count);
+        let (old_lines, new_lines) = (lines_with_breaks(&old), lines_with_breaks(&new));
+        let keys = |lines: &[(usize, &str)]| -> LineKeys {
+            let content: Vec<String> = lines
+                .iter()
+                .map(|&(_, line)| line.trim_end_matches(['\r', '\n']).to_string())
+                .collect();
+            let trimmed = content.iter().map(|line| line.trim().to_string()).collect();
+            let bare = content.iter().map(|line| line.replace(' ', "")).collect();
+            [content, trimmed, bare]
+        };
+        let pairs = joined_lines(
+            &keys(&old_lines),
+            &keys(&new_lines),
+            &(0..old_lines.len()),
+            &(0..new_lines.len()),
+            &mut work,
+        );
+        assert_eq!(pairs, Some(vec![]));
+        // What bounds such an answer is the table pairing its whitespace
+        // lines, quadratic in them: some 1,000 fit the default budget.
+        let accepted = |count: usize| {
+            let (old, new) = (texts(count, 'a'), texts(count, 'b'));
+            let map = dedent_lines(&old, &[]);
+            let answer = [edit((0, 0), (2 * count as u32, 0), &new)];
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&old, &mapped) == new)
+        };
+        assert_eq!(accepted(900), Ok(true));
+        assert_eq!(accepted(1_100), Err(FormattingRefusal::OutOfWork));
+    }
+
     #[test]
     fn a_refusal_says_whether_shape_or_size_decided_it() {
         // Lines dedented by two and by four: a new line has no one indent.
@@ -3201,16 +3284,16 @@ mod formatting {
 
     #[test]
     fn pairing_joined_lines_stops_when_out_of_work() {
-        // The join search is quadratic: each comparison is spent, and out
-        // of work it refuses, not runs on.
-        let keys = |lines: &[&str]| -> [Vec<String>; 2] {
+        // Indexing the old lines and each lookup are spent, and out of
+        // work the search refuses, not runs on.
+        let keys = |lines: &[&str]| -> LineKeys {
             let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-            [lines.clone(), lines]
+            [lines.clone(), lines.clone(), lines]
         };
         let (old, new) = (keys(&["a"]), keys(&["a b"]));
         let pairs = |budget| joined_lines(&old, &new, &(0..1), &(0..1), &mut Work::new(budget));
-        assert_eq!(pairs(1), Some(vec![(0, 0)]));
-        assert_eq!(pairs(0), None);
+        assert_eq!(pairs(2), Some(vec![(0, 0)]));
+        assert_eq!(pairs(1), None);
     }
 
     #[test]
@@ -3218,9 +3301,9 @@ mod formatting {
         // Every cell of the table is spent before it is taken: a run of
         // blank lines just within the budget pairs, one just past it
         // refuses at once, not held in memory.
-        let keys = |count: usize| -> [Vec<String>; 2] {
+        let keys = |count: usize| -> LineKeys {
             let lines = vec![String::new(); count];
-            [lines.clone(), lines]
+            [lines.clone(), lines.clone(), lines]
         };
         let small = (keys(3), keys(2));
         let pairs =
