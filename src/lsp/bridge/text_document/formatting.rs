@@ -40,7 +40,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{BridgeResponseContext, LanguageServerPool, UpstreamId};
 use super::super::protocol::{EditMode, translate_virtual_text_edits_to_host};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
@@ -105,13 +105,7 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(
-                    response,
-                    ctx.offset,
-                    virtual_content,
-                    region_end,
-                )
-                .map(Some)
+                formatting_answer_to_host(response, ctx, virtual_content, region_end).map(Some)
             },
             downstream_id_probe,
         )
@@ -522,6 +516,29 @@ fn build_formatting_request(
         },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/formatting", params)
+}
+
+/// A formatting or range formatting answer arriving in `ctx`, in host
+/// coordinates: [`transform_formatting_response_to_host`] through
+/// `ctx.offset`.
+pub(super) fn formatting_answer_to_host(
+    response: serde_json::Value,
+    ctx: &BridgeResponseContext<'_>,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Vec<TextEdit>> {
+    transform_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
+}
+
+/// [`formatting_answer_to_host`] for an on-type formatting answer (see
+/// [`transform_on_type_formatting_response_to_host`]).
+pub(super) fn on_type_formatting_answer_to_host(
+    response: serde_json::Value,
+    ctx: &BridgeResponseContext<'_>,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Vec<TextEdit>> {
+    transform_on_type_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
 }
 
 /// Translate each `TextEdit` from virtual to host coordinates via `offset`.
@@ -2149,5 +2166,43 @@ mod tests {
             crate::text::edit::apply_text_edits(host, &edits),
             "x = ''\n  foo'';\n"
         );
+    }
+
+    #[rstest]
+    #[case::formatting(formatting_answer_to_host)]
+    #[case::on_type_formatting(on_type_formatting_answer_to_host)]
+    fn a_prepared_answer_maps_through_its_context(
+        #[case] answer_to_host: fn(
+            serde_json::Value,
+            &BridgeResponseContext<'_>,
+            &str,
+            Position,
+        ) -> io::Result<Vec<TextEdit>>,
+    ) {
+        let offset = nix_json_offset();
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.nix".parse().unwrap();
+        let answer = || {
+            let ctx = BridgeResponseContext {
+                virtual_uri_string: String::new(),
+                host_uri_lsp: &host_uri,
+                offset: &offset,
+            };
+            let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": " "
+            }]});
+            answer_to_host(
+                response,
+                &ctx,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+        };
+        // Mapped through the context's prepared map: the inserted space
+        // lands after the line's removed indent, regained.
+        let edits = answer().expect("mapped");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start.line, 1);
     }
 }
