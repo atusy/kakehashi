@@ -542,49 +542,82 @@ pub(super) fn formatting_answer_to_host(
     region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
     transform_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
-        .inspect_err(|error| log_refusal(error, ctx))
+        .map_err(|error| placed(error, ctx))
 }
 
-/// A formatting answer the prepared map refused, and why: the error the
-/// transforms fail with, logged once by the caller that knows the document.
+/// A formatting answer the prepared map refused, why, and (once the
+/// caller that knows the document says) where: the error the transforms
+/// fail with. The fan-in logs it once for the reply, with the server, and
+/// counts it as that server failing.
 #[derive(Debug)]
-pub(crate) struct PreparedAnswerRefused(pub(crate) FormattingRefusal);
+pub(crate) struct PreparedAnswerRefused {
+    pub(crate) reason: FormattingRefusal,
+    /// The host document and the region's virtual document.
+    pub(crate) place: Option<String>,
+}
 
 impl std::fmt::Display for PreparedAnswerRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "formatting response refused: {}", self.0)
+        match &self.place {
+            Some(place) => write!(
+                f,
+                "formatting response for {place} refused: {}",
+                self.reason
+            ),
+            None => write!(f, "formatting response refused: {}", self.reason),
+        }
     }
 }
 
 impl std::error::Error for PreparedAnswerRefused {}
 
-/// Warn, once per refused region, of a formatting answer its prepared map
-/// refused, naming the document, the region and why. Other failures were
-/// logged where they were found.
-fn log_refusal(error: &io::Error, ctx: &BridgeResponseContext<'_>) {
-    if let Some(PreparedAnswerRefused(reason)) = error
+/// The reason a prepared map refused an answer, if that is why `error`
+/// was raised.
+fn refusal(error: &io::Error) -> Option<FormattingRefusal> {
+    error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>())
-    {
-        warn!(
-            target: "kakehashi::bridge",
-            "Refused a formatting answer for {} (region {}): {reason}",
-            ctx.host_uri_lsp.as_str(),
-            ctx.virtual_uri_string
-        );
+        .map(|refused| refused.reason)
+}
+
+/// `error`, a refusal named with the host document and the region.
+fn placed(error: io::Error, ctx: &BridgeResponseContext<'_>) -> io::Error {
+    match refusal(&error) {
+        Some(reason) => io::Error::other(PreparedAnswerRefused {
+            reason,
+            place: Some(format!(
+                "{} (region {})",
+                ctx.host_uri_lsp.as_str(),
+                ctx.virtual_uri_string
+            )),
+        }),
+        None => error,
     }
 }
 
 /// [`formatting_answer_to_host`] for an on-type formatting answer (see
-/// [`transform_on_type_formatting_response_to_host`]).
+/// [`transform_on_type_formatting_response_to_host`]). One the prepared
+/// map refuses is no answer, logged at debug, as one the host moved under
+/// is: on-type answers come on trigger keystrokes, and a failure there
+/// would warn the user on every one.
 pub(super) fn on_type_formatting_answer_to_host(
     response: serde_json::Value,
     ctx: &BridgeResponseContext<'_>,
     virtual_content: &str,
     region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
-    transform_on_type_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
-        .inspect_err(|error| log_refusal(error, ctx))
+    match transform_on_type_formatting_response_to_host(
+        response,
+        ctx.offset,
+        virtual_content,
+        region_end,
+    ) {
+        Err(error) if refusal(&error).is_some() => {
+            log::debug!(target: "kakehashi::bridge", "{}", placed(error, ctx));
+            Ok(Vec::new())
+        }
+        result => result,
+    }
 }
 
 /// Translate each `TextEdit` from virtual to host coordinates via `offset`.
@@ -726,7 +759,10 @@ fn transform_formatting_style_response(
     // Logged by the caller, which knows the document (see
     // `PreparedAnswerRefused`).
     if let Err(reason) = translate_virtual_formatting_edits_to_host(&mut edits, offset) {
-        return Err(io::Error::other(PreparedAnswerRefused(reason)));
+        return Err(io::Error::other(PreparedAnswerRefused {
+            reason,
+            place: None,
+        }));
     }
 
     // Clamp positions past the end of the last content line into the region:
@@ -2247,7 +2283,10 @@ mod tests {
             error
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>()),
-            Some(PreparedAnswerRefused(FormattingRefusal::Shape))
+            Some(PreparedAnswerRefused {
+                reason: FormattingRefusal::Shape,
+                place: None
+            })
         ));
     }
 
@@ -2374,6 +2413,53 @@ mod tests {
         assert_eq!(
             crate::text::edit::apply_text_edits(virtual_content, &edits),
             "  top\n  b\n"
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_names_where_and_why_once() {
+        // Text rewritten past any likeness, in a region of 20,000
+        // characters: the diff runs out of work.
+        let mut seed = 7u64;
+        let mut text = |length: usize| -> String {
+            (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    char::from(b'a' + (seed >> 60) as u8 % 4)
+                })
+                .collect()
+        };
+        let (old, new) = (text(20_000), text(20_000));
+        let virtual_content = format!("  {old}\n");
+        let offset = prepared_offset(
+            &virtual_content,
+            0,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///refused.md".parse().unwrap();
+        let ctx = BridgeResponseContext {
+            virtual_uri_string: "file:///region.lua".to_string(),
+            host_uri_lsp: &host_uri,
+            offset: &offset,
+        };
+        let response = || {
+            json!({ "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": format!("{new}\n")
+            }]})
+        };
+        let end = region_host_end(&prepared, &offset);
+        // Formatting: an error the fan-in logs once, with where and why.
+        let error = formatting_answer_to_host(response(), &ctx, &prepared, end).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("file:///refused.md"), "{message}");
+        assert!(message.contains("file:///region.lua"), "{message}");
+        assert!(message.contains("ran out of work"), "{message}");
+        // On type: no answer, not a failure warned on every keystroke.
+        assert_eq!(
+            on_type_formatting_answer_to_host(response(), &ctx, &prepared, end).unwrap(),
+            vec![]
         );
     }
 
