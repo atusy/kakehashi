@@ -600,7 +600,7 @@ impl Kakehashi {
         failure_sink: &RequestErrorSink,
     ) -> bool {
         let verdict = self.sources_verdict(lsp_uri, sources.iter()).await;
-        if verdict == Verdict::Current {
+        if verdict.keeps() {
             return true;
         }
         log::warn!(
@@ -618,27 +618,11 @@ impl Kakehashi {
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
     ) -> Verdict {
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        if !sources.clone().any(Sourced::is_prepared) {
-            return Verdict::Current;
-        }
-        settled_verdict(
-            || {
-                sources.clone().all(|source| {
-                    source.still_current(pool, tracker, || self.host_content_version(lsp_uri))
-                })
-            },
-            || {
-                let now = self.host_content_version(lsp_uri);
-                sources.clone().any(|source| {
-                    source
-                        .request_content_version()
-                        .is_some_and(|version| Some(version) != now)
-                })
-            },
-            || sources.clone().any(|source| source.settling(pool)),
-            crate::lsp::bridge::PREPARE_TIMEOUT,
+        sources_verdict(
+            self.bridge.pool(),
+            self.bridge.node_tracker(),
+            || self.host_content_version(lsp_uri),
+            sources,
         )
         .await
     }
@@ -2378,6 +2362,45 @@ impl std::fmt::Display for Verdict {
     }
 }
 
+impl Verdict {
+    /// Whether the answer judged so is kept: only one still current.
+    pub(super) fn keeps(self) -> bool {
+        self == Self::Current
+    }
+}
+
+/// [`settled_verdict`] for an answer mapped through `sources`, the host's
+/// content version read by `current_version`: `Current` at once for one
+/// mapped through no prepared region.
+pub(super) async fn sources_verdict<'a, T: 'a>(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+) -> Verdict {
+    if !sources.clone().any(Sourced::is_prepared) {
+        return Verdict::Current;
+    }
+    settled_verdict(
+        || {
+            sources
+                .clone()
+                .all(|source| source.still_current(pool, tracker, &current_version))
+        },
+        || {
+            let now = current_version();
+            sources.clone().any(|source| {
+                source
+                    .request_content_version()
+                    .is_some_and(|version| Some(version) != now)
+            })
+        },
+        || sources.clone().any(|source| source.settling(pool)),
+        crate::lsp::bridge::PREPARE_TIMEOUT,
+    )
+    .await
+}
+
 /// Judge an answer once it can be: `Current` as soon as `current` holds;
 /// `Moved` as soon as `moved` does (the host edited since the request read
 /// its text: no settling brings that back); `Stale` as soon as nothing is
@@ -2544,6 +2567,101 @@ mod tests {
             .await;
             assert_eq!(verdict, Verdict::Stale, "{case}");
             assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
+    }
+
+    /// The judgement the formatting methods make as the final answer is
+    /// chosen, through a real pool and tracker: kept only once current;
+    /// moved, stale and never-settled answers dropped, the first two at
+    /// once.
+    #[tokio::test(start_paused = true)]
+    async fn the_final_check_waits_only_for_what_can_settle() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for case in ["settles", "moves", "revoked", "never settles"] {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            let host = url::Url::parse("file:///test/final-check.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            // Another fence edited to version 1, its pass not settled: the
+            // request read version 1.
+            pool.note_host_edited(&host, 1, 1);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                1,
+            );
+            let version = Arc::new(AtomicU64::new(1));
+            match case {
+                "settles" => {
+                    let (pool, host) = (Arc::clone(&pool), host.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        pool.note_host_settled(&host, 1, 1);
+                    });
+                }
+                "moves" => version.store(2, Ordering::SeqCst),
+                "revoked" => {
+                    pool.note_host_settled(&host, 1, 1);
+                    revocation.revoke(u64::MAX);
+                }
+                _ => {}
+            }
+            let start = tokio::time::Instant::now();
+            let verdict = sources_verdict(
+                &pool,
+                &tracker,
+                || Some(version.load(Ordering::SeqCst)),
+                std::iter::once(&held),
+            )
+            .await;
+            let waited = start.elapsed();
+            let (expected, at_once) = match case {
+                "settles" => (Verdict::Current, false),
+                "moves" => (Verdict::Moved, true),
+                "revoked" => (Verdict::Stale, true),
+                _ => (Verdict::Unsettled, false),
+            };
+            assert_eq!(verdict, expected, "{case}");
+            assert_eq!(verdict.keeps(), case == "settles", "{case}");
+            if at_once {
+                assert_eq!(waited, std::time::Duration::ZERO, "{case}");
+            } else if case == "settles" {
+                assert!(
+                    waited < std::time::Duration::from_secs(2),
+                    "{case}: {waited:?}"
+                );
+            } else {
+                assert!(
+                    waited >= crate::lsp::bridge::PREPARE_TIMEOUT,
+                    "{case}: {waited:?}"
+                );
+            }
         }
     }
 

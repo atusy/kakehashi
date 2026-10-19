@@ -693,8 +693,12 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
             response.get("error").is_none(),
             "{strategy} {method}: {response}"
         );
-        let edits = response["result"].as_array().cloned().unwrap_or_default();
-        assert!(edits.is_empty(), "{strategy} {method}, edited: {response}");
+        // Dropped whole: no answer at all, not an empty list some layer
+        // gave.
+        assert!(
+            response["result"].is_null(),
+            "{strategy} {method}, edited: {response}"
+        );
     }
 }
 
