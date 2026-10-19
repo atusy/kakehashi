@@ -184,7 +184,7 @@ impl PreparedMap {
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
-        let hunks = diff_hunks(prepared, &edited, &mut work).ok_or(FormattingRefusal::OutOfWork)?;
+        let hunks = diff_hunks(prepared, &edited, &mut work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // where one writes over the start of a line another ends at (see
         // `diff_hunks`), each then on its own line.
@@ -598,26 +598,36 @@ impl PreparedMap {
                 .take_while(|run| run.virtual_.end == virtual_start)
                 .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
         };
+        // Text written over a whole blank line, other than after the
+        // whitespace the peer kept on it, is a line of the content in its
+        // place: that line's whitespace was never an indent (a line the peer
+        // emptied, an empty line), or the text is not written after it.
+        let blank_line_text_in_place = whole_lines && {
+            let line_end = prepared[old.start..]
+                .find(['\n', '\r'])
+                .map_or(prepared.len(), |end| old.start + end);
+            let kept = &prepared[old.start..line_end];
+            let first = new_text.split(['\n', '\r']).next().unwrap_or_default();
+            kept.trim_matches([' ', '\t']).is_empty()
+                && !first.trim_matches([' ', '\t']).is_empty()
+                && (kept.is_empty() || !first.starts_with(kept))
+        };
         let first = first_indent(&EdgeShape {
             whole_lines,
             lines_before_own_indent,
+            blank_line_text_in_place,
             start_indent: start_indent.map(|run| &virtual_text[run.virtual_.clone()]),
             blank_at_start: blank_at_start.is_some(),
             end_line_indent,
             starts_virtual_line: is_line_start(virtual_text, virtual_start),
             starts_prepared_line_or_after_gap: is_line_start(prepared, old.start) || after_gap,
             ends_virtual_line: is_line_end(virtual_text, virtual_start),
-            ends_prepared_line: is_line_end(prepared, old.start),
             // Read only where `first_indent` does: a whitespace-only rest
             // of a long line is not scanned again for every edit on it.
             virtual_rest_blank: whole_lines
                 && is_line_start(virtual_text, virtual_start)
                 && rest_of_line_blank(virtual_text, virtual_start),
             text_breaks_line: new_text.contains(['\n', '\r']),
-            text_first_line_has_content: new_text
-                .split(['\n', '\r'])
-                .next()
-                .is_some_and(|first| !first.trim_matches([' ', '\t']).is_empty()),
             tail,
             text_joins_line: new_text.is_empty() || begins_line(following),
             inserts_nothing: old.is_empty() && new_text.is_empty(),
@@ -767,6 +777,9 @@ struct EdgeShape<'a> {
     /// Lines inserted at a line start whose removed indent is not the
     /// content's: lines of the content, going before that indent.
     lines_before_own_indent: bool,
+    /// Text written over a whole blank line, other than after the whitespace
+    /// the peer kept on it: a line of the content in its place.
+    blank_line_text_in_place: bool,
     /// The removed indent the change starts before, covering it.
     start_indent: Option<&'a str>,
     /// That indent is a blank line's the peer emptied, not the content's.
@@ -781,14 +794,10 @@ struct EdgeShape<'a> {
     starts_prepared_line_or_after_gap: bool,
     /// The mapped start ends its V line.
     ends_virtual_line: bool,
-    /// The change starts at the end of its P line.
-    ends_prepared_line: bool,
     /// The rest of the V line from the mapped start is only spaces and tabs.
     virtual_rest_blank: bool,
     /// The edit's text holds a line break.
     text_breaks_line: bool,
-    /// The edit's first line holds more than spaces and tabs.
-    text_first_line_has_content: bool,
     /// The removed indent of the existing line the change ends before.
     tail: Option<&'a str>,
     /// The edit's text is empty, or the character after the change (P's, or
@@ -807,6 +816,7 @@ fn first_indent<'a>(shape: &EdgeShape<'a>) -> FirstIndent<'a> {
     }
     match shape.start_indent {
         _ if shape.lines_before_own_indent => FirstIndent::Uniform,
+        _ if shape.blank_line_text_in_place => FirstIndent::Uniform,
         // Whole lines deleted before an existing line, or replaced by text
         // without a line break before a non-blank one: what remains is that
         // line, which keeps its own indent (deleting a line must not
@@ -827,12 +837,6 @@ fn first_indent<'a>(shape: &EdgeShape<'a>) -> FirstIndent<'a> {
         }
         // Text on a blank line is a line of the content.
         Some(_) if shape.blank_at_start => FirstIndent::Uniform,
-        // Text written over a whitespace-only line the peer cleared (empty in
-        // P) is a line of the content: that whitespace was never an indent,
-        // and an empty line takes the content's.
-        Some(_) if shape.ends_prepared_line && shape.text_first_line_has_content => {
-            FirstIndent::Uniform
-        }
         // Likewise replacing whole lines from a whitespace-only line the peer
         // kept as is: that whitespace says nothing of the indent.
         None if shape.whole_lines && shape.starts_virtual_line && shape.virtual_rest_blank => {
@@ -951,7 +955,7 @@ struct Hunk {
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
-fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
+fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Result<Vec<Hunk>, FormattingRefusal> {
     // Whole lines alike at either end are set aside, uncharged: a small
     // answer in a large region costs work for its own size.
     let (head, tail) = alike_line_ends(old, new);
@@ -1000,15 +1004,20 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
         0..new_lines.len(),
         work,
         &mut aligned,
-    )?;
+    )
+    .ok_or(FormattingRefusal::OutOfWork)?;
+    let mut runs = Vec::new();
+    for (old_range, new_range) in aligned {
+        runs.extend(
+            runs_to_diff(&old_lines, &new_lines, &old_keys, old_range, new_range)
+                .ok_or(FormattingRefusal::Shape)?,
+        );
+    }
     let block = |lines: &[(usize, &str)], end: usize, range: Range<usize>| {
         line_start(lines, end, range.start)..line_start(lines, end, range.end)
     };
-    let blocks = aligned
+    let blocks = runs
         .into_iter()
-        .flat_map(|(old_range, new_range)| {
-            runs_to_diff(&old_lines, &new_lines, &old_keys, old_range, new_range)
-        })
         .filter_map(|(old_range, new_range, blanks_out)| {
             // A pair alike to the byte, or nothing on either side, is no change.
             let same = old_range.len() == 1
@@ -1064,7 +1073,9 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
             .peekable();
         let mut shift = 0isize;
         let new_byte = |index: isize| byte_at(&new_chars, new_block.end, index as usize);
-        for (old_range, new_range) in char_hunks(&old_values, &new_values, work)? {
+        for (old_range, new_range) in
+            char_hunks(&old_values, &new_values, work).ok_or(FormattingRefusal::OutOfWork)?
+        {
             while let Some((kept, line)) = removed.next_if(|&(kept, _)| kept <= old_range.start) {
                 let at = new_byte(kept as isize + shift);
                 stretches.push((line, at..at));
@@ -1136,7 +1147,7 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
             }
         }
     }
-    Some(hunks)
+    Ok(hunks)
 }
 
 /// Each line's text without its break (0), that trimmed of whitespace at
@@ -1367,6 +1378,10 @@ fn alike_ends(
     Some(pairs)
 }
 
+/// Old lines, new lines, and whether the old side's blank lines are left
+/// out of the character diff (see [`runs_to_diff`]).
+type DiffRun = (Range<usize>, Range<usize>, bool);
+
 /// How to diff what [`align_lines`] gave, `old_range` against
 /// `new_range`: as it is (`false`), or with the old side's blank lines left
 /// out of the character diff and removed whole (`true`); a pair is left as
@@ -1376,36 +1391,59 @@ fn alike_ends(
 /// rewritten, and diffed with the blank lines, it could be read as written
 /// on one the answer removed, regaining that line's indent, not the
 /// content's. Where the old side holds blank lines only, as many as the new
-/// lines and ending alike (each with a line break, or the last without),
-/// text written there is read as written on them, line for line (see
-/// [`ALIGNMENTS`]); otherwise the answer removed them and wrote lines of
-/// its own, which go before them, removed whole.
+/// lines (the new not ending with a line break the old lacks), the new
+/// lines take their places line for line: a blank line, or text written on
+/// a whitespace line the peer kept after its whitespace, is that line (see
+/// [`ALIGNMENTS`]); other text is a line of the content in place of a
+/// blank line removed. Otherwise the answer removed them and wrote lines
+/// of its own, which go before them, removed whole.
 fn runs_to_diff(
     old_lines: &[(usize, &str)],
     new_lines: &[(usize, &str)],
     old_keys: &LineKeys,
     old_range: Range<usize>,
     new_range: Range<usize>,
-) -> Vec<(Range<usize>, Range<usize>, bool)> {
+) -> Option<Vec<DiffRun>> {
     let blank = |line: usize| old_keys[1][line].is_empty();
     let breaks = |lines: &[(usize, &str)], range: &Range<usize>| {
         range.end == 0 || lines[range.end - 1].1.ends_with(['\n', '\r'])
     };
-    if new_range.is_empty() || !old_range.clone().any(blank) {
+    Some(if new_range.is_empty() || !old_range.clone().any(blank) {
         vec![(old_range, new_range, false)]
     } else if !old_range.clone().all(blank) {
         vec![(old_range, new_range, true)]
     } else if old_range.len() == new_range.len()
-        && breaks(old_lines, &old_range) == breaks(new_lines, &new_range)
+        && (breaks(old_lines, &old_range) || !breaks(new_lines, &new_range))
     {
-        vec![(old_range, new_range, false)]
+        // Line for line: a blank line for a blank line, text written on a
+        // whitespace line the peer kept after its whitespace; other text in
+        // place of an empty line is a line of the content. Other text where
+        // a kept whitespace line was is refused: written on it (keeping no
+        // indent) or in place of it removed (taking the content's), no
+        // answer tells.
+        let mut runs = Vec::new();
+        for (old_line, new_line) in old_range.zip(new_range) {
+            let kept = &old_keys[0][old_line];
+            let written = new_lines[new_line].1;
+            if written.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+                || (!kept.is_empty() && written.starts_with(kept.as_str()))
+            {
+                runs.push((old_line..old_line + 1, new_line..new_line + 1, false));
+            } else if kept.is_empty() {
+                runs.push((old_line..old_line, new_line..new_line + 1, false));
+                runs.push((old_line..old_line + 1, new_line + 1..new_line + 1, false));
+            } else {
+                return None;
+            }
+        }
+        runs
     } else {
         let start = old_range.start;
         vec![
             (start..start, new_range.clone(), false),
             (old_range, new_range.end..new_range.end, false),
         ]
-    }
+    })
 }
 
 /// Pair the lines of `old_range` with those of `new_range` at

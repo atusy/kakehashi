@@ -289,10 +289,14 @@ run of lines left between pairs, is then diffed by character. A run
 holding lines of text on P's side is diffed without its blank lines, which
 go whole: its new text is that text rewritten, never text written on a
 blank line the answer removed (which would take that line's indentation,
-not the content's). A run of blank lines takes text written on it line
-for line only where the answer holds as many lines there, ending alike; otherwise the answer removed them and wrote lines of its own. Text
-written over a whitespace line the peer emptied takes the content's
-indentation. Every stretch the
+not the content's). A run of blank lines takes the answer's lines line
+for line where it holds as many there (not ending with a line break P
+lacks); otherwise the answer removed them and wrote lines of its own. Line
+for line, text written on a whitespace line the peer kept, after that
+whitespace, is that line's (no indentation added); text where an empty
+line was, or one the peer emptied, takes the content's indentation; other
+text where a kept whitespace line was is refused: written on it, or in its
+place, no answer tells. Every stretch the
 result differs from P in maps as one edit does above; stretches touching at
 a line start stay apart where the later replaces some of that line's start
 with text, or where the earlier ends with a line break of P and the later
@@ -657,9 +661,12 @@ a hook per kind of change.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
-- Text a formatter writes on a whitespace-only line the peer kept regains no
-  indentation, the rule set for typing there; where an answer reads as
-  well as a line of its own beside the blank lines, that reading is taken.
+- Text a formatter writes on a whitespace-only line the peer kept, after its
+  whitespace, regains no indentation, the rule set for typing there; where
+  an answer reads as well as a line of its own beside the blank lines, that
+  reading is taken. Text replacing a kept whitespace line's own whitespace
+  is refused, the answer not telling whether it was written there or in
+  the line's place.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
