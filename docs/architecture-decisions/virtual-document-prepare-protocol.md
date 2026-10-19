@@ -291,8 +291,10 @@ go whole: its new text is that text rewritten, never text written on a
 blank line the answer removed (which would take that line's indentation,
 not the content's). A run of blank lines takes the answer's lines line
 for line where it holds as many there (not ending with a line break P
-lacks); otherwise the answer removed them and wrote lines of its own. Line
-for line, text written on a whitespace line the peer kept, after that
+lacks); with more or fewer, each kept whitespace line keeps the first line
+typed on it, in order, the other blank lines went, and the other lines are
+the content's. Line
+for line, text typed on a whitespace line the peer kept, right after that
 whitespace, is that line's (no indentation added); text where an empty
 line was, or one the peer emptied, takes the content's indentation; other
 text where a kept whitespace line was is refused: written on it, or in its
@@ -662,11 +664,11 @@ a hook per kind of change.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
-- Text a formatter writes on a whitespace-only line the peer kept, after its
-  whitespace, regains no indentation, the rule set for typing there; where
+- Text a formatter writes on a whitespace-only line the peer kept, right
+  after its whitespace, regains no indentation, the rule set for typing there; where
   an answer reads as well as a line of its own beside the blank lines, that
-  reading is taken. Text replacing a kept whitespace line's own whitespace
-  is refused, the answer not telling whether it was written there or in
+  reading is taken. Text replacing a kept whitespace line's own whitespace,
+  or only indented further than it, is refused, the answer not telling whether it was written there or in
   the line's place: some 0.2% of the answers the exact-text property
   generates, all of them answers no reading places for sure.
 - A peer must be bridged for the languages it prepares, so it receives
