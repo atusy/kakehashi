@@ -64,11 +64,20 @@ impl std::fmt::Display for FormattingRefusal {
 /// each element they index, so their memory is linear in the budget (a
 /// few tens of MiB at most) besides what is linear in the texts. A step
 /// compares two elements whole, so time also grows with the lines'
-/// length; with lines of usual length, spending the budget whole takes
-/// some 10 ms in a release build: little enough to run where the answer
-/// arrives, on the async runtime, rather than hand it to a blocking
-/// thread.
+/// length; with lines of usual length, spending this fixed part whole
+/// takes some 10 ms in a release build, and the part that grows with the
+/// texts (`FORMATTING_DIFF_WORK_PER_BYTE`) time linear in them: little
+/// enough to run where the answer arrives, on the async runtime, rather
+/// than hand it to a blocking thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
+
+/// Work the diff of a formatting answer may do on top of
+/// `FORMATTING_DIFF_BUDGET` for each byte of P and of the edited P: a diff
+/// pairing every line and diffing each on its own does work linear in the
+/// texts, a few dozen steps for each line, which no fixed budget covers
+/// for a large region. What is quadratic in a region outgrows this as the
+/// region grows, and is refused still.
+const FORMATTING_DIFF_WORK_PER_BYTE: usize = 16;
 
 /// The indentation a mapped edit's first line regains.
 #[derive(Clone, Copy)]
@@ -131,15 +140,28 @@ impl PreparedMap {
         &self,
         edits: &[TextEdit],
     ) -> Result<Vec<TextEdit>, FormattingRefusal> {
-        self.map_formatting(edits, FORMATTING_DIFF_BUDGET)
+        self.map_formatting_within(edits, FORMATTING_DIFF_BUDGET, FORMATTING_DIFF_WORK_PER_BYTE)
     }
 
     /// [`Self::map_formatting_answer`], the diff doing at most `budget`
     /// steps of work.
+    #[cfg(test)]
     fn map_formatting(
         &self,
         edits: &[TextEdit],
         budget: usize,
+    ) -> Result<Vec<TextEdit>, FormattingRefusal> {
+        self.map_formatting_within(edits, budget, 0)
+    }
+
+    /// [`Self::map_formatting_answer`], the diff doing at most `budget`
+    /// steps of work and `per_byte` more for each byte of P and the edited
+    /// P.
+    fn map_formatting_within(
+        &self,
+        edits: &[TextEdit],
+        budget: usize,
+        per_byte: usize,
     ) -> Result<Vec<TextEdit>, FormattingRefusal> {
         let prepared = &self.prepared_lines.text;
         let (ranges, order) =
@@ -155,6 +177,7 @@ impl PreparedMap {
         if edited == *prepared {
             return Ok(Vec::new());
         }
+        let budget = budget.saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()));
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
@@ -581,12 +604,17 @@ impl PreparedMap {
             starts_virtual_line: is_line_start(virtual_text, virtual_start),
             starts_prepared_line_or_after_gap: is_line_start(prepared, old.start) || after_gap,
             ends_virtual_line: is_line_end(virtual_text, virtual_start),
+            ends_prepared_line: is_line_end(prepared, old.start),
             // Read only where `first_indent` does: a whitespace-only rest
             // of a long line is not scanned again for every edit on it.
             virtual_rest_blank: whole_lines
                 && is_line_start(virtual_text, virtual_start)
                 && rest_of_line_blank(virtual_text, virtual_start),
             text_breaks_line: new_text.contains(['\n', '\r']),
+            text_first_line_has_content: new_text
+                .split(['\n', '\r'])
+                .next()
+                .is_some_and(|first| !first.trim_matches([' ', '\t']).is_empty()),
             tail,
             text_joins_line: new_text.is_empty() || begins_line(following),
             inserts_nothing: old.is_empty() && new_text.is_empty(),
@@ -750,10 +778,14 @@ struct EdgeShape<'a> {
     starts_prepared_line_or_after_gap: bool,
     /// The mapped start ends its V line.
     ends_virtual_line: bool,
+    /// The change starts at the end of its P line.
+    ends_prepared_line: bool,
     /// The rest of the V line from the mapped start is only spaces and tabs.
     virtual_rest_blank: bool,
     /// The edit's text holds a line break.
     text_breaks_line: bool,
+    /// The edit's first line holds more than spaces and tabs.
+    text_first_line_has_content: bool,
     /// The removed indent of the existing line the change ends before.
     tail: Option<&'a str>,
     /// The edit's text is empty, or the character after the change (P's, or
@@ -792,6 +824,12 @@ fn first_indent<'a>(shape: &EdgeShape<'a>) -> FirstIndent<'a> {
         }
         // Text on a blank line is a line of the content.
         Some(_) if shape.blank_at_start => FirstIndent::Uniform,
+        // Text written over a whitespace-only line the peer cleared (empty in
+        // P) is a line of the content: that whitespace was never an indent,
+        // and an empty line takes the content's.
+        Some(_) if shape.ends_prepared_line && shape.text_first_line_has_content => {
+            FirstIndent::Uniform
+        }
         // Likewise replacing whole lines from a whitespace-only line the peer
         // kept as is: that whitespace says nothing of the indent.
         None if shape.whole_lines && shape.starts_virtual_line && shape.virtual_rest_blank => {
@@ -928,6 +966,15 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
                 .iter()
                 .map(|&(_, line)| content(line).replace([' ', '\t'], ""))
                 .collect(),
+            lines
+                .iter()
+                .map(|&(_, line)| {
+                    content(line)
+                        .chars()
+                        .filter(|c| c.is_alphanumeric())
+                        .collect()
+                })
+                .collect(),
         ]
     };
     let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
@@ -944,23 +991,46 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
     let block = |lines: &[(usize, &str)], text: &str, range: Range<usize>| {
         line_start(lines, text, range.start)..line_start(lines, text, range.end)
     };
-    let blocks = aligned.into_iter().filter_map(|(old_range, new_range)| {
-        // A pair alike to the byte, or nothing on either side, is no change.
-        let same = old_range.len() == 1
-            && new_range.len() == 1
-            && old_lines[old_range.start].1 == new_lines[new_range.start].1;
-        (!same && !(old_range.is_empty() && new_range.is_empty())).then(|| {
-            (
-                block(&old_lines, old, old_range),
-                block(&new_lines, new, new_range),
-            )
+    let blocks = aligned
+        .into_iter()
+        .flat_map(|(old_range, new_range)| {
+            runs_to_diff(&old_lines, &new_lines, &old_keys, old_range, new_range)
         })
-    });
+        .filter_map(|(old_range, new_range, blanks_out)| {
+            // A pair alike to the byte, or nothing on either side, is no change.
+            let same = old_range.len() == 1
+                && new_range.len() == 1
+                && old_lines[old_range.start].1 == new_lines[new_range.start].1;
+            // The old blank lines a run removes whole (see `push_run`).
+            let removed: Vec<Range<usize>> = if blanks_out {
+                old_range
+                    .clone()
+                    .filter(|&line| old_keys[1][line].is_empty())
+                    .map(|line| {
+                        let (start, text) = old_lines[line];
+                        start..start + text.len()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (!same && !(old_range.is_empty() && new_range.is_empty())).then(|| {
+                (
+                    block(&old_lines, old, old_range),
+                    block(&new_lines, new, new_range),
+                    removed,
+                )
+            })
+        });
     let mut hunks: Vec<Hunk> = Vec::new();
-    for (old_block, new_block) in blocks {
+    for (old_block, new_block, removed) in blocks {
         let old_chars: Vec<(usize, char)> = old[old_block.clone()]
             .char_indices()
             .map(|(at, c)| (old_block.start + at, c))
+            .filter(|(at, _)| {
+                let next = removed.partition_point(|line| line.end <= *at);
+                !removed.get(next).is_some_and(|line| line.contains(at))
+            })
             .collect();
         let new_chars: Vec<(usize, char)> = new[new_block.clone()]
             .char_indices()
@@ -971,11 +1041,38 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
         };
         let old_values: Vec<char> = old_chars.iter().map(|&(_, c)| c).collect();
         let new_values: Vec<char> = new_chars.iter().map(|&(_, c)| c).collect();
+        // The character diff, with each removed blank line no stretch spans
+        // deleted whole where it is: just before the next stretch, or in
+        // the stretch the texts hold alike around it.
+        let mut stretches: Vec<(Range<usize>, Range<usize>)> = Vec::new();
+        let mut removed = removed
+            .into_iter()
+            .map(|line| (old_chars.partition_point(|&(at, _)| at < line.start), line))
+            .peekable();
+        let mut shift = 0isize;
+        let new_byte = |index: isize| byte_at(&new_chars, new_block.end, index as usize);
         for (old_range, new_range) in char_hunks(&old_values, &new_values, work)? {
-            let mut old_bytes = byte_at(&old_chars, old_block.end, old_range.start)
-                ..byte_at(&old_chars, old_block.end, old_range.end);
-            let mut new_bytes = byte_at(&new_chars, new_block.end, new_range.start)
-                ..byte_at(&new_chars, new_block.end, new_range.end);
+            while let Some((kept, line)) = removed.next_if(|&(kept, _)| kept <= old_range.start) {
+                let at = new_byte(kept as isize + shift);
+                stretches.push((line, at..at));
+            }
+            while removed
+                .next_if(|&(kept, _)| kept <= old_range.end)
+                .is_some()
+            {}
+            shift = new_range.end as isize - old_range.end as isize;
+            stretches.push((
+                byte_at(&old_chars, old_block.end, old_range.start)
+                    ..byte_at(&old_chars, old_block.end, old_range.end),
+                byte_at(&new_chars, new_block.end, new_range.start)
+                    ..byte_at(&new_chars, new_block.end, new_range.end),
+            ));
+        }
+        for (kept, line) in removed {
+            let at = new_byte(kept as isize + shift);
+            stretches.push((line, at..at));
+        }
+        for (mut old_bytes, mut new_bytes) in stretches {
             // The character widened over is unchanged, the same in both
             // texts: a CR before the start, an LF after the end.
             if splits_crlf(old, old_bytes.start) || splits_crlf(new, new_bytes.start) {
@@ -1023,18 +1120,24 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
 }
 
 /// Each line's text without its break (0), that trimmed of whitespace at
-/// its edges (1), and with no whitespace at all (2).
-type LineKeys = [Vec<String>; 3];
+/// its edges (1), with no whitespace at all (2), and its letters and digits
+/// alone (3).
+type LineKeys = [Vec<String>; 4];
 
 /// One way [`align_lines`] pairs lines.
 #[derive(Clone, Copy)]
 enum Alignment {
     /// Lines whose keys (see [`LineKeys`]) a patience diff finds alike,
-    /// among the lines whose key passes.
-    Diff(usize, fn(&str) -> bool),
+    /// among the lines whose key passes; stretches with no key found once
+    /// on each side are diffed further only when `true` (see
+    /// [`patience_pairs`]).
+    Diff(usize, fn(&str) -> bool, bool),
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
+    /// Lines of text at the run's two ends, in order, alike in their
+    /// letters and digits (see [`alike_ends`]).
+    AlikeEnds,
     /// Blank lines with blank lines: as many as can pair, and among those
     /// alignments, the one with the most pairs alike to the whitespace (see
     /// [`blank_lines`]).
@@ -1049,23 +1152,35 @@ enum Alignment {
 /// - Lines of text alike but for whitespace anywhere in them, the same
 ///   way: a line a formatter respaced (`x=1` to `x = 1`) is the line it
 ///   was, diffed by character on its own.
+/// - Then, between those, both again, lines found as many times more than
+///   once on each side paired too (by the fewest changes): only once every
+///   line telling where it belongs is placed may a line alike to several
+///   (`}`) take one of them, and only where each has one to take.
 /// - Lines of text other lines were joined onto.
 /// - Blank lines among themselves: as many as can pair, so that text the
 ///   formatter writes beside blank lines is never read as written on one
 ///   while a blank line of the answer could be that line; of the
 ///   alignments pairing as many, the one with the most pairs alike to the
 ///   whitespace (a kept whitespace line kept as it was).
+/// - Lines of text in order from either end of what is left (where
+///   the answer removed no blank line), while they
+///   are alike in their letters and digits: a line whose quotes,
+///   separators or punctuation a formatter rewrote (`f('a')` to
+///   `f("a");`) is the line it was, however many lines it rewrote.
 ///
 /// What is left between pairs (lines rewritten past telling, lines written
 /// or removed) is diffed by character as one run. Which of several blank
 /// lines alike a line was written on, or which went, no answer tells; text
 /// the run's diff writes on a whitespace line the peer kept gains no
 /// indent, as typed text there does.
-const ALIGNMENTS: [Alignment; 4] = [
-    Alignment::Diff(1, |key| !key.is_empty()),
-    Alignment::Diff(2, |key| !key.is_empty()),
+const ALIGNMENTS: [Alignment; 7] = [
+    Alignment::Diff(1, |key| !key.is_empty(), false),
+    Alignment::Diff(2, |key| !key.is_empty(), false),
+    Alignment::Diff(1, |key| !key.is_empty(), true),
+    Alignment::Diff(2, |key| !key.is_empty(), true),
     Alignment::Joined,
     Alignment::Blanks,
+    Alignment::AlikeEnds,
 ];
 
 /// Pairs of the blank lines of `old_range` with those of `new_range`, in
@@ -1181,6 +1296,98 @@ fn joined_lines(
     Some(pairs)
 }
 
+/// Pairs of the lines of text (blank lines skipped) of `old_range` and
+/// `new_range` taken in order from the start while their letters and
+/// digits are alike, then from the end the same way. Only lines at the
+/// same place from an end pair: a line no later than where the two texts
+/// part ways is the line it was there. None where the old side holds a
+/// blank line: the answer removed it (the blank-line stage paired every
+/// one it could), and the run's text is left whole to diff without it
+/// (see [`push_run`]), lest a line it split be read as written on it.
+fn alike_ends(
+    old_keys: &LineKeys,
+    new_keys: &LineKeys,
+    old_range: &Range<usize>,
+    new_range: &Range<usize>,
+    work: &mut Work,
+) -> Option<Vec<(usize, usize)>> {
+    work.spend(old_range.len() + new_range.len())?;
+    if old_range.clone().any(|line| old_keys[1][line].is_empty()) {
+        return Some(Vec::new());
+    }
+    let text = |keys: &LineKeys, range: &Range<usize>| -> Vec<usize> {
+        range
+            .clone()
+            .filter(|&index| !keys[1][index].is_empty())
+            .collect()
+    };
+    let (old, new) = (text(old_keys, old_range), text(new_keys, new_range));
+    let alike = |old_line: usize, new_line: usize| old_keys[3][old_line] == new_keys[3][new_line];
+    let mut head = 0;
+    while head < old.len().min(new.len()) && alike(old[head], new[head]) {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < old.len().min(new.len()) - head
+        && alike(old[old.len() - 1 - tail], new[new.len() - 1 - tail])
+    {
+        tail += 1;
+    }
+    let mut pairs: Vec<(usize, usize)> = old[..head]
+        .iter()
+        .copied()
+        .zip(new[..head].iter().copied())
+        .collect();
+    pairs.extend(
+        old[old.len() - tail..]
+            .iter()
+            .copied()
+            .zip(new[new.len() - tail..].iter().copied()),
+    );
+    Some(pairs)
+}
+
+/// How to diff what [`align_lines`] gave, `old_range` against
+/// `new_range`: as it is (`false`), or with the old side's blank lines left
+/// out of the character diff and removed whole (`true`); a pair is left as
+/// it is. Where the old side holds lines of text, its blank lines (a run
+/// holds blank lines on one side at most, the blank-line stage having
+/// paired as many as can) go whole: the new text is the old text
+/// rewritten, and diffed with the blank lines, it could be read as written
+/// on one the answer removed, regaining that line's indent, not the
+/// content's. Where the old side holds blank lines only, as many as the new
+/// lines and ending alike (each with a line break, or the last without),
+/// text written there is read as written on them, line for line (see
+/// [`ALIGNMENTS`]); otherwise the answer removed them and wrote lines of
+/// its own, which go before them, removed whole.
+fn runs_to_diff(
+    old_lines: &[(usize, &str)],
+    new_lines: &[(usize, &str)],
+    old_keys: &LineKeys,
+    old_range: Range<usize>,
+    new_range: Range<usize>,
+) -> Vec<(Range<usize>, Range<usize>, bool)> {
+    let blank = |line: usize| old_keys[1][line].is_empty();
+    let breaks = |lines: &[(usize, &str)], range: &Range<usize>| {
+        range.end == 0 || lines[range.end - 1].1.ends_with(['\n', '\r'])
+    };
+    if new_range.is_empty() || !old_range.clone().any(blank) {
+        vec![(old_range, new_range, false)]
+    } else if !old_range.clone().all(blank) {
+        vec![(old_range, new_range, true)]
+    } else if old_range.len() == new_range.len()
+        && breaks(old_lines, &old_range) == breaks(new_lines, &new_range)
+    {
+        vec![(old_range, new_range, false)]
+    } else {
+        let start = old_range.start;
+        vec![
+            (start..start, new_range.clone(), false),
+            (old_range, new_range.end..new_range.end, false),
+        ]
+    }
+}
+
 /// Pair the lines of `old_range` with those of `new_range` at
 /// `ALIGNMENTS[level]`, and each looser one between the pairs it finds:
 /// `aligned` is given in order every pair (one line each) and every run
@@ -1208,8 +1415,9 @@ fn align_lines(
     };
     let pairs: Vec<(usize, usize)> = match alignment {
         Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, work)?,
+        Alignment::AlikeEnds => alike_ends(old_keys, new_keys, &old_range, &new_range, work)?,
         Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, work)?,
-        Alignment::Diff(keys, takes_part) => {
+        Alignment::Diff(keys, takes_part, fall_back) => {
             let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
                 range
                     .clone()
@@ -1227,6 +1435,7 @@ fn align_lines(
                     .iter()
                     .map(|&index| &new_keys[keys][index])
                     .collect::<Vec<_>>(),
+                fall_back,
                 work,
             )?
             .into_iter()

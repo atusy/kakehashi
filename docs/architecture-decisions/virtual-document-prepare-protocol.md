@@ -272,16 +272,27 @@ layout of P restored as for any document, and the result diffed against
 P. Lines are paired first: a line of text with the line it was rewritten
 from (alike but for the whitespace around its text, a line found once in
 each text anchoring the rest), then one alike but for whitespace anywhere
-in it, the same way, then a line other lines were joined onto (found by
-looking up the old lines' texts, not comparing every pair),
-then blank lines with blank lines — as many as can pair, and of the
+in it, the same way; then, between those, lines found as many times on
+each side (a `}` among several), by the fewest changes; then a line other
+lines were joined onto (found by looking up the old lines' texts, not
+comparing every pair); then blank lines with blank lines — as many as can pair, and of the
 alignments pairing as many, the one keeping most whitespace lines with ones
 holding the same whitespace, so that text the formatter writes beside blank
 lines is a line of its own whenever a blank line of the answer could be the
 line it would otherwise be written on, not text written on one
 (which, on a whitespace line the peer kept, would regain no indentation and
-lose the formatter's relative indentation). Each pair, and each run of lines
-left between pairs, is then diffed by character, and every stretch the
+lose the formatter's relative indentation); then, where the answer removed
+no blank line, lines of text in order from either end of what is left
+while their letters and digits are alike (a line whose quotes or
+punctuation a formatter rewrote is the line it was). Each pair, and each
+run of lines left between pairs, is then diffed by character. A run
+holding lines of text on P's side is diffed without its blank lines, which
+go whole: its new text is that text rewritten, never text written on a
+blank line the answer removed (which would take that line's indentation,
+not the content's). A run of blank lines takes text written on it line
+for line only where the answer holds as many lines there, ending alike; otherwise the answer removed them and wrote lines of its own. Text
+written over a whitespace line the peer emptied takes the content's
+indentation. Every stretch the
 result differs from P in maps as one edit does above; stretches touching at
 a line start stay apart where the later replaces some of that line's start
 with text, or where the earlier ends with a line break of P and the later
@@ -293,16 +304,18 @@ went, no answer tells: the run's diff decides.
 
 The diff has a budget counted in work, not time: each step of its searches
 (a comparison, a cell of a table, a diagonal followed) spends one, about a
-million in all, so an answer is accepted or refused alike on any machine
+million in all and 16 more for each byte of the texts (pairing every line
+and diffing each on its own is linear work no fixed budget covers for a
+large region), so an answer is accepted or refused alike on any machine
 and under any load. The character diff pairs the characters other than
 whitespace first and diffs only what lies between them, so an answer that
 mostly moves whitespace (a pretty-printer's) costs work linear in the
 texts. An answer whose diff runs out of work is refused, and logged apart
 from the refusals its shape decides. The tables the searches keep (pairing
 blank lines takes one quadratic in them) are spent before they are
-taken, so their memory is linear in the budget; spent whole on lines of
-usual length, it takes some 10 ms, and the diff runs where the answer
-arrives. So the budget decides only
+taken, so their memory is linear in the budget; time is linear in it and
+the texts, some 10 ms for the fixed part, and the diff runs where the
+answer arrives. So the budget decides only
 which answers are refused, never what an accepted one writes; a large
 region heavily rewritten may be refused.
 
@@ -629,16 +642,15 @@ a hook per kind of change.
   not resolved.
 - A formatting answer whose diff runs out of its work budget is refused, so a
   large region heavily reformatted may be left as it is (counted a failure
-  by `kakehashi format`). The common case costs little: an answer that keeps
-  most lines, or mostly moves whitespace, costs work linear in the region.
-  Pairing blank lines takes a table quadratic in the blank lines of one
-  stretch no line of text anchors: an answer changing every line of text,
-  with whitespace lines between them (a formatter normalizing quotes on
-  each line, say), is refused from about 1,000 such text lines (some
-  2,000 lines in all). Respacing every line (`x=1` to `x = 1`) costs work
-  linear in the region. A step counts one
-  comparison of two lines whatever their length, so time and memory also
-  grow linearly with the texts' size.
+  by `kakehashi format`). The common case costs work linear in the region:
+  an answer that keeps most lines, mostly moves whitespace, respaces every
+  line (`x=1` to `x = 1`), or rewrites the punctuation of every line
+  (`f('a')` to `f("a");`, 20,000 lines). Pairing blank lines takes a table
+  quadratic in the blank lines of one stretch no line of text anchors: an
+  answer changing the letters of every line of text, with whitespace lines
+  between them, is refused from about 1,000 such text lines (some 2,000
+  lines in all). A step counts one comparison of two lines whatever their
+  length, so time and memory also grow linearly with the texts' size.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
