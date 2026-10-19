@@ -2454,6 +2454,23 @@ mod tests {
             None
         );
         assert_eq!(failures(&failures_sink), 2);
+        // A region opening mid-line after a blockquote marker: the marker
+        // is the first line's prefix, not a delimiter whose line break is
+        // layout, so it counts as a prefix too.
+        let (offset, prepared) = prepared_region_at("  a; b\n", &[2], 2);
+        let prefixes = ["> ".to_string(), String::new()];
+        assert_eq!(
+            prepared_pipeline_edits(
+                &prepared,
+                "a\nb\n",
+                &offset,
+                &prefixes,
+                &uri,
+                &failures_sink
+            ),
+            None
+        );
+        assert_eq!(failures(&failures_sink), 3);
     }
 
     #[test]
