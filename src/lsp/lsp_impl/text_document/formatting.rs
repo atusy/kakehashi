@@ -181,14 +181,17 @@ impl Kakehashi {
                 // The final answer chosen: its prepared regions' edits checked
                 // once more against the host text, which may have moved while
                 // it was held.
-                answer.and_then(|(edits, sources)| {
-                    self.formatting_sources_current(
-                        &lsp_uri,
-                        &sources,
-                        &cancel_state.request_error_sink,
-                    )
-                    .then_some(edits)
-                })
+                match answer {
+                    Some((edits, sources)) => self
+                        .formatting_sources_current(
+                            &lsp_uri,
+                            &sources,
+                            &cancel_state.request_error_sink,
+                        )
+                        .await
+                        .then_some(edits),
+                    None => None,
+                }
             }
             AggregationStrategy::Concatenated => {
                 // Sequential cross-layer pipeline (cross-layer-aggregation
@@ -252,11 +255,14 @@ impl Kakehashi {
                 // The final answer: the virt edits it builds on checked once
                 // more against the host text, which may have moved while later
                 // layers ran.
-                if !self.formatting_sources_current(
-                    &lsp_uri,
-                    &virt_sources,
-                    &cancel_state.request_error_sink,
-                ) {
+                if !self
+                    .formatting_sources_current(
+                        &lsp_uri,
+                        &virt_sources,
+                        &cancel_state.request_error_sink,
+                    )
+                    .await
+                {
                     return Ok(None);
                 }
                 match producers {
@@ -574,34 +580,66 @@ impl Kakehashi {
         )
     }
 
-    /// Whether every prepared region a formatting answer was mapped through
-    /// is still the host's text (see [`Sourced::still_current`]). One that
-    /// is not fails the request — counted in `failure_sink`, for the CLI to
-    /// exit non-zero —
-    /// and the caller drops the whole answer, the host layer's edits and
-    /// those of regions still current too: the host moved under the
-    /// answer, and an edit read for a region no longer as it was would land
-    /// elsewhere.
-    pub(super) fn formatting_sources_current(
+    /// Whether every prepared region a formatting answer was mapped
+    /// through is still the host's text (see [`Sourced::still_current`]).
+    /// One that is not fails the request — counted in `failure_sink`, for
+    /// the CLI to exit non-zero — and the caller drops the whole answer,
+    /// the host layer's edits and those of regions still current too: the
+    /// host moved under the answer, and an edit read for a region no longer
+    /// as it was would land elsewhere.
+    ///
+    /// The host's last edit may not be settled yet, or a region held for
+    /// its prepare answer, though its text is the request's: the answer is
+    /// judged once that clears (see [`settled_verdict`]), not dropped. A
+    /// formatting request comes once per action, unlike completion's on
+    /// every keystroke, so an answer dropped for that is never asked again.
+    pub(super) async fn formatting_sources_current(
         &self,
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         sources: &[Sourced<()>],
         failure_sink: &RequestErrorSink,
     ) -> bool {
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        if sources.iter().all(|source| {
-            source.still_current(pool, tracker, || self.host_content_version(lsp_uri))
-        }) {
+        let verdict = self.sources_verdict(lsp_uri, sources.iter()).await;
+        if verdict == Verdict::Current {
             return true;
         }
         log::warn!(
             target: "kakehashi::formatting",
-            "formatting result for {} dropped: the host text moved under a prepared virtual document it was mapped through",
+            "formatting result for {} dropped: {verdict}",
             lsp_uri.as_str()
         );
         count_request_errors(failure_sink, 1);
         false
+    }
+
+    /// [`settled_verdict`] for an answer mapped through `sources`.
+    pub(super) async fn sources_verdict<'a, T: 'a>(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+    ) -> Verdict {
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        if !sources.clone().any(Sourced::is_prepared) {
+            return Verdict::Current;
+        }
+        settled_verdict(
+            || {
+                sources.clone().all(|source| {
+                    source.still_current(pool, tracker, || self.host_content_version(lsp_uri))
+                })
+            },
+            || {
+                let now = self.host_content_version(lsp_uri);
+                sources.clone().any(|source| {
+                    source
+                        .request_content_version()
+                        .is_some_and(|version| Some(version) != now)
+                })
+            },
+            crate::lsp::bridge::PREPARE_TIMEOUT,
+        )
+        .await
     }
 
     /// Format the host document itself (the **host** layer,
@@ -2307,10 +2345,133 @@ pub(super) async fn finalize_formatting_edits(
     })
 }
 
+/// How an answer mapped through prepared regions was judged as the final
+/// answer was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Verdict {
+    /// Every region it was mapped through is still the host's text.
+    Current,
+    /// The host was edited since the request's text was read.
+    Moved,
+    /// The host's last edit did not settle, or a region stayed held, in
+    /// time: the answer is not judged current.
+    Unsettled,
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "the host text is current",
+            Self::Moved => {
+                "the host text moved under a prepared virtual document it was mapped through"
+            }
+            Self::Unsettled => "the host text did not settle in time after its last edit",
+        })
+    }
+}
+
+/// Judge an answer once it can be: `Current` as soon as `current` holds;
+/// `Moved` as soon as `moved` does (the host edited since the request read
+/// its text: no settling brings that back); otherwise the host's last edit
+/// is still settling, or a region held for its prepare answer, the text
+/// unchanged: wait, polling, until one holds, `Unsettled` past `within`.
+pub(super) async fn settled_verdict(
+    current: impl Fn() -> bool,
+    moved: impl Fn() -> bool,
+    within: std::time::Duration,
+) -> Verdict {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if current() {
+            return Verdict::Current;
+        }
+        if moved() {
+            return Verdict::Moved;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Verdict::Unsettled;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
+
+    /// An answer whose reply came before the host's last edit settled (its
+    /// text unchanged by it: another fence edited) is kept once the edit
+    /// settles, not dropped; one the host moved under while it waited is
+    /// dropped as moved.
+    #[tokio::test]
+    async fn an_answer_is_judged_once_the_hosts_last_edit_settles() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                .unwrap();
+        for moves in [false, true] {
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            let host = url::Url::parse("file:///test/settle.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            // Another fence edited: version 1, its pass not settled yet. The
+            // request read version 1, its region's text unchanged.
+            pool.note_host_edited(&host, 1, 1);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                1,
+            );
+            let version = Arc::new(AtomicU64::new(1));
+            assert!(!held.still_current(&pool, &tracker, || Some(1)));
+            let settle = {
+                let (pool, host, version) = (Arc::clone(&pool), host.clone(), Arc::clone(&version));
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if moves {
+                        version.store(2, Ordering::SeqCst);
+                    } else {
+                        pool.note_host_settled(&host, 1, 1);
+                    }
+                })
+            };
+            let verdict = settled_verdict(
+                || held.still_current(&pool, &tracker, || Some(version.load(Ordering::SeqCst))),
+                || version.load(Ordering::SeqCst) != 1,
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            settle.await.unwrap();
+            assert_eq!(
+                verdict,
+                if moves {
+                    Verdict::Moved
+                } else {
+                    Verdict::Current
+                }
+            );
+        }
+    }
 
     fn resolved_region(
         language: &str,

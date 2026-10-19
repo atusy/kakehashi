@@ -439,6 +439,14 @@ impl<T> Sourced<T> {
         self.prepared.is_some()
     }
 
+    /// The host's content version the request's text was read at, for an
+    /// answer mapped through a prepared map.
+    pub(crate) fn request_content_version(&self) -> Option<u64> {
+        self.prepared
+            .as_ref()
+            .and_then(|source| source.content_version)
+    }
+
     /// Whether the edits mapped into the answer still land where they were
     /// mapped: always so without a map. Otherwise the host must not have
     /// been edited since the request's text was read (`current_version`,
