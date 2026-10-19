@@ -2139,6 +2139,35 @@ mod tests {
     }
 
     #[test]
+    fn joining_a_nix_strings_last_line_maps() {
+        // The closing `'';` follows the last content line on the same host
+        // line: P has no final line break, and the answer joins that line.
+        let host = "x = ''\n  foo(\n    a)'';\n";
+        let virtual_content = "\n  foo(\n    a)";
+        let offset = prepared_offset(
+            virtual_content,
+            6,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "foo(\n  a)");
+        let formatted = format_host(
+            host,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 4 } },
+                "newText": "foo(a)\n"
+            }]),
+        );
+        assert_eq!(formatted, "x = ''\n  foo(a)'';\n");
+    }
+
+    #[test]
     fn a_line_after_a_removed_blank_line_keeps_the_contents_indent() {
         // A list item's Python fence: its blank lines carry the item's
         // indent, which the peer removes with the rest. Black removes one

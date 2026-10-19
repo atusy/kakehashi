@@ -1092,8 +1092,15 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
             // own. Apart, neither's text bears on the other there. Whole
             // lines the later removes go with the earlier, the removed
             // indents they take along with them.
+            // A stretch removing the rest of P, which ends with no line
+            // break, is no line of its own to keep apart: the line before
+            // it takes its place, whatever the earlier wrote there.
+            let removes_the_end = new_bytes.is_empty()
+                && old_bytes.end == old.len()
+                && !old[old_bytes.clone()].contains(['\n', '\r']);
             let apart = |last: &Hunk| {
                 is_line_start(old, old_bytes.start)
+                    && !removes_the_end
                     && ((!new_bytes.is_empty() && !old_bytes.is_empty())
                         || (old[..last.old.end].ends_with(['\n', '\r'])
                             && !old[old_bytes.clone()].contains(['\n', '\r'])))
