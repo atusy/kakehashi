@@ -689,6 +689,14 @@ a hook per kind of change.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
+- With a peer that dedents unevenly (leaving some lines as they were), an
+  answer that writes a line of P more or fewer times is refused when P's
+  copies of it have different removed indents, or one that is not the
+  content's: which copy it kept no answer tells. Where every copy count
+  holds, a line the answer leaves unchanged is read as itself, and one
+  rewritten in place as the line it was, though with same-text lines
+  around a line the peer left alone another reading may be what the
+  formatter meant. Peers dedenting evenly meet neither.
 - Text a formatter writes where a whitespace-only line the peer kept was is
   refused, typed after its whitespace or not: a whole-text answer does not
   tell text typed on that line from a line written in its place. Where an
