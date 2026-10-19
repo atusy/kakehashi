@@ -329,6 +329,31 @@ mod tests {
     }
 
     #[test]
+    fn myers_pairs_as_many_as_a_longest_common_subsequence_holds() {
+        assert_eq!(pairs("aabb", "baa").len(), 2);
+        assert_eq!(pairs("xaby", "zabw"), vec![(1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn each_search_takes_exactly_the_work_it_spends() {
+        // The least budget a search completes with: one step less gives
+        // up. Every charge counts toward it (a step left uncharged lowers
+        // it), and what the tables keep is charged as it is taken.
+        let (a, b): (Vec<char>, Vec<char>) = (
+            "the quick brown fox".chars().collect(),
+            "a quick brown dog jumps".chars().collect(),
+        );
+        assert!(myers_pairs(&a, &b, &mut Work::new(66)).is_some());
+        assert_eq!(myers_pairs(&a, &b, &mut Work::new(65)), None);
+        let (a, b) = (
+            ["a", "x", "b", "c", "x", "d"],
+            ["a", "b", "x", "c", "d", "x"],
+        );
+        assert!(patience_pairs(&a, &b, true, &mut Work::new(18)).is_some());
+        assert_eq!(patience_pairs(&a, &b, true, &mut Work::new(17)), None);
+    }
+
+    #[test]
     fn myers_finds_a_longest_common_subsequence() {
         assert_eq!(pairs("abcabba", "cbabac").len(), 4);
         assert_eq!(pairs("", "abc"), vec![]);
