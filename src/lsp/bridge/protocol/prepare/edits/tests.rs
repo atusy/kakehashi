@@ -3448,6 +3448,23 @@ mod formatting {
     }
 
     #[test]
+    fn kept_whitespace_lines_none_is_typed_on_cost_work_linear_in_them() {
+        // 8,000 kept `\t` lines replaced by 8,001 lines of text, none typed
+        // after a tab: which line each kept line keeps is looked up, not
+        // searched for through every line of the answer.
+        let count = 8_000;
+        let virtual_text = format!("  a\n{}  b\n", "\t\n".repeat(count));
+        let mut removed = vec![2];
+        removed.extend(std::iter::repeat_n(0, count));
+        removed.push(2);
+        let map = dedent_lines(&virtual_text, &removed);
+        let formatted = format!("a\n{}b\n", "x\n".repeat(count + 1));
+        let answer = [edit((0, 0), (count as u32 + 2, 0), &formatted)];
+        let budget = 40 * (virtual_text.len() + formatted.len());
+        assert!(map.map_formatting(&answer, budget).is_ok());
+    }
+
+    #[test]
     fn a_small_answer_in_a_large_region_costs_work_for_its_size() {
         // One line changed among 300,000: the lines alike at either end are
         // set aside before any line is keyed or paired, uncharged.

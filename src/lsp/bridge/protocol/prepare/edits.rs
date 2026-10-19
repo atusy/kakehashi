@@ -1007,10 +1007,9 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Result<Vec<Hunk>, Format
     .ok_or(FormattingRefusal::OutOfWork)?;
     let mut runs = Vec::new();
     for (old_range, new_range) in aligned {
-        runs.extend(
-            runs_to_diff(&old_lines, &new_lines, &old_keys, old_range, new_range)
-                .ok_or(FormattingRefusal::Shape)?,
-        );
+        runs.extend(runs_to_diff(
+            &old_lines, &new_lines, &old_keys, old_range, new_range, work,
+        )?);
     }
     let block = |lines: &[(usize, &str)], end: usize, range: Range<usize>| {
         line_start(lines, end, range.start)..line_start(lines, end, range.end)
@@ -1408,12 +1407,13 @@ fn runs_to_diff(
     old_keys: &LineKeys,
     old_range: Range<usize>,
     new_range: Range<usize>,
-) -> Option<Vec<DiffRun>> {
+    work: &mut Work,
+) -> Result<Vec<DiffRun>, FormattingRefusal> {
     let blank = |line: usize| old_keys[1][line].is_empty();
     let breaks = |lines: &[(usize, &str)], range: &Range<usize>| {
         range.end == 0 || lines[range.end - 1].1.ends_with(['\n', '\r'])
     };
-    Some(if new_range.is_empty() || !old_range.clone().any(blank) {
+    Ok(if new_range.is_empty() || !old_range.clone().any(blank) {
         vec![(old_range, new_range, false)]
     } else if !old_range.clone().all(blank) {
         vec![(old_range, new_range, true)]
@@ -1438,7 +1438,7 @@ fn runs_to_diff(
                 runs.push((old_line..old_line, new_line..new_line + 1, false));
                 runs.push((old_line..old_line + 1, new_line + 1..new_line + 1, false));
             } else {
-                return None;
+                return Err(FormattingRefusal::Shape);
             }
         }
         runs
@@ -1447,12 +1447,28 @@ fn runs_to_diff(
         // line keeps the first line written on it, after its whitespace,
         // in order; the other blank lines went, and the other lines are
         // the content's, in their places.
+        // Text typed right after a kept line's whitespace starts with
+        // exactly that whitespace: the new lines are indexed by theirs, and
+        // each kept line looks its own up, past the lines taken before.
+        work.spend(old_range.len() + new_range.len())
+            .ok_or(FormattingRefusal::OutOfWork)?;
+        let mut typed_after: HashMap<&str, Vec<usize>> = HashMap::new();
+        for new_line in new_range.clone() {
+            let line = new_lines[new_line].1;
+            let whitespace = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+            if !whitespace.is_empty() {
+                typed_after.entry(whitespace).or_default().push(new_line);
+            }
+        }
         let mut runs = Vec::new();
         let mut next = new_range.start;
         for old_line in old_range.clone() {
-            let kept = &old_keys[0][old_line];
-            let written_on =
-                (next..new_range.end).find(|&new_line| written_after(kept, new_lines[new_line].1));
+            let kept = old_keys[0][old_line].as_str();
+            let written_on = typed_after.get(kept).and_then(|lines| {
+                lines
+                    .get(lines.partition_point(|&line| line < next))
+                    .copied()
+            });
             match written_on {
                 Some(new_line) => {
                     if new_line > next {
