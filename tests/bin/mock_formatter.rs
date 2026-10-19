@@ -10,8 +10,10 @@
 //! order end-to-end:
 //!
 //! - `upper` — advertises `documentFormattingProvider`; uppercases the text.
-//!   (In every mode, formatting a text holding `OVERLAP` is answered with two
-//!   overlapping edits: an answer no document takes.)
+//!   (In the modes answering `textDocument/formatting` and
+//!   `textDocument/rangeFormatting` with a whole-document edit, formatting a
+//!   text holding `OVERLAP` is answered with two overlapping edits: an
+//!   answer no document takes.)
 //! - `append` — advertises `documentFormattingProvider`; appends a
 //!   `-- mock-marker` line (lowercase, so a later `upper` step would be
 //!   detectable).
