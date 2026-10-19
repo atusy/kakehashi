@@ -28,7 +28,7 @@ use tower_lsp_server::ls_types::{Position, TextEdit};
 
 mod edits;
 
-pub(crate) use edits::EditMode;
+pub(crate) use edits::{EditMode, FormattingRefusal};
 
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";

@@ -1951,14 +1951,12 @@ fn prepared_pipeline_edits(
         range: Range::new(Position::new(0, 0), end),
         new_text: restored,
     }];
-    if !crate::lsp::bridge::translate_virtual_text_edits_to_host(
-        &mut edits,
-        offset,
-        crate::lsp::bridge::EditMode::Formatting,
-    ) {
+    if let Err(reason) =
+        crate::lsp::bridge::translate_virtual_formatting_edits_to_host(&mut edits, offset)
+    {
         log::warn!(
             target: "kakehashi::formatting",
-            "concatenated formatting result for {} dropped: it cannot be mapped back through the prepared virtual document",
+            "concatenated formatting result for {} dropped: {reason}",
             uri
         );
         count_request_errors(failure_sink, 1);

@@ -41,7 +41,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{BridgeResponseContext, LanguageServerPool, UpstreamId};
-use super::super::protocol::{EditMode, translate_virtual_text_edits_to_host};
+use super::super::protocol::{FormattingRefusal, translate_virtual_formatting_edits_to_host};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -539,6 +539,37 @@ pub(super) fn formatting_answer_to_host(
     region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
     transform_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
+        .inspect_err(|error| log_refusal(error, ctx))
+}
+
+/// A formatting answer the prepared map refused, and why: the error the
+/// transforms fail with, logged once by the caller that knows the document.
+#[derive(Debug)]
+pub(crate) struct PreparedAnswerRefused(pub(crate) FormattingRefusal);
+
+impl std::fmt::Display for PreparedAnswerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "formatting response refused: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreparedAnswerRefused {}
+
+/// Warn, once per refused region, of a formatting answer its prepared map
+/// refused, naming the document, the region and why. Other failures were
+/// logged where they were found.
+fn log_refusal(error: &io::Error, ctx: &BridgeResponseContext<'_>) {
+    if let Some(PreparedAnswerRefused(reason)) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>())
+    {
+        warn!(
+            target: "kakehashi::bridge",
+            "Refused a formatting answer for {} (region {}): {reason}",
+            ctx.host_uri_lsp.as_str(),
+            ctx.virtual_uri_string
+        );
+    }
 }
 
 /// [`formatting_answer_to_host`] for an on-type formatting answer (see
@@ -550,6 +581,7 @@ pub(super) fn on_type_formatting_answer_to_host(
     region_end: Position,
 ) -> io::Result<Vec<TextEdit>> {
     transform_on_type_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
+        .inspect_err(|error| log_refusal(error, ctx))
 }
 
 /// Translate each `TextEdit` from virtual to host coordinates via `offset`.
@@ -688,14 +720,10 @@ fn transform_formatting_style_response(
     // answers dropped below: the server did its job, and the region is left
     // unformatted only because its result cannot be placed in the host. An
     // unprepared document's edits translate as ranges, never refused.
-    if !translate_virtual_text_edits_to_host(&mut edits, offset, EditMode::Formatting) {
-        warn!(
-            target: "kakehashi::bridge",
-            "Refused a formatting response: its result cannot be mapped back through the prepared virtual document"
-        );
-        return Err(io::Error::other(
-            "formatting response cannot be mapped back through the prepared virtual document",
-        ));
+    // Logged by the caller, which knows the document (see
+    // `PreparedAnswerRefused`).
+    if let Err(reason) = translate_virtual_formatting_edits_to_host(&mut edits, offset) {
+        return Err(io::Error::other(PreparedAnswerRefused(reason)));
     }
 
     // Clamp positions past the end of the last content line into the region:
@@ -2152,9 +2180,15 @@ mod tests {
             "newText": "a\nb\nc\n"
         }]});
         let region_end = region_host_end("a\nb\n", &offset);
-        assert!(
-            transform_formatting_response_to_host(response, &offset, "a\nb\n", region_end).is_err()
-        );
+        let error = transform_formatting_response_to_host(response, &offset, "a\nb\n", region_end)
+            .unwrap_err();
+        // Carrying why, for the caller that knows the document to log.
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>()),
+            Some(PreparedAnswerRefused(FormattingRefusal::Shape))
+        ));
     }
 
     #[test]

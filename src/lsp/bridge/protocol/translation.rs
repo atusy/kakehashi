@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{Position, Range, TextEdit};
 
-use super::prepare::{Bias, EditMode, PreparedMap};
+use super::prepare::{Bias, EditMode, FormattingRefusal, PreparedMap};
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -202,10 +202,9 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 /// lines lost and keep off the host text the peer hid (gaps, deleted edge
 /// lines), so the set goes through [`PreparedMap::map_edits`]. An
 /// unprepared document's edits translate one by one, as ranges, allocating
-/// nothing. Mapped, the set may hold other edits than it came with (see
-/// [`EditMode`]): it is replaced whole.
+/// nothing.
 pub(crate) fn translate_virtual_text_edits_to_host(
-    edits: &mut Vec<TextEdit>,
+    edits: &mut [TextEdit],
     offset: &RegionOffset,
     mode: EditMode,
 ) -> bool {
@@ -218,8 +217,34 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     let Some(mapped) = map_to_host(prepared, edits, offset, mode) else {
         return false;
     };
-    *edits = mapped;
+    // One for each, in order (see [`EditMode`]).
+    for (edit, mapped) in edits.iter_mut().zip(mapped) {
+        *edit = mapped;
+    }
     true
+}
+
+/// [`translate_virtual_text_edits_to_host`] for a formatting answer
+/// ([`PreparedMap::map_formatting_answer`]), saying why when it is
+/// refused. Mapped, the set may hold other edits than it came with: it is
+/// replaced whole.
+pub(crate) fn translate_virtual_formatting_edits_to_host(
+    edits: &mut Vec<TextEdit>,
+    offset: &RegionOffset,
+) -> Result<(), FormattingRefusal> {
+    let Some(prepared) = offset.prepared() else {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        return Ok(());
+    };
+    let mut mapped = prepared.map_formatting_answer(edits)?;
+    for edit in &mut mapped {
+        translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
+    }
+    *edits = mapped;
+    Ok(())
 }
 
 /// [`translate_virtual_text_edits_to_host`] for one edit keeping its
