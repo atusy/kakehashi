@@ -2111,6 +2111,31 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_answer_ending_past_the_last_line_maps_to_the_region_end() {
+        // A whole-document answer ending at `(lineCount, 0)`, the line past
+        // P's last: the transform clamps it to P's end, and the lines it
+        // breaks regain the removed indent.
+        let virtual_content = "  a; b\n";
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "a; b\n");
+        let host = format_host(
+            virtual_content,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+                "newText": "a;\nb\n"
+            }]),
+        );
+        assert_eq!(host, "  a;\n  b\n");
+    }
+
+    #[test]
     fn a_prepared_answer_the_map_refuses_fails_the_request() {
         // Lines dedented by two and by four: a new line has no one indent.
         let virtual_content = "  a\n    b\n";
