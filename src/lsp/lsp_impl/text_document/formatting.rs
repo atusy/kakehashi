@@ -414,9 +414,11 @@ impl Kakehashi {
                 client_progress_token: None,
             };
             // The document as its servers see it: prepared when its peer
-            // prepares it, waiting for the answer (the lifecycle pass has
-            // started every region's attempt already: waiting for each in
-            // turn costs the slowest one), and the method closed to it as
+            // prepares it, waiting for the answer (once the lifecycle pass
+            // has looked the document up it has started every region's
+            // attempt, so waiting for each in turn costs about the slowest
+            // one; a request before that waits for the lookup as well), and
+            // the method closed to it as
             // the answer's shape says (a prepared one stays open, its edits
             // mapped back through its map).
             let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
@@ -576,9 +578,10 @@ impl Kakehashi {
     /// is still the host's text (see [`Sourced::still_current`]). One that
     /// is not fails the request — counted in `failure_sink`, for the CLI to
     /// exit non-zero —
-    /// and the answer's virt edits are dropped, whichever region they came
-    /// from: the host moved under the answer, and an edit read for a region
-    /// no longer as it was would land elsewhere.
+    /// and the caller drops the whole answer, the host layer's edits and
+    /// those of regions still current too: the host moved under the
+    /// answer, and an edit read for a region no longer as it was would land
+    /// elsewhere.
     pub(super) fn formatting_sources_current(
         &self,
         lsp_uri: &tower_lsp_server::ls_types::Uri,

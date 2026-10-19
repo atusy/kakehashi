@@ -1093,7 +1093,8 @@ languages = ["lua"]
 #[test]
 fn e2e_format_without_experimental_features_formats_as_unprepared() {
     // A prepare peer configured, experimental features off: the region is
-    // formatted as on main, the formatter's text as it wrote it (the line
+    // formatted as with preparation off, the formatter's text as it wrote
+    // it (the line
     // it breaks off regains no indent).
     let markdown = "# Test\n\n```lua\n  local x = 1; local y = 2\n```\n";
     let ws = workspace_with(&[("doc.md", markdown)]);
