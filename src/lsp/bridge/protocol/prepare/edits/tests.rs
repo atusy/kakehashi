@@ -3321,6 +3321,33 @@ mod formatting {
     }
 
     #[test]
+    fn a_start_past_the_last_line_names_p_s_end_only_as_an_empty_range() {
+        // P "if x:\n  y\n" has lines 0 to 2; line 3, just past them, names
+        // P's end, as whole-document answers do. A start there with an end
+        // before it is reversed, and one further on names nothing.
+        let (_, map) = dedented();
+        let past = map.prepared_lines.text.lines().count() as u32 + 1;
+        for answer in [
+            [edit((past + 5, 0), (past, 0), "x")],
+            [edit((past, 1), (past, 1), "x")],
+            [edit((past + 1, 0), (past + 1, 0), "x")],
+        ] {
+            assert_eq!(
+                map.map_formatting_answer(&answer),
+                Err(FormattingRefusal::Shape),
+                "{answer:?}"
+            );
+        }
+        // An insertion at P's end is that.
+        let answer = [edit((past, 0), (past, 0), "z\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to("  if x:\n    y\n", &mapped)),
+            Ok("  if x:\n    y\n  z\n".to_string())
+        );
+    }
+
+    #[test]
     fn a_small_answer_in_a_large_region_costs_work_for_its_size() {
         // One line changed among 300,000: the lines alike at either end are
         // set aside before any line is keyed or paired, uncharged.
