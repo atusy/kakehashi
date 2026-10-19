@@ -918,7 +918,8 @@ fn without_experimental_features_nothing_is_prepared() {
         }),
     );
     assert!(!response["result"].is_null(), "{response}");
-    // Edits translate as ranges only, as on main: no text re-indented.
+    // Edits translate as ranges only, as with preparation off: no text
+    // re-indented.
     let response = client.send_request(
         "textDocument/completion",
         json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 4 } }),

@@ -281,8 +281,9 @@ line it would otherwise be written on, not text written on one
 lose the formatter's relative indentation). Each pair, and each run of lines
 left between pairs, is then diffed by character, and every stretch the
 result differs from P in maps as one edit does above; stretches touching at
-a line start stay apart where the later writes text there or changes only
-that line's leading whitespace. Of two stretches touching there, the first
+a line start stay apart where the later replaces some of that line's start
+with text, or where the earlier ends with a line break of P and the later
+replaces no line break. Of two stretches touching there, the first
 leaves the line's removed indentation to the second rather than take it
 along and give it back (the same text), so they do not both claim it. The
 set is then checked as a whole, as above. Which of several blank lines alike a line was written on, or which
@@ -351,8 +352,8 @@ stay shown without their edits. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
 fan-in would fall through to a server ranked below it whose reply came once
-the host settled. Moved, the whole answer is dropped (the edits of regions
-still current too) and the request is counted failed, so `kakehashi format`
+the host settled. Moved, the whole answer is dropped (the host's own
+formatter's edits and those of regions still current too) and the request is counted failed, so `kakehashi format`
 exits 2 and writes nothing (range and on-type formatting, which no one-shot
 run makes, answer nothing). A reply its map refuses counts as that server
 failing, as any failed reply does: `kakehashi format` exits 2 when no other

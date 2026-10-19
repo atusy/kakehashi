@@ -872,11 +872,12 @@ struct Hunk {
 /// (see `FORMATTING_DIFF_BUDGET`). Lines are
 /// paired first (see [`align_lines`]): a line of text with the line it was
 /// rewritten from, blank lines among themselves, lines joined onto another
-/// with that one. Each pair, and each run of lines left between pairs, is
-/// then diffed by character. So a stretch never covers a line both texts
-/// hold alike, nor does a character diff align text of one line with text
-/// of another; either would map that text as written on the wrong line,
-/// with that line's indent. A stretch never starts or ends between a CR
+/// with that one. Each pair that differs, and each run of lines left
+/// between pairs, is then diffed by character. So a stretch never covers
+/// a line both texts hold alike, and a character diff aligns text of one
+/// line with text of another only within a run, among lines no pairing
+/// could tell apart; outside a run, either would map that text as written
+/// on the wrong line, with that line's indent. A stretch never starts or ends between a CR
 /// and its LF in either text (no LSP position names that place): it widens
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
@@ -955,9 +956,9 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
             }
             // Touching stretches merge (mapped apart, each would read the
             // other's place as P's), but not at a line start where the later
-            // writes text over that line's start, or, after a line break of
-            // P the earlier ends with, changes only that line's leading
-            // whitespace: merged, the later line would map as one the
+            // replaces some of that line's start with text, or, after a line
+            // break of P the earlier ends with, changes nothing past that
+            // line's break (no line break of P in what it replaces): merged, the later line would map as one the
             // stretch writes anew, with the content's indent rather than its
             // own. Apart, neither's text bears on the other there. Whole
             // lines the later removes go with the earlier, the removed
