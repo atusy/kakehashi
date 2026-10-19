@@ -271,7 +271,9 @@ P's last naming P's end, as whole-document answers do), the region's edge
 layout of P restored as for any document, and the result diffed against
 P. Lines are paired first: a line of text with the line it was rewritten
 from (alike but for the whitespace around its text, a line found once in
-each text anchoring the rest), then a line other lines were joined onto,
+each text anchoring the rest), then one alike but for whitespace anywhere
+in it, the same way, then a line other lines were joined onto (found by
+looking up the old lines' texts, not comparing every pair),
 then blank lines with blank lines — as many as can pair, and of the
 alignments pairing as many, the one keeping most whitespace lines with ones
 holding the same whitespace, so that text the formatter writes beside blank
@@ -629,10 +631,12 @@ a hook per kind of change.
   large region heavily reformatted may be left as it is (counted a failure
   by `kakehashi format`). The common case costs little: an answer that keeps
   most lines, or mostly moves whitespace, costs work linear in the region.
-  An answer changing every line of text, with whitespace lines between
-  them (a formatter normalizing quotes on each line, say), costs work
-  quadratic in its lines: about 700 such text lines (some 1,400 lines in
-  all) are refused, where about 250 are accepted. A step counts one
+  Pairing blank lines takes a table quadratic in the blank lines of one
+  stretch no line of text anchors: an answer changing every line of text,
+  with whitespace lines between them (a formatter normalizing quotes on
+  each line, say), is refused from about 1,000 such text lines (some
+  2,000 lines in all). Respacing every line (`x=1` to `x = 1`) costs work
+  linear in the region. A step counts one
   comparison of two lines whatever their length, so time and memory also
   grow linearly with the texts' size.
 - The concatenated formatting pipeline does not re-apply host line prefixes
