@@ -45,11 +45,15 @@ pub(crate) enum EditMode {
 /// search (applying the answer to P, the per-character tables, mapping
 /// each stretch) runs in time linear in the texts on top. An answer whose
 /// diff runs out of work is refused, on any machine and under any load
-/// alike: the count, not a clock, decides. The tables the searches keep
-/// take a cell for each step spent, so this bounds their memory too (4
-/// bytes a cell, 4 MiB). Spent whole, it takes some 10 ms in a release
-/// build: little enough to run where the answer arrives, on the async
-/// runtime, rather than hand it to a blocking thread.
+/// alike: the count, not a clock, decides. Everything the searches keep
+/// is spent before it is taken, a step for each cell of a table and for
+/// each element they index, so their memory is linear in the budget (a
+/// few tens of MiB at most) besides what is linear in the texts. A step
+/// compares two elements whole, so time also grows with the lines'
+/// length; with lines of usual length, spending the budget whole takes
+/// some 10 ms in a release build: little enough to run where the answer
+/// arrives, on the async runtime, rather than hand it to a blocking
+/// thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 
 /// The indentation a mapped edit's first line regains.
