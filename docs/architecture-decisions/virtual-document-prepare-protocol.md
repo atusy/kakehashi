@@ -627,7 +627,14 @@ a hook per kind of change.
   not resolved.
 - A formatting answer whose diff runs out of its work budget is refused, so a
   large region heavily reformatted may be left as it is (counted a failure
-  by `kakehashi format`).
+  by `kakehashi format`). The common case costs little: an answer that keeps
+  most lines, or mostly moves whitespace, costs work linear in the region.
+  An answer changing every line of text, with whitespace lines between
+  them (a formatter normalizing quotes on each line, say), costs work
+  quadratic in its lines: about 700 such text lines (some 1,400 lines in
+  all) are refused, where about 250 are accepted. A step counts one
+  comparison of two lines whatever their length, so time and memory also
+  grow linearly with the texts' size.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
