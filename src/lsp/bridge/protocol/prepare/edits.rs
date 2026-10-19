@@ -181,7 +181,16 @@ impl PreparedMap {
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
-        let hunks = diff_hunks(prepared, &edited, &mut work)?;
+        let indents = |line_start: usize| {
+            let own = empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
+                .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
+            let at = map_offset(&self.runs, line_start, Bias::Start, Side::Prepared);
+            (
+                own.to_string(),
+                self.uniform_indent_at(at).map(str::to_string),
+            )
+        };
+        let hunks = diff_hunks(prepared, &edited, &indents, &mut work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // at a line start where the later replaces some of that line's start
         // with text, or where the earlier ends with a line break of P and the
@@ -464,6 +473,26 @@ impl PreparedMap {
     ) -> Option<(Range<usize>, String)> {
         if self.hunk_reaches_into_gap(&old) {
             return None;
+        }
+        let prepared = &self.prepared_lines.text;
+        // Breaking a line inside its text writes its rest as a line of its
+        // own, with the content's indent: refused where the line's own
+        // removed indent is another (a line the peer dedented unevenly, or
+        // left alone), lest that rest move from where the line kept it.
+        if new_text.contains(['\n', '\r'])
+            && !prepared[old.clone()].contains(['\n', '\r'])
+            && !is_line_start(prepared, old.start)
+            && !is_line_end(prepared, old.end)
+        {
+            let line_start = prepared[..old.start]
+                .rfind(['\n', '\r'])
+                .map_or(0, |at| at + 1);
+            let own = empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
+                .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
+            let at = map_offset(&self.runs, line_start, Bias::Start, Side::Prepared);
+            if self.uniform_indent_at(at) != Some(own) {
+                return None;
+            }
         }
         let prepared_after = following;
         // A change starting at a P line start that removes whole lines (its
@@ -954,7 +983,12 @@ struct Hunk {
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
-fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Result<Vec<Hunk>, FormattingRefusal> {
+fn diff_hunks(
+    old: &str,
+    new: &str,
+    indents: &dyn Fn(usize) -> (String, Option<String>),
+    work: &mut Work,
+) -> Result<Vec<Hunk>, FormattingRefusal> {
     // Whole lines alike at either end are set aside, uncharged: a small
     // answer in a large region costs work for its own size.
     let (head, tail) = alike_line_ends(old, new);
@@ -994,6 +1028,9 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Result<Vec<Hunk>, Format
         ]
     };
     let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
+    if lines_alike_tell_no_indent(old, new, &new_keys, indents) {
+        return Err(FormattingRefusal::Shape);
+    }
     let mut aligned = Vec::new();
     align_lines(
         &old_keys,
@@ -1191,8 +1228,7 @@ enum Alignment {
 ///   while a blank line of the answer could be that line; of the
 ///   alignments pairing as many, the one with the most pairs alike to the
 ///   whitespace (a kept whitespace line kept as it was).
-/// - Lines of text in order from either end of what is left (where
-///   the answer removed no whitespace line the peer kept), while they
+/// - Lines of text in order from either end of what is left, while they
 ///   are alike in their letters and digits: a line whose quotes,
 ///   separators or punctuation a formatter rewrote (`f('a')` to
 ///   `f("a");`) is the line it was, however many lines it rewrote.
@@ -1329,11 +1365,10 @@ fn joined_lines(
 /// `new_range` taken in order from the start while their letters and
 /// digits are alike, then from the end the same way. Only lines at the
 /// same place from an end pair: a line no later than where the two texts
-/// part ways is the line it was there. None where the old side holds a
-/// whitespace line the peer kept: the answer removed it (the blank-line
-/// stage paired every one it could), and the run's text is left whole to
-/// diff without it (see [`runs_to_diff`]), lest a line it split be left
-/// alone where that line was, written on it or in its place.
+/// part ways is the line it was there. A whitespace line the peer kept
+/// left between them, the answer's text in its place, is read line for
+/// line, and refused where the text is not typed on it (see
+/// [`runs_to_diff`]).
 fn alike_ends(
     old_keys: &LineKeys,
     new_keys: &LineKeys,
@@ -1342,12 +1377,6 @@ fn alike_ends(
     work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
     work.spend(old_range.len() + new_range.len())?;
-    if old_range
-        .clone()
-        .any(|line| old_keys[1][line].is_empty() && !old_keys[0][line].is_empty())
-    {
-        return Some(Vec::new());
-    }
     let text = |keys: &LineKeys, range: &Range<usize>| -> Vec<usize> {
         range
             .clone()
@@ -1575,6 +1604,66 @@ fn align_lines(
         work,
         aligned,
     )
+}
+
+/// Whether lines of text alike (but for the whitespace around them) leave
+/// the answer's copies without an indent of their own: old lines alike
+/// whose removed indents differ, kept in the answer (which copy is which
+/// decides each one's indent); or one whose removed indent is not the
+/// content's, written in the answer more or fewer times (which copy is the
+/// old line, keeping its indent, and which the content's, no answer
+/// tells). Only texts the answer writes in what it changes (`new_keys`)
+/// are looked for, through the whole of both texts. `indents` gives a
+/// line's own removed indent and the content's there, by the line's start
+/// in `old`.
+fn lines_alike_tell_no_indent(
+    old: &str,
+    new: &str,
+    new_keys: &LineKeys,
+    indents: &dyn Fn(usize) -> (String, Option<String>),
+) -> bool {
+    let written: std::collections::HashSet<&str> = new_keys[1]
+        .iter()
+        .map(String::as_str)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if written.is_empty() {
+        return false;
+    }
+    fn text_of(line: &str) -> &str {
+        line.trim_end_matches(['\r', '\n'])
+            .trim_matches([' ', '\t'])
+    }
+    // Per text: the old lines' removed indent (none when they differ),
+    // whether it is the content's, and how many old lines hold it.
+    let mut old_texts: HashMap<&str, (Option<String>, bool, usize)> = HashMap::new();
+    for (start, line) in lines_with_breaks(old) {
+        let text = text_of(line);
+        let Some(&text) = written.get(text) else {
+            continue;
+        };
+        let (own, uniform) = indents(start);
+        let content = uniform.as_deref() == Some(own.as_str());
+        let entry = old_texts
+            .entry(text)
+            .or_insert_with(|| (Some(own.clone()), content, 0));
+        if entry.0.as_deref() != Some(own.as_str()) {
+            entry.0 = None;
+        }
+        entry.1 &= content;
+        entry.2 += 1;
+    }
+    let mut new_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, line) in lines_with_breaks(new) {
+        let text = text_of(line);
+        if let Some((&text, _)) = old_texts.get_key_value(text) {
+            *new_counts.entry(text).or_default() += 1;
+        }
+    }
+    new_counts.iter().any(|(text, &count)| {
+        let (indent, content, kept) = &old_texts[text];
+        indent.is_none() || (!content && count != *kept)
+    })
 }
 
 /// How many bytes of whole lines `old` and `new` hold alike at their start,

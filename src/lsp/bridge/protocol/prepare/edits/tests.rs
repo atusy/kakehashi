@@ -3215,6 +3215,51 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_the_peer_left_alone_keeps_its_indent_beside_a_blank_line_removed() {
+        // The peer dedented only the lines holding four spaces: `  a=…`
+        // stays as it is. The answer writes `  }` above it and removes the
+        // kept whitespace line after it: `a=…` is the line it was, not one
+        // broken off a line written anew.
+        let virtual_text = "    y\n  a=f('q')\n      \n";
+        let map = dedent_lines(virtual_text, &[4, 0, 4]);
+        let answer = [edit((0, 0), (3, 0), "y\n  }\n  a=f(\"q\")\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    y\n      }\n  a=f(\"q\")\n")
+        );
+    }
+
+    #[test]
+    fn lines_alike_with_indents_of_their_own_are_refused_when_the_answer_cannot_tell_them_apart() {
+        // `let s = "é";` twice, once dedented by two tabs, once left alone:
+        // the answer keeps one, and which it kept decides its indent.
+        let virtual_text = "\t\ta\rlet s = \"é\";\r\t\tlet s = \"é\"; \r\t\t)\r\t\tpass  \r";
+        let map = dedent_lines(virtual_text, &[2, 0, 2, 2, 2]);
+        let answer = [edit((0, 0), (5, 0), "let s = \"é\"; \r\n)\r\npass  \r\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // ` }` left alone, the answer writing it twice: which copy is the
+        // line the peer left alone no answer tells.
+        let virtual_text = "    a\n }\n    b\n";
+        let map = dedent_lines(virtual_text, &[4, 0, 4]);
+        let answer = [edit((0, 0), (3, 0), "a\n }\n }\nb\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Alike lines with the same indent stay mapped.
+        let virtual_text = "  }\n  a\n  }\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2]);
+        let answer = [edit((0, 0), (3, 0), "}\nb\n}\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  }\n  b\n  }\n")
+        );
+    }
+
+    #[test]
     fn text_where_a_kept_whitespace_line_was_is_refused_unless_written_after_it() {
         // A line split, its second half joined onto the next across a kept
         // `  \t` the answer replaced: written on it (no indent) or in its
