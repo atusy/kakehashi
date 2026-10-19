@@ -297,9 +297,10 @@ whitespace first and diffs only what lies between them, so an answer that
 mostly moves whitespace (a pretty-printer's) costs work linear in the
 texts. An answer whose diff runs out of work is refused, and logged apart
 from the refusals its shape decides. The tables the searches keep (pairing
-blank lines takes one quadratic in them) take a cell for each step spent,
-so the budget bounds their memory as well, and spent whole it takes some
-10 ms: the diff runs where the answer arrives. So the budget decides only
+blank lines takes one quadratic in them) are spent before they are
+taken, so their memory is linear in the budget; spent whole on lines of
+usual length, it takes some 10 ms, and the diff runs where the answer
+arrives. So the budget decides only
 which answers are refused, never what an accepted one writes; a large
 region heavily rewritten may be refused.
 
