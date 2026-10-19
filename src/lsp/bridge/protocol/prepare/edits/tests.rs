@@ -3238,6 +3238,23 @@ mod formatting {
         );
     }
 
+    #[rstest::rstest]
+    #[case::lf("  a\n  b", "  a b")]
+    #[case::crlf("  a\r\n  b", "  a b")]
+    fn joining_the_last_line_with_no_line_break_maps(
+        #[case] virtual_text: &str,
+        #[case] expected: &str,
+    ) {
+        // The line joined away ends the document with no line break: its
+        // removal goes with the join, not apart from it.
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (1, 1), "a b")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
     /// `count` assignments written tight, and as a formatter spacing every
     /// one: the same text but for whitespace inside each line.
     fn spaced_assignments(count: usize) -> (String, String) {
