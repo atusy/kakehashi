@@ -242,17 +242,33 @@ impl PreparedMap {
         // than overlap. Anything else overlapping is left for the set's
         // check to refuse.
         let virtual_text = &self.virtual_lines.text;
+        // An insertion at that line start lands after the indent, and gives
+        // it back at its end, while the next stretch claims the indent from
+        // the line start: the insertion goes before the indent instead,
+        // writing it for its own first line rather than giving it back (the
+        // same text), and the two touch.
+        let indent = |text: &str| text.chars().all(|c| c == ' ' || c == '\t');
         for at in 1..mapped.len() {
-            let next_start = mapped[at].0.start;
+            let (next_start, next_end) = (mapped[at].0.start, mapped[at].0.end);
             let (earlier, _) = mapped.split_at_mut(at);
             let (range, new_text) = &mut earlier[at - 1];
             if range.start <= next_start && next_start < range.end {
                 let taken = &virtual_text[next_start..range.end];
                 // Only a removed indent is ever taken along and given back:
                 // anything else overlapping is the set check's to refuse.
-                if new_text.ends_with(taken) && taken.chars().all(|c| c == ' ' || c == '\t') {
+                if new_text.ends_with(taken) && indent(taken) {
                     new_text.truncate(new_text.len() - taken.len());
                     range.end = next_start;
+                }
+            } else if range.start == range.end
+                && next_start < range.start
+                && range.start <= next_end
+            {
+                let taken = &virtual_text[next_start..range.start];
+                if new_text.ends_with(taken) && indent(taken) {
+                    new_text.truncate(new_text.len() - taken.len());
+                    new_text.insert_str(0, taken);
+                    *range = next_start..next_start;
                 }
             }
         }

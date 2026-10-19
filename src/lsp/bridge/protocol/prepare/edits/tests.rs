@@ -3308,6 +3308,35 @@ mod formatting {
         );
     }
 
+    #[rstest::rstest]
+    #[case::cleared("  a\n   \n  b\n", &[2, 2, 2], "a\nc\n\nb\n", "  a\n  c\n\n  b\n")]
+    #[case::comment(
+        "  a = 1\n      \n  b = 2\n",
+        &[2, 2, 2],
+        "a = 1\n# x\n\nb = 2\n",
+        "  a = 1\n  # x\n\n  b = 2\n"
+    )]
+    #[case::sorted(
+        "  import c\n  import b\n  import a\n      \n  y = 1\n",
+        &[2, 2, 2, 2, 2],
+        "import a\nimport b\nimport c\n\ny = 1\n",
+        "  import a\n  import b\n  import c\n\n  y = 1\n"
+    )]
+    fn a_line_written_before_a_dedented_whitespace_line_the_answer_clears_maps(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+        #[case] expected: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split('\n').count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
     #[test]
     fn text_where_a_kept_whitespace_line_was_is_refused() {
         // A line split, its second half joined onto the next across a kept
