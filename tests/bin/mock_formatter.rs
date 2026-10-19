@@ -52,7 +52,8 @@
 //!   a slow host layer for a test to edit the host while it runs.
 //! - `empty-on-release` — `slow-empty`, but each formatting answer waits
 //!   for the file `MOCK_RELEASE_FILE` names to exist instead of a delay: a
-//!   barrier a test lifts once it has edited the host while a request runs.
+//!   barrier a test lifts once it has edited the host while a request runs
+//!   (or, unlifted, a minute later).
 //!   (A `didChange` cannot be the barrier: the upstream forwards the host's
 //!   edit to this server only after its in-flight request is answered.)
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
@@ -2744,7 +2745,11 @@ fn main() {
                 if mode == "empty-on-release" =>
             {
                 let release = std::env::var("MOCK_RELEASE_FILE").expect("MOCK_RELEASE_FILE");
-                while !std::path::Path::new(&release).exists() {
+                // Bounded: a test failing before it releases must not leave
+                // this server spinning forever.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !std::path::Path::new(&release).exists() && std::time::Instant::now() < until
+                {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 respond(&mut writer, id, json!([]));
