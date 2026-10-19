@@ -33,6 +33,9 @@ pub(crate) enum EditMode {
     /// as precisely as small edits. The set mapped is the diff's, not the
     /// edits sent. A range may also end at the line just past P's last
     /// (`(lineCount, 0)`), naming P's end, as whole-document answers do.
+    /// The formatting transforms clamp such an end to P's last line before
+    /// mapping, to the same place; it is read here too so that the mode
+    /// takes an answer as servers send it, whoever calls it.
     Formatting,
 }
 
