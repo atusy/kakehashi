@@ -183,7 +183,9 @@ impl PreparedMap {
             let (range, new_text) = &mut earlier[at - 1];
             if range.start <= next_start && next_start < range.end {
                 let taken = &virtual_text[next_start..range.end];
-                if new_text.ends_with(taken) {
+                // Only a removed indent is ever taken along and given back:
+                // anything else overlapping is the set check's to refuse.
+                if new_text.ends_with(taken) && taken.chars().all(|c| c == ' ' || c == '\t') {
                     new_text.truncate(new_text.len() - taken.len());
                     range.end = next_start;
                 }
