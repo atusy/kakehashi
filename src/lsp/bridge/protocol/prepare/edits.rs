@@ -66,9 +66,12 @@ impl std::fmt::Display for FormattingRefusal {
 /// compares two elements whole, so time also grows with the lines'
 /// length; with lines of usual length, spending this fixed part whole
 /// takes some 10 ms in a release build, and the part that grows with the
-/// texts (`FORMATTING_DIFF_WORK_PER_BYTE`) time linear in them: little
-/// enough to run where the answer arrives, on the async runtime, rather
-/// than hand it to a blocking thread.
+/// texts (`FORMATTING_DIFF_WORK_PER_BYTE`) time linear in what the answer
+/// changes (the lines alike at either end are set aside first): a 20,000
+/// line region of half a megabyte rewritten whole maps in some 30 to 100
+/// ms, and a one-line answer in any region in well under a millisecond
+/// past the scan for what is alike. It runs where the answer arrives, on
+/// the async runtime, rather than on a blocking thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 
 /// Work the diff of a formatting answer may do on top of
@@ -949,10 +952,20 @@ struct Hunk {
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
 fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
-    let old_lines = lines_with_breaks(old);
-    let new_lines = lines_with_breaks(new);
-    let line_start = |lines: &[(usize, &str)], text: &str, index: usize| {
-        lines.get(index).map_or(text.len(), |&(start, _)| start)
+    // Whole lines alike at either end are set aside, uncharged: a small
+    // answer in a large region costs work for its own size.
+    let (head, tail) = alike_line_ends(old, new);
+    let (old_end, new_end) = (old.len() - tail, new.len() - tail);
+    fn lines_from(text: &str, range: Range<usize>) -> Vec<(usize, &str)> {
+        lines_with_breaks(&text[range.clone()])
+            .into_iter()
+            .map(|(start, line)| (start + range.start, line))
+            .collect()
+    }
+    let old_lines = lines_from(old, head..old_end);
+    let new_lines = lines_from(new, head..new_end);
+    let line_start = |lines: &[(usize, &str)], end: usize, index: usize| {
+        lines.get(index).map_or(end, |&(start, _)| start)
     };
     let line_keys = |lines: &[(usize, &str)]| -> LineKeys {
         let content = |line: &str| line.trim_end_matches(['\r', '\n']).to_string();
@@ -988,8 +1001,8 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
         work,
         &mut aligned,
     )?;
-    let block = |lines: &[(usize, &str)], text: &str, range: Range<usize>| {
-        line_start(lines, text, range.start)..line_start(lines, text, range.end)
+    let block = |lines: &[(usize, &str)], end: usize, range: Range<usize>| {
+        line_start(lines, end, range.start)..line_start(lines, end, range.end)
     };
     let blocks = aligned
         .into_iter()
@@ -1016,8 +1029,8 @@ fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
             };
             (!same && !(old_range.is_empty() && new_range.is_empty())).then(|| {
                 (
-                    block(&old_lines, old, old_range),
-                    block(&new_lines, new, new_range),
+                    block(&old_lines, old_end, old_range),
+                    block(&new_lines, new_end, new_range),
                     removed,
                 )
             })
@@ -1473,6 +1486,32 @@ fn align_lines(
         work,
         aligned,
     )
+}
+
+/// How many bytes of whole lines `old` and `new` hold alike at their start,
+/// and at their end (not overlapping): each ends, or starts, where a line
+/// does in both, never between a CR and its LF.
+fn alike_line_ends(old: &str, new: &str) -> (usize, usize) {
+    let (old, new) = (old.as_bytes(), new.as_bytes());
+    let starts_line = |text: &[u8], at: usize| {
+        at == 0 || text[at - 1] == b'\n' || (text[at - 1] == b'\r' && text.get(at) != Some(&b'\n'))
+    };
+    let mut head = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    while head > 0 && !(starts_line(old, head) && starts_line(new, head)) {
+        head -= 1;
+    }
+    let most = old.len().min(new.len()) - head;
+    let mut tail = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(most)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while tail > 0 && !(starts_line(old, old.len() - tail) && starts_line(new, new.len() - tail)) {
+        tail -= 1;
+    }
+    (head, tail)
 }
 
 /// `text`'s lines, each with its line break (LF, CRLF or a lone CR), and

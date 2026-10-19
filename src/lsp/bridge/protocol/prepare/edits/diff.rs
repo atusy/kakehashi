@@ -55,7 +55,9 @@ pub(super) fn myers_pairs<T: Eq + Hash>(
     {
         suffix += 1;
     }
-    work.spend(prefix + suffix + 1)?;
+    // The scan for what is alike at the ends is linear in the input and
+    // not charged: a long text changed in one place costs that place.
+    work.spend(1)?;
     let (core_a, core_b) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
     work.spend(core_a.len() + core_b.len())?;
     let shared = |from: &[T], other: &[T]| -> Vec<usize> {

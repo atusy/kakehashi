@@ -3255,6 +3255,39 @@ mod formatting {
         );
     }
 
+    #[test]
+    fn a_small_answer_in_a_large_region_costs_work_for_its_size() {
+        // One line changed among 300,000: the lines alike at either end are
+        // set aside before any line is keyed or paired, uncharged.
+        let count = 300_000;
+        let virtual_text: String = (0..count).map(|index| format!("  x{index}\n")).collect();
+        let map = dedent_lines(&virtual_text, &vec![2; count]);
+        let line = (count / 2) as u32;
+        let answer = [edit((line, 0), (line, 0), "y")];
+        let mapped = map
+            .map_formatting(&answer, 1_000)
+            .map(|mapped| apply_to(&virtual_text, &mapped));
+        let expected = virtual_text.replacen(
+            &format!("  x{}\n", count / 2),
+            &format!("  yx{}\n", count / 2),
+            1,
+        );
+        assert_eq!(mapped, Ok(expected));
+        // One character inserted in a line of 1.1 MB: the text alike at its
+        // ends is set aside the same way.
+        let long = "a".repeat(1_100_000);
+        let virtual_text = format!("  {long}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 550_000), (0, 550_000), "b")];
+        let mut expected = virtual_text.clone();
+        expected.insert(2 + 550_000, 'b');
+        assert_eq!(
+            map.map_formatting(&answer, 1_000)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
     /// `count` assignments written tight, and as a formatter spacing every
     /// one: the same text but for whitespace inside each line.
     fn spaced_assignments(count: usize) -> (String, String) {
