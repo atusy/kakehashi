@@ -2238,6 +2238,85 @@ mod tests {
         );
     }
 
+    /// The server ranked first keeps its place though its reply came while
+    /// the host had moved (an edit to another fence, its pass not settled
+    /// yet) and the next one's came once it settled with the content
+    /// unchanged: whether the host moved is read once, where the answer is
+    /// chosen, not per reply, where a refused reply would count as that
+    /// server failing and hand the region to the next.
+    #[tokio::test]
+    async fn the_server_ranked_first_wins_though_its_reply_came_before_the_host_settled() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::aggregation::server::priority::PriorityEntry;
+        use crate::lsp::aggregation::server::{FanInResult, TaggedResult, preferred};
+        let virtual_content = "  a\n  b\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared_document = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        let offset =
+            RegionOffset::new(0, 0).with_prepared(std::sync::Arc::clone(&prepared_document.map));
+        let prepared = prepared_document.text.clone();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/two-fences.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared_document);
+        let reply = |first_line: &str| {
+            let ctx = pool.response_context_for_test(&host_lsp, &offset);
+            formatting_answer_to_host(
+                json!({"jsonrpc": "2.0", "id": 1, "result": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
+                    "newText": format!("{first_line}\nb\n")
+                }]}),
+                &ctx,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+        };
+        // Another fence edited, its pass not settled: the top server replies.
+        pool.note_host_edited(&host, 1, 1);
+        let top = reply("top");
+        // Settled, this region's text unchanged: the next server replies.
+        pool.note_host_settled(&host, 1, 1);
+        let next = reply("next");
+        assert!(!next.as_ref().unwrap().is_empty());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (server_name, value) in [("next", next), ("top", top)] {
+            tasks.spawn(async move {
+                TaggedResult {
+                    server_name: server_name.to_string(),
+                    value,
+                }
+            });
+        }
+        let result = preferred(
+            &mut tasks,
+            |edits: &Vec<TextEdit>| !edits.is_empty(),
+            &[
+                PriorityEntry::Server("top".to_string()),
+                PriorityEntry::Server("next".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let FanInResult::Done(edits) = result else {
+            panic!("an answer");
+        };
+        assert_eq!(
+            crate::text::edit::apply_text_edits(virtual_content, &edits),
+            "  top\n  b\n"
+        );
+    }
+
     #[rstest]
     #[case::formatting(formatting_answer_to_host)]
     #[case::on_type_formatting(on_type_formatting_answer_to_host)]
