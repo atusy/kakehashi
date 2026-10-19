@@ -1398,9 +1398,11 @@ type DiffRun = (Range<usize>, Range<usize>, bool);
 /// lines (the new not ending with a line break the old lacks), the new
 /// lines take their places line for line: a blank line, or text written on
 /// a whitespace line the peer kept after its whitespace, is that line (see
-/// [`ALIGNMENTS`]); other text is a line of the content in place of a
-/// blank line removed. Otherwise the answer removed them and wrote lines
-/// of its own, which go before them, removed whole.
+/// [`ALIGNMENTS`]); other text is a line of the content in place of an
+/// empty line, and refused in place of a kept whitespace line. With more
+/// or fewer, each kept whitespace line keeps the first line written on it
+/// after its whitespace, in order; the others went, and the other lines
+/// are the content's.
 fn runs_to_diff(
     old_lines: &[(usize, &str)],
     new_lines: &[(usize, &str)],
@@ -1430,7 +1432,7 @@ fn runs_to_diff(
             let kept = &old_keys[0][old_line];
             let written = new_lines[new_line].1;
             if written.trim_matches([' ', '\t', '\r', '\n']).is_empty()
-                || (!kept.is_empty() && written.starts_with(kept.as_str()))
+                || written_after(kept, written)
             {
                 runs.push((old_line..old_line + 1, new_line..new_line + 1, false));
             } else if kept.is_empty() {
@@ -1442,12 +1444,42 @@ fn runs_to_diff(
         }
         runs
     } else {
-        let start = old_range.start;
-        vec![
-            (start..start, new_range.clone(), false),
-            (old_range, new_range.end..new_range.end, false),
-        ]
+        // More or fewer lines than the blank lines: each kept whitespace
+        // line keeps the first line written on it, after its whitespace,
+        // in order; the other blank lines went, and the other lines are
+        // the content's, in their places.
+        let mut runs = Vec::new();
+        let mut next = new_range.start;
+        for old_line in old_range.clone() {
+            let kept = &old_keys[0][old_line];
+            let written_on =
+                (next..new_range.end).find(|&new_line| written_after(kept, new_lines[new_line].1));
+            match written_on {
+                Some(new_line) => {
+                    if new_line > next {
+                        runs.push((old_line..old_line, next..new_line, false));
+                    }
+                    runs.push((old_line..old_line + 1, new_line..new_line + 1, false));
+                    next = new_line + 1;
+                }
+                None => runs.push((old_line..old_line + 1, next..next, false)),
+            }
+        }
+        if next < new_range.end {
+            runs.push((old_range.end..old_range.end, next..new_range.end, false));
+        }
+        runs
     })
+}
+
+/// Whether `written` is text typed on a whitespace line holding `kept`,
+/// after that whitespace: it starts with it, and its text right after (a
+/// line indented further reads as well as a line of the content).
+fn written_after(kept: &str, written: &str) -> bool {
+    !kept.is_empty()
+        && written
+            .strip_prefix(kept)
+            .is_some_and(|rest| !rest.starts_with([' ', '\t']))
 }
 
 /// Pair the lines of `old_range` with those of `new_range` at
