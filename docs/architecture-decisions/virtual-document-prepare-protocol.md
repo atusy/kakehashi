@@ -272,8 +272,8 @@ layout of P restored as for any document (but for an on-type answer, which
 keeps the edges as it writes them, typing being an edit, not a
 reformatting of the region), and the result diffed against
 P. Lines are paired first: a line of text with the line it was rewritten
-from (alike but for the whitespace around its text, a line found once in
-each text anchoring the rest), then one alike but for whitespace anywhere
+from (alike to the byte, then alike but for the whitespace around its
+text, a line found once in each text anchoring the rest), then one alike but for whitespace anywhere
 in it, the same way; then, between those, lines found as many times on
 each side (a `}` among several), by the fewest changes; then a line other
 lines were joined onto (found by looking up the old lines' texts, not
@@ -283,10 +283,17 @@ holding the same whitespace, so that text the formatter writes beside blank
 lines is a line of its own whenever a blank line of the answer could be the
 line it would otherwise be written on, not text written on one
 (which, on a whitespace line the peer kept, would regain no indentation and
-lose the formatter's relative indentation); then, where the answer removed
-no whitespace line the peer kept, lines of text in order from either end of what is left
-while their letters and digits are alike (a line whose quotes or
-punctuation a formatter rewrote is the line it was). Each pair, and each
+lose the formatter's relative indentation); then lines of text in order
+from either end of what is left while their letters and digits are alike (a line whose quotes or
+punctuation a formatter rewrote is the line it was). An answer that
+writes a line of P more or fewer times, yet still writes it, is refused
+where P's copies of it have removed indents that differ, or one that is
+not the content's: which copy was kept, and which written anew, decides
+each one's indent, and no answer tells. A formatting answer breaking a
+line inside its text is refused where that line's own removed indent is
+not the content's, lest its rest move from where the line kept it
+(edits keeping their extents state where they go and are not so
+refused). Each pair, and each
 run of lines left between pairs, is then diffed by character. A run
 holding lines of text on P's side is diffed without its blank lines, which
 go whole: its new text is that text rewritten, never text written on a
