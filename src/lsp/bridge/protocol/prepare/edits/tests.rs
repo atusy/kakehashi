@@ -2939,31 +2939,31 @@ fn many_edits_on_one_long_line_look_at_it_in_linear_work() {
 
 mod formatting {
     use super::*;
-    use std::time::Duration;
 
     /// V formatted through `map` by a formatter answering `edits` to P, the
-    /// diff given `budget`; `None` when the map refuses the answer.
+    /// diff given `budget` steps of work; `None` when the map refuses the
+    /// answer.
     fn formatted(
         map: &PreparedMap,
         virtual_text: &str,
         edits: &[TextEdit],
-        budget: Duration,
+        budget: usize,
     ) -> Option<String> {
         let mapped = map.map_edits_within(edits, EditMode::Formatting, budget)?;
         Some(apply_to(virtual_text, &mapped))
     }
 
-    /// [`formatted`] with time enough; with none, an answer changing
+    /// [`formatted`] with work enough; with none, an answer changing
     /// anything is refused.
     fn formatted_either_way(
         map: &PreparedMap,
         virtual_text: &str,
         edits: &[TextEdit],
     ) -> Option<String> {
-        let precise = formatted(map, virtual_text, edits, Duration::from_secs(10));
-        let coarse = formatted(map, virtual_text, edits, Duration::ZERO);
+        let precise = formatted(map, virtual_text, edits, usize::MAX);
+        let coarse = formatted(map, virtual_text, edits, 0);
         if precise.as_deref() != Some(virtual_text) {
-            assert_eq!(coarse, None, "a diff out of time is refused");
+            assert_eq!(coarse, None, "a diff out of work is refused");
         }
         precise
     }
@@ -2971,7 +2971,7 @@ mod formatting {
     #[test]
     fn lines_the_formatter_left_alone_keep_their_own_indent() {
         // `b` was left at column 0; the formatter changed the lines around
-        // it. A diff out of time would cover `b` and indent it as content.
+        // it. A coarser diff would cover `b` and indent it as content.
         let virtual_text = "  a\nb\n  c\n";
         let map = prepare(
             virtual_text,
@@ -3077,52 +3077,132 @@ mod formatting {
         );
     }
 
+    /// Minified JSON of at least `bytes`, and the same pretty-printed, two
+    /// spaces a level: they differ only in whitespace.
+    fn json_pair(bytes: usize) -> (String, String) {
+        let mut items = Vec::new();
+        let mut length = 0;
+        while length < bytes {
+            let index = items.len();
+            let item = format!(
+                "{{\"key{index}\":[{index},{},\"v{index}\"],\"n\":{{\"x\":{index}}}}}",
+                index * 7
+            );
+            length += item.len() + 1;
+            items.push(item);
+        }
+        let minified = format!("[{}]", items.join(","));
+        let value: serde_json::Value = serde_json::from_str(&minified).unwrap();
+        (minified, serde_json::to_string_pretty(&value).unwrap())
+    }
+
+    /// A one-line JSON document in an indented block, and an answer
+    /// pretty-printing it: V, its map, the answer, and V formatted.
+    fn pretty_printed(bytes: usize) -> (String, PreparedMap, [TextEdit; 1], String) {
+        let (minified, pretty) = json_pair(bytes);
+        let virtual_text = format!("  {minified}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 0), (1, 0), &format!("{pretty}\n"))];
+        let expected = pretty.lines().map(|line| format!("  {line}\n")).collect();
+        (virtual_text, map, answer, expected)
+    }
+
     #[test]
-    fn pairing_joined_lines_stops_at_the_deadline() {
-        // The join search is quadratic: past its deadline it pairs nothing
-        // more, for the answer to be refused in time, not to run on.
+    fn a_large_pretty_printed_answer_maps() {
+        // Some 25 KB rewritten into thousands of lines: every character
+        // other than whitespace is kept, so pairing those first finds them
+        // along one diagonal, and only the whitespace between them is
+        // diffed.
+        let (virtual_text, map, answer, expected) = pretty_printed(25_000);
+        assert!(virtual_text.len() > 25_000);
+        assert_eq!(
+            map.map_edits(&answer, EditMode::Formatting)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn whitespace_rewritten_costs_work_linear_in_the_texts() {
+        let (virtual_text, map, answer, expected) = pretty_printed(25_000);
+        let budget = 4 * (virtual_text.len() + expected.len());
+        assert_eq!(
+            formatted(&map, &virtual_text, &answer, budget),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn the_work_an_answer_takes_decides_it_alike_every_time() {
+        // No clock: the least budget mapping an answer maps it on every
+        // run, and one step less refuses it on every run.
+        let (_, map, answer, _) = pretty_printed(2_000);
+        let maps = |budget| map.map_edits_within(&answer, EditMode::Formatting, budget);
+        let (mut refusing, mut mapping) = (0, FORMATTING_DIFF_BUDGET);
+        let mapped = maps(mapping);
+        assert!(mapped.is_some());
+        assert_eq!(maps(refusing), None);
+        while mapping - refusing > 1 {
+            let between = refusing + (mapping - refusing) / 2;
+            if maps(between).is_some() {
+                mapping = between;
+            } else {
+                refusing = between;
+            }
+        }
+        for _ in 0..5 {
+            assert_eq!(maps(refusing), None);
+            assert_eq!(maps(mapping), mapped);
+        }
+    }
+
+    #[test]
+    fn pairing_joined_lines_stops_when_out_of_work() {
+        // The join search is quadratic: each comparison is spent, and out
+        // of work it refuses, not runs on.
         let keys = |lines: &[&str]| -> [Vec<String>; 2] {
             let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
             [lines.clone(), lines]
         };
         let (old, new) = (keys(&["a"]), keys(&["a b"]));
-        let pairs = |deadline| joined_lines(&old, &new, &(0..1), &(0..1), deadline);
-        assert_eq!(
-            pairs(Instant::now() + Duration::from_secs(10)),
-            vec![(0, 0)]
-        );
-        assert_eq!(pairs(Instant::now() - Duration::from_millis(1)), vec![]);
+        let pairs = |budget| joined_lines(&old, &new, &(0..1), &(0..1), &mut Work::new(budget));
+        assert_eq!(pairs(1), Some(vec![(0, 0)]));
+        assert_eq!(pairs(0), None);
     }
 
     #[test]
-    fn pairing_blank_lines_past_its_table_size_refuses() {
-        // Blank lines in one run, too many to pair in the table's bound:
-        // refused at once, not held in memory.
+    fn pairing_blank_lines_takes_a_table_only_as_large_as_its_work() {
+        // Every cell of the table is spent before it is taken: a run of
+        // blank lines just within the budget pairs, one just past it
+        // refuses at once, not held in memory.
         let keys = |count: usize| -> [Vec<String>; 2] {
             let lines = vec![String::new(); count];
             [lines.clone(), lines]
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
         let small = (keys(3), keys(2));
-        assert_eq!(
-            blank_lines(&small.0, &small.1, &(0..3), &(0..2), deadline),
-            Some(vec![(0, 0), (1, 1)])
-        );
-        let side = 1 << 11;
+        let pairs =
+            |budget| blank_lines(&small.0, &small.1, &(0..3), &(0..2), &mut Work::new(budget));
+        assert_eq!(pairs(12), Some(vec![(0, 0), (1, 1)]));
+        assert_eq!(pairs(11), None);
+        // The largest square run the default budget holds pairs whole.
+        let side = (1 << 10) - 1;
         let large = keys(side);
+        let mut work = Work::new(FORMATTING_DIFF_BUDGET);
+        let paired = blank_lines(&large, &large, &(0..side), &(0..side), &mut work);
+        assert_eq!(paired.map(|pairs| pairs.len()), Some(side));
+        let side = 1 << 10;
+        let large = keys(side);
+        let mut work = Work::new(FORMATTING_DIFF_BUDGET);
         assert_eq!(
-            blank_lines(&large, &large, &(0..side), &(0..side), deadline),
+            blank_lines(&large, &large, &(0..side), &(0..side), &mut work),
             None
         );
-        // And so the whole answer, however much time it has.
+        // And so the whole answer.
         let virtual_text = format!("  a\n{}", "\n".repeat(side));
         let map = dedent_lines(&virtual_text, &[2]);
         let formatted = format!("b\n{}", "\n".repeat(side));
         let answer = [edit((0, 0), (side as u32 + 1, 0), &formatted)];
-        assert_eq!(
-            map.map_edits_within(&answer, EditMode::Formatting, Duration::from_secs(10)),
-            None
-        );
+        assert_eq!(map.map_edits(&answer, EditMode::Formatting), None);
     }
 
     #[test]
@@ -3393,9 +3473,9 @@ mod formatting {
         let answer = [edit((0, 0), (2, 0), "if x:\n  y\n")];
         assert_eq!(map.map_edits(&answer, EditMode::Formatting), Some(vec![]));
         assert_eq!(map.map_edits(&[], EditMode::Formatting), Some(vec![]));
-        // Nothing to diff: not refused for want of time.
+        // Nothing to diff: not refused for want of work.
         assert_eq!(
-            map.map_edits_within(&answer, EditMode::Formatting, Duration::ZERO),
+            map.map_edits_within(&answer, EditMode::Formatting, 0),
             Some(vec![])
         );
     }
@@ -3501,7 +3581,6 @@ mod formatting_reference {
     use proptest::prelude::*;
     use proptest::test_runner::{Config, TestCaseError, TestRunner};
     use std::cell::Cell;
-    use std::time::Duration;
 
     const BODIES: [&str; 5] = ["a", "é", "𝄞x", "b c", "if x:"];
 
@@ -4021,7 +4100,7 @@ mod formatting_reference {
     /// Run `cases` generated answers mapped with `budget`, checking each
     /// accepted one against [`reference`]; how many were mapped, and how
     /// many of those changed P.
-    fn check(budget: Duration, cases: u32) -> (usize, usize) {
+    fn check(budget: usize, cases: u32) -> (usize, usize) {
         let mut runner = TestRunner::new(Config {
             cases,
             failure_persistence: None,
@@ -4064,11 +4143,11 @@ mod formatting_reference {
                     prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
                     let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
                     else {
-                        // Refused with time enough: an answer the host
+                        // Refused with work enough: an answer the host
                         // cannot take, or (rarely) one turning line breaks
                         // among several blank lines, whose pairing can meet
                         // a CR and an LF the check refuses.
-                        if budget > Duration::ZERO && reference(&document, &output).is_some() {
+                        if budget > 0 && reference(&document, &output).is_some() {
                             over_refused.set(over_refused.get() + 1);
                         }
                         return Ok(());
@@ -4110,9 +4189,9 @@ mod formatting_reference {
     }
 
     #[test]
-    fn answers_whose_diff_runs_out_of_time_are_refused() {
+    fn answers_whose_diff_runs_out_of_work_are_refused() {
         // Only an answer changing nothing needs no diff.
-        let (mapped, changing) = check(Duration::ZERO, 1000);
+        let (mapped, changing) = check(0, 1000);
         assert_eq!(changing, 0, "mapped {mapped}");
         assert!(mapped > 0);
     }

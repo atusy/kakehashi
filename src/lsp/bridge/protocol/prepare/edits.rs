@@ -8,7 +8,6 @@
 //! are fine one by one cannot combine into a corruption of it.
 
 use std::ops::Range;
-use std::time::{Duration, Instant};
 
 use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
 
@@ -16,6 +15,10 @@ use super::{
     Bias, LineMap, PreparedMap, Run, RunKind, Side, empty_run, is_line_start, map_offset,
     map_offset_stopping, rest_of_line_blank, splits_crlf,
 };
+
+mod diff;
+
+use diff::{Work, char_hunks, patience_pairs};
 
 /// How a set of edits to P is read when mapped to V
 /// ([`PreparedMap::map_edits`]).
@@ -33,15 +36,18 @@ pub(crate) enum EditMode {
     Formatting,
 }
 
-/// How long the diff of a formatting answer may search, pairing lines and
-/// then the fewest changes within them (see [`EditMode::Formatting`]); the
-/// work around the search (applying the answer to P, the per-character
-/// tables, mapping each stretch) runs in time linear in the texts on top.
-/// An answer whose diff runs out of time is refused. Out of time, the diff
-/// falls back to coarser stretches, which can span lines the formatter left
-/// alone and would map them with the segment's indent, not their own. So
-/// the budget bears only on which answers are refused.
-const FORMATTING_DIFF_BUDGET: Duration = Duration::from_millis(200);
+/// How much work the diff of a formatting answer may do, pairing lines and
+/// then the fewest changes within them (see [`EditMode::Formatting`]),
+/// counted in steps of its searches (see [`Work`]); the work around the
+/// search (applying the answer to P, the per-character tables, mapping
+/// each stretch) runs in time linear in the texts on top. An answer whose
+/// diff runs out of work is refused, on any machine and under any load
+/// alike: the count, not a clock, decides. The tables the searches keep
+/// take a cell for each step spent, so this bounds their memory too (4
+/// bytes a cell, 4 MiB). Spent whole, it takes some 10 ms in a release
+/// build: little enough to run where the answer arrives, on the async
+/// runtime, rather than hand it to a blocking thread.
+const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 
 /// The indentation a mapped edit's first line regains.
 #[derive(Clone, Copy)]
@@ -88,13 +94,13 @@ impl PreparedMap {
         self.map_edits_within(edits, mode, FORMATTING_DIFF_BUDGET)
     }
 
-    /// [`Self::map_edits`], the diff of a formatting answer searching for
-    /// at most `budget`.
+    /// [`Self::map_edits`], the diff of a formatting answer doing at most
+    /// `budget` steps of work.
     pub(super) fn map_edits_within(
         &self,
         edits: &[TextEdit],
         mode: EditMode,
-        budget: Duration,
+        budget: usize,
     ) -> Option<Vec<TextEdit>> {
         match mode {
             EditMode::Extent => self.map_extents(edits),
@@ -104,7 +110,7 @@ impl PreparedMap {
 
     /// [`EditMode::Formatting`]: the edits applied to P, and each stretch
     /// the result differs from P in mapped as one edit.
-    fn map_formatting(&self, edits: &[TextEdit], budget: Duration) -> Option<Vec<TextEdit>> {
+    fn map_formatting(&self, edits: &[TextEdit], budget: usize) -> Option<Vec<TextEdit>> {
         let prepared = &self.prepared_lines.text;
         let (ranges, order) = sorted_extents(&self.prepared_lines, edits, true)?;
         let mut edited = String::with_capacity(prepared.len());
@@ -118,15 +124,16 @@ impl PreparedMap {
         if edited == *prepared {
             return Some(Vec::new());
         }
-        let deadline = Instant::now() + budget;
-        // `None` past what pairing blank lines may hold in memory.
-        let hunks = diff_hunks(prepared, &edited, deadline)?;
-        // The diff gives up only once it has seen the deadline pass: a diff
-        // finishing past it may have, and is not trusted (see
-        // `FORMATTING_DIFF_BUDGET`).
-        if Instant::now() >= deadline {
+        let mut work = Work::new(budget);
+        let Some(hunks) = diff_hunks(prepared, &edited, &mut work) else {
+            // Told apart from the refusals below, which the answer's shape
+            // decides: this one only its size does.
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Refused a formatting answer whose diff ran out of work ({budget} steps)"
+            );
             return None;
-        }
+        };
         // Each stretch maps on its own as an edit does: stretches touch only
         // where one writes over the start of a line another ends at (see
         // `diff_hunks`), each then on its own line.
@@ -861,21 +868,20 @@ struct Hunk {
     new: Range<usize>,
 }
 
-/// The stretches `new` differs from `old` in, until `deadline`. Lines are
+/// The stretches `new` differs from `old` in; `None` when `work` runs out
+/// (see `FORMATTING_DIFF_BUDGET`). Lines are
 /// paired first (see [`align_lines`]): a line of text with the line it was
 /// rewritten from, blank lines among themselves, lines joined onto another
 /// with that one. Each pair, and each run of lines left between pairs, is
 /// then diffed by character. So a stretch never covers a line both texts
 /// hold alike, nor does a character diff align text of one line with text
 /// of another; either would map that text as written on the wrong line,
-/// with that line's indent. Past the deadline the diffs give coarser
-/// stretches, which still turn `old` into `new` (see
-/// `FORMATTING_DIFF_BUDGET`). A stretch never starts or ends between a CR
+/// with that line's indent. A stretch never starts or ends between a CR
 /// and its LF in either text (no LSP position names that place): it widens
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
-fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Option<Vec<Hunk>> {
+fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Option<Vec<Hunk>> {
     let old_lines = lines_with_breaks(old);
     let new_lines = lines_with_breaks(new);
     let line_start = |lines: &[(usize, &str)], text: &str, index: usize| {
@@ -893,17 +899,15 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Option<Vec<Hunk>> {
     };
     let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
     let mut aligned = Vec::new();
-    if !align_lines(
+    align_lines(
         &old_keys,
         &new_keys,
         0,
         0..old_lines.len(),
         0..new_lines.len(),
-        deadline,
+        work,
         &mut aligned,
-    ) {
-        return None;
-    }
+    )?;
     let block = |lines: &[(usize, &str)], text: &str, range: Range<usize>| {
         line_start(lines, text, range.start)..line_start(lines, text, range.end)
     };
@@ -934,16 +938,7 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Option<Vec<Hunk>> {
         };
         let old_values: Vec<char> = old_chars.iter().map(|&(_, c)| c).collect();
         let new_values: Vec<char> = new_chars.iter().map(|&(_, c)| c).collect();
-        for op in similar::capture_diff_slices_deadline(
-            similar::Algorithm::Myers,
-            &old_values,
-            &new_values,
-            Some(deadline),
-        ) {
-            if matches!(op, similar::DiffOp::Equal { .. }) {
-                continue;
-            }
-            let (old_range, new_range) = (op.old_range(), op.new_range());
+        for (old_range, new_range) in char_hunks(&old_values, &new_values, work)? {
             let mut old_bytes = byte_at(&old_chars, old_block.end, old_range.start)
                 ..byte_at(&old_chars, old_block.end, old_range.end);
             let mut new_bytes = byte_at(&new_chars, new_block.end, new_range.start)
@@ -998,8 +993,9 @@ fn diff_hunks(old: &str, new: &str, deadline: Instant) -> Option<Vec<Hunk>> {
 #[derive(Clone, Copy)]
 enum Alignment {
     /// Lines whose keys (0: the text without its break; 1: that trimmed of
-    /// whitespace) a diff finds alike, among the lines whose key passes.
-    Diff(usize, similar::Algorithm, fn(&str) -> bool),
+    /// whitespace) a patience diff finds alike, among the lines whose key
+    /// passes.
+    Diff(usize, fn(&str) -> bool),
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
@@ -1027,28 +1023,23 @@ enum Alignment {
 /// the run's diff writes on a whitespace line the peer kept gains no
 /// indent, as typed text there does.
 const ALIGNMENTS: [Alignment; 3] = [
-    Alignment::Diff(1, similar::Algorithm::Patience, |key| !key.is_empty()),
+    Alignment::Diff(1, |key| !key.is_empty()),
     Alignment::Joined,
     Alignment::Blanks,
 ];
 
-/// How many cells the table pairing blank lines may take (4 bytes each): a
-/// run of blank lines beyond that, its table quadratic in them, refuses
-/// the answer rather than hold the memory.
-const BLANK_PAIRING_CELLS: usize = 1 << 22;
-
 /// Pairs of the blank lines of `old_range` with those of `new_range`, in
 /// order: as many as an alignment of them can pair, and among those, as
 /// many pairs alike to the whitespace as can be. Lines of text take no
-/// part. Quadratic in the blank lines: past `deadline` it pairs nothing,
-/// for the answer to be refused; `None`, to refuse it at once, when its
-/// table would outgrow `BLANK_PAIRING_CELLS`.
+/// part. Its table is quadratic in the blank lines, every cell spent from
+/// `work` before it is taken: `None`, to refuse the answer, when there is
+/// not as much.
 fn blank_lines(
     old_keys: &[Vec<String>; 2],
     new_keys: &[Vec<String>; 2],
     old_range: &Range<usize>,
     new_range: &Range<usize>,
-    deadline: Instant,
+    work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
     let blanks = |keys: &[Vec<String>; 2], range: &Range<usize>| -> Vec<usize> {
         range
@@ -1057,9 +1048,7 @@ fn blank_lines(
             .collect()
     };
     let (old, new) = (blanks(old_keys, old_range), blanks(new_keys, new_range));
-    if (old.len() + 1).saturating_mul(new.len() + 1) > BLANK_PAIRING_CELLS {
-        return None;
-    }
+    work.spend((old.len() + 1).saturating_mul(new.len() + 1))?;
     // Alike to the whitespace, holding some: empty lines are all alike, and
     // say nothing of which is which.
     let alike = |old_line: usize, new_line: usize| {
@@ -1067,14 +1056,14 @@ fn blank_lines(
     };
     // score[i][j]: the best of old[i..] against new[j..], by the count of
     // pairs, then of pairs alike: a pair counts `pair`, more than every
-    // pair alike together, and a pair alike 1 more. (Below the cell cap,
-    // the shorter side holds at most 2048 lines: no overflow.)
-    let pair = u32::try_from(old.len().min(new.len())).unwrap_or(u32::MAX - 1) + 1;
+    // pair alike together, and a pair alike 1 more. A score is at most
+    // `pair` squared less one; a side too long for that to fit (far past
+    // the default budget) refuses rather than overflow.
+    let pair = u32::try_from(old.len().min(new.len()) + 1)
+        .ok()
+        .filter(|pair| pair.checked_mul(*pair).is_some())?;
     let mut score = vec![vec![0u32; new.len() + 1]; old.len() + 1];
     for i in (0..old.len()).rev() {
-        if Instant::now() >= deadline {
-            return Some(Vec::new());
-        }
         for j in (0..new.len()).rev() {
             let alike = alike(old[i], new[j]);
             let paired = score[i + 1][j + 1] + pair + u32::from(alike);
@@ -1101,38 +1090,41 @@ fn blank_lines(
 /// after it, in order: the first such old line for each new line, past the
 /// one paired before.
 ///
-/// The search is quadratic in the lines left unpaired: it stops at
-/// `deadline`, as the diffs do, for the answer to be refused.
+/// The search is quadratic in the lines left unpaired, each comparison
+/// spent from `work`: `None`, to refuse the answer, when it runs out.
 fn joined_lines(
     old_keys: &[Vec<String>; 2],
     new_keys: &[Vec<String>; 2],
     old_range: &Range<usize>,
     new_range: &Range<usize>,
-    deadline: Instant,
-) -> Vec<(usize, usize)> {
+    work: &mut Work,
+) -> Option<Vec<(usize, usize)>> {
     let mut pairs = Vec::new();
     let mut old_from = old_range.start;
     for new_line in new_range.clone() {
-        if Instant::now() >= deadline {
-            break;
-        }
         let written = &new_keys[1][new_line];
-        if let Some(old_line) = (old_from..old_range.end).find(|&old_line| {
-            let text = &old_keys[1][old_line];
-            !text.is_empty() && written.starts_with(text.as_str())
-        }) {
-            pairs.push((old_line, new_line));
-            old_from = old_line + 1;
+        for (old_line, text) in old_keys[1]
+            .iter()
+            .enumerate()
+            .take(old_range.end)
+            .skip(old_from)
+        {
+            work.spend(1)?;
+            if !text.is_empty() && written.starts_with(text.as_str()) {
+                pairs.push((old_line, new_line));
+                old_from = old_line + 1;
+                break;
+            }
         }
     }
-    pairs
+    Some(pairs)
 }
 
 /// Pair the lines of `old_range` with those of `new_range` at
 /// `ALIGNMENTS[level]`, and each looser one between the pairs it finds:
 /// `aligned` is given in order every pair (one line each) and every run
-/// left between pairs (to diff by character); `false` when a stage refuses
-/// the answer (see [`blank_lines`]). `keys` are each line's text
+/// left between pairs (to diff by character); `None` when `work` runs
+/// out. `keys` are each line's text
 /// without its break, then trimmed of whitespace. A line joined onto
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
@@ -1142,26 +1134,21 @@ fn align_lines(
     level: usize,
     old_range: Range<usize>,
     new_range: Range<usize>,
-    deadline: Instant,
+    work: &mut Work,
     aligned: &mut Vec<(Range<usize>, Range<usize>)>,
-) -> bool {
+) -> Option<()> {
     if old_range.is_empty() || new_range.is_empty() {
         aligned.push((old_range, new_range));
-        return true;
+        return Some(());
     }
     let Some(&alignment) = ALIGNMENTS.get(level) else {
         aligned.push((old_range, new_range));
-        return true;
+        return Some(());
     };
     let pairs: Vec<(usize, usize)> = match alignment {
-        Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, deadline),
-        Alignment::Blanks => {
-            match blank_lines(old_keys, new_keys, &old_range, &new_range, deadline) {
-                Some(pairs) => pairs,
-                None => return false,
-            }
-        }
-        Alignment::Diff(keys, algorithm, takes_part) => {
+        Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, work)?,
+        Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, work)?,
+        Alignment::Diff(keys, takes_part) => {
             let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
                 range
                     .clone()
@@ -1170,8 +1157,7 @@ fn align_lines(
             };
             let old_candidates = candidates(&old_keys[keys], &old_range);
             let new_candidates = candidates(&new_keys[keys], &new_range);
-            similar::capture_diff_slices_deadline(
-                algorithm,
+            patience_pairs(
                 &old_candidates
                     .iter()
                     .map(|&index| &old_keys[keys][index])
@@ -1180,28 +1166,24 @@ fn align_lines(
                     .iter()
                     .map(|&index| &new_keys[keys][index])
                     .collect::<Vec<_>>(),
-                Some(deadline),
-            )
+                work,
+            )?
             .into_iter()
-            .filter(|op| matches!(op, similar::DiffOp::Equal { .. }))
-            .flat_map(|op| op.old_range().zip(op.new_range()))
             .map(|(old_at, new_at)| (old_candidates[old_at], new_candidates[new_at]))
             .collect()
         }
     };
     let (mut old_at, mut new_at) = (old_range.start, new_range.start);
     for (old_line, new_line) in pairs {
-        if !align_lines(
+        align_lines(
             old_keys,
             new_keys,
             level + 1,
             old_at..old_line,
             new_at..new_line,
-            deadline,
+            work,
             aligned,
-        ) {
-            return false;
-        }
+        )?;
         aligned.push((old_line..old_line + 1, new_line..new_line + 1));
         (old_at, new_at) = (old_line + 1, new_line + 1);
     }
@@ -1211,7 +1193,7 @@ fn align_lines(
         level + 1,
         old_at..old_range.end,
         new_at..new_range.end,
-        deadline,
+        work,
         aligned,
     )
 }
