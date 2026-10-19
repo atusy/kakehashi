@@ -282,7 +282,7 @@ lines is a line of its own whenever a blank line of the answer could be the
 line it would otherwise be written on, not text written on one
 (which, on a whitespace line the peer kept, would regain no indentation and
 lose the formatter's relative indentation); then, where the answer removed
-no blank line, lines of text in order from either end of what is left
+no whitespace line the peer kept, lines of text in order from either end of what is left
 while their letters and digits are alike (a line whose quotes or
 punctuation a formatter rewrote is the line it was). Each pair, and each
 run of lines left between pairs, is then diffed by character. A run

@@ -1194,7 +1194,7 @@ enum Alignment {
 ///   alignments pairing as many, the one with the most pairs alike to the
 ///   whitespace (a kept whitespace line kept as it was).
 /// - Lines of text in order from either end of what is left (where
-///   the answer removed no blank line), while they
+///   the answer removed no whitespace line the peer kept), while they
 ///   are alike in their letters and digits: a line whose quotes,
 ///   separators or punctuation a formatter rewrote (`f('a')` to
 ///   `f("a");`) is the line it was, however many lines it rewrote.
@@ -1332,9 +1332,10 @@ fn joined_lines(
 /// digits are alike, then from the end the same way. Only lines at the
 /// same place from an end pair: a line no later than where the two texts
 /// part ways is the line it was there. None where the old side holds a
-/// blank line: the answer removed it (the blank-line stage paired every
-/// one it could), and the run's text is left whole to diff without it
-/// (see [`push_run`]), lest a line it split be read as written on it.
+/// whitespace line the peer kept: the answer removed it (the blank-line
+/// stage paired every one it could), and the run's text is left whole to
+/// diff without it (see [`runs_to_diff`]), lest a line it split be left
+/// alone where that line was, written on it or in its place.
 fn alike_ends(
     old_keys: &LineKeys,
     new_keys: &LineKeys,
@@ -1343,7 +1344,10 @@ fn alike_ends(
     work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
     work.spend(old_range.len() + new_range.len())?;
-    if old_range.clone().any(|line| old_keys[1][line].is_empty()) {
+    if old_range
+        .clone()
+        .any(|line| old_keys[1][line].is_empty() && !old_keys[0][line].is_empty())
+    {
         return Some(Vec::new());
     }
     let text = |keys: &LineKeys, range: &Range<usize>| -> Vec<usize> {
