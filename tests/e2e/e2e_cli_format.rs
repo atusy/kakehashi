@@ -934,8 +934,9 @@ languages = ["lua"]
 #[test]
 fn e2e_format_formats_a_region_its_prepare_peer_prepared() {
     // The same region, prepared by its peer (dedented), is formatted: the
-    // formatter's answer maps back with the indentation restored.
-    let markdown = "# Test\n\n```lua\n  print('ok')\n```\n";
+    // formatter's answer maps back with the indentation restored, on the
+    // line it breaks off too (unprepared, that line would lose it).
+    let markdown = "# Test\n\n```lua\n  local x = 1; local y = 2\n```\n";
     let ws = workspace_with(&[("doc.md", markdown)]);
     std::fs::write(
         ws.path().join("kakehashi.toml"),
@@ -953,7 +954,7 @@ cmd = ['{bin}', 'prepare-peer']
 languages = ["lua"]
 
 [languageServers.mock-upper]
-cmd = ['{bin}', 'upper']
+cmd = ['{bin}', 'echo-document']
 languages = ["lua"]
 "#,
             bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
@@ -979,7 +980,7 @@ languages = ["lua"]
     );
     assert_eq!(
         read(ws.path(), "doc.md"),
-        "# Test\n\n```lua\n  PRINT('OK')\n```\n"
+        "# Test\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n"
     );
 }
 

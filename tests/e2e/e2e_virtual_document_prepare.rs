@@ -521,6 +521,37 @@ fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
 }
 
 #[test]
+fn on_type_formatting_with_the_caret_in_a_removed_indent_is_answered() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/on-type-indent.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // The caret inside the indent the peer removed has no place of its own
+    // in the prepared text: it is sent as its line's start there, and the
+    // answer maps back as from anywhere else.
+    let response = client.send_request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 1 },
+            "ch": ";",
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        "{response}"
+    );
+}
+
+#[test]
 fn the_concatenated_pipeline_formats_a_prepared_document() {
     let (mut client, _dir) = Setup {
         concatenated: true,
@@ -623,11 +654,12 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
 fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format-early.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
     open(&mut client, uri, text);
 
     // At once: the answer is not in yet. The request waits for it and
-    // formats the prepared text, its edits mapped back.
+    // formats the prepared text, its edits mapped back: the line the
+    // formatter breaks off regains the indent (unprepared, it would not).
     let response = client.send_request(
         "textDocument/formatting",
         json!({
@@ -641,7 +673,7 @@ fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
         .unwrap_or_else(|| panic!("{response}"));
     assert_eq!(
         apply_edits(text, &edits),
-        "# t\n\n```lua\n  LOCAL X = 1\n```\n",
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
         "{response}"
     );
 }
