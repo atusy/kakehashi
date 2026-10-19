@@ -40,15 +40,24 @@ impl Kakehashi {
             )
             .await?;
         // The final answer chosen: its edits checked once more against the
-        // host text, which may have moved while it was held. A stale one is
-        // no answer.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        Ok(answer.and_then(|sourced| {
-            sourced
-                .still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-                .then_some(sourced.value)
-        }))
+        // host text, which may have moved while it was held, once the host's
+        // last edit settled (see `formatting_sources_current`). A stale one
+        // is no answer.
+        let Some(sourced) = answer else {
+            return Ok(None);
+        };
+        let verdict = self
+            .sources_verdict(&lsp_uri, std::iter::once(&sourced))
+            .await;
+        if verdict != super::formatting::Verdict::Current {
+            log::debug!(
+                target: "kakehashi::formatting",
+                "on-type formatting result for {} dropped: {verdict}",
+                lsp_uri.as_str()
+            );
+            return Ok(None);
+        }
+        Ok(Some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the typed character.

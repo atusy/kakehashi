@@ -81,6 +81,7 @@ pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
+pub(crate) use protocol::PREPARE_TIMEOUT;
 #[cfg(test)]
 pub(crate) use protocol::PreparedDocument;
 pub(crate) use protocol::PreparedMap;

@@ -359,7 +359,8 @@ The answer is checked against:
   dropped;
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
-  host's newer text waits for its prepare answer — dropped;
+  host's newer text waits for its prepare answer — dropped, but for the
+  formatting methods, which wait for that to clear (see below);
 - the peer failed the request's input (see Failure; a reply arriving
   after that is refused whole, and one the failure lands under keeps no
   edit) — dropped;
@@ -377,7 +378,15 @@ stay shown without their edits. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
 fan-in would fall through to a server ranked below it whose reply came once
-the host settled. Moved, the whole answer is dropped (the host's own
+the host settled. Nor does formatting drop an answer for the host's last
+edit not having settled yet, or a region held for its prepare answer:
+formatting, range and on-type formatting each come once per action (an
+on-type trigger, a save), so an answer dropped for that would not be asked
+again. The final check waits, as a request waits for its text (up to the
+prepare timeout), until the edit settles and the hold clears, then judges
+the answer as above; the host edited meanwhile, it is dropped at once as
+moved, and one that never settles is dropped when the wait ends. The
+warning says which. Moved, the whole answer is dropped (the host's own
 formatter's edits and those of regions still current too) and the request is counted failed, so `kakehashi format`
 exits 2 and writes nothing (range and on-type formatting, which no one-shot
 run makes, answer nothing). A reply its map refuses counts as that server
@@ -389,10 +398,12 @@ dropped, not kept stale. How an edit maps back depends on the whole text
 — which lines are blank, what an inserted line joins, which indentation
 a created line regains — so no text but the request's is known to place
 it as the server meant, and a stale edit could land in indentation the
-host has and P never showed. Clients ask again on every keystroke, so the
-answer for the latest text still arrives and is kept: the cost is
-availability (an answer within a keystroke's parse and prepare
-round-trip), never a misplaced edit.
+host has and P never showed. For completion, color presentations and
+inlay hints clients ask again on every keystroke, so the answer for the
+latest text still arrives and is kept: the cost is availability (an answer
+within a keystroke's parse and prepare round-trip), never a misplaced
+edit. The formatting methods, asked once per action, wait for the host to
+settle instead (see above).
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
