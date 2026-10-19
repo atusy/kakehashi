@@ -61,8 +61,9 @@ impl std::fmt::Display for FormattingRefusal {
 /// diff runs out of work is refused, on any machine and under any load
 /// alike: the count, not a clock, decides. Everything the searches keep
 /// is spent before it is taken, a step for each cell of a table and for
-/// each element they index, so their memory is linear in the budget (a
-/// few tens of MiB at most) besides what is linear in the texts. Hashing
+/// each element they index, so their memory is linear in the budget
+/// (`FORMATTING_DIFF_BUDGET_CAP` bounds it whatever the texts) besides what
+/// is linear in the texts. Hashing
 /// or comparing a line's text whole costs a step for every
 /// `BYTES_PER_STEP` bytes of it, so long lines spend the budget as they
 /// cost time; with lines of usual length, spending this fixed part whole
@@ -74,6 +75,11 @@ impl std::fmt::Display for FormattingRefusal {
 /// past the scan for what is alike. It runs where the answer arrives, on
 /// the async runtime, rather than on a blocking thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
+
+/// The most a formatting answer's diff may spend, the per-byte allowance
+/// included: the tables its searches keep take a cell per step (4 bytes),
+/// some 64 MiB at most however large the texts.
+const FORMATTING_DIFF_BUDGET_CAP: usize = 1 << 24;
 
 /// How many bytes a step of work covers where the searches hash or compare
 /// a line's text whole: such a step costs its length, not one.
@@ -237,7 +243,13 @@ impl PreparedMap {
             return Ok(Vec::new());
         }
 
-        let budget = budget.saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()));
+        let budget = budget
+            .saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()))
+            .min(if per_byte > 0 {
+                FORMATTING_DIFF_BUDGET_CAP
+            } else {
+                usize::MAX
+            });
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
@@ -421,8 +433,11 @@ impl PreparedMap {
     fn mapped_edits_keep_host_text(&self, mapped: &[(Range<usize>, String)]) -> bool {
         let virtual_text = &self.virtual_lines.text;
         // Edits apart in P map apart (touching ones are refused or keep
-        // their order, see `map_edits`); the overlap check stays as the
-        // guard every later read of the sorted set relies on.
+        // their order, see `map_edits`), but stretches of a formatting
+        // answer that touch in P can overlap once mapped, each regaining an
+        // indent the other claims (see `map_formatting_within`): this check
+        // refuses those, and every later read of the sorted set relies on
+        // it.
         let mut sorted: Vec<&(Range<usize>, String)> = mapped.iter().collect();
         sorted.sort_by_key(|(range, _)| (range.start, range.end));
         if sorted
@@ -1580,8 +1595,8 @@ fn runs_to_diff(
 /// `ALIGNMENTS[level]`, and each looser one between the pairs it finds:
 /// `aligned` is given in order every pair (one line each) and every run
 /// left between pairs (to diff by character); `None` when `work` runs
-/// out. `keys` are each line's text
-/// without its break, then trimmed of whitespace. A line joined onto
+/// out. `old_keys` and `new_keys` are each line's keys (see
+/// [`LineKeys`]). A line joined onto
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
 fn align_lines(

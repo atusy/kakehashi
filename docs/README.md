@@ -956,8 +956,9 @@ regain the indentation the prepare server removed, and edits that would reach
 into host text the prepared document does not show are dropped (completion
 snippets are offered only when they are literal text; a formatting result
 that cannot be placed, or that rewrites a large region too heavily to
-compare within a fixed amount of work, counts as its server failing, and
-`kakehashi format` exits 2 when no other server formats the region). An
+compare within the work its size allows, counts as its server failing, and
+`kakehashi format` exits 2 when no other server formats the region; an
+on-type result that cannot be placed is no result, logged at debug). An
 answer to a request the document was edited after brings no edits: the
 editor's next request answers for the edited text. Code actions, rename and
 the other edit-producing methods are not available on a prepared document,

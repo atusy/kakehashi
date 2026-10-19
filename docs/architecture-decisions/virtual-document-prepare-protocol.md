@@ -213,26 +213,26 @@ not carried.
 An edit a server makes to P maps onto V keeping its extent: its range maps
 as positions do, except that a change starting at a line start that
 replaces, clears or deletes whole lines, or opens with a line break, also
-covers the indentation the peer removed from that line, and a change ending
-at a line start keeps that line's own removed indentation (the change takes
-it along and gives it back). Every line the edit's text begins regains the
-indentation the peer removed from the segment it lands in, provided every
-indentation the peer removed from the segment's content lines is the same
-(lines it left alone do not count, nor do whitespace-only lines, but in a
-segment holding nothing else); otherwise an edit creating a line of text
-that would regain it there is refused, since no single indentation is right
-(a blank line needs none, and the existing line an edit ends before keeps its
-own). A segment that says nothing of its
-indentation (no indentation removed, and no block of text opening a line
-of its own: the rest of a line after an interpolation, blank lines)
-regains the segment's before it. The document's deleted indentation-only
-last line (the indentation before a closing `''`) counts only in a segment
-of whitespace alone, with no other indentation removed and no closing
-lines deleted with it: a created line never takes host layout's
-indentation over the content's (nixfmt's shallower closing indent), nor
-any beside content left at column 0. Lines inserted at that last line's
-start are content lines: they go before its indentation, which the text
-after their last line break, if any, joins.
+covers the indentation the peer removed from that line, and a change
+ending at a line start keeps that line's own removed indentation (the
+change takes it along and gives it back). Every line the edit's text
+begins regains the indentation the peer removed from the segment it lands
+in, provided every indentation the peer removed from the segment's content
+lines is the same (lines it left alone do not count, nor do
+whitespace-only lines, but in a segment holding nothing else); otherwise
+an edit creating a line of text that would regain it there is refused,
+since no single indentation is right (a blank line needs none, and the
+existing line an edit ends before keeps its own). A segment that says
+nothing of its indentation (no indentation removed, and no block of text
+opening a line of its own: the rest of a line after an interpolation,
+blank lines) regains the segment's before it.
+The document's deleted indentation-only last line (the indentation before
+a closing `''`) counts only in a segment of whitespace alone, with no
+other indentation removed and no closing lines deleted with it: a created
+line never takes host layout's indentation over the content's (nixfmt's
+shallower closing indent), nor any beside content left at column 0. Lines
+inserted at that last line's start are content lines: they go before its
+indentation, which the text after their last line break, if any, joins.
 
 A set of edits the client applies together (a hint's `textEdits`, a
 completion item's or color presentation's main edit with its
@@ -266,58 +266,58 @@ deleted with them: P has no position inside them.
 
 A formatter's answer (formatting, range and on-type formatting, and the
 concatenated pipeline's result) is read as what it changes, not edit for
-edit: its edits are applied to P (an end at the start of the line just past
-P's last naming P's end, as whole-document answers do), the region's edge
-layout of P restored as for any document (but for an on-type answer, which
-keeps the edges as it writes them, typing being an edit, not a
-reformatting of the region), and the result diffed against
-P. Lines are paired first: a line of text with the line it was rewritten
-from (alike to the byte, then alike but for the whitespace around its
-text, a line found once in each text anchoring the rest), then one alike but for whitespace anywhere
-in it, the same way; then, between those, lines found as many times on
-each side (a `}` among several), by the fewest changes; then a line other
-lines were joined onto (found by looking up the old lines' texts, not
-comparing every pair); then blank lines with blank lines — as many as can pair, and of the
-alignments pairing as many, the one keeping most whitespace lines with ones
-holding the same whitespace, so that text the formatter writes beside blank
-lines is a line of its own whenever a blank line of the answer could be the
-line it would otherwise be written on, not text written on one
-(which, on a whitespace line the peer kept, would regain no indentation and
-lose the formatter's relative indentation); then lines of text in order
-from either end of what is left while their letters and digits are alike (a line whose quotes or
-punctuation a formatter rewrote is the line it was). An answer that
-writes a line of P more or fewer times, yet still writes it, is refused
-where P's copies of it have removed indents that differ, or one that is
-not the content's: which copy was kept, and which written anew, decides
-each one's indent, and no answer tells. A formatting answer breaking a
-line inside its text is refused where that line's own removed indent is
-not the content's, lest its rest move from where the line kept it
-(edits keeping their extents state where they go and are not so
-refused). Each pair, and each
-run of lines left between pairs, is then diffed by character. A run
+edit: its edits are applied to P (an end at the start of the line just
+past P's last naming P's end, as whole-document answers do), the region's
+edge layout of P restored as for any document (but for an on-type answer,
+which keeps the edges as it writes them, typing being an edit, not a
+reformatting of the region), and the result diffed against P. Lines are
+paired first: a line of text with the line it was rewritten from (alike to
+the byte, then alike but for the whitespace around its text, a line found
+once in each text anchoring the rest), then one alike but for whitespace
+anywhere in it, the same way; then, between those, lines found as many
+times on each side (a `}` among several), by the fewest changes; then a
+line other lines were joined onto (found by looking up the old lines'
+texts, not comparing every pair); then blank lines with blank lines — as
+many as can pair, and of the alignments pairing as many, the one keeping
+most whitespace lines with ones holding the same whitespace, so that text
+the formatter writes beside blank lines is a line of its own whenever a
+blank line of the answer could be the line it would otherwise be written
+on, not text written on one (which, on a whitespace line the peer kept,
+would regain no indentation and lose the formatter's relative
+indentation); then lines of text in order from either end of what is left
+while their letters and digits are alike (a line whose quotes or
+punctuation a formatter rewrote is the line it was). An answer that writes
+a line of P more or fewer times, yet still writes it, is refused where P's
+copies of it have removed indents that differ, or one that is not the
+content's: which copy was kept, and which written anew, decides each one's
+indent, and no answer tells. A formatting answer breaking a line inside
+its text is refused where that line's own removed indent is not the
+content's, lest its rest move from where the line kept it (edits keeping
+their extents state where they go and are not so refused). Each pair, and
+each run of lines left between pairs, is then diffed by character. A run
 holding lines of text on P's side is diffed without its blank lines, which
 go whole: its new text is that text rewritten, never text written on a
 blank line the answer removed (which would take that line's indentation,
-not the content's). A run of blank lines takes the answer's lines line
-for line where it holds as many there (not ending with a line break P
-lacks); with more or fewer, the blank lines went and the other lines are
-the content's. Text where an empty line was, or one the peer emptied,
-takes the content's indentation. Text where a whitespace line the peer
-kept was is refused, even typed right after that whitespace: in a
-whole-text answer, "typed on that line" is only how the diff aligned the
-text, which reads as well as a line written in its place, the kept line
-removed, and the two readings give different host text. (Edits that keep
-their extents, a completion's say, state where they go: text inserted
-after a kept line's whitespace is typed on that line, gaining no
-indentation.) Every stretch the
-result differs from P in maps as one edit does above; stretches touching at
-a line start stay apart where the later replaces some of that line's start
-with text, or where the earlier ends with a line break of P and the later
-replaces no line break. Of two stretches touching there, the first
-leaves the line's removed indentation to the second rather than take it
-along and give it back (the same text), so they do not both claim it. The
-set is then checked as a whole, as above. Which of several blank lines alike a line was written on, or which
-went, no answer tells: the run's diff decides.
+not the content's). A run of blank lines takes the answer's lines line for
+line where it holds as many there (not ending with a line break P lacks);
+with more or fewer, the blank lines went and the other lines are the
+content's. Text where an empty line was, or one the peer emptied, takes
+the content's indentation. Text where a whitespace line the peer kept was
+is refused, even typed right after that whitespace: in a whole-text
+answer, "typed on that line" is only how the diff aligned the text, which
+reads as well as a line written in its place, the kept line removed, and
+the two readings give different host text. (Edits that keep their extents,
+a completion's say, state where they go: text inserted after a kept line's
+whitespace is typed on that line, gaining no indentation.) Every stretch
+the result differs from P in maps as one edit does above; stretches
+touching at a line start stay apart where the later replaces some of that
+line's start with text, or where the earlier ends with a line break of P
+and the later replaces no line break. Of two stretches touching there, the
+first leaves the line's removed indentation to the second rather than take
+it along and give it back (the same text), so they do not both claim it.
+The set is then checked as a whole, as above. Which of several blank lines
+alike a line was written on, or which went, no answer tells: the run's
+diff decides.
 
 The diff has a budget counted in work, not time: each step of its searches
 (a comparison, a cell of a table, a diagonal followed) spends one, about a
@@ -329,15 +329,16 @@ whitespace first and diffs only what lies between them, so an answer that
 mostly moves whitespace (a pretty-printer's) costs work linear in the
 texts. An answer whose diff runs out of work is refused, and logged apart
 from the refusals its shape decides. The tables the searches keep (pairing
-blank lines takes one quadratic in them) are spent before they are
-taken, so their memory is linear in the budget. Whole lines alike at
-either end of P and the edited P are set aside first, uncharged, so the
+blank lines takes one quadratic in them) are spent before they are taken,
+so their memory is linear in the budget, which itself grows with the texts
+but stops at 2^24 steps: some 64 MiB of tables at most. Whole lines alike
+at either end of P and the edited P are set aside first, uncharged, so the
 work follows what the answer changes, not the region's size: a one-line
 answer costs its line in any region, and a 20,000-line region of half a
-megabyte rewritten whole maps in some 30 to 100 ms (release build). The
-diff runs where the answer arrives. So the budget decides only
-which answers are refused, never what an accepted one writes; a large
-region heavily rewritten may be refused.
+megabyte rewritten whole maps in some 30 to 100 ms (release build), so the
+diff runs where the answer arrives. The budget decides only which answers
+are refused, never what an accepted one writes; a large region heavily
+rewritten may be refused.
 
 An answer's edits are mapped only while they would land where the server
 meant them. This is read where an answer is chosen, not as each reply
@@ -388,9 +389,9 @@ asked to re-query), color presentations answer nothing, and inlay hints
 stay shown without their edits. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
-fan-in would fall through to a server ranked below it whose reply came once
-the host settled. Nor does formatting drop an answer for the host's last
-edit not having settled yet, or a region held for its prepare answer:
+fan-in would fall through to a server ranked below it whose reply came
+once the host settled. Nor does formatting drop an answer for the host's
+last edit not having settled yet, or a region held for its prepare answer:
 formatting, range and on-type formatting each come once per action (an
 on-type trigger, a save), so an answer dropped for that would not be asked
 again. The final check waits, as a request waits for its text (up to the
@@ -399,12 +400,16 @@ the answer as above; the host edited meanwhile, it is dropped at once as
 moved, and once nothing is left to settle or clear, an answer still not
 current (its region re-prepared to other coordinates, no longer tracked,
 its host reopened, its map revoked) is dropped at once as stale; one that
-never settles is dropped when the wait ends. The warning says which. Moved, the whole answer is dropped (the host's own
-formatter's edits and those of regions still current too) and the request is counted failed, so `kakehashi format`
-exits 2 and writes nothing (range and on-type formatting, which no one-shot
-run makes, answer nothing). A reply its map refuses counts as that server
-failing, as any failed reply does: `kakehashi format` exits 2 when no other
-server formats the region.
+never settles is dropped when the wait ends. The warning says which.
+Moved, the whole answer is dropped (the host's own formatter's edits and
+those of regions still current too) and the request is counted failed, so
+`kakehashi format` exits 2 and writes nothing (range and on-type
+formatting, which no one-shot run makes, answer nothing). A reply its map
+refuses counts as that server failing, as any failed reply does:
+`kakehashi format` exits 2 when no other server formats the region.
+On-type formatting is the exception: an answer refused, or dropped at the
+final check, is no answer, logged at debug, so that trigger keystrokes do
+not warn the user each time.
 
 Unlike on an unprepared document, an answer overtaken by typing is
 dropped, not kept stale. How an edit maps back depends on the whole text
@@ -702,10 +707,15 @@ a hook per kind of change.
   formatter meant. Peers dedenting evenly meet neither.
 - Text a formatter writes where a whitespace-only line the peer kept was is
   refused, typed after its whitespace or not: a whole-text answer does not
-  tell text typed on that line from a line written in its place. Where an
+  tell text typed on that line from a line written in its place. That is
+  text in the kept line's place line for line, or, where the answer holds
+  more or fewer lines there, text starting with exactly that line's
+  whitespace; text indented otherwise is a line of the content. Where an
   answer reads as well as a line of its own beside the blank lines, that
   reading is taken. On documents with kept whitespace lines, a geometry
-  sweep sees some 6 such refusals per 20,000 answers (about 0.03%).
+  sweep sees some 6 such refusals per 20,000 answers (about 0.03%); the
+  exact-text property, which writes on kept whitespace lines on purpose,
+  about 0.2% of its answers.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
