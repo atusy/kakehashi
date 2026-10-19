@@ -49,7 +49,7 @@ impl Kakehashi {
         let verdict = self
             .sources_verdict(&lsp_uri, std::iter::once(&sourced))
             .await;
-        if verdict != super::formatting::Verdict::Current {
+        if !verdict.keeps() {
             log::debug!(
                 target: "kakehashi::formatting",
                 "on-type formatting result for {} dropped: {verdict}",
