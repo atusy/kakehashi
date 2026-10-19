@@ -530,8 +530,11 @@ fn build_formatting_request(
 /// below it whose reply came once the host settled, against the configured
 /// order. An answer mapped through a map the host moved under is only ever
 /// discarded: the map is the one the server's text was prepared under, so
-/// mapping through it is well defined, and nothing reads the result before
-/// that check.
+/// mapping through it is well defined. Until that check, only the
+/// concatenated pipeline's later layers read the result: the host's own
+/// formatter is sent the text with these edits applied, a coherent text
+/// of the same snapshot, and its answer is discarded with the rest when
+/// the check fails.
 pub(super) fn formatting_answer_to_host(
     response: serde_json::Value,
     ctx: &BridgeResponseContext<'_>,
