@@ -3260,20 +3260,40 @@ mod formatting {
 
     #[test]
     fn lines_alike_with_indents_of_their_own_are_refused_when_the_answer_cannot_tell_them_apart() {
-        // `let s = "é";` twice, once dedented by two tabs, once left alone:
-        // the answer keeps one, and which it kept decides its indent.
+        // `let s = "é";` twice, once dedented by two tabs (with a space
+        // after), once left alone: the answer keeps the copy written as
+        // it was, the one with the space, whose indent comes back.
         let virtual_text = "\t\ta\rlet s = \"é\";\r\t\tlet s = \"é\"; \r\t\t)\r\t\tpass  \r";
         let map = dedent_lines(virtual_text, &[2, 0, 2, 2, 2]);
         let answer = [edit((0, 0), (5, 0), "let s = \"é\"; \r\n)\r\npass  \r\n")];
         assert_eq!(
-            map.map_formatting_answer(&answer),
-            Err(FormattingRefusal::Shape)
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("\t\tlet s = \"é\"; \r\n\t\t)\r\n\t\tpass  \r\n")
         );
         // ` }` left alone, the answer writing it twice: which copy is the
         // line the peer left alone no answer tells.
         let virtual_text = "    a\n }\n    b\n";
         let map = dedent_lines(virtual_text, &[4, 0, 4]);
         let answer = [edit((0, 0), (3, 0), "a\n }\n }\nb\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Two lines of P alike but for the whitespace before them, each
+        // left as it was: no copy is in doubt.
+        let virtual_text = "    x='a'\n    }\n  }\n    y='b'\n";
+        let map = dedent_lines(virtual_text, &[4, 4, 0, 4]);
+        let answer = [edit((0, 0), (4, 0), "x = \"a\"\n}\n  }\ny = \"b\"\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    x = \"a\"\n    }\n  }\n    y = \"b\"\n")
+        );
+        // One of two copies with indents of their own removed, the other
+        // kept among lines alike at the end: which was kept no answer
+        // tells.
+        let virtual_text = "\t\ta\nlet s;\n\t\tlet s;\n\t\tb\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2, 2]);
+        let answer = [edit((0, 0), (4, 0), "let s;\nb\n")];
         assert_eq!(
             map.map_formatting_answer(&answer),
             Err(FormattingRefusal::Shape)
