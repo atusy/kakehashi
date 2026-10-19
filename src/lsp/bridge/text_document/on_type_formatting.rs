@@ -27,7 +27,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_text_document_position_params,
 };
-use super::formatting::transform_on_type_formatting_response_to_host;
+use super::formatting::on_type_formatting_answer_to_host;
 
 impl LanguageServerPool {
     /// Send an onTypeFormatting request and wait for the response.
@@ -112,13 +112,8 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
-                transform_on_type_formatting_response_to_host(
-                    response,
-                    ctx.offset,
-                    virtual_content,
-                    region_end,
-                )
-                .map(Some)
+                on_type_formatting_answer_to_host(response, ctx, virtual_content, region_end)
+                    .map(Some)
             },
         )
         .await?

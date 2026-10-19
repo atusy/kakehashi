@@ -32,7 +32,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     translate_host_range_to_virtual,
 };
-use super::formatting::transform_formatting_response_to_host;
+use super::formatting::formatting_answer_to_host;
 
 impl LanguageServerPool {
     /// Send a `textDocument/rangeFormatting` request and wait for the response.
@@ -101,13 +101,7 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(
-                    response,
-                    ctx.offset,
-                    virtual_content,
-                    region_end,
-                )
-                .map(Some)
+                formatting_answer_to_host(response, ctx, virtual_content, region_end).map(Some)
             },
             downstream_id_probe,
         )
