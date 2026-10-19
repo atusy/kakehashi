@@ -313,9 +313,12 @@ mostly moves whitespace (a pretty-printer's) costs work linear in the
 texts. An answer whose diff runs out of work is refused, and logged apart
 from the refusals its shape decides. The tables the searches keep (pairing
 blank lines takes one quadratic in them) are spent before they are
-taken, so their memory is linear in the budget; time is linear in it and
-the texts, some 10 ms for the fixed part, and the diff runs where the
-answer arrives. So the budget decides only
+taken, so their memory is linear in the budget. Whole lines alike at
+either end of P and the edited P are set aside first, uncharged, so the
+work follows what the answer changes, not the region's size: a one-line
+answer costs its line in any region, and a 20,000-line region of half a
+megabyte rewritten whole maps in some 30 to 100 ms (release build). The
+diff runs where the answer arrives. So the budget decides only
 which answers are refused, never what an accepted one writes; a large
 region heavily rewritten may be refused.
 
