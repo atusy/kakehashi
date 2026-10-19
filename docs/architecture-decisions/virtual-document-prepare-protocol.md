@@ -338,13 +338,16 @@ The answer is checked against:
 
 Dropped, completion answers nothing (an empty incomplete list when it
 asked to re-query), color presentations answer nothing, and inlay hints
-stay shown without their edits. A formatting answer the host moved under,
-or one its map refuses, fails the request: refused per response, that
-server's answer counts as a failure; dropped when the final answer is
-chosen, all the answer's injected edits go (those of regions still current
-too) and the request is counted failed, so `kakehashi format` exits 2 and
-writes nothing (range and on-type formatting, which no one-shot run makes,
-answer without them).
+stay shown without their edits. Formatting reads whether the host moved
+under its answer only when the final answer is chosen, not as each reply
+arrives: refused there, a reply would count as its server failing, and the
+fan-in would fall through to a server ranked below it whose reply came once
+the host settled. Moved, the whole answer is dropped (the edits of regions
+still current too) and the request is counted failed, so `kakehashi format`
+exits 2 and writes nothing (range and on-type formatting, which no one-shot
+run makes, answer nothing). A reply its map refuses counts as that server
+failing, as any failed reply does: `kakehashi format` exits 2 when no other
+server formats the region.
 
 Unlike on an unprepared document, an answer overtaken by typing is
 dropped, not kept stale. How an edit maps back depends on the whole text

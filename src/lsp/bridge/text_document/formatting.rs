@@ -521,6 +521,17 @@ fn build_formatting_request(
 /// A formatting or range formatting answer arriving in `ctx`, in host
 /// coordinates: [`transform_formatting_response_to_host`] through
 /// `ctx.offset`.
+///
+/// Whether the host moved under a prepared answer since its request is not
+/// read here: the formatting fan-outs check every prepared region once, as
+/// the final answer is chosen (`Sourced::still_current`), which drops the
+/// answer whole. Refused here instead, the reply would count as its server
+/// failing, and the preferred fan-in would fall through to a server ranked
+/// below it whose reply came once the host settled, against the configured
+/// order. An answer mapped through a map the host moved under is only ever
+/// discarded: the map is the one the server's text was prepared under, so
+/// mapping through it is well defined, and nothing reads the result before
+/// that check.
 pub(super) fn formatting_answer_to_host(
     response: serde_json::Value,
     ctx: &BridgeResponseContext<'_>,
