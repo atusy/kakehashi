@@ -3077,6 +3077,19 @@ mod formatting {
         );
     }
 
+    #[test]
+    fn lines_repeating_a_lines_start_are_each_indented() {
+        // `x` begins two written lines: whichever the diff keeps as the
+        // old one, every line written gains the indent, none twice.
+        let virtual_text = "  x\n  y\n";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "xa\nq\nxb\ny\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  xa\n  q\n  xb\n  y\n")
+        );
+    }
+
     /// Minified JSON of at least `bytes`, and the same pretty-printed, two
     /// spaces a level: they differ only in whitespace.
     fn json_pair(bytes: usize) -> (String, String) {
