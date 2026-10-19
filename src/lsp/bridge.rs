@@ -87,6 +87,8 @@ pub(crate) use protocol::PreparedDocument;
 pub(crate) use protocol::PreparedMap;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
+#[cfg(test)]
+pub(crate) use protocol::Revocation;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::host_position_within_region_bounds;

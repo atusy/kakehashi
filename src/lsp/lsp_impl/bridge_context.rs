@@ -439,6 +439,15 @@ impl<T> Sourced<T> {
         self.prepared.is_some()
     }
 
+    /// Whether whether this answer is current may still change while the
+    /// host's content version stays put (see
+    /// `LanguageServerPool::host_settling`): never so without a map.
+    pub(crate) fn settling(&self, pool: &crate::lsp::bridge::LanguageServerPool) -> bool {
+        self.prepared.as_ref().is_some_and(|source| {
+            pool.host_settling(&source.host_uri, &source.language, &source.region_id)
+        })
+    }
+
     /// The host's content version the request's text was read at, for an
     /// answer mapped through a prepared map.
     pub(crate) fn request_content_version(&self) -> Option<u64> {

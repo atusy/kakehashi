@@ -387,8 +387,10 @@ on-type trigger, a save), so an answer dropped for that would not be asked
 again. The final check waits, as a request waits for its text (up to the
 prepare timeout), until the edit settles and the hold clears, then judges
 the answer as above; the host edited meanwhile, it is dropped at once as
-moved, and one that never settles is dropped when the wait ends. The
-warning says which. Moved, the whole answer is dropped (the host's own
+moved, and once nothing is left to settle or clear, an answer still not
+current (its region re-prepared to other coordinates, no longer tracked,
+its host reopened, its map revoked) is dropped at once as stale; one that
+never settles is dropped when the wait ends. The warning says which. Moved, the whole answer is dropped (the host's own
 formatter's edits and those of regions still current too) and the request is counted failed, so `kakehashi format`
 exits 2 and writes nothing (range and on-type formatting, which no one-shot
 run makes, answer nothing). A reply its map refuses counts as that server

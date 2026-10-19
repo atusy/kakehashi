@@ -637,6 +637,7 @@ impl Kakehashi {
                         .is_some_and(|version| Some(version) != now)
                 })
             },
+            || sources.clone().any(|source| source.settling(pool)),
             crate::lsp::bridge::PREPARE_TIMEOUT,
         )
         .await
@@ -2356,6 +2357,10 @@ pub(super) enum Verdict {
     /// The host's last edit did not settle, or a region stayed held, in
     /// time: the answer is not judged current.
     Unsettled,
+    /// Settled, the text unedited, a region it was mapped through is no
+    /// longer the request's: re-prepared to other coordinates, no longer
+    /// tracked, its host closed or reopened, or its map revoked.
+    Stale,
 }
 
 impl std::fmt::Display for Verdict {
@@ -2366,18 +2371,23 @@ impl std::fmt::Display for Verdict {
                 "the host text moved under a prepared virtual document it was mapped through"
             }
             Self::Unsettled => "the host text did not settle in time after its last edit",
+            Self::Stale => {
+                "a prepared virtual document it was mapped through is no longer the request's"
+            }
         })
     }
 }
 
 /// Judge an answer once it can be: `Current` as soon as `current` holds;
 /// `Moved` as soon as `moved` does (the host edited since the request read
-/// its text: no settling brings that back); otherwise the host's last edit
-/// is still settling, or a region held for its prepare answer, the text
-/// unchanged: wait, polling, until one holds, `Unsettled` past `within`.
+/// its text: no settling brings that back); `Stale` as soon as nothing is
+/// `settling` (no edit left to settle, no hold to clear: what `current`
+/// says stays so). Otherwise wait, polling, until one holds, `Unsettled`
+/// past `within`.
 pub(super) async fn settled_verdict(
     current: impl Fn() -> bool,
     moved: impl Fn() -> bool,
+    settling: impl Fn() -> bool,
     within: std::time::Duration,
 ) -> Verdict {
     let deadline = tokio::time::Instant::now() + within;
@@ -2387,6 +2397,9 @@ pub(super) async fn settled_verdict(
         }
         if moved() {
             return Verdict::Moved;
+        }
+        if !settling() {
+            return Verdict::Stale;
         }
         if tokio::time::Instant::now() >= deadline {
             return Verdict::Unsettled;
@@ -2458,6 +2471,7 @@ mod tests {
             let verdict = settled_verdict(
                 || held.still_current(&pool, &tracker, || Some(version.load(Ordering::SeqCst))),
                 || version.load(Ordering::SeqCst) != 1,
+                || held.settling(&pool),
                 std::time::Duration::from_secs(5),
             )
             .await;
@@ -2471,6 +2485,82 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// Staleness nothing can clear (the map revoked, the host reopened)
+    /// is judged at once, not polled until the wait ends: only an edit
+    /// left to settle, or a hold, is waited for.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_nothing_can_make_current_is_judged_at_once() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        for case in ["revoked", "reopened"] {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            let host = url::Url::parse("file:///test/stale.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                0,
+            );
+            assert!(held.still_current(&pool, &tracker, || Some(0)));
+            match case {
+                "revoked" => revocation.revoke(u64::MAX),
+                _ => pool.open_host_incarnation(&host, 2).await,
+            }
+            assert!(!held.settling(&pool), "{case}");
+            let start = tokio::time::Instant::now();
+            let verdict = settled_verdict(
+                || held.still_current(&pool, &tracker, || Some(0)),
+                || false,
+                || held.settling(&pool),
+                crate::lsp::bridge::PREPARE_TIMEOUT,
+            )
+            .await;
+            assert_eq!(verdict, Verdict::Stale, "{case}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_settles_once_its_last_edit_settles() {
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/settling.md").unwrap();
+        assert!(
+            !pool.host_settling(&host, "lua", "r"),
+            "nothing kept: settled"
+        );
+        pool.open_host_incarnation(&host, 1).await;
+        assert!(!pool.host_settling(&host, "lua", "r"));
+        pool.note_host_edited(&host, 1, 1);
+        assert!(pool.host_settling(&host, "lua", "r"), "edited, not settled");
+        pool.note_host_settled(&host, 1, 1);
+        assert!(!pool.host_settling(&host, "lua", "r"));
     }
 
     fn resolved_region(
