@@ -50,6 +50,11 @@
 //! - `slow-empty` — advertises formatting, range and on-type (`;`)
 //!   formatting, and answers each with no edits after a second and a half:
 //!   a slow host layer for a test to edit the host while it runs.
+//! - `empty-on-release` — `slow-empty`, but each formatting answer waits
+//!   for the file `MOCK_RELEASE_FILE` names to exist instead of a delay: a
+//!   barrier a test lifts once it has edited the host while a request runs.
+//!   (A `didChange` cannot be the barrier: the upstream forwards the host's
+//!   edit to this server only after its in-flight request is answered.)
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -351,7 +356,7 @@ fn main() {
                         "documentRangeFormattingProvider": true,
                         "textDocumentSync": 1
                     }),
-                    "slow-empty" => json!({
+                    "slow-empty" | "empty-on-release" => json!({
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
                         "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
@@ -2731,6 +2736,17 @@ fn main() {
                 if mode == "slow-empty" =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
+                respond(&mut writer, id, json!([]));
+            }
+            "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
+                if mode == "empty-on-release" =>
+            {
+                let release = std::env::var("MOCK_RELEASE_FILE").expect("MOCK_RELEASE_FILE");
+                while !std::path::Path::new(&release).exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
                 respond(&mut writer, id, json!([]));
             }
             "textDocument/onTypeFormatting" => {

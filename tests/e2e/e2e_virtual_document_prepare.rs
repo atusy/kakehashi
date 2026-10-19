@@ -54,6 +54,10 @@ struct Setup {
     /// Format markdown's lua documents with the concatenated pipeline (the
     /// echo mock its one step).
     concatenated: bool,
+    /// The mock mode of the `slow_host` server: `slow-empty`, or
+    /// `empty-on-release` to answer only once the test creates `release`
+    /// in its directory.
+    host_mode: &'static str,
 }
 
 impl Default for Setup {
@@ -69,6 +73,7 @@ impl Default for Setup {
             experimental: true,
             slow_host: None,
             concatenated: false,
+            host_mode: "slow-empty",
         }
     }
 }
@@ -119,7 +124,14 @@ impl Setup {
                 "KAKEHASHI_EXPERIMENTAL",
                 if self.experimental { "true" } else { "false" },
             )
-            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder);
+            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder)
+            .env(
+                "MOCK_RELEASE_FILE",
+                dir.path()
+                    .join("release")
+                    .to_str()
+                    .expect("UTF-8 release path"),
+            );
         if self.wire_log {
             builder = builder.env(
                 "MOCK_LSP_WIRE_LOG",
@@ -146,7 +158,7 @@ impl Setup {
         });
         if self.slow_host.is_some() {
             servers["slowhost"] = json!({
-                "cmd": [mock_bin(), "slow-empty"],
+                "cmd": [mock_bin(), self.host_mode],
                 "languages": ["markdown"]
             });
         }
@@ -611,9 +623,9 @@ fn formatting_params(method: &str, uri: &str) -> Value {
 }
 
 /// A formatting answer mapped through a prepared document is checked once
-/// more as the final answer is chosen: while the slow host layer still
-/// ran, the host was edited, and the virt edits the answer would carry are
-/// dropped. Without the edit, the same request answers with them.
+/// more as the final answer is chosen: while the host layer still ran, the
+/// host was edited, and the whole answer is dropped, without an error.
+/// Without the edit, the same request answers with the virt edits.
 #[test]
 fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
     let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
@@ -638,13 +650,49 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
             !edits.is_empty(),
             "{strategy} {method}, unedited: {response}"
         );
+        drop(client);
 
-        // The virt layer answers at once, the host layer after 1.5 s: edit
-        // the host (outside the region) while it runs.
+        // Now a host layer answering only when released. Edit the host
+        // (outside the region) once the host layer's request is out, and
+        // release it once the edit is in. The request read the host's
+        // version as it started, before either layer was sent: whether the
+        // virt layer's answer came before the edit or after the release,
+        // it is made for the text before the edit, and the answer chosen
+        // after the host layer's is checked against the edited host.
+        let (mut client, dir) = Setup {
+            slow_host: Some(strategy),
+            host_mode: "empty-on-release",
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
         let id = client.send_request_async(method, formatting_params(method, uri));
-        std::thread::sleep(Duration::from_millis(600));
+        let wire = dir.path().join("wire.log");
+        let host_request = format!("{method}\t{uri}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == host_request)
+        {
+            assert!(
+                Instant::now() < until,
+                "{strategy} {method}: host request not sent: {}",
+                std::fs::read_to_string(&wire).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+        // A request after the edit is answered once the edit is in.
+        hover(&mut client, uri, 0, 0);
+        std::fs::write(dir.path().join("release"), "").expect("release the host layer");
         let response = client.receive_response_for_id_public(id);
+        assert!(
+            response.get("error").is_none(),
+            "{strategy} {method}: {response}"
+        );
         let edits = response["result"].as_array().cloned().unwrap_or_default();
         assert!(edits.is_empty(), "{strategy} {method}, edited: {response}");
     }
