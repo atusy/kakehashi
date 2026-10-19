@@ -655,8 +655,9 @@ a hook per kind of change.
   (`f('a')` to `f("a");`, 20,000 lines). Pairing blank lines takes a table
   quadratic in the blank lines of one stretch no line of text anchors: an
   answer changing the letters of every line of text, with whitespace lines
-  between them, is refused from about 1,000 such text lines (some 2,000
-  lines in all). A step counts one comparison of two lines whatever their
+  between them, is refused from about 1,100 such text lines (some 2,200
+  lines in all); one that also collapses the blank lines between them (two
+  to one), from about 770 text lines. A step counts one comparison of two lines whatever their
   length, so time and memory also grow linearly with the texts' size.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
@@ -666,7 +667,8 @@ a hook per kind of change.
   an answer reads as well as a line of its own beside the blank lines, that
   reading is taken. Text replacing a kept whitespace line's own whitespace
   is refused, the answer not telling whether it was written there or in
-  the line's place.
+  the line's place: some 0.2% of the answers the exact-text property
+  generates, all of them answers no reading places for sure.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
