@@ -129,15 +129,34 @@ impl PreparedMap {
         }
         // Each stretch maps on its own as an edit does: stretches touch only
         // where one writes over the start of a line another ends at (see
-        // `diff_hunks`), each then on its own line; one taking a removed
-        // indent the other also claims is refused as an overlap once mapped.
-        let mapped = hunks
+        // `diff_hunks`), each then on its own line.
+        let mut mapped = hunks
             .into_iter()
             .map(|hunk| {
                 let following = prepared[hunk.old.end..].chars().next();
                 self.hunk_to_virtual(hunk.old, &edited[hunk.new], following)
             })
             .collect::<Option<Vec<_>>>()?;
+        // A stretch ending at a line start takes the removed indent there
+        // along and gives it back at its end; one starting there claims the
+        // same indent (a blank line inserted, a whitespace-only line
+        // cleared). The first need not: ending before the indent, and not
+        // giving it back, it writes the same text, and the two touch rather
+        // than overlap. Anything else overlapping is left for the set's
+        // check to refuse.
+        let virtual_text = &self.virtual_lines.text;
+        for at in 1..mapped.len() {
+            let next_start = mapped[at].0.start;
+            let (earlier, _) = mapped.split_at_mut(at);
+            let (range, new_text) = &mut earlier[at - 1];
+            if range.start <= next_start && next_start < range.end {
+                let taken = &virtual_text[next_start..range.end];
+                if new_text.ends_with(taken) {
+                    new_text.truncate(new_text.len() - taken.len());
+                    range.end = next_start;
+                }
+            }
+        }
         self.to_text_edits(mapped)
     }
 

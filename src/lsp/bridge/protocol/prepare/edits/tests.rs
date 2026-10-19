@@ -3288,6 +3288,67 @@ mod formatting {
     }
 
     #[test]
+    fn a_stretch_ending_at_a_line_start_leaves_its_indent_to_the_next() {
+        // A stretch ending at a dedented line's start takes that line's
+        // removed indent along and gives it back; one starting there (a
+        // blank line inserted, a whitespace-only line cleared) claims the
+        // same indent. They map to touching edits, not overlapping ones.
+        for (virtual_text, removed, formatted, expected) in [
+            ("  a\r\n  c\r\n", &[2, 2][..], "a\n\nc\n", "  a\n\n  c\n"),
+            (
+                "  a\r\n    \r\n  c\r\n",
+                &[2, 2, 2],
+                "a\n\nc\n",
+                "  a\n\n  c\n",
+            ),
+            (
+                "  a\n  c\n",
+                &[2, 2],
+                "a\r\n\r\nc\r\n",
+                "  a\r\n\r\n  c\r\n",
+            ),
+            ("  a\r  b\r", &[2, 2], "a\n\nb\n", "  a\n\n  b\n"),
+            (
+                "  a\n  b\n   \n  c\n",
+                &[2, 2, 2, 2],
+                "a b\n\nc\n",
+                "  a b\n\n  c\n",
+            ),
+            (
+                "  x = [\n    1,\n  ]\n    \n  c\n",
+                &[2, 2, 2, 2, 2],
+                "x = [1]\n\nc\n",
+                "  x = [1]\n\n  c\n",
+            ),
+        ] {
+            let map = dedent_lines(virtual_text, removed);
+            let lines = map.prepared_lines.text.lines().count() as u32 + 1;
+            let answer = [edit((0, 0), (lines, 0), formatted)];
+            assert_eq!(
+                formatted_either_way(&map, virtual_text, &answer).as_deref(),
+                Some(expected),
+                "{virtual_text:?} -> {formatted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_lines_rewritten_in_order_map_without_both_claiming_an_indent() {
+        // Blank lines rewritten in order: the empty line written ` ` (text
+        // on an empty line, taking the content's indent), the dedented ` `
+        // emptied. The stretches touch at the second line's start, each
+        // taking its removed indent along: mapped, they touch, not overlap.
+        let virtual_text = "\r\n     \n      q";
+        let map = dedent_lines(virtual_text, &[0, 4, 4]);
+        assert_eq!(map.prepared_lines.text, "\r\n \n  q");
+        let answer = [edit((0, 0), (3, 0), " \n\n  q")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("     \n\n      q")
+        );
+    }
+
+    #[test]
     fn lines_joined_keep_the_first_ones_indent() {
         // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
         let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";

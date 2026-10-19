@@ -282,8 +282,10 @@ lose the formatter's relative indentation). Each pair, and each run of lines
 left between pairs, is then diffed by character, and every stretch the
 result differs from P in maps as one edit does above; stretches touching at
 a line start stay apart where the later writes text there or changes only
-that line's leading whitespace. The set is then checked as a whole, as
-above. Which of several blank lines alike a line was written on, or which
+that line's leading whitespace. Of two stretches touching there, the first
+leaves the line's removed indentation to the second rather than take it
+along and give it back (the same text), so they do not both claim it. The
+set is then checked as a whole, as above. Which of several blank lines alike a line was written on, or which
 went, no answer tells: the run's diff decides.
 
 The diff has a budget (200 ms of search). An answer whose diff runs out of
