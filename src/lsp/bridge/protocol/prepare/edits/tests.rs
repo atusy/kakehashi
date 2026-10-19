@@ -3727,7 +3727,7 @@ mod formatting {
         );
         assert_eq!(pairs, Some(vec![]));
         // What bounds such an answer is the table pairing its whitespace
-        // lines, quadratic in them: some 1,000 fit the default budget.
+        // lines, quadratic in them: some 1,100 fit the default budget.
         let accepted = |count: usize| {
             let (old, new) = (texts(count, 'a'), texts(count, 'b'));
             let map = dedent_lines(&old, &[]);
