@@ -143,6 +143,36 @@ impl PreparedMap {
         self.map_formatting_within(edits, FORMATTING_DIFF_BUDGET, FORMATTING_DIFF_WORK_PER_BYTE)
     }
 
+    /// Whether a formatting answer of `edits` drops P's final line break
+    /// where the host's deleted closing (lines after the content, a closing
+    /// indent) follows it: mapped, it would edit that closing, taking its
+    /// indent off or writing a line on it. Answers whose edge layout is not
+    /// restored before they are mapped (on-type ones) are refused so.
+    pub(crate) fn drops_the_break_before_the_closing(&self, edits: &[TextEdit]) -> bool {
+        let prepared = &self.prepared_lines.text;
+        if !prepared.ends_with(['\n', '\r'])
+            || empty_run(&self.runs, prepared.len(), |kind| kind == RunKind::Deleted).is_none()
+        {
+            return false;
+        }
+        let Some((ranges, order)) = sorted_extents(&self.prepared_lines, edits, true) else {
+            return false;
+        };
+        // What ends the edited P: the last edit's text if it reaches P's end,
+        // else P's own end.
+        match order.last() {
+            Some(&last) if ranges[last].end == prepared.len() => {
+                let text = &edits[last].new_text;
+                if text.is_empty() {
+                    !prepared[..ranges[last].start].ends_with(['\n', '\r'])
+                } else {
+                    !text.ends_with(['\n', '\r'])
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// [`Self::map_formatting_answer`], the diff doing at most `budget`
     /// steps of work.
     #[cfg(test)]
@@ -201,6 +231,7 @@ impl PreparedMap {
         if edited == *prepared {
             return Ok(Vec::new());
         }
+
         let budget = budget.saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()));
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape

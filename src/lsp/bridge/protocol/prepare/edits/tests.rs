@@ -3337,6 +3337,34 @@ mod formatting {
         );
     }
 
+    #[rstest::rstest]
+    // The closing indent the peer removed with the last line.
+    #[case::closing_indent("  a\n  ", json!([
+        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+    ]), "a")]
+    #[case::nixfmt("    a\n  ", json!([
+        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""},
+        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+    ]), "a\nb")]
+    fn an_answer_dropping_ps_final_line_break_before_a_deleted_closing_is_told(
+        #[case] virtual_text: &str,
+        #[case] changes: serde_json::Value,
+        #[case] answer: &str,
+    ) {
+        // Formatting answers keep P's edges, restored before mapping; an
+        // on-type answer does not: one dropping P's final line break would
+        // edit the closing the peer deleted (taking its indent off, or
+        // writing a line on it), which the on-type transform refuses.
+        let map = prepare(virtual_text, changes);
+        assert_eq!(map.prepared_lines.text, "a\n");
+        let answer = [edit((0, 0), (1, 0), answer)];
+        assert!(map.drops_the_break_before_the_closing(&answer));
+        // Keeping the break, it does not.
+        let kept = [edit((0, 0), (1, 0), "b\n")];
+        assert!(!map.drops_the_break_before_the_closing(&kept));
+    }
+
     #[test]
     fn text_where_a_kept_whitespace_line_was_is_refused() {
         // A line split, its second half joined onto the next across a kept
