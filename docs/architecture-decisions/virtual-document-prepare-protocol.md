@@ -268,7 +268,9 @@ A formatter's answer (formatting, range and on-type formatting, and the
 concatenated pipeline's result) is read as what it changes, not edit for
 edit: its edits are applied to P (an end at the start of the line just past
 P's last naming P's end, as whole-document answers do), the region's edge
-layout of P restored as for any document, and the result diffed against
+layout of P restored as for any document (but for an on-type answer, which
+keeps the edges as it writes them, typing being an edit, not a
+reformatting of the region), and the result diffed against
 P. Lines are paired first: a line of text with the line it was rewritten
 from (alike but for the whitespace around its text, a line found once in
 each text anchoring the rest), then one alike but for whitespace anywhere

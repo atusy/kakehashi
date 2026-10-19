@@ -103,18 +103,15 @@ impl PreparedMap {
     /// V, as `mode` reads them (see [`EditMode`]), one for each in order (a
     /// formatting answer is read by [`Self::map_formatting_answer`]).
     ///
-    /// Every edit (in a formatting answer, every stretch the edited P
-    /// differs from P in) is mapped on its own, keeping its extent and
+    /// Every edit is mapped on its own, keeping its extent and
     /// restoring the indentation the peer removed from lines it creates or
     /// replaces. The mapped set is then checked as a whole against the host
     /// text V holds and P does not show (see
     /// [`Self::mapped_edits_keep_host_text`]). `None` — refuse the set — when
-    /// an edit is reversed, reaches a line past P's last (but for a
-    /// formatting answer's end at P's end), edits overlap in P or once mapped
-    /// (or, keeping their extents, touch where either's text bears on the
-    /// other), an edit reaches into a gap, a line of text created in content
-    /// has no single indentation to regain, or the host text would not
-    /// survive.
+    /// an edit is reversed, reaches a line past P's last, edits overlap in P
+    /// or once mapped (or touch where either's text bears on the other), an
+    /// edit reaches into a gap, a line of text created in content has no
+    /// single indentation to regain, or the host text would not survive.
     ///
     /// The host's own text, gaps and edge lines, is always kept; but on a
     /// map with gaps the indentation lines regain is not yet exact in some
@@ -186,8 +183,10 @@ impl PreparedMap {
         // decides: this one only its size does.
         let hunks = diff_hunks(prepared, &edited, &mut work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
-        // where one writes over the start of a line another ends at (see
-        // `diff_hunks`), each then on its own line.
+        // at a line start where the later replaces some of that line's start
+        // with text, or where the earlier ends with a line break of P and the
+        // later replaces no line break (see `diff_hunks`), each then on its
+        // own line.
         let mut mapped = hunks
             .into_iter()
             .map(|hunk| {
@@ -947,7 +946,7 @@ struct Hunk {
 /// rewritten from, blank lines among themselves, lines joined onto another
 /// with that one. Each pair that differs, and each run of lines left
 /// between pairs, is then diffed by character. So a stretch never covers
-/// a line both texts hold alike, and a character diff aligns text of one
+/// a line paired as alike, and a character diff aligns text of one
 /// line with text of another only within a run, among lines no pairing
 /// could tell apart; outside a run, either would map that text as written
 /// on the wrong line, with that line's indent. A stretch never starts or ends between a CR

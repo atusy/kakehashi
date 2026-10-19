@@ -942,7 +942,8 @@ fn range_formatting_does_not_wait_for_regions_outside_its_range() {
 #[test]
 fn without_experimental_features_formatting_answers_as_unprepared() {
     // With experimental features off, the formatting methods answer as on
-    // main: the edits' ranges translated, their text as the server wrote it
+    // any unprepared document: the edits' ranges translated, their text as
+    // the server wrote it
     // (the line the formatter breaks off regains no indent).
     let (mut client, _dir) = Setup {
         experimental: false,
