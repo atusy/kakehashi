@@ -3170,6 +3170,74 @@ mod formatting {
         }
     }
 
+    #[rstest::rstest]
+    // A kept whitespace line deleted, the next line rewritten.
+    #[case::kept("  a\n \n  b\n", &[2, 0, 2], "a\nB\n", "  a\n  B\n")]
+    // A whitespace line the peer cleared, deleted the same way.
+    #[case::cleared("  a\n   \n  b\n", &[2, 3, 2], "a\nB\n", "  a\n  B\n")]
+    // And with two lines made one beside it.
+    #[case::merged("  a\n \n  b\n  c\n", &[2, 0, 2, 2], "a\nB C\n", "  a\n  B C\n")]
+    fn text_is_never_written_on_a_whitespace_line_the_answer_removed(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+        #[case] expected: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split_inclusive('\n').count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::quotes(|index: usize| format!("x = 'a{index}'"), |index: usize| format!("x = \"a{index}\""))]
+    #[case::call(
+        |index: usize| format!("foo('a{index}', \"b\")"),
+        |index: usize| format!("foo(\"a{index}\", \"b\");")
+    )]
+    #[case::object(
+        |index: usize| format!("\"k{index}\":[1,2,{{'a':'b'}}],"),
+        |index: usize| format!("\"k{index}\": [1, 2, {{\"a\": \"b\"}}],")
+    )]
+    fn every_line_rewritten_in_place_maps_in_linear_work(
+        #[case] old_line: fn(usize) -> String,
+        #[case] new_line: fn(usize) -> String,
+    ) {
+        // No line alike to another but for whitespace, every one changed:
+        // lines alike in their letters and digits pair in order, each
+        // diffed on its own, however many there are. One line split in
+        // two in the middle leaves the lines on either side paired.
+        let count = 20_000;
+        let indented = |line: String| format!("  {line}\n");
+        let virtual_text: String = (0..count).map(old_line).map(indented).collect();
+        let map = dedent_lines(&virtual_text, &vec![2; count]);
+        let split = count / 2;
+        let formatted: String = (0..count)
+            .map(|index| {
+                let line = new_line(index);
+                if index == split {
+                    let (head, tail) = line.split_at(line.len() / 2);
+                    format!("{head}\n{tail}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        let answer = [edit((0, 0), (count as u32, 0), &formatted)];
+        let expected: String = formatted
+            .lines()
+            .map(|line| indented(line.to_string()))
+            .collect();
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
     /// `count` assignments written tight, and as a formatter spacing every
     /// one: the same text but for whitespace inside each line.
     fn spaced_assignments(count: usize) -> (String, String) {
@@ -3230,7 +3298,11 @@ mod formatting {
                 .collect();
             let trimmed = content.iter().map(|line| line.trim().to_string()).collect();
             let bare = content.iter().map(|line| line.replace(' ', "")).collect();
-            [content, trimmed, bare]
+            let alphanumeric = content
+                .iter()
+                .map(|line| line.chars().filter(|c| c.is_alphanumeric()).collect())
+                .collect();
+            [content, trimmed, bare, alphanumeric]
         };
         let pairs = joined_lines(
             &keys(&old_lines),
@@ -3250,7 +3322,7 @@ mod formatting {
                 .map(|mapped| apply_to(&old, &mapped) == new)
         };
         assert_eq!(accepted(900), Ok(true));
-        assert_eq!(accepted(1_100), Err(FormattingRefusal::OutOfWork));
+        assert_eq!(accepted(1_500), Err(FormattingRefusal::OutOfWork));
     }
 
     #[test]
@@ -3288,7 +3360,7 @@ mod formatting {
         // work the search refuses, not runs on.
         let keys = |lines: &[&str]| -> LineKeys {
             let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-            [lines.clone(), lines.clone(), lines]
+            [lines.clone(), lines.clone(), lines.clone(), lines]
         };
         let (old, new) = (keys(&["a"]), keys(&["a b"]));
         let pairs = |budget| joined_lines(&old, &new, &(0..1), &(0..1), &mut Work::new(budget));
@@ -3303,7 +3375,7 @@ mod formatting {
         // refuses at once, not held in memory.
         let keys = |count: usize| -> LineKeys {
             let lines = vec![String::new(); count];
-            [lines.clone(), lines.clone(), lines]
+            [lines.clone(), lines.clone(), lines.clone(), lines]
         };
         let small = (keys(3), keys(2));
         let pairs =
@@ -3323,10 +3395,12 @@ mod formatting {
             blank_lines(&large, &large, &(0..side), &(0..side), &mut work),
             None
         );
-        // And so the whole answer.
+        // And so the whole answer, its blank lines all rewritten (the
+        // budget grows with the texts, a little).
+        let side = 1_100;
         let virtual_text = format!("  a\n{}", "\n".repeat(side));
         let map = dedent_lines(&virtual_text, &[2]);
-        let formatted = format!("b\n{}", "\n".repeat(side));
+        let formatted = format!("b\n{}", " \n".repeat(side));
         let answer = [edit((0, 0), (side as u32 + 1, 0), &formatted)];
         assert_eq!(map.map_formatting_answer(&answer).ok(), None);
     }

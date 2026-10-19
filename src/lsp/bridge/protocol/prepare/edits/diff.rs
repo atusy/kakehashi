@@ -165,10 +165,13 @@ fn myers_core<T: PartialEq>(a: &[T], b: &[T], work: &mut Work) -> Option<Vec<(us
 /// Pairs of `a` and `b` alike, in order, by patience: elements found once in
 /// each anchor the rest (a longest increasing run of them), the stretches
 /// between anchors paired the same way in turn, and a stretch with no such
-/// element paired by [`myers_pairs`]; `None` when `work` runs out.
+/// element paired by [`myers_pairs`] when `fall_back` (among the elements
+/// found as many times on each side), left unpaired otherwise; `None` when
+/// `work` runs out.
 pub(super) fn patience_pairs<T: Eq + Hash>(
     a: &[T],
     b: &[T],
+    fall_back: bool,
     work: &mut Work,
 ) -> Option<Vec<(usize, usize)>> {
     let mut pairs = Vec::new();
@@ -200,8 +203,24 @@ pub(super) fn patience_pairs<T: Eq + Hash>(
             })
             .collect();
         if unique.is_empty() {
-            for (old_at, new_at) in myers_pairs(&a[old.clone()], &b[new.clone()], work)? {
-                pairs.push((old_at + old.start, new_at + new.start));
+            if !fall_back {
+                continue;
+            }
+            // Only elements found as many times on each side: of one found
+            // more often on one side, which is which no order tells.
+            let balanced = |at: &usize, side: &[T]| {
+                counts
+                    .get(&side[*at])
+                    .is_some_and(|&(in_a, in_b, _)| in_a == in_b)
+            };
+            let kept_a: Vec<usize> = old.clone().filter(|at| balanced(at, a)).collect();
+            let kept_b: Vec<usize> = new.clone().filter(|at| balanced(at, b)).collect();
+            let (search_a, search_b): (Vec<&T>, Vec<&T>) = (
+                kept_a.iter().map(|&at| &a[at]).collect(),
+                kept_b.iter().map(|&at| &b[at]).collect(),
+            );
+            for (old_at, new_at) in myers_pairs(&search_a, &search_b, work)? {
+                pairs.push((kept_a[old_at], kept_b[new_at]));
             }
             continue;
         }
@@ -371,7 +390,7 @@ mod tests {
     fn patience_anchors_unique_elements_then_fills_between() {
         let a = ["x", "}", "y", "}", "z"];
         let b = ["x", "}", "w", "}", "z"];
-        let found = patience_pairs(&a, &b, &mut Work::new(usize::MAX)).unwrap();
+        let found = patience_pairs(&a, &b, true, &mut Work::new(usize::MAX)).unwrap();
         assert_eq!(found, vec![(0, 0), (1, 1), (3, 3), (4, 4)]);
     }
 }

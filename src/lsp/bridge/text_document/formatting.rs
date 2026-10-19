@@ -2139,6 +2139,34 @@ mod tests {
     }
 
     #[test]
+    fn a_line_after_a_removed_blank_line_keeps_the_contents_indent() {
+        // A list item's Python fence: its blank lines carry the item's
+        // indent, which the peer removes with the rest. Black removes one
+        // of two blank lines and rewrites the line after them: that line
+        // is the one it was, not text written on the blank line removed.
+        let virtual_content = "  if a:\n      b = 1\n  \n  \n      c = 'y'\n      d = c\n";
+        let changes: Vec<_> = (0..6)
+            .map(|line| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""}))
+            .collect();
+        let offset = prepared_offset(virtual_content, 0, json!(changes));
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "if a:\n    b = 1\n\n\n    c = 'y'\n    d = c\n");
+        let host = format_host(
+            virtual_content,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 6, "character": 0 } },
+                "newText": "if a:\n    b = 1\n\n    c = \"y\"\n    d = c\n"
+            }]),
+        );
+        assert_eq!(
+            host,
+            "  if a:\n      b = 1\n  \n      c = \"y\"\n      d = c\n"
+        );
+    }
+
+    #[test]
     fn a_prepared_answer_ending_past_the_last_line_maps_to_the_region_end() {
         // A whole-document answer ending at `(lineCount, 0)`, the line past
         // P's last: the transform clamps it to P's end, and the lines it
