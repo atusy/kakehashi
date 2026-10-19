@@ -2949,7 +2949,7 @@ mod formatting {
         edits: &[TextEdit],
         budget: usize,
     ) -> Option<String> {
-        let mapped = map.map_edits_within(edits, EditMode::Formatting, budget)?;
+        let mapped = map.map_formatting(edits, budget).ok()?;
         Some(apply_to(virtual_text, &mapped))
     }
 
@@ -3129,7 +3129,8 @@ mod formatting {
         let (virtual_text, map, answer, expected) = pretty_printed(25_000);
         assert!(virtual_text.len() > 25_000);
         assert_eq!(
-            map.map_edits(&answer, EditMode::Formatting)
+            map.map_formatting_answer(&answer)
+                .ok()
                 .map(|mapped| apply_to(&virtual_text, &mapped)),
             Some(expected)
         );
@@ -3150,7 +3151,7 @@ mod formatting {
         // No clock: the least budget mapping an answer maps it on every
         // run, and one step less refuses it on every run.
         let (_, map, answer, _) = pretty_printed(2_000);
-        let maps = |budget| map.map_edits_within(&answer, EditMode::Formatting, budget);
+        let maps = |budget| map.map_formatting(&answer, budget).ok();
         let (mut refusing, mut mapping) = (0, FORMATTING_DIFF_BUDGET);
         let mapped = maps(mapping);
         assert!(mapped.is_some());
@@ -3167,6 +3168,35 @@ mod formatting {
             assert_eq!(maps(refusing), None);
             assert_eq!(maps(mapping), mapped);
         }
+    }
+
+    #[test]
+    fn a_refusal_says_whether_shape_or_size_decided_it() {
+        // Lines dedented by two and by four: a new line has no one indent.
+        let map = dedent_lines("  a\n    b\n", &[2, 4]);
+        let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Text rewritten past any likeness: the diff runs out of work.
+        let mut seed = 42u64;
+        let mut text = |length: usize| -> String {
+            (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    char::from(b'a' + (seed >> 60) as u8 % 4)
+                })
+                .collect()
+        };
+        let (old, new) = (text(20_000), text(20_000));
+        let virtual_text = format!("  {old}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 0), (1, 0), &format!("{new}\n"))];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::OutOfWork)
+        );
     }
 
     #[test]
@@ -3215,7 +3245,7 @@ mod formatting {
         let map = dedent_lines(&virtual_text, &[2]);
         let formatted = format!("b\n{}", "\n".repeat(side));
         let answer = [edit((0, 0), (side as u32 + 1, 0), &formatted)];
-        assert_eq!(map.map_edits(&answer, EditMode::Formatting), None);
+        assert_eq!(map.map_formatting_answer(&answer).ok(), None);
     }
 
     #[test]
@@ -3476,7 +3506,7 @@ mod formatting {
             Some("  if x:\n      y\n      z\n")
         );
         // Only what changed is edited: the first line is left alone.
-        let mapped = map.map_edits(&answer, EditMode::Formatting).unwrap();
+        let mapped = map.map_formatting_answer(&answer).ok().unwrap();
         assert!(mapped.iter().all(|edit| edit.range.start.line >= 1));
     }
 
@@ -3484,13 +3514,10 @@ mod formatting {
     fn an_answer_changing_nothing_maps_to_no_edit() {
         let (_, map) = dedented();
         let answer = [edit((0, 0), (2, 0), "if x:\n  y\n")];
-        assert_eq!(map.map_edits(&answer, EditMode::Formatting), Some(vec![]));
-        assert_eq!(map.map_edits(&[], EditMode::Formatting), Some(vec![]));
+        assert_eq!(map.map_formatting_answer(&answer).ok(), Some(vec![]));
+        assert_eq!(map.map_formatting_answer(&[]).ok(), Some(vec![]));
         // Nothing to diff: not refused for want of work.
-        assert_eq!(
-            map.map_edits_within(&answer, EditMode::Formatting, 0),
-            Some(vec![])
-        );
+        assert_eq!(map.map_formatting(&answer, 0).ok(), Some(vec![]));
     }
 
     #[test]
@@ -3505,7 +3532,7 @@ mod formatting {
         // Only that exact place: not a column on it, nor a line further.
         for end in [(3, 1), (4, 0)] {
             assert_eq!(
-                map.map_edits(&[edit((0, 0), end, "")], EditMode::Formatting),
+                map.map_formatting_answer(&[edit((0, 0), end, "")]).ok(),
                 None,
                 "{end:?}"
             );
@@ -3541,7 +3568,7 @@ mod formatting {
             ]),
         );
         let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
-        assert_eq!(map.map_edits(&answer, EditMode::Formatting), None);
+        assert_eq!(map.map_formatting_answer(&answer).ok(), None);
         // Changing text within a line needs no indent.
         assert_eq!(
             formatted_either_way(&map, virtual_text, &[edit((0, 0), (2, 0), "A\nb\n")]).as_deref(),
@@ -3564,9 +3591,9 @@ mod formatting {
     fn overlapping_or_reversed_answers_are_refused() {
         let (_, map) = dedented();
         let overlapping = [edit((0, 0), (1, 0), "x"), edit((0, 2), (0, 3), "y")];
-        assert_eq!(map.map_edits(&overlapping, EditMode::Formatting), None);
+        assert_eq!(map.map_formatting_answer(&overlapping).ok(), None);
         let reversed = [edit((1, 0), (0, 0), "x")];
-        assert_eq!(map.map_edits(&reversed, EditMode::Formatting), None);
+        assert_eq!(map.map_formatting_answer(&reversed).ok(), None);
     }
 }
 
@@ -4154,8 +4181,7 @@ mod formatting_reference {
                         .collect();
                     let edits = answer(&prepared, &formatted, shape);
                     prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
-                    let Some(mapped) = map.map_edits_within(&edits, EditMode::Formatting, budget)
-                    else {
+                    let Some(mapped) = map.map_formatting(&edits, budget).ok() else {
                         // Refused with work enough: an answer the host
                         // cannot take, or (rarely) one turning line breaks
                         // among several blank lines, whose pairing can meet

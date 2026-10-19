@@ -27,20 +27,33 @@ pub(crate) enum EditMode {
     /// Edits keeping their extents (a completion's replace range, an inlay
     /// hint's text edits), mapped one by one.
     Extent,
-    /// A formatter's answer: what it changes counts, not how it says so. The
-    /// edits are applied to P and the result diffed against P; each changed
-    /// stretch maps as one edit would, so a whole-document replacement maps
-    /// as precisely as small edits. The set mapped is the diff's, not the
-    /// edits sent. A range may also end at the line just past P's last
-    /// (`(lineCount, 0)`), naming P's end, as whole-document answers do.
-    /// The formatting transforms clamp such an end to P's last line before
-    /// mapping, to the same place; it is read here too so that the mode
-    /// takes an answer as servers send it, whoever calls it.
-    Formatting,
+}
+
+/// Why a formatting answer was refused (see
+/// [`PreparedMap::map_formatting_answer`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormattingRefusal {
+    /// Its shape: the host cannot take what it changes, as mapped.
+    Shape,
+    /// Its size: the diff ran out of work (see `FORMATTING_DIFF_BUDGET`)
+    /// before telling what it changes.
+    OutOfWork,
+}
+
+impl std::fmt::Display for FormattingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Shape => "its result cannot be mapped back through the prepared virtual document",
+            Self::OutOfWork => {
+                "its diff against the prepared virtual document ran out of work (the region is too heavily rewritten to compare)"
+            }
+        })
+    }
 }
 
 /// How much work the diff of a formatting answer may do, pairing lines and
-/// then the fewest changes within them (see [`EditMode::Formatting`]),
+/// then the fewest changes within them (see
+/// [`PreparedMap::map_formatting_answer`]),
 /// counted in steps of its searches (see [`Work`]); the work around the
 /// search (applying the answer to P, the per-character tables, mapping
 /// each stretch) runs in time linear in the texts on top. An answer whose
@@ -74,11 +87,10 @@ enum FirstIndent<'a> {
 
 impl PreparedMap {
     /// Translate a set of edits a downstream server made to P into edits to
-    /// V, as `mode` reads them (see [`EditMode`]): with extents, one for each
-    /// in order; for a formatting answer, one for each stretch the edited P
-    /// differs from P in, in P's order (none when it changes nothing).
+    /// V, as `mode` reads them (see [`EditMode`]), one for each in order (a
+    /// formatting answer is read by [`Self::map_formatting_answer`]).
     ///
-    /// Every edit (with [`EditMode::Formatting`], every stretch the edited P
+    /// Every edit (in a formatting answer, every stretch the edited P
     /// differs from P in) is mapped on its own, keeping its extent and
     /// restoring the indentation the peer removed from lines it creates or
     /// replaces. The mapped set is then checked as a whole against the host
@@ -98,28 +110,39 @@ impl PreparedMap {
     /// contiguous regions only, which have none; one opening on a
     /// noncontiguous region needs those fixed first.
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
-        self.map_edits_within(edits, mode, FORMATTING_DIFF_BUDGET)
-    }
-
-    /// [`Self::map_edits`], the diff of a formatting answer doing at most
-    /// `budget` steps of work.
-    pub(super) fn map_edits_within(
-        &self,
-        edits: &[TextEdit],
-        mode: EditMode,
-        budget: usize,
-    ) -> Option<Vec<TextEdit>> {
         match mode {
             EditMode::Extent => self.map_extents(edits),
-            EditMode::Formatting => self.map_formatting(edits, budget),
         }
     }
 
-    /// [`EditMode::Formatting`]: the edits applied to P, and each stretch
-    /// the result differs from P in mapped as one edit.
-    fn map_formatting(&self, edits: &[TextEdit], budget: usize) -> Option<Vec<TextEdit>> {
+    /// [`Self::map_edits`] for a formatter's answer, saying why when it is
+    /// refused: what it changes counts, not how it says so. The edits are
+    /// applied to P and the result diffed against P; each changed stretch
+    /// maps as one edit would, in P's order (none when it changes nothing),
+    /// so a whole-document replacement maps as precisely as small edits.
+    /// The set mapped is the diff's, not the edits sent. A range may also
+    /// end at the line just past P's last (`(lineCount, 0)`), naming P's
+    /// end, as whole-document answers do. The formatting transforms clamp
+    /// such an end to P's last line before mapping, to the same place; it
+    /// is read here too so that an answer is taken as servers send it,
+    /// whoever calls this.
+    pub(crate) fn map_formatting_answer(
+        &self,
+        edits: &[TextEdit],
+    ) -> Result<Vec<TextEdit>, FormattingRefusal> {
+        self.map_formatting(edits, FORMATTING_DIFF_BUDGET)
+    }
+
+    /// [`Self::map_formatting_answer`], the diff doing at most `budget`
+    /// steps of work.
+    fn map_formatting(
+        &self,
+        edits: &[TextEdit],
+        budget: usize,
+    ) -> Result<Vec<TextEdit>, FormattingRefusal> {
         let prepared = &self.prepared_lines.text;
-        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, true)?;
+        let (ranges, order) =
+            sorted_extents(&self.prepared_lines, edits, true).ok_or(FormattingRefusal::Shape)?;
         let mut edited = String::with_capacity(prepared.len());
         let mut cursor = 0;
         for &index in &order {
@@ -129,18 +152,12 @@ impl PreparedMap {
         }
         edited.push_str(&prepared[cursor..]);
         if edited == *prepared {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
         let mut work = Work::new(budget);
-        let Some(hunks) = diff_hunks(prepared, &edited, &mut work) else {
-            // Told apart from the refusals below, which the answer's shape
-            // decides: this one only its size does.
-            log::warn!(
-                target: "kakehashi::bridge",
-                "Refused a formatting answer whose diff ran out of work ({budget} steps)"
-            );
-            return None;
-        };
+        // Told apart from the refusals below, which the answer's shape
+        // decides: this one only its size does.
+        let hunks = diff_hunks(prepared, &edited, &mut work).ok_or(FormattingRefusal::OutOfWork)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // where one writes over the start of a line another ends at (see
         // `diff_hunks`), each then on its own line.
@@ -150,7 +167,8 @@ impl PreparedMap {
                 let following = prepared[hunk.old.end..].chars().next();
                 self.hunk_to_virtual(hunk.old, &edited[hunk.new], following)
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+            .ok_or(FormattingRefusal::Shape)?;
         // A stretch ending at a line start takes the removed indent there
         // along and gives it back at its end; one starting there claims the
         // same indent (a blank line inserted, a whitespace-only line
@@ -171,7 +189,7 @@ impl PreparedMap {
                 }
             }
         }
-        self.to_text_edits(mapped)
+        self.to_text_edits(mapped).ok_or(FormattingRefusal::Shape)
     }
 
     /// [`EditMode::Extent`]: each edit mapped on its own.

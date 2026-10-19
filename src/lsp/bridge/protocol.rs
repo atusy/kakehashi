@@ -39,9 +39,9 @@ pub(crate) use lifecycle::*;
 #[cfg(test)]
 pub(crate) use prepare::AnswerOrigin;
 pub(crate) use prepare::{
-    Bias, EditMode, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument, PrepareParams,
-    PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, Revocation, VirtualLayout,
-    apply_prepare_result_at, next_presentation, parse_prepare_response,
+    Bias, EditMode, FormattingRefusal, PREPARE_METHOD, PREPARE_TIMEOUT, PrepareHostTextDocument,
+    PrepareParams, PrepareResult, PrepareTextDocument, PreparedDocument, PreparedMap, Revocation,
+    VirtualLayout, apply_prepare_result_at, next_presentation, parse_prepare_response,
 };
 #[cfg(test)]
 pub(crate) use prepare::{SegmentKind, apply_prepare_result};
