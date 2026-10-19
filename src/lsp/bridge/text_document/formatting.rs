@@ -746,6 +746,16 @@ fn transform_formatting_style_response(
 
     if keep_edges {
         edits = keep_edge_layout(edits, virtual_content, offset);
+    } else if offset
+        .prepared()
+        .is_some_and(|prepared| prepared.drops_the_break_before_the_closing(&edits))
+    {
+        // An on-type answer keeps no edges: one dropping P's final line
+        // break would edit the closing the peer deleted after it.
+        return Err(io::Error::other(PreparedAnswerRefused {
+            reason: FormattingRefusal::Shape,
+            place: None,
+        }));
     }
 
     // On a prepared document the server formatted P (`virtual_content`),
@@ -2206,6 +2216,43 @@ mod tests {
         assert_eq!(formatted, "x = ''\n  foo(a)'';\n");
     }
 
+    #[rstest]
+    // The closing indent the peer removed after the last line.
+    #[case::closing_indent("  a\n  ", 2, "a", "  a\n  ")]
+    // nixfmt's: content deeper than the closing indent.
+    #[case::nixfmt("    a\n  ", 4, "a\nb", "    a\n  ")]
+    fn an_on_type_answer_dropping_the_final_break_keeps_the_closing(
+        #[case] virtual_content: &str,
+        #[case] dedent: u32,
+        #[case] answer: &str,
+        #[case] _host: &str,
+    ) {
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": dedent}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "a\n");
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "newText": answer
+        }]});
+        // Refused, not edited into the closing the peer deleted.
+        assert!(
+            transform_on_type_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn a_line_after_a_removed_blank_line_keeps_the_contents_indent() {
         // A list item's Python fence: its blank lines carry the item's
@@ -2318,22 +2365,21 @@ mod tests {
             }]),
         );
         assert_eq!(formatted, "x = ''\n  bar\n  '';\n");
-        // Joining the last line onto the one before it (an on-type answer
-        // keeps no edges) takes the deleted indent along, past P's end.
+        // Joining the closing onto the last line (an on-type answer keeps
+        // no edges, so the final line break it drops is the closing's):
+        // refused, the closing the peer deleted left as it is.
         let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
             "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 1, "character": 0 } },
             "newText": ""
         }]});
-        let edits = transform_on_type_formatting_response_to_host(
-            response,
-            &offset,
-            &prepared,
-            region_host_end(&prepared, &offset),
-        )
-        .unwrap();
-        assert_eq!(
-            crate::text::edit::apply_text_edits(host, &edits),
-            "x = ''\n  foo'';\n"
+        assert!(
+            transform_on_type_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+            .is_err()
         );
     }
 
