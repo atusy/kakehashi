@@ -288,14 +288,19 @@ along and give it back (the same text), so they do not both claim it. The
 set is then checked as a whole, as above. Which of several blank lines alike a line was written on, or which
 went, no answer tells: the run's diff decides.
 
-The diff has a budget (200 ms of search). An answer whose diff runs out of
-it is refused: out of time, the diff falls back to coarser stretches, which
-can span lines the formatter left alone and would map them with the
-content's indentation, not their own. Pairing blank lines takes a table
-quadratic in them; past four million cells the answer is refused as well.
-So the budget and the bound decide only which answers are refused, never
-what an accepted one writes; a large region heavily reformatted may be
-refused.
+The diff has a budget counted in work, not time: each step of its searches
+(a comparison, a cell of a table, a diagonal followed) spends one, about a
+million in all, so an answer is accepted or refused alike on any machine
+and under any load. The character diff pairs the characters other than
+whitespace first and diffs only what lies between them, so an answer that
+mostly moves whitespace (a pretty-printer's) costs work linear in the
+texts. An answer whose diff runs out of work is refused, and logged apart
+from the refusals its shape decides. The tables the searches keep (pairing
+blank lines takes one quadratic in them) take a cell for each step spent,
+so the budget bounds their memory as well, and spent whole it takes some
+10 ms: the diff runs where the answer arrives. So the budget decides only
+which answers are refused, never what an accepted one writes; a large
+region heavily rewritten may be refused.
 
 An answer's edits are mapped only while they would land where the server
 meant them. This is read where an answer is chosen, not as each reply
@@ -618,7 +623,7 @@ a hook per kind of change.
   available on prepared documents, nor is any on a prepared document with
   gaps; completion items there are snippets only as literal text, and are
   not resolved.
-- A formatting answer whose diff runs out of its budget is refused, so a
+- A formatting answer whose diff runs out of its work budget is refused, so a
   large region heavily reformatted may be left as it is (counted a failure
   by `kakehashi format`).
 - The concatenated formatting pipeline does not re-apply host line prefixes
