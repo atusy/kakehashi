@@ -3177,6 +3177,14 @@ mod formatting {
     #[case::cleared("  a\n   \n  b\n", &[2, 3, 2], "a\nB\n", "  a\n  B\n")]
     // And with two lines made one beside it.
     #[case::merged("  a\n \n  b\n  c\n", &[2, 0, 2, 2], "a\nB C\n", "  a\n  B C\n")]
+    // A line split, its second half joined onto the next line across a
+    // blank line the answer removed, a cleared one: in its place.
+    #[case::rejoined_cleared(
+        "    ={x}y  =\n    \t=\n          \n    \te {\n",
+        &[4, 4, 10, 4],
+        "= { x\n\t} y = =\n\te {\n",
+        "    = { x\n    \t} y = =\n    \te {\n"
+    )]
     fn text_is_never_written_on_a_whitespace_line_the_answer_removed(
         #[case] virtual_text: &str,
         #[case] removed: &[usize],
@@ -3189,6 +3197,28 @@ mod formatting {
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn text_where_a_kept_whitespace_line_was_is_refused_unless_written_after_it() {
+        // A line split, its second half joined onto the next across a kept
+        // `  \t` the answer replaced: written on it (no indent) or in its
+        // place (the content's), no answer tells. Refused, not guessed.
+        let virtual_text = "  )  } =  (y\n  \t)  \n  \t\n  ,  in\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), ") } =\n\t( y )\n, in\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Written after the kept whitespace, it is that line's.
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\n x\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n x\n  b\n")
         );
     }
 
@@ -3692,14 +3722,15 @@ mod formatting {
 
     #[test]
     fn a_line_break_changed_before_text_written_on_a_line_keeps_them_apart() {
-        // CRLF turned to LF on `a`, text written on the kept ` ` below it:
+        // CRLF turned to LF on `a`, text written on the kept ` ` below it
+        // (after its whitespace):
         // that text is the line's, not one after the changed break.
         let virtual_text = "\ta\r\n \r\n";
         let map = dedent_lines(virtual_text, &[1, 0]);
-        let answer = [edit((0, 0), (2, 0), "a\nw\r\n")];
+        let answer = [edit((0, 0), (2, 0), "a\n w\r\n")];
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("\ta\nw\r\n")
+            Some("\ta\n w\r\n")
         );
     }
 
@@ -4081,6 +4112,10 @@ mod formatting_reference {
         Write(usize),
     }
 
+    /// The origin of a line the reference refuses to place (see
+    /// `Rewrite::Write`).
+    const AMBIGUOUS: usize = usize::MAX;
+
     fn rewrite() -> impl Strategy<Value = Rewrite> {
         prop_oneof![
             4 => Just(Rewrite::Keep),
@@ -4199,11 +4234,20 @@ mod formatting_reference {
                     ));
                 }
                 Rewrite::TrailingSpace => output.push((format!("{text} "), line_break, origin)),
-                Rewrite::Write(spaces) if is_blank(index) => output.push((
-                    format!("{}w{index}", " ".repeat(spaces)),
-                    line_break,
-                    origin,
-                )),
+                // Text written on a whitespace line the peer kept, after
+                // that whitespace, is that line's; text written where an
+                // empty line was is a line of the content. Other text where
+                // a kept whitespace line was is ambiguous (written on it, or
+                // in its place), and refused.
+                Rewrite::Write(spaces) if is_blank(index) => {
+                    let written = format!("{}w{index}", " ".repeat(spaces));
+                    let origin = if written.starts_with(&text) {
+                        origin
+                    } else {
+                        Some(AMBIGUOUS)
+                    };
+                    output.push((written, line_break, origin))
+                }
                 Rewrite::Write(_) => output.push((text, line_break, origin)),
                 Rewrite::LineAfter(spaces) => {
                     output.push((text, some_break, origin));
@@ -4256,6 +4300,12 @@ mod formatting_reference {
     /// content is, the deleted edge lines put back around it. `None` when
     /// the closing lines would not start a line.
     fn reference(document: &Document, output: &[Output]) -> Option<String> {
+        if output
+            .iter()
+            .any(|(_, _, origin)| *origin == Some(AMBIGUOUS))
+        {
+            return None;
+        }
         let mut indented = String::new();
         for (at, (text, line_break, origin)) in output.iter().enumerate() {
             // A line written last, with no break, is written on the
