@@ -3286,6 +3286,41 @@ mod formatting {
     }
 
     #[test]
+    fn every_line_rewritten_and_empty_lines_removed_maps_in_linear_work() {
+        // An empty line after every tenth, all of them removed, every line
+        // of text rewritten: the lines still pair in order.
+        let count = 20_000;
+        let virtual_text: String = (0..count)
+            .map(|index| {
+                let line = format!("  \"k{index}\":[1,2,{{'a':'b'}}],\n");
+                if index % 10 == 9 {
+                    format!("{line}\n")
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let removed: Vec<usize> = virtual_text
+            .lines()
+            .map(|line| if line.is_empty() { 0 } else { 2 })
+            .collect();
+        let map = dedent_lines(&virtual_text, &removed);
+        let formatted: String = (0..count)
+            .map(|index| format!("\"k{index}\": [1, 2, {{\"a\": \"b\"}}],\n"))
+            .collect();
+        let answer = [edit((0, 0), (removed.len() as u32, 0), &formatted)];
+        let expected: String = formatted
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect();
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
+    #[test]
     fn a_small_answer_in_a_large_region_costs_work_for_its_size() {
         // One line changed among 300,000: the lines alike at either end are
         // set aside before any line is keyed or paired, uncharged.
