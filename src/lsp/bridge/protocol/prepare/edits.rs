@@ -62,9 +62,10 @@ impl std::fmt::Display for FormattingRefusal {
 /// alike: the count, not a clock, decides. Everything the searches keep
 /// is spent before it is taken, a step for each cell of a table and for
 /// each element they index, so their memory is linear in the budget (a
-/// few tens of MiB at most) besides what is linear in the texts. A step
-/// compares two elements whole, so time also grows with the lines'
-/// length; with lines of usual length, spending this fixed part whole
+/// few tens of MiB at most) besides what is linear in the texts. Hashing
+/// or comparing a line's text whole costs a step for every
+/// `BYTES_PER_STEP` bytes of it, so long lines spend the budget as they
+/// cost time; with lines of usual length, spending this fixed part whole
 /// takes some 10 ms in a release build, and the part that grows with the
 /// texts (`FORMATTING_DIFF_WORK_PER_BYTE`) time linear in what the answer
 /// changes (the lines alike at either end are set aside first): a 20,000
@@ -73,6 +74,10 @@ impl std::fmt::Display for FormattingRefusal {
 /// past the scan for what is alike. It runs where the answer arrives, on
 /// the async runtime, rather than on a blocking thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
+
+/// How many bytes a step of work covers where the searches hash or compare
+/// a line's text whole: such a step costs its length, not one.
+const BYTES_PER_STEP: usize = 64;
 
 /// Work the diff of a formatting answer may do on top of
 /// `FORMATTING_DIFF_BUDGET` for each byte of P and of the edited P: a diff
@@ -1406,7 +1411,8 @@ fn joined_lines(
             if !written.is_char_boundary(length) {
                 continue;
             }
-            work.spend(1)?;
+            // A lookup hashes the prefix: charged by its length too.
+            work.spend(1 + length / BYTES_PER_STEP)?;
             if let Some(lines) = index.get(&written[..length]) {
                 let at = lines.partition_point(|&line| line < old_from);
                 if let Some(&line) = lines.get(at) {
@@ -1445,6 +1451,16 @@ fn alike_ends(
             .collect()
     };
     let (old, new) = (text(old_keys, old_range), text(new_keys, new_range));
+    // Each line compared at most twice, a comparison costing its length.
+    let bytes: usize = old
+        .iter()
+        .map(|&line| old_keys[3][line].len())
+        .sum::<usize>()
+        + new
+            .iter()
+            .map(|&line| new_keys[3][line].len())
+            .sum::<usize>();
+    work.spend(2 * bytes / BYTES_PER_STEP)?;
     let alike = |old_line: usize, new_line: usize| old_keys[3][old_line] == new_keys[3][new_line];
     let mut head = 0;
     while head < old.len().min(new.len()) && alike(old[head], new[head]) {
@@ -1598,21 +1614,27 @@ fn align_lines(
             };
             let old_candidates = candidates(&old_keys[keys], &old_range);
             let new_candidates = candidates(&new_keys[keys], &new_range);
-            patience_pairs(
-                &old_candidates
-                    .iter()
-                    .map(|&index| &old_keys[keys][index])
-                    .collect::<Vec<_>>(),
-                &new_candidates
-                    .iter()
-                    .map(|&index| &new_keys[keys][index])
-                    .collect::<Vec<_>>(),
-                fall_back,
-                work,
-            )?
-            .into_iter()
-            .map(|(old_at, new_at)| (old_candidates[old_at], new_candidates[new_at]))
-            .collect()
+            // Keys interned once, their bytes charged: the searches then
+            // compare and hash numbers, a step each whatever a line's length.
+            let mut ids: HashMap<&str, u32> = HashMap::new();
+            let mut old_ids = Vec::with_capacity(old_candidates.len());
+            for &index in &old_candidates {
+                let key = old_keys[keys][index].as_str();
+                work.spend(1 + key.len() / BYTES_PER_STEP)?;
+                let next = ids.len() as u32;
+                old_ids.push(*ids.entry(key).or_insert(next));
+            }
+            let mut new_ids = Vec::with_capacity(new_candidates.len());
+            for &index in &new_candidates {
+                let key = new_keys[keys][index].as_str();
+                work.spend(1 + key.len() / BYTES_PER_STEP)?;
+                let next = ids.len() as u32;
+                new_ids.push(*ids.entry(key).or_insert(next));
+            }
+            patience_pairs(&old_ids, &new_ids, fall_back, work)?
+                .into_iter()
+                .map(|(old_at, new_at)| (old_candidates[old_at], new_candidates[new_at]))
+                .collect()
         }
     };
     let (mut old_at, mut new_at) = (old_range.start, new_range.start);

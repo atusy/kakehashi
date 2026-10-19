@@ -684,8 +684,11 @@ a hook per kind of change.
   answer changing the letters of every line of text, with whitespace lines
   between them, is refused from about 1,100 such text lines (some 2,200
   lines in all); one that also collapses the blank lines between them (two
-  to one), from about 770 text lines. A step counts one comparison of two lines whatever their
-  length, so time and memory also grow linearly with the texts' size.
+  to one), from about 770 text lines. Hashing or comparing a line's text
+  costs a step for every 64 bytes of it (lines are numbered once, then
+  compared as numbers), so the budget bounds time with long lines too:
+  1 MB of 1 KB lines alike but for their ends is refused in some 90 ms,
+  a 4 MB answer in some 300 ms (release build, measured under load).
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
