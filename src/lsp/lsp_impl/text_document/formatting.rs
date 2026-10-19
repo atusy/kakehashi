@@ -325,7 +325,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
-        let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
+        let mut outer_join_set: JoinSet<Option<RegionEdits>> = JoinSet::new();
 
         // Shared host-text position mapper for prefix extraction, built at
         // most once per request: constructing it is O(document size), so
@@ -349,9 +349,6 @@ impl Kakehashi {
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
         let mut spans = SpanReservations::default();
-        // The prepared regions edits are mapped through, for the final
-        // answer's check (see `formatting_sources_current`).
-        let mut sources = Vec::new();
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
@@ -440,14 +437,11 @@ impl Kakehashi {
             // One unprepared before it counts unless this one answers for
             // the span (an empty answer, already formatted, included).
             let owed = spans.owes(span);
-            if region_ctx.prepared.is_some() {
-                sources.push(Sourced::from_region(
-                    &region_ctx,
-                    (),
-                    self.bridge.node_tracker(),
-                    revision,
-                ));
-            }
+            // Counted toward the final check only once its task returns edits
+            // (see `finalize_formatting_edits`).
+            let source = region_ctx.prepared.is_some().then(|| {
+                Sourced::from_region(&region_ctx, (), self.bridge.node_tracker(), revision)
+            });
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -528,30 +522,34 @@ impl Kakehashi {
             let request_error_sink = cancel_state.request_error_sink.clone();
 
             outer_join_set.spawn(async move {
-                if let Some((servers, host_line_prefixes)) = pipeline {
-                    dispatch_concatenated_formatting(
-                        &region_ctx,
-                        pool.clone(),
-                        options,
-                        servers,
-                        host_line_prefixes,
-                        region_cancel_rx,
-                        request_error_sink,
-                        owed,
-                    )
-                    .await
-                } else {
-                    dispatch_preferred_formatting(
-                        &region_ctx,
-                        pool.clone(),
-                        options,
-                        region_cancel_rx,
-                        request_error_sink,
-                        region_cp_tokens,
-                        owed,
-                    )
-                    .await
+                let edits = async move {
+                    if let Some((servers, host_line_prefixes)) = pipeline {
+                        dispatch_concatenated_formatting(
+                            &region_ctx,
+                            pool.clone(),
+                            options,
+                            servers,
+                            host_line_prefixes,
+                            region_cancel_rx,
+                            request_error_sink,
+                            owed,
+                        )
+                        .await
+                    } else {
+                        dispatch_preferred_formatting(
+                            &region_ctx,
+                            pool.clone(),
+                            options,
+                            region_cancel_rx,
+                            request_error_sink,
+                            region_cp_tokens,
+                            owed,
+                        )
+                        .await
+                    }
                 }
+                .await;
+                edits.map(|edits| (edits, source))
             });
         }
 
@@ -573,11 +571,7 @@ impl Kakehashi {
         // wiping the registry on this arm's completion would drop the
         // sibling's live cancel registrations. `formatting_impl_with_error_sink`
         // sweeps once after the whole strategy dispatch.
-        Ok(
-            finalize_formatting_edits(outer_join_set, cancel_state.token.clone())
-                .await?
-                .map(|edits| (edits, sources)),
-        )
+        finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await
     }
 
     /// Whether every prepared region a formatting answer was mapped
@@ -2294,6 +2288,10 @@ impl Kakehashi {
     }
 }
 
+/// A region's formatting edits, and the prepared region they were mapped
+/// through, if any.
+pub(super) type RegionEdits = (Vec<TextEdit>, Option<Sourced<()>>);
+
 /// Collect per-region `JoinSet` results, sort the concatenated edits, and
 /// shape into the LSP-spec response (`None` when there are no edits).
 ///
@@ -2307,27 +2305,32 @@ impl Kakehashi {
 /// 3. Map `vec![]` to `Ok(None)` per the LSP convention that empty edit
 ///    lists are equivalent to no response.
 pub(super) async fn finalize_formatting_edits(
-    outer_join_set: JoinSet<Option<Vec<TextEdit>>>,
+    outer_join_set: JoinSet<Option<RegionEdits>>,
     cancel_token: Option<CancellationToken>,
-) -> Result<Option<Vec<TextEdit>>> {
-    let all_edits = collect_region_results_with_cancel(
+) -> Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>> {
+    // A region's prepared source is checked as the final answer is chosen
+    // only when its edits are in the answer: one whose formatter answered
+    // nothing cannot move the answer, nor hold it up.
+    let collected = collect_region_results_with_cancel(
         outer_join_set,
         cancel_token.map(cancel_rx_from_token),
-        |acc, opt: Option<Vec<TextEdit>>| {
-            if let Some(items) = opt {
-                acc.extend(items);
+        |acc: &mut Vec<RegionEdits>, opt| {
+            if let Some((items, source)) = opt
+                && !items.is_empty()
+            {
+                acc.push((items, source));
             }
         },
     )
-    .await;
-
-    let mut all_edits = all_edits?;
+    .await?;
+    let mut all_edits = Vec::new();
+    let mut sources = Vec::new();
+    for (items, source) in collected {
+        all_edits.extend(items);
+        sources.extend(source);
+    }
     sort_edits_by_start_position(&mut all_edits);
-    Ok(if all_edits.is_empty() {
-        None
-    } else {
-        Some(all_edits)
-    })
+    Ok((!all_edits.is_empty()).then_some((all_edits, sources)))
 }
 
 /// How an answer mapped through prepared regions was judged as the final
@@ -2663,6 +2666,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A prepared region whose formatter answered nothing is not judged
+    /// with the answer: only the regions whose edits it carries are.
+    #[tokio::test]
+    async fn only_regions_whose_edits_the_answer_carries_are_judged() {
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "red",
+            &crate::lsp::bridge::VirtualLayout::single("red"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let host = url::Url::parse("file:///test/sources.md").unwrap();
+        let source = || {
+            Some(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host,
+                    "lua",
+                    "region",
+                    &map,
+                    1,
+                    0,
+                ),
+            )
+        };
+        let edit = TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            new_text: "x".to_string(),
+        };
+        let mut tasks = JoinSet::new();
+        let (with_edits, without) = ((vec![edit.clone()], None), (Vec::new(), source()));
+        tasks.spawn(async move { Some(with_edits) });
+        tasks.spawn(async move { Some(without) });
+        let (edits, sources) = finalize_formatting_edits(tasks, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edits, vec![edit.clone()]);
+        assert!(sources.is_empty());
+        let mut tasks = JoinSet::new();
+        let carried = (vec![edit], source());
+        tasks.spawn(async move { Some(carried) });
+        let (_, sources) = finalize_formatting_edits(tasks, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sources.len(), 1);
     }
 
     #[tokio::test]
