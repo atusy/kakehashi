@@ -217,7 +217,10 @@ covers the indentation the peer removed from that line, and a change
 ending at a line start keeps that line's own removed indentation (the
 change takes it along and gives it back). Every line the edit's text
 begins regains the indentation the peer removed from the segment it lands
-in, provided every indentation the peer removed from the segment's content
+in — but text joined at the start of a whitespace line the peer kept,
+including a line the edit begins there, gains none (it is text typed on
+that line, its whitespace after it; a formatting answer writing there is
+refused instead, see below) — provided every indentation the peer removed from the segment's content
 lines is the same (lines it left alone do not count, nor do
 whitespace-only lines, but in a segment holding nothing else); otherwise
 an edit creating a line of text that would regain it there is refused,
@@ -339,9 +342,8 @@ from the refusals its shape decides. The tables quadratic in what they
 search (the line diff's trace, and pairing blank lines, 4 bytes a step)
 are spent before they are taken, so their memory is linear in the budget,
 which itself grows with the texts but stops at 2^24 steps: some 64 MiB at
-most. The rest (the line diff's frontier, some 16 bytes a charged element,
-and the lines' keys and indexes, some 30 bytes a line) is linear in the
-texts. Whole lines alike
+most. The rest (the line diff's frontier, the lines' keys and indexes,
+and the characters the character diff compares) is linear in the texts. Whole lines alike
 at either end of P and the edited P are set aside first, uncharged, so the
 work follows what the answer changes, not the region's size: a one-line
 answer costs its line in any region, and a 20,000-line region of half a
