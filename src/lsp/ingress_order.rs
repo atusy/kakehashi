@@ -36,7 +36,7 @@
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename/color-presentation/
-//!   willSaveWaitUntil/linkedEditingRange requests, and pull
+//!   willSaveWaitUntil/linkedEditingRange/completion requests, and pull
 //!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
@@ -309,7 +309,9 @@ enum Role {
 /// `textDocument/willSaveWaitUntil` and `textDocument/linkedEditingRange` are
 /// edit-producing too: save-time edits are applied to the buffer as saved,
 /// which includes every edit sent before the request, and linked ranges drive
-/// the client's mirrored edits.
+/// the client's mirrored edits. So is `textDocument/completion`: it follows
+/// its trigger keystroke's didChange on the wire, and its textEdit and
+/// additionalTextEdits are applied at the post-keystroke caret.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568), and so is `textDocument/inlayHint`, whose
@@ -372,6 +374,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/prepareTypeHierarchy"
         | "textDocument/willSaveWaitUntil"
         | "textDocument/linkedEditingRange"
+        | "textDocument/completion"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
@@ -832,6 +835,7 @@ mod tests {
             "kakehashi/node/descendantForPointRange",
             "textDocument/willSaveWaitUntil",
             "textDocument/linkedEditingRange",
+            "textDocument/completion",
         ] {
             let reader = classify(&notification(method, URI));
             assert!(
@@ -1294,6 +1298,13 @@ mod tests {
     #[tokio::test]
     async fn gate_runs_linked_editing_range_only_after_preceding_change() {
         assert_runs_only_after_stalled_change("textDocument/linkedEditingRange").await;
+    }
+
+    /// Completion follows its trigger keystroke's didChange on the wire; its
+    /// textEdit and additionalTextEdits are applied at the post-keystroke caret.
+    #[tokio::test]
+    async fn gate_runs_completion_only_after_preceding_change() {
+        assert_runs_only_after_stalled_change("textDocument/completion").await;
     }
 
     #[tokio::test]
