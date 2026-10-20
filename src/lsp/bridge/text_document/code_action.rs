@@ -2165,6 +2165,105 @@ mod tests {
         assert!(!resolves_within_request(caps_resolve(), true));
     }
 
+    /// A prepared action's resolve reply is mapped only while its region
+    /// still passes the final check: its map revoked meanwhile (or the
+    /// region re-prepared, held), the action comes back unresolved.
+    #[tokio::test]
+    async fn a_prepared_actions_resolve_is_judged_as_its_reply_arrives() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_advertising_resolve_methods, devnull_config, wait_for_sent_request,
+        };
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            let mut listed =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+            let revocation = Arc::new(Revocation::default());
+            Arc::get_mut(&mut listed.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("ruff");
+            let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let virtual_uri =
+                VirtualDocumentUri::new(&make_host_uri(), "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &listed.text,
+                    map: Some(&listed.map),
+                },
+            );
+            let generation = pool
+                .held_text(&virtual_uri.to_uri_string(), &key)
+                .unwrap()
+                .generation;
+            let offset = RegionOffset::new(3, 0).with_prepared(Arc::clone(&listed.map));
+            let mut action = CodeAction {
+                title: "Fix".to_string(),
+                data: Some(json!({ "id": 1 })),
+                ..CodeAction::default()
+            };
+            envelope_action_data(
+                &mut action,
+                &CodeActionEnvelopeContext {
+                    held_generation: Some(generation),
+                    // No host lifetime tracked in this pool.
+                    incarnation: None,
+                    ..envelope_ctx_for_test(&offset)
+                },
+            );
+            let mut settings = WorkspaceSettings::default();
+            settings
+                .language_servers
+                .insert("ruff".to_string(), devnull_config());
+            let upstream_id = UpstreamId::Number(80);
+            let resolve = {
+                let pool = Arc::clone(&pool);
+                let upstream_id = upstream_id.clone();
+                tokio::spawn(async move {
+                    pool.dispatch_code_action_resolve(
+                        action,
+                        &settings,
+                        caps_resolve(),
+                        Some(upstream_id),
+                        Position::new(4, 0),
+                        &|_| None,
+                    )
+                    .await
+                })
+            };
+            let request_id = wait_for_sent_request(&handle, &upstream_id).await;
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            let uri = virtual_uri.to_uri_string();
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "result": {
+                    "title": "Fix",
+                    "edit": { "changes": { uri: [{
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                        "newText": "b"
+                    }] } }
+                }
+            }));
+            let resolved = resolve.await.unwrap();
+            assert_eq!(
+                resolved.edit.is_none(),
+                revoked,
+                "revoked: {revoked}: {resolved:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn resolve_response_accepts_a_retired_producer_after_send() {
         let pool = Arc::new(LanguageServerPool::new());
