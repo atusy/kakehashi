@@ -28,6 +28,8 @@ use tower_lsp_server::ls_types::{Position, TextEdit};
 
 mod edits;
 
+#[cfg(test)]
+pub(crate) use edits::exact_reference;
 pub(crate) use edits::{EditMode, FormattingRefusal};
 
 /// The request kakehashi sends to the configured prepare peer.

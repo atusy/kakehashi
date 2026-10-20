@@ -48,7 +48,7 @@ fn a_property_floor_is_the_same_share_of_the_cases_run() {
 /// repeatable, and a failure it finds found again. `PROPTEST_RNG_SEED` picks
 /// another seed, `KAKEHASHI_PROPTEST_RANDOM` set a random one, and
 /// `KAKEHASHI_PROPTEST_CASES` another number of cases.
-fn property_runner(cases: u32) -> proptest::test_runner::TestRunner {
+pub(crate) fn property_runner(cases: u32) -> proptest::test_runner::TestRunner {
     use proptest::test_runner::{Config, RngSeed, TestRunner};
     let cases = property_cases(cases);
     let rng_seed = if std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_some() {
@@ -82,7 +82,7 @@ fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
 }
 
 /// `text` with `edits` applied (a column past a line's end meaning its end).
-pub(super) fn apply_to(text: &str, edits: &[TextEdit]) -> String {
+pub(crate) fn apply_to(text: &str, edits: &[TextEdit]) -> String {
     let lines = LineMap::new(text.to_string());
     let (ranges, order) = sorted_extents(&lines, edits, true).expect("edits apply");
     let mut output = String::with_capacity(text.len());
@@ -1861,15 +1861,18 @@ fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
 // builds from the edited prepared text
 // =============================================================================
 
-mod exact_reference {
+/// The exact-text reference for edits to generated prepared documents,
+/// which other features' properties reuse for the text their edits insert.
+pub(crate) mod exact_reference {
     use super::*;
+    pub(crate) use super::{apply_to, property_runner};
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
     use std::cell::Cell;
 
     /// One line of a generated document.
     #[derive(Debug, Clone)]
-    enum Line {
+    pub(crate) enum Line {
         /// Indented content (`body` from [`BODIES`]), with an interpolation
         /// after it and text after that when `gap` says so.
         Content { body: usize, gap: Option<bool> },
@@ -1906,7 +1909,7 @@ mod exact_reference {
 
     /// A generated document: its pieces and the text the reference puts
     /// back around the edited content.
-    struct Document {
+    pub(crate) struct Document {
         virtual_text: String,
         pieces: Vec<(SegmentKind, Range<usize>, String)>,
         /// Whether each gap is a fence (starts a line), in order.
@@ -1923,7 +1926,7 @@ mod exact_reference {
         indent_only_last_line: bool,
     }
 
-    fn line() -> impl Strategy<Value = Line> {
+    pub(crate) fn line() -> impl Strategy<Value = Line> {
         prop_oneof![
             4 => (0..BODIES.len(), prop::option::of(any::<bool>()))
                 .prop_map(|(body, gap)| Line::Content { body, gap }),
@@ -2082,7 +2085,7 @@ mod exact_reference {
     /// starting in content (not with a fence) indented, the deleted edge
     /// text put back around it. `None` where the edited P leaves a fence or
     /// the closing text not starting a line, which the host cannot take.
-    fn reference(
+    pub(crate) fn reference(
         document: &Document,
         map: &PreparedMap,
         edits: &[TextEdit],
@@ -2191,7 +2194,7 @@ mod exact_reference {
     /// The contiguous document `lines` describe (see [`document`]) and
     /// the map of the peer's answer for it; `None` for a shape the peer
     /// could not answer for, or one with gaps.
-    fn prepared(
+    pub(crate) fn prepared(
         lines: &[Line],
         indent: &str,
         leading: usize,
@@ -2215,6 +2218,16 @@ mod exact_reference {
         )
         .ok()?;
         Some((document, prepared.map))
+    }
+
+    /// The virtual text of a generated document.
+    pub(crate) fn virtual_text(document: &Document) -> &str {
+        &document.virtual_text
+    }
+
+    /// The prepared text a map maps.
+    pub(crate) fn prepared_text(map: &PreparedMap) -> &str {
+        &map.prepared_lines.text
     }
 
     #[test]
