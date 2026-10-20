@@ -1381,6 +1381,7 @@ async fn dispatch_concatenated_formatting(
         &final_text?,
         &offset,
         &host_line_prefixes,
+        &region_ctx.resolved.container_blank_rows,
     )?;
     Some(vec![TextEdit {
         range: replacement_range,
@@ -1693,6 +1694,7 @@ fn pipeline_region_text(
     final_text: &str,
     offset: &RegionOffset,
     host_line_prefixes: &[String],
+    container_blank_rows: &[u32],
 ) -> Option<String> {
     // A region opening mid-line, after a delimiter on its first line (a Nix
     // `''`), has its leading line break as layout and no line prefix: the
@@ -1728,7 +1730,7 @@ fn pipeline_region_text(
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
     let first_row_prefix = host_line_prefixes.first().cloned().unwrap_or_default();
-    let common = block_common_prefix(&host_line_prefixes, original_virtual);
+    let common = block_common_prefix(&host_line_prefixes, container_blank_rows);
     let (host_line_prefixes, first_row_blank) =
         fill_blank_row_prefixes(host_line_prefixes, offset, &common);
     // Decision point 4: the virtual output starts at column 0 of the embedded
@@ -1756,12 +1758,12 @@ fn pipeline_region_text(
 /// The region's common host prefix, which continuation lines take when the
 /// line count changes: the longest prefix shared by its rows, past the
 /// trailing empty entries (the closing fence's row) and past the blank rows
-/// whose prefix is only whitespace. A list item's blank row keeps none, a
-/// part, or a tab of the item's indentation, and none of those may narrow
-/// the prefix the item's content takes. Blockquote blank rows keep their
-/// `>`, so they count as before.
-fn block_common_prefix(prefixes: &[String], original_virtual: &str) -> String {
-    let lines = split_lsp_lines(original_virtual);
+/// of markdown container blocks whose prefix is only whitespace
+/// (`container_blank_rows`, as discovery marks them). A list item's blank
+/// row keeps none, a part, or a tab of the item's indentation, and none of
+/// those may narrow the prefix the item's content takes. Every other row
+/// counts, so a region without such rows gets the prefix it always did.
+fn block_common_prefix(prefixes: &[String], container_blank_rows: &[u32]) -> String {
     let mut content = prefixes;
     while let [rest @ .., last] = content {
         if !last.is_empty() {
@@ -1769,16 +1771,19 @@ fn block_common_prefix(prefixes: &[String], original_virtual: &str) -> String {
         }
         content = rest;
     }
-    let mut kept = content.iter().enumerate().filter(|(row, prefix)| {
-        let blank_row = lines
-            .get(*row)
-            .is_some_and(|(line, _)| crate::text::is_markdown_blank(line));
-        !(blank_row && crate::text::is_markdown_blank(prefix))
+    let mut skipped = container_blank_rows.iter().peekable();
+    let mut kept = (0u32..).zip(content).filter_map(|(row, prefix)| {
+        while skipped.next_if(|&&blank| blank < row).is_some() {}
+        if skipped.next_if_eq(&&row).is_some() {
+            None
+        } else {
+            Some(prefix)
+        }
     });
-    let Some((_, first)) = kept.next() else {
+    let Some(first) = kept.next() else {
         return String::new();
     };
-    kept.fold(first.as_str(), |common, (_, prefix)| {
+    kept.fold(first.as_str(), |common, prefix| {
         let len = common
             .char_indices()
             .zip(prefix.chars())
@@ -2144,6 +2149,7 @@ mod tests {
             virtual_content: String::new(),
             line_column_offsets: vec![0],
             protected_blank_rows: Vec::new(),
+            container_blank_rows: Vec::new(),
             contiguous: true,
         }
     }
@@ -2781,6 +2787,7 @@ mod tests {
             "{\n}\n  ",
             &RegionOffset::new(1, 19),
             &nix_prefixes(4),
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n{\n}\n  "));
@@ -2797,6 +2804,7 @@ mod tests {
             "    {}\n  ",
             &RegionOffset::new(1, 19),
             &nix_prefixes(3),
+            &[],
         );
 
         assert_eq!(text, None);
@@ -2819,6 +2827,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n  ",
             &RegionOffset::new(1, 19),
             &prefixes,
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n{\n    \"a\": 1\n}\n  "));
@@ -2835,6 +2844,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n",
             &RegionOffset::with_per_line_offsets(3, vec![2, 0]),
             &prefixes,
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
@@ -2850,6 +2860,7 @@ mod tests {
             "{\n    \"a\": 1\n}",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }"));
@@ -2860,6 +2871,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
@@ -2874,6 +2886,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n\n",
             &RegionOffset::with_per_line_offsets(1, vec![2]),
             &["  ".to_string(), String::new(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n      \"a\": 1\n  }\n\n"));
@@ -2892,6 +2905,7 @@ mod tests {
                 String::new(),
                 String::new(),
             ],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\nif x; then\n  y\nfi\n  "));
@@ -2906,6 +2920,7 @@ mod tests {
             "{\n  \"a\": 1\n}",
             &RegionOffset::new(0, 19),
             &["  d = /* json */ ''".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n  \"a\": 1\n}"));
@@ -2920,6 +2935,7 @@ mod tests {
             "\nx",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n> x"));
@@ -2994,8 +3010,14 @@ mod tests {
             &columns,
             lsp_line_count(original_virtual),
         );
-        let new_text = pipeline_region_text(original_virtual, formatted, &offset, &prefixes)
-            .expect("the region changed");
+        let new_text = pipeline_region_text(
+            original_virtual,
+            formatted,
+            &offset,
+            &prefixes,
+            &offset.protected_blank_row_list(),
+        )
+        .expect("the region changed");
         let range = region_replacement_range(original_virtual, &offset).unwrap();
 
         let edited_host =
@@ -3068,9 +3090,14 @@ mod tests {
             &resolved.line_column_offsets,
             lsp_line_count(&resolved.virtual_content),
         );
-        let new_text =
-            pipeline_region_text(&resolved.virtual_content, formatted, &offset, &prefixes)
-                .expect("the region changed");
+        let new_text = pipeline_region_text(
+            &resolved.virtual_content,
+            formatted,
+            &offset,
+            &prefixes,
+            &[],
+        )
+        .expect("the region changed");
         let range = region_replacement_range(&resolved.virtual_content, &offset).unwrap();
 
         assert_eq!(
@@ -3119,15 +3146,73 @@ mod tests {
             &columns,
             lsp_line_count(&original),
         );
+        assert!(resolved.container_blank_rows.is_empty());
         let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
 
-        let text = pipeline_region_text(&original, "a\nz\n    b", &offset, &prefixes)
+        let text = pipeline_region_text(&original, "a\nz\n    b", &offset, &prefixes, &[])
             .expect("the region changed");
 
         assert_eq!(text, "a\nz\n    \\t    b");
     }
 
     const SHORT_ROW_HOST: &str = "- item\n\n  ```py\n  a\n \n  b\n  ```\n";
+
+    /// A region discovery marks no container blank rows on (a Python string)
+    /// gets the common prefix main gives it: its blank row's empty prefix
+    /// still counts when the line count changes.
+    #[test]
+    fn pipeline_keeps_main_s_common_prefix_outside_container_blocks() {
+        let text = pipeline_region_text(
+            "a\n\n    b",
+            "a\nz\n\n    b",
+            &RegionOffset::with_per_line_offsets(0, vec![11, 0, 6]),
+            &[
+                "    x = \"\"\"".to_string(),
+                String::new(),
+                "    \\t".to_string(),
+            ],
+            &[],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\nz\n\n    b"));
+    }
+
+    /// Without container blank rows, the common prefix is main's: the
+    /// longest prefix of the rows past the trailing empty entries.
+    #[test]
+    fn block_common_prefix_without_container_blank_rows_is_main_s() {
+        let fixtures: &[&[&str]] = &[
+            &["> ", "> ", ""],
+            &["> ", "> > ", "> "],
+            &["> ", ">", "> "],
+            &["  ", "", "  ", ""],
+            &["  ", " ", "  ", ""],
+            &["  ", "\t", "  ", ""],
+            &["", "  ", ""],
+            &["    x = \"\"\"", "", "    \\t"],
+            &["    ", ""],
+            &["    ", "", ""],
+            &["  d = /* json */ ''"],
+            &["> - ", ">   ", ">", ">   "],
+            &[],
+            &["", "", ""],
+        ];
+        for fixture in fixtures {
+            let prefixes: Vec<String> = fixture.iter().map(|p| p.to_string()).collect();
+            let mut content = prefixes.as_slice();
+            while let [rest @ .., last] = content {
+                if !last.is_empty() {
+                    break;
+                }
+                content = rest;
+            }
+            assert_eq!(
+                block_common_prefix(&prefixes, &[]),
+                longest_common_prefix(content),
+                "{fixture:?}"
+            );
+        }
+    }
 
     /// A blank row keeping one space of a two-space item records a 1-space
     /// prefix. It is a blank row of the item: output there takes the item's
@@ -3207,12 +3292,17 @@ mod tests {
             &columns,
             lsp_line_count(&original),
         );
+        let container_blank_rows = resolved.container_blank_rows.clone();
         let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
         let range = region_replacement_range(&original, &offset).unwrap();
-        let edited =
-            pipeline_region_text(&original, formatted, &offset, &prefixes).map(|new_text| {
-                crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }])
-            });
+        let edited = pipeline_region_text(
+            &original,
+            formatted,
+            &offset,
+            &prefixes,
+            &container_blank_rows,
+        )
+        .map(|new_text| crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]));
 
         assert_eq!(edited.as_deref(), expected_host);
     }
@@ -3241,11 +3331,13 @@ mod tests {
         let formatted = format!("a\nc{}{}", "\n".repeat(BLANK_ROWS), last_text.trim_end());
         let started = std::time::Instant::now();
 
+        let offset = RegionOffset::with_content(3, columns, &original);
         let text = pipeline_region_text(
             &original,
             &formatted,
-            &RegionOffset::with_content(3, columns, &original),
+            &offset,
             &prefixes,
+            &offset.protected_blank_row_list(),
         )
         .expect("the region changed");
 
@@ -3266,6 +3358,7 @@ mod tests {
             "x\nz",
             &RegionOffset::with_per_line_offsets(3, vec![4, 0]),
             &["    ".to_string(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("x\nz"));
@@ -3280,6 +3373,7 @@ mod tests {
             "a\nc\n",
             &RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]),
             &["> ".to_string(), "> ".to_string(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("a\n> c\n"));
@@ -3293,6 +3387,7 @@ mod tests {
             "x\nz\n",
             &RegionOffset::new(3, 4),
             &["    ".to_string(), String::new(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("x\nz\n"));
@@ -3300,7 +3395,7 @@ mod tests {
 
     #[test]
     fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
-        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[], &[]);
 
         assert_eq!(text.as_deref(), Some("x\n"));
     }

@@ -193,13 +193,27 @@ pub(super) fn compute_line_prefixes(
 /// continuation line) anchors nothing. The row after the content's final
 /// line break is the closing fence's, which the edit checks treat apart.
 /// Two linear passes over the rows.
+#[cfg(test)]
 pub(crate) fn protected_blank_rows(
     columns: &[u32],
     prefixes: &[LinePrefix],
     virtual_content: &str,
 ) -> Vec<u32> {
+    container_blank_rows(columns, prefixes, virtual_content).0
+}
+
+/// [`protected_blank_rows`], and every blank row of a container block whose
+/// prefix is only whitespace, protected or not (a tab row giving a two-space
+/// item its full indentation). The concatenated pipeline's common prefix
+/// skips the latter: such a row keeps none or part of the item's
+/// indentation, which must not narrow the prefix the item's content takes.
+pub(crate) fn container_blank_rows(
+    columns: &[u32],
+    prefixes: &[LinePrefix],
+    virtual_content: &str,
+) -> (Vec<u32>, Vec<u32>) {
     if columns.len() <= 1 || !columns.iter().any(|&column| column > 0) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     // Whether each LSP line (a lone CR ends one too, as the offsets count
     // them) is blank as markdown reads it.
@@ -255,6 +269,7 @@ pub(crate) fn protected_blank_rows(
     }
     let mut previous = None;
     let mut protected = Vec::new();
+    let mut container = Vec::new();
     for row in 0..rows {
         if blank[row] {
             let width = previous.or(next_anchor[row]).unwrap_or(0);
@@ -263,15 +278,19 @@ pub(crate) fn protected_blank_rows(
             // content there. A tab reaching the content's column is enough.
             let short = columns[row] == 0
                 || matches!(prefix(row), LinePrefix::Whitespace(own) if own < width);
+            let whitespace = columns[row] == 0 || matches!(prefix(row), LinePrefix::Whitespace(_));
             if width > 0 && short {
                 protected.push(row as u32);
+            }
+            if width > 0 && whitespace {
+                container.push(row as u32);
             }
         }
         if let Some(width) = anchor(row) {
             previous = Some(width);
         }
     }
-    protected
+    (protected, container)
 }
 
 /// Per-parse wall-clock budget for every native parse that runs on the

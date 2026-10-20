@@ -246,6 +246,7 @@ mod tests {
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
             protected_blank_rows: Vec::new(),
+            container_blank_rows: Vec::new(),
             contiguous: true,
         };
 
