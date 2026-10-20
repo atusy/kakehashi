@@ -960,9 +960,7 @@ impl LanguageServerPool {
         let held_map = if envelope.offset.prepared {
             let held = virtual_uri
                 .as_deref()
-                .and_then(|uri| self.held_text(uri, handle.key()))
-                .filter(|held| Some(held.generation) == envelope.held_generation)
-                .and_then(|held| held.map);
+                .and_then(|uri| self.prepared_action_held_map(uri, handle.key(), &envelope));
             let Some(map) = held else {
                 log::debug!(
                     target: "kakehashi::bridge",
@@ -1183,6 +1181,22 @@ impl LanguageServerPool {
     /// Send a `codeAction/resolve` request on an already-connected handle and
     /// parse the response into a resolved `CodeAction`. Returns `None` on any
     /// failure (register/send/wait/parse) so callers can fail soft.
+    /// The map an action minted from a prepared document resolves through:
+    /// the one its server holds for `virtual_uri` now, while that is the
+    /// very text the action was listed on (the generation its envelope
+    /// records). `None` once another text was sent, or none prepared is
+    /// held.
+    fn prepared_action_held_map(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        envelope: &CodeActionEnvelope,
+    ) -> Option<Arc<PreparedMap>> {
+        self.held_text(virtual_uri, connection_key)
+            .filter(|held| Some(held.generation) == envelope.held_generation)
+            .and_then(|held| held.map)
+    }
+
     async fn send_code_action_resolve_on_handle(
         &self,
         handle: &Arc<ConnectionHandle>,
@@ -2057,6 +2071,73 @@ mod tests {
                 "held {held}, sent after: {after:?}"
             );
         }
+    }
+
+    /// A prepared action resolves through the map its server holds only
+    /// while that is the text it was listed on.
+    #[test]
+    fn a_prepared_action_resolves_only_through_the_text_it_was_listed_on() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("ruff");
+        let host = Url::parse("file:///test.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+        );
+        let uri = virtual_uri.to_uri_string();
+        let listed = dedented("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &listed.text,
+                map: Some(&listed.map),
+            },
+        );
+        let generation = pool.held_text(&uri, &key).unwrap().generation;
+        let offset = RegionOffset::new(3, 0).with_prepared(Arc::clone(&listed.map));
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(
+            &mut action,
+            &CodeActionEnvelopeContext {
+                held_generation: Some(generation),
+                ..envelope_ctx_for_test(&offset)
+            },
+        );
+        let envelope = extract_code_action_envelope(&action).unwrap();
+        assert!(envelope.offset.prepared);
+        let map = pool
+            .prepared_action_held_map(&uri, &key, &envelope)
+            .expect("the text it was listed on");
+        assert!(Arc::ptr_eq(&map, &listed.map));
+        // Another text sent since: not resolved through its map.
+        let other = dedented("  b");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &other.text,
+                map: Some(&other.map),
+            },
+        );
+        assert!(
+            pool.prepared_action_held_map(&uri, &key, &envelope)
+                .is_none()
+        );
     }
 
     #[tokio::test]
