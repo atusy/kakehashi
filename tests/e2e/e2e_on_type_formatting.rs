@@ -24,14 +24,25 @@ fn mock_formatter_bin() -> &'static str {
 /// initialize handshake. Returns the initialize response for capability
 /// assertions.
 fn init_client(language_servers: Value) -> (LspClient, Value, tempfile::TempDir) {
+    init_client_with_env(language_servers, &[])
+}
+
+/// [`init_client`] with extra environment variables for the kakehashi process.
+fn init_client_with_env(
+    language_servers: Value,
+    env: &[(&str, &str)],
+) -> (LspClient, Value, tempfile::TempDir) {
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("on_type_formatting.toml");
     std::fs::write(&config_path, "").expect("Failed to write config");
 
-    let mut client = LspClient::builder()
+    let mut builder = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().expect("temp path should be UTF-8"))
-        .build();
+        .arg(config_path.to_str().expect("temp path should be UTF-8"));
+    for (key, value) in env {
+        builder = builder.env(*key, *value);
+    }
+    let mut client = builder.build();
 
     let init_response = client.send_request(
         "initialize",
@@ -161,6 +172,68 @@ fn e2e_on_type_formatting_advertises_sorted_trigger_union_and_translates_edits()
         response["result"],
         Value::Null,
         "a character the downstream does not declare must be filtered by the bridge"
+    );
+
+    shutdown(&mut client);
+}
+
+/// The trigger keystroke's didChange and its on-type request arrive back to
+/// back. The didChange handler is held (as it is when queued behind another
+/// pass's edit lock) longer than an on-type round trip to the warm mock takes,
+/// so a request that is not ordered behind it answers from the text WITHOUT the
+/// typed `}` — edits the client would then apply at the post-keystroke caret.
+#[test]
+fn e2e_on_type_formatting_sees_its_trigger_keystroke() {
+    let bin = mock_formatter_bin();
+    let (mut client, _init_response, _config_dir) = init_client_with_env(
+        json!({
+            "mock-ontype": {
+                "cmd": [bin, "on-type"],
+                "languages": ["lua"],
+                "onTypeFormattingTriggers": ["}", ";"]
+            }
+        }),
+        &[("KAKEHASHI_E2E_STALL_DID_CHANGE_MS", "2000")],
+    );
+    open_markdown(&mut client);
+
+    // Warm the downstream so the request below needs no retry: a retry would
+    // re-ask after the stall and hide an ungated first answer.
+    let warm = request_with_retry(&mut client, ";");
+    assert_eq!(warm[0]["newText"], "LOCAL X = 1\n");
+
+    // Type `}` at the end of "local x = 1" (host line 3).
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{
+                "range": {
+                    "start": { "line": 3, "character": 11 },
+                    "end": { "line": 3, "character": 11 }
+                },
+                "text": "}"
+            }]
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI },
+            "position": { "line": 3, "character": 12 },
+            "ch": "}",
+            "options": { "tabSize": 4, "insertSpaces": true },
+        }),
+    );
+    assert!(response.get("error").is_none(), "got: {response:?}");
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected TextEdit[]; got: {response:?}"));
+    assert_eq!(edits.len(), 1, "got: {edits:?}");
+    assert_eq!(
+        edits[0]["newText"], "LOCAL X = 1}\n",
+        "on-type edits must be computed on the text that includes the trigger"
     );
 
     shutdown(&mut client);
