@@ -1632,6 +1632,21 @@ mod tests {
         assert_eq!(offset.line_column_offsets, None);
     }
 
+    /// A list item's fence marks its blank rows from the region's text; an
+    /// envelope carries them through the client, so the offset rebuilt at
+    /// resolve equals the live one and the resolve is not taken as stale.
+    #[test]
+    fn envelope_offset_round_trips_the_protected_blank_rows() {
+        let live = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
+        assert_eq!(live.protected_blank_row_list(), vec![1, 2]);
+
+        let json = serde_json::to_value(EnvelopeOffset::from(&live)).unwrap();
+        assert_eq!(json["protected_blank_rows"], json!([1, 2]));
+        let echoed: EnvelopeOffset = serde_json::from_value(json).unwrap();
+
+        assert_eq!(RegionOffset::from(&echoed), live);
+    }
+
     #[test]
     fn envelope_offset_round_trips_with_line_column_offsets() {
         let offset = EnvelopeOffset {
