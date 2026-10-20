@@ -447,8 +447,10 @@ pub(super) fn transform_completion_item(
         // On a prepared document the client inserts the text at the caret
         // as is. Where the same text as an edit at the caret regains an
         // indent (a blank line among dedented ones, where no word prefix is
-        // the client's to replace), the item goes out as that edit, as an
-        // item with one would; one mapping anywhere else is refused.
+        // the client's to replace), or replaces whitespace there with the
+        // content's indent (a blank line the peer emptied of other
+        // whitespace), the item goes out as that edit, as an item with one
+        // would; one mapping off the caret's line or the caret is refused.
         if prepared
             && let Some(caret) = request_host_position
             && !effective.is_empty()
@@ -459,12 +461,24 @@ pub(super) fn transform_completion_item(
                 range: tower_lsp_server::ls_types::Range::new(at, at),
                 new_text: effective.to_string(),
             }];
-            if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent)
-                || probe[0].range != tower_lsp_server::ls_types::Range::new(caret, caret)
+            // The edit may replace whitespace around the caret on its line
+            // (a blank line the peer emptied, whose whitespace the content's
+            // indent replaces); it must stay on that line and contain the
+            // caret, as LSP requires of an item's edit.
+            if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent) {
+                return false;
+            }
+            let range = probe[0].range;
+            if range.start.line != caret.line
+                || range.end.line != caret.line
+                || caret < range.start
+                || range.end < caret
             {
                 return false;
             }
-            if probe[0].new_text != effective {
+            if probe[0].new_text != effective
+                || range != tower_lsp_server::ls_types::Range::new(caret, caret)
+            {
                 // Written here, it answers to the region's checks as any
                 // edit does (a caret on the closing fence's line, say).
                 if !text_edit_safe_in_region(&probe[0], offset, region_end) {
@@ -1503,6 +1517,58 @@ mod tests {
         };
         assert_eq!(edit.new_text, "  foo");
         assert_eq!(single.insert_text_mode, None);
+        let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
+        assert!(!transform(&mut multi));
+    }
+
+    /// A caret on a blank line the peer emptied of a space shorter than
+    /// the content's indent: text typed there regains the content's indent,
+    /// replacing that space. An item without a textEdit goes out as that
+    /// edit, its range on the caret's line and containing the caret; one
+    /// with a textEdit at the caret maps to the same edit; multi-line text
+    /// is dropped as anywhere on a prepared document.
+    #[test]
+    fn an_item_on_an_emptied_blank_line_replaces_its_whitespace() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range, TextEdit};
+        let virtual_text = "  a\n \n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let caret = Position::new(11, 1);
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(caret),
+                ClientInsertMode::default(),
+            )
+        };
+        let expected = Some(CompletionTextEdit::Edit(TextEdit {
+            range: Range::new(Position::new(11, 0), Position::new(11, 1)),
+            new_text: "  z".to_string(),
+        }));
+        let mut implicit = item(json!({"label": "z"}));
+        assert!(transform(&mut implicit));
+        assert_eq!(implicit.text_edit, expected);
+        let mut explicit = item(json!({"label": "z", "textEdit": {
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+            "newText": "z"
+        }}));
+        assert!(transform(&mut explicit));
+        assert_eq!(explicit.text_edit, expected);
         let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
         assert!(!transform(&mut multi));
     }
