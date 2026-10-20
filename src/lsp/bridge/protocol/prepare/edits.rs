@@ -219,6 +219,36 @@ impl PreparedMap {
         self.uniform_indent_at(at) != Some(own)
     }
 
+    /// Whether a line of the content (not whitespace alone, nor starting in
+    /// a gap's text) lost other indentation than its segment's uniform one:
+    /// the peer left it alone, or removed another indent. A formatting
+    /// answer rewrites lines wholesale, and which of its lines is which old
+    /// one, and so which indent each regains, only a pairing reads; with
+    /// every line regaining the one uniform indent, no reading decides any
+    /// indent. Edits keeping their extents state where they go, and are not
+    /// so refused.
+    fn dedents_unevenly(&self) -> bool {
+        lines_with_breaks(&self.prepared_lines.text)
+            .into_iter()
+            .any(|(start, line)| {
+                if line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+                    return false;
+                }
+                let run = self.runs.partition_point(|run| run.prepared.end <= start);
+                if self
+                    .runs
+                    .get(run)
+                    .is_some_and(|run| run.kind == RunKind::Gap && run.prepared.start <= start)
+                {
+                    return false;
+                }
+                let own = empty_run(&self.runs, start, |kind| kind == RunKind::Deleted)
+                    .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
+                let at = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
+                self.uniform_indent_at(at) != Some(own)
+            })
+    }
+
     /// [`Self::map_formatting_answer`], the diff doing at most `budget`
     /// steps of work and `per_byte` more for each byte of P and the edited
     /// P.
@@ -241,6 +271,9 @@ impl PreparedMap {
         edited.push_str(&prepared[cursor..]);
         if edited == *prepared {
             return Ok(Vec::new());
+        }
+        if self.dedents_unevenly() {
+            return Err(FormattingRefusal::Shape);
         }
 
         let budget = budget
