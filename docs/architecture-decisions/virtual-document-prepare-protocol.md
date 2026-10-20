@@ -379,8 +379,12 @@ is. Groups are diffed apart, never as one text: a whole-text diff could move
 a change onto another line reading the same in P (the first of two alike
 lines deleted, a whitespace line below the second going with it), against
 what the edits state. The mapped set is then checked as a whole, as above.
-Annotated edits, which must keep their identity and count, keep their
-extents one by one.
+A `documentChanges` entry holding annotated edits, which must keep their
+identity and count, is taken only where replaying maps one edit for each:
+every edit within one line and touching no other, each then mapped
+keeping its extent; an entry whose edits add, remove or rewrite lines, or
+touch, is refused with the whole edit, as no edit of a replayed diff is
+any one of them.
 
 The choice was made on an exact-text property built without the map:
 documents generated as lines of text over one indentation (some left at
@@ -820,7 +824,10 @@ a hook per kind of change.
   region the peer dedented unevenly is refused whole (in-line edits, a
   rename's, still map): the property above refuses every such change
   there, where mapping each edit keeping its extent would map many of them
-  rightly but none of the whole-document forms.
+  rightly but few of the whole-document forms.
+- A `documentChanges` entry of annotated edits (an editor supporting
+  change annotations) whose edits add, remove or rewrite lines is refused:
+  its edits cannot be replayed one for each.
 - A workspace edit editing the host document directly inside a prepared
   region, or ordering its region's edits after other host entries, is
   refused; edits a server makes to another region's virtual document are

@@ -91,9 +91,12 @@ impl EditTranslation for Ranges<'_> {
 }
 
 /// A prepared document's edits: one set the client applies together,
-/// replayed through its map ([`translate_virtual_replayed_edits_to_host`]);
-/// annotated edits, which must keep their identity, keep their extents,
-/// one mapped for each.
+/// replayed through its map ([`translate_virtual_replayed_edits_to_host`]).
+/// An entry holding annotated edits, which must keep their identity, is
+/// taken only where replaying maps one for each (every edit within one
+/// line, apart from the others: [`EditMode::InLine`]); one whose edits add,
+/// remove or rewrite lines is refused, since no edit of a replayed diff is
+/// any one of them.
 struct Replayed<'a>(&'a RegionOffset);
 
 impl EditTranslation for Replayed<'_> {
@@ -121,7 +124,7 @@ impl EditTranslation for Replayed<'_> {
                 OneOf::Right(annotated) => annotated.text_edit.clone(),
             })
             .collect();
-        if !translate_virtual_text_edits_to_host(&mut plain, self.0, EditMode::Extent) {
+        if !translate_virtual_text_edits_to_host(&mut plain, self.0, EditMode::InLine) {
             return false;
         }
         for (one_of, text_edit) in edits.iter_mut().zip(plain) {
@@ -1888,5 +1891,56 @@ mod tests {
         };
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text_document.uri, host_uri);
+    }
+
+    #[test]
+    fn annotated_prepared_edits_reaching_across_lines_refuse_the_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let text_edit =
+            |value: serde_json::Value| -> TextEdit { serde_json::from_value(value).unwrap() };
+        let annotated = |edits: Vec<serde_json::Value>| WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document:
+                    tower_lsp_server::ls_types::OptionalVersionedTextDocumentIdentifier {
+                        uri: virtual_uri.parse().unwrap(),
+                        version: None,
+                    },
+                edits: edits
+                    .into_iter()
+                    .map(|edit| {
+                        OneOf::Right(AnnotatedTextEdit {
+                            text_edit: text_edit(edit),
+                            annotation_id: "fix".to_string(),
+                        })
+                    })
+                    .collect(),
+            }])),
+            ..Default::default()
+        };
+        for edits in [
+            // A whole-document fix-all.
+            vec![
+                json!({"range": range_json((0, 0), (2, 0)), "newText": "def g(a):\n  return a\n"}),
+            ],
+            // A line inserted.
+            vec![json!({"range": range_json((0, 0), (0, 0)), "newText": "import m\n"})],
+            // Two edits touching on one line.
+            vec![
+                json!({"range": range_json((0, 4), (0, 5)), "newText": "g"}),
+                json!({"range": range_json((0, 5), (0, 6)), "newText": "["}),
+            ],
+        ] {
+            let mut edit = annotated(edits.clone());
+            assert!(
+                !transform_workspace_edit_to_host(
+                    &mut edit,
+                    &virtual_uri,
+                    &host_uri,
+                    &prepared_offset()
+                ),
+                "{edits:?}"
+            );
+        }
     }
 }

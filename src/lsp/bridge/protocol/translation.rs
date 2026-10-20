@@ -237,7 +237,7 @@ pub(crate) fn translate_virtual_text_edits_to_host(
     };
     // Only a mode mapping one edit for each, in order: a replayed set may
     // come back with others (see `translate_virtual_replayed_edits_to_host`).
-    debug_assert_eq!(mode, EditMode::Extent, "edits mapped one for each");
+    debug_assert_ne!(mode, EditMode::Replay, "edits mapped one for each");
     let Some(mapped) = map_to_host(prepared, edits, offset, mode) else {
         return false;
     };
