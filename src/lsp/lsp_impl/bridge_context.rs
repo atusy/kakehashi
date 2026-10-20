@@ -80,8 +80,8 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 /// `translate_virtual_text_edit_to_host` for edits keeping their extents,
 /// `translate_virtual_formatting_edits_to_host` for a formatter's answer,
 /// `translate_virtual_replayed_edits_to_host` for a workspace edit), or the
-/// ranges a client edits through in place must read alike in the host
-/// (`translate_editable_virtual_range_to_host`, prepareRename's).
+/// ranges standing for their text must read alike in the host
+/// (`translate_editable_virtual_range_to_host`: prepareRename's).
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
