@@ -43,14 +43,58 @@ pub(crate) fn extract_clean_content(
 /// Each offset is the width of the blockquote prefix (or other excluded content)
 /// before the gap on that line. When `included_ranges` is `None`, returns
 /// `vec![start_column]` — the non-blockquote fallback where only line 0 has an offset.
+#[cfg(test)]
 pub(super) fn compute_line_column_offsets(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
     start_column: u32,
     included_ranges: Option<&[tree_sitter::Range]>,
 ) -> Vec<u32> {
+    compute_line_prefixes(host_text, byte_range, start_column, included_ranges).0
+}
+
+/// What the host text before a virtual line's content is made of: the text
+/// a column offset skips. Only whitespace and markdown container markers
+/// make a prefix that repeats on every line of a block; anything else (the
+/// code before a string that opens mid-line, an excluded escape sequence)
+/// is no container prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinePrefix {
+    /// Spaces and tabs only, or nothing: list-item indentation.
+    Whitespace,
+    /// Whitespace and container markers (`>`, `-`, `+`, `*`, `1.`, `1)`).
+    Container,
+    /// Any other text.
+    Other,
+}
+
+impl LinePrefix {
+    fn of(text: &str) -> Self {
+        if text.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+            Self::Whitespace
+        } else if text.bytes().all(|byte| {
+            matches!(
+                byte,
+                b' ' | b'\t' | b'>' | b'-' | b'+' | b'*' | b'.' | b')' | b'0'..=b'9'
+            )
+        }) {
+            Self::Container
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// [`compute_line_column_offsets`], with what each line's prefix is made of.
+/// Lines without a recorded offset have an empty prefix.
+pub(super) fn compute_line_prefixes(
+    host_text: &str,
+    byte_range: std::ops::Range<usize>,
+    start_column: u32,
+    included_ranges: Option<&[tree_sitter::Range]>,
+) -> (Vec<u32>, Vec<LinePrefix>) {
     match included_ranges {
-        None => vec![start_column],
+        None => (vec![start_column], Vec::new()),
         Some(ranges) => {
             // Build a map from virtual line → column offset.
             // Each gap range starts at a known point with a column value.
@@ -78,11 +122,23 @@ pub(super) fn compute_line_column_offsets(
                     }
                 }
             };
+            // The host line the region opens on starts before the region.
+            let first_line_start = bytes[..byte_range.start.min(bytes.len())]
+                .iter()
+                .rposition(|&byte| byte == b'\n' || byte == b'\r')
+                .map_or(0, |at| at + 1);
             let mut offsets = Vec::new();
+            let mut prefixes = Vec::new();
             for range in ranges {
                 let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
                 advance_to(gap_abs_byte, &mut line, &mut line_start);
                 let gap_start_line = line;
+                let prefix_start = if gap_start_line == 0 {
+                    first_line_start
+                } else {
+                    line_start
+                };
+                let prefix = LinePrefix::of(clamped_slice(host_text, prefix_start..gap_abs_byte));
                 // The column offset is the gap's start column within the host line.
                 // For the first line of the content node, use start_column
                 // (which accounts for the full prefix from the line start).
@@ -103,18 +159,103 @@ pub(super) fn compute_line_column_offsets(
                 // its spanned lines stay at the default 0.
                 if offsets.len() <= line {
                     offsets.resize(line + 1, 0);
+                    prefixes.resize(line + 1, LinePrefix::Whitespace);
                 }
                 if let Some(slot) = offsets.get_mut(gap_start_line) {
                     *slot = column;
+                    prefixes[gap_start_line] = prefix;
                 }
             }
             if offsets.is_empty() {
-                vec![start_column]
+                (vec![start_column], Vec::new())
             } else {
-                offsets
+                (offsets, prefixes)
             }
         }
     }
+}
+
+/// The virtual lines of a region that are blank rows of a markdown
+/// container block, which the edit checks protect.
+///
+/// A list item's fence leaves its blank rows unindented (or indented less
+/// than its content), so virtual column 0 maps there to a host column short
+/// of the item's indentation. Such a row is blank in `virtual_content`
+/// (spaces and tabs only, as markdown counts it) and records no prefix, and
+/// its nearest row that holds text (before it, or after it when none is
+/// before) records a container prefix. A prefix of other text (a string opening mid-line) is no
+/// container, and a row recording no prefix that holds text (a lazy
+/// continuation line) anchors nothing. The row after the content's final
+/// line break is the closing fence's, which the edit checks treat apart.
+/// Two linear passes over the rows.
+pub(crate) fn protected_blank_rows(
+    columns: &[u32],
+    prefixes: &[LinePrefix],
+    virtual_content: &str,
+) -> Vec<u32> {
+    if columns.len() <= 1 || !columns.iter().any(|&column| column > 0) {
+        return Vec::new();
+    }
+    // Whether each LSP line (a lone CR ends one too, as the offsets count
+    // them) is blank as markdown reads it.
+    let mut blank = Vec::with_capacity(columns.len());
+    let bytes = virtual_content.as_bytes();
+    let mut line_blank = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                blank.push(line_blank);
+                line_blank = true;
+            }
+            b'\r' => {
+                blank.push(line_blank);
+                line_blank = true;
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b' ' | b'\t' => {}
+            _ => line_blank = false,
+        }
+        i += 1;
+    }
+    // The row after the final line break is the closing fence's.
+    if !virtual_content.ends_with(['\n', '\r']) {
+        blank.push(line_blank);
+    }
+    let rows = columns.len().min(blank.len());
+    let prefix = |row: usize| prefixes.get(row).copied().unwrap_or(LinePrefix::Whitespace);
+    // A row holding text anchors the blank rows near it with the width of
+    // its container prefix (0 when it has none).
+    let anchor = |row: usize| {
+        (!blank[row]).then(|| match prefix(row) {
+            LinePrefix::Whitespace | LinePrefix::Container => columns[row],
+            LinePrefix::Other => 0,
+        })
+    };
+    let mut next_anchor = vec![None; rows];
+    let mut next = None;
+    for row in (0..rows).rev() {
+        next_anchor[row] = next;
+        if let Some(width) = anchor(row) {
+            next = Some(width);
+        }
+    }
+    let mut previous = None;
+    let mut protected = Vec::new();
+    for row in 0..rows {
+        if blank[row] {
+            let width = previous.or(next_anchor[row]).unwrap_or(0);
+            if width > 0 && columns[row] == 0 {
+                protected.push(row as u32);
+            }
+        }
+        if let Some(width) = anchor(row) {
+            previous = Some(width);
+        }
+    }
+    protected
 }
 
 /// Per-parse wall-clock budget for every native parse that runs on the

@@ -212,10 +212,10 @@ pub(super) fn resolved_region_geometry(
     resolved: ResolvedInjection,
 ) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
-    let offset = RegionOffset::with_content(
+    let offset = RegionOffset::with_protected_blank_rows(
         start_line,
         resolved.line_column_offsets,
-        &resolved.virtual_content,
+        &resolved.protected_blank_rows,
     );
     let region_end = region_host_end(&resolved.virtual_content, &offset);
     (
@@ -245,6 +245,7 @@ mod tests {
             injection_language: "rust".to_string(),
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
+            protected_blank_rows: Vec::new(),
             contiguous: true,
         };
 
@@ -264,7 +265,16 @@ mod tests {
 
     /// The regions injection discovery finds in a markdown `host`.
     fn discover(host: &str, query: &str) -> Vec<ResolvedInjection> {
-        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        discover_in(tree_sitter_md::LANGUAGE.into(), host, query)
+    }
+
+    /// The regions injection discovery finds in a `host` of `language`.
+    fn discover_in(
+        language: tree_sitter::Language,
+        host: &str,
+        query: &str,
+    ) -> Vec<ResolvedInjection> {
+        let md = language;
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&md).unwrap();
         let tree = parser.parse(host, None).unwrap();
@@ -375,5 +385,39 @@ mod tests {
         assert!(!accepts(resolved(), &edit((4, 0), (4, 0), "b = 2")));
         assert!(!accepts(resolved(), &edit((5, 0), (5, 0), "b = 2\n")));
         assert!(accepts(resolved(), &edit((4, 0), (4, 0), "\n")));
+    }
+
+    /// A string whose content has an escape sequence records per-line
+    /// offsets, the first being where the string opens mid-line. That is no
+    /// container prefix: the blank rows inside the string are content rows
+    /// of the host language, and text written there is judged as anywhere.
+    #[test]
+    fn a_blank_row_inside_a_string_opening_mid_line_is_not_protected() {
+        let host = "x = \"\"\"a\n\nb\\tc\n\nd\"\"\"\n";
+        let query = "((string (string_content) @injection.content) \
+            (#set! injection.language \"sql\"))";
+        let discover = |host: &str| discover_in(tree_sitter_python::LANGUAGE.into(), host, query);
+        let resolved = discover(host).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![7, 0, 3, 0, 0]);
+
+        let change = edit((1, 0), (1, 0), "z");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited)[0].virtual_content, "a\nz\nbc\n\nd");
+    }
+
+    /// Discovery marks only blank rows of markdown container blocks.
+    #[rstest::rstest]
+    #[case::list_fence_trailing_blank_rows("- item\n\n  ```py\n  a = 1\n\n\n  ```\n", FENCE_QUERY, vec![1, 2])]
+    #[case::list_fence_leading_blank_rows("- item\n\n  ```py\n\n\n  a = 1\n  ```\n", FENCE_QUERY, vec![0, 1])]
+    #[case::ordered_list_fence("1. item\n\n   ```py\n   a\n\n   b\n   ```\n", FENCE_QUERY, vec![1])]
+    #[case::blockquote_fence("> ```py\n> a\n>\n> b\n> ```\n", FENCE_QUERY, vec![])]
+    #[case::lazy_continuation("> a\nb\n> c\n", INLINE_QUERY, vec![])]
+    fn discovery_marks_the_blank_rows_of_container_blocks(
+        #[case] host: &str,
+        #[case] query: &str,
+        #[case] expected: Vec<u32>,
+    ) {
+        assert_eq!(discover(host, query)[0].protected_blank_rows, expected);
     }
 }

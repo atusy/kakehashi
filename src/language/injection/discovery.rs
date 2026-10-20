@@ -7,7 +7,7 @@ use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingI
 use ulid::Ulid;
 use url::Url;
 
-use super::content::{compute_line_column_offsets, extract_clean_content};
+use super::content::{compute_line_prefixes, extract_clean_content, protected_blank_rows};
 use super::language::extract_injection_language;
 use super::offset::InjectionOffset;
 use super::ranges::{
@@ -261,16 +261,17 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
     start..end
 }
 
-/// Compute clean virtual content and per-line column offsets for an injection region.
+/// Compute clean virtual content, per-line column offsets and protected
+/// blank rows for an injection region.
 ///
 /// This combines `compute_included_ranges`, `extract_clean_content`, and
-/// `compute_line_column_offsets` into a single call, avoiding duplication
+/// `compute_line_prefixes` into a single call, avoiding duplication
 /// across resolve methods.
 fn extract_virtual_content_and_offsets(
     region: &InjectionRegionInfo,
     cacheable: &CacheableInjectionRegion,
     text: &str,
-) -> Option<(String, Vec<u32>)> {
+) -> Option<(String, Vec<u32>, Vec<u32>)> {
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
@@ -295,13 +296,15 @@ fn extract_virtual_content_and_offsets(
         cacheable.byte_range.clone(),
         included_ranges.as_deref(),
     );
-    let line_column_offsets = compute_line_column_offsets(
+    let (line_column_offsets, line_prefixes) = compute_line_prefixes(
         text,
         cacheable.byte_range.clone(),
         cacheable.start_column,
         included_ranges.as_deref(),
     );
-    Some((virtual_content, line_column_offsets))
+    let protected_blank_rows =
+        protected_blank_rows(&line_column_offsets, &line_prefixes, &virtual_content);
+    Some((virtual_content, line_column_offsets, protected_blank_rows))
 }
 
 impl CacheableInjectionRegion {
@@ -945,6 +948,10 @@ pub(crate) struct ResolvedInjection {
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
+    /// The virtual lines that are blank rows of a markdown container block
+    /// (see [`protected_blank_rows`]); empty for most regions, and for a
+    /// multi-capture combined region.
+    pub protected_blank_rows: Vec<u32>,
     /// Whether `virtual_content` maps through the ordinary single-region path.
     /// For a multi-capture combined document this is `false` whenever the union
     /// of included ranges leaves uncovered host bytes, including inter-capture
@@ -1130,7 +1137,7 @@ impl InjectionResolver {
         let region_id_str = region_id.to_string();
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text, lone_crs);
-        let (virtual_content, line_column_offsets) =
+        let (virtual_content, line_column_offsets, protected_blank_rows) =
             extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
@@ -1139,6 +1146,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            protected_blank_rows,
             contiguous: true,
         })
     }
@@ -1181,7 +1189,7 @@ impl InjectionResolver {
         if regions.len() == 1 {
             let first = regions[0];
             let first_cacheable = cacheable[0];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, protected_blank_rows) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1192,6 +1200,7 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                protected_blank_rows,
                 contiguous: true,
             });
         }
@@ -1222,7 +1231,7 @@ impl InjectionResolver {
             let index = active_indices[0];
             let first = regions[index];
             let first_cacheable = cacheable[index];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, protected_blank_rows) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1233,6 +1242,7 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                protected_blank_rows,
                 contiguous: true,
             });
         }
@@ -1289,6 +1299,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            protected_blank_rows: Vec::new(),
             contiguous,
         })
     }
@@ -1498,7 +1509,7 @@ impl InjectionResolver {
             };
             let region = &regions[index];
             if let Some(cacheable) = prebuilt {
-                let Some((virtual_content, line_column_offsets)) =
+                let Some((virtual_content, line_column_offsets, protected_blank_rows)) =
                     extract_virtual_content_and_offsets(region, &cacheable[index], text)
                 else {
                     continue;
@@ -1510,6 +1521,7 @@ impl InjectionResolver {
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                    protected_blank_rows,
                     contiguous: true,
                 });
             } else {

@@ -956,10 +956,10 @@ async fn dispatch_concatenated_formatting(
     cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
 ) -> Option<Vec<TextEdit>> {
-    let offset = RegionOffset::with_content(
+    let offset = RegionOffset::with_protected_blank_rows(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
-        &region_ctx.resolved.virtual_content,
+        &region_ctx.resolved.protected_blank_rows,
     );
     let original_virtual = region_ctx.resolved.virtual_content.clone();
     // Precompute the host replacement range now, while we still hold
@@ -2105,6 +2105,7 @@ mod tests {
             injection_language: language.to_string(),
             virtual_content: String::new(),
             line_column_offsets: vec![0],
+            protected_blank_rows: Vec::new(),
             contiguous: true,
         }
     }
@@ -3038,6 +3039,54 @@ mod tests {
             crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]),
             expected_host
         );
+    }
+
+    /// A string whose content has an escape sequence records per-line
+    /// offsets, with prefixes made of host code (`    x = """`), not of
+    /// container markers. The pipeline adds none of that text to output
+    /// on the string's blank rows.
+    #[test]
+    fn pipeline_adds_no_prefix_to_blank_rows_of_a_string_opening_mid_line() {
+        let host = "    x = \"\"\"a\n\n    \\tb\"\"\"\n";
+        let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &language,
+            "((string (string_content) @injection.content) \
+              (#set! injection.language \"sql\"))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.py").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        let original = resolved.virtual_content.clone();
+        let columns = resolved.line_column_offsets.clone();
+        assert_eq!(
+            (original.as_str(), columns.as_slice()),
+            ("a\n\n    b", &[11, 0, 6][..])
+        );
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            0,
+            &columns,
+            lsp_line_count(&original),
+        );
+        let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
+
+        let text = pipeline_region_text(&original, "a\nz\n    b", &offset, &prefixes)
+            .expect("the region changed");
+
+        assert_eq!(text, "a\nz\n    \\t    b");
     }
 
     /// Filling the blank rows of a long list-item fence takes time linear
