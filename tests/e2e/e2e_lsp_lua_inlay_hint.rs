@@ -1212,6 +1212,24 @@ fn e2e_inlay_hint_range_starting_before_regions_covers_every_intersected_region(
         );
     }
 
+    // A range that only touches a region's edge reaches no region: one
+    // ending exactly where the first fence's content starts (3,0), and one
+    // starting exactly where it ends (4,0) and stopping before the second.
+    // Main asked no region for either.
+    for (start, end) in [(0, 3), (4, 9)] {
+        let response = client.send_request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": start, "character": 0 },
+                    "end": { "line": end, "character": 0 }
+                }
+            }),
+        );
+        assert!(response["result"].is_null(), "{start}..{end}: {response}");
+    }
+
     let first_only = inlay_hints_once(&mut client, uri, 0, 6);
     let positions: Vec<&Value> = first_only.iter().map(|hint| &hint["position"]).collect();
     assert_eq!(positions, [&json!({ "line": 3, "character": 1 })]);
