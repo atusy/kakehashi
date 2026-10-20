@@ -3250,8 +3250,9 @@ impl LanguageServerPool {
 
     /// What `connection_key` holds for `virtual_uri`, noted as a resolve is
     /// queued: a resolve has no text check of its own (its item was minted
-    /// from the region's text as is — one minted from a prepared text never
-    /// resolves), so whether its reply was computed on a text held as is,
+    /// from the region's text as is — one minted from a prepared text
+    /// resolves, if at all, through [`Self::note_held_under`]), so whether
+    /// its reply was computed on a text held as is,
     /// and that one, is told afterwards by [`Self::held_unchanged`]. Nothing
     /// is noted without the prepare layer, where every text is held as is.
     pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
