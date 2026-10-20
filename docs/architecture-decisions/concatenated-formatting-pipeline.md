@@ -155,8 +155,12 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    (a 1:1 mapping). When the formatter changes the line count, new lines have no
    original counterpart and — since the pipeline computes no diff/alignment — the
    **region's common prefix** is applied to them — the longest leading host
-   prefix shared by every line of the region (its lines' LCP, equivalently the
-   narrowest per-line `RegionOffset` column). This is exact for the usual
+   prefix shared by the region's lines that hold text (their LCP). A blank
+   line's prefix is not the region's: a list item's fence leaves its blank
+   lines unindented and a blockquote leaves a blank line's `>` without its
+   space, so blank lines are left out of the LCP, and output text that lands
+   on a blank line takes the LCP when the line's own prefix falls short of
+   it. This is exact for the usual
    uniform-prefix injection (single-level indentation, or a uniform `> `) and is a
    documented limitation for the rare region whose per-line prefixes genuinely
    differ across a line-count change. On **empty** output lines the prefix's
