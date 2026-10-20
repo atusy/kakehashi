@@ -466,8 +466,8 @@ The answer is checked against:
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
   host's newer text waits for its prepare answer — dropped, but for the
-  formatting methods, renames and color presentations, which wait for
-  that to clear (see below);
+  formatting methods, renames, color presentations, code actions and
+  linked editing ranges, which wait for that to clear (see below);
 - the peer failed the request's input (see Failure; a reply arriving
   after that is refused whole, and one the failure lands under keeps no
   edit) — dropped;
@@ -483,10 +483,15 @@ Dropped, completion answers nothing (an empty incomplete list when it
 asked to re-query), color presentations answer nothing, inlay hints
 stay shown without their edits, code actions answer without the stale
 region's actions (the host layer's and other regions' stay), and linked
-editing ranges answer nothing: asked again as the caret moves, none of
-them waits. A rename comes once per action, like formatting: it waits as
-formatting does (below), and dropped, it is answered as `ContentModified`,
-so that it is asked again rather than read as nothing to rename.
+editing ranges answer nothing. Code actions and linked editing ranges
+wait, as formatting does (below), while the host's last edit settles or a
+region's hold clears: an editor may ask them once right after an edit
+elsewhere (Neovim asks code actions once per keypress), and an answer
+dropped only for that would be asked again only on the next keypress.
+Completion and inlay hints, asked again as the caret moves, do not wait.
+A rename comes once per action, like formatting: it waits as formatting
+does, and dropped, it is answered as `ContentModified`, so that it is
+asked again rather than read as nothing to rename.
 prepareRename's range is display only, and its server's own rename is
 what is checked. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
@@ -550,10 +555,11 @@ as an empty incomplete list, which the client asks again for, and inlay
 hints stay shown with only their edits stripped: the answer for the latest
 text still arrives, the cost availability (an answer within a keystroke's
 parse and prepare round-trip), never a misplaced edit; code actions and
-linked editing ranges, asked again as the caret moves, likewise. Color
-presentations are asked once per picker interaction, and the formatting
-methods and renames once per action: they wait for the host to settle
-instead, as the final check described above does.
+linked editing ranges likewise, though they first wait for the host's last
+edit to settle (see above). Color presentations are asked once per picker
+interaction, and the formatting methods and renames once per action: they
+wait for the host to settle instead, as the final check described above
+does.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
