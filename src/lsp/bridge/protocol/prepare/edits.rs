@@ -273,9 +273,25 @@ impl PreparedMap {
             .saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()))
             .min(cap.unwrap_or(usize::MAX));
         let mut work = Work::new(budget);
+        let mapped = self.map_span_diff(0..prepared.len(), &edited, 0..edited.len(), &mut work)?;
+        self.to_text_edits(mapped).ok_or(FormattingRefusal::Shape)
+    }
+
+    /// The stretches `edited[new]` differs from P's `old` bytes in (see
+    /// `diff_hunks`), each mapped onto V as one edit does, in P's order;
+    /// stretches touching at a line start leave a removed indent there to
+    /// the later one. Not yet checked as a set.
+    fn map_span_diff(
+        &self,
+        old: Range<usize>,
+        edited: &str,
+        new: Range<usize>,
+        work: &mut Work,
+    ) -> Result<Vec<(Range<usize>, String)>, FormattingRefusal> {
+        let prepared = &self.prepared_lines.text;
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
-        let hunks = diff_hunks(prepared, &edited, &mut work)?;
+        let hunks = diff_hunks(&prepared[old.clone()], &edited[new.clone()], work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // at a line start where the later replaces some of that line's start
         // with text, or where the earlier ends with a line break of P and the
@@ -284,8 +300,12 @@ impl PreparedMap {
         let mut mapped = hunks
             .into_iter()
             .map(|hunk| {
-                let following = prepared[hunk.old.end..].chars().next();
-                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following, true)
+                let (old, new) = (
+                    hunk.old.start + old.start..hunk.old.end + old.start,
+                    hunk.new.start + new.start..hunk.new.end + new.start,
+                );
+                let following = prepared[old.end..].chars().next();
+                self.hunk_to_virtual(old, &edited[new], following, true)
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(FormattingRefusal::Shape)?;
@@ -341,7 +361,7 @@ impl PreparedMap {
                 }
             }
         }
-        self.to_text_edits(mapped).ok_or(FormattingRefusal::Shape)
+        Ok(mapped)
     }
 
     /// [`EditMode::Extent`]: each edit mapped on its own.
