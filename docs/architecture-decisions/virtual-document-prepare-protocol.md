@@ -335,10 +335,13 @@ and under any load. The character diff pairs the characters other than
 whitespace first and diffs only what lies between them, so an answer that
 mostly moves whitespace (a pretty-printer's) costs work linear in the
 texts. An answer whose diff runs out of work is refused, and logged apart
-from the refusals its shape decides. The tables the searches keep (pairing
-blank lines takes one quadratic in them) are spent before they are taken,
-so their memory is linear in the budget, which itself grows with the texts
-but stops at 2^24 steps: some 64 MiB of tables at most. Whole lines alike
+from the refusals its shape decides. The tables quadratic in what they
+search (the line diff's trace, and pairing blank lines, 4 bytes a step)
+are spent before they are taken, so their memory is linear in the budget,
+which itself grows with the texts but stops at 2^24 steps: some 64 MiB at
+most. The rest (the line diff's frontier, some 16 bytes a charged element,
+and the lines' keys and indexes, some 30 bytes a line) is linear in the
+texts. Whole lines alike
 at either end of P and the edited P are set aside first, uncharged, so the
 work follows what the answer changes, not the region's size: a one-line
 answer costs its line in any region, and a 20,000-line region of half a
@@ -380,7 +383,8 @@ The answer is checked against:
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
   host's newer text waits for its prepare answer — dropped, but for the
-  formatting methods, which wait for that to clear (see below);
+  formatting methods and color presentations, which wait for that to
+  clear (see below);
 - the peer failed the request's input (see Failure; a reply arriving
   after that is refused whole, and one the failure lands under keeps no
   edit) — dropped;
@@ -398,18 +402,18 @@ stay shown without their edits. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
 fan-in would fall through to a server ranked below it whose reply came
-once the host settled. Nor does formatting drop an answer for the host's
+once the host settled. Nor do formatting and color presentations drop an answer for the host's
 last edit not having settled yet, or a region held for its prepare answer:
 formatting, range and on-type formatting each come once per action (an
-on-type trigger, a save), so an answer dropped for that would not be asked
-again. The final check waits, as a request waits for its text (up to the
+on-type trigger, a save), and a color presentation once per picker
+interaction, so an answer dropped for that would not be asked again. The final check waits, as a request waits for its text (up to the
 prepare timeout), until the edit settles and the hold clears, then judges
 the answer as above; the host edited meanwhile, it is dropped at once as
 moved, and once nothing is left to settle or clear, an answer still not
 current (its region re-prepared to other coordinates, no longer tracked,
 its host reopened, its map revoked) is dropped at once as stale; one that
 never settles is dropped when the wait ends. The warning says which.
-Moved, the whole answer is dropped (the host's own formatter's edits and
+Dropped (moved, stale or unsettled), the whole answer is dropped (the host's own formatter's edits and
 those of regions still current too) and the request is counted failed, so
 `kakehashi format` exits 2 and writes nothing (range and on-type
 formatting, which no one-shot run makes, answer nothing). A reply its map
@@ -430,7 +434,8 @@ hints stay shown with only their edits stripped: the answer for the latest
 text still arrives, the cost availability (an answer within a keystroke's
 parse and prepare round-trip), never a misplaced edit. Color presentations
 are asked once per picker interaction, and the formatting methods once per
-action: they wait for the host to settle instead (see above).
+action: they wait for the host to settle instead, as the final check
+described above does.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
@@ -699,7 +704,9 @@ a hook per kind of change.
   lines in all); one that also collapses the blank lines between them (two
   to one), from about 770 text lines. Hashing or comparing a line's text
   costs a step for every 64 bytes of it (lines are numbered once, then
-  compared as numbers), so the budget bounds time with long lines too:
+  compared as numbers), so the budget bounds the diff's time with long
+  lines too, and the answer's positions and the result's convert to bytes
+  and UTF-16 columns in one pass over each line they fall on, uncharged:
   1 MB of 1 KB lines, each rewritten at its end, maps in some 60 ms; 4 MB
   of them is refused in some 200 ms, and a 4 MB answer to a 500 KB region
   in some 140 ms (release build, measured on a loaded machine).
@@ -728,10 +735,9 @@ a hook per kind of change.
   more or fewer lines there, text starting with exactly that line's
   whitespace; text indented otherwise is a line of the content. Where an
   answer reads as well as a line of its own beside the blank lines, that
-  reading is taken. A geometry sweep of mixed documents sees 13 such
-  refusals in 15,000 answers (about 0.09%); the
-  exact-text property, which writes on kept whitespace lines on purpose,
-  about 0.2% of its answers.
+  reading is taken. The exact-text property, which writes on kept
+  whitespace lines on purpose, sees such refusals in about 1.4% of its
+  answers changing evenly dedented documents.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
