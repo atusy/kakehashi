@@ -16,9 +16,14 @@ impl PreparedMap {
 
 /// A property's runner over `cases` cases, from a fixed seed: a run is
 /// repeatable, and a failure it finds found again. `PROPTEST_RNG_SEED` picks
-/// another seed, and `KAKEHASHI_PROPTEST_RANDOM` set a random one.
+/// another seed, `KAKEHASHI_PROPTEST_RANDOM` set a random one, and
+/// `KAKEHASHI_PROPTEST_CASES` another number of cases.
 fn property_runner(cases: u32) -> proptest::test_runner::TestRunner {
     use proptest::test_runner::{Config, RngSeed, TestRunner};
+    let cases = std::env::var("KAKEHASHI_PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(cases);
     let rng_seed = if std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_some() {
         RngSeed::Random
     } else if std::env::var_os("PROPTEST_RNG_SEED").is_some() {
@@ -5782,13 +5787,15 @@ mod replay_reference {
         /// An import inserted above line `at`, and every `a` renamed.
         Import { at: usize },
         /// Lines `from..=to` wrapped in a block: a header inserted before
-        /// them and each indented, the header and the first indent sent as
-        /// one edit or two.
+        /// them and each line of text indented (blank lines among them left
+        /// alone), the header and the first indent sent as one edit or two.
         Wrap { from: usize, to: usize, one: bool },
-        /// The block line `at` opens unwrapped: it goes, and the lines after
-        /// it nested deeper lose that nesting, the line's deletion and the
-        /// first one's sent as one edit or two.
-        Unwrap { at: usize, one: bool },
+        /// The block line `at` opens unwrapped: it goes, and the lines of
+        /// text after it nested deeper (blank lines among them left alone)
+        /// lose that nesting, the line's deletion and the first one's sent
+        /// as one edit or two; with `rename`, every `a` after it renamed
+        /// too, beside those edits on their lines.
+        Unwrap { at: usize, one: bool, rename: bool },
         /// Line `at` deleted, blank or not.
         Delete { at: usize },
     }
@@ -5803,7 +5810,8 @@ mod replay_reference {
                     to: a.max(b),
                     one
                 }),
-                (0..8usize, any::<bool>()).prop_map(|(at, one)| Change::Unwrap { at, one }),
+                (0..8usize, any::<bool>(), any::<bool>())
+                    .prop_map(|(at, one, rename)| Change::Unwrap { at, one, rename }),
                 (0..8usize).prop_map(|at| Change::Delete { at }),
             ],
             // Sent as one edit replacing the whole document (a fix-all).
@@ -5829,8 +5837,8 @@ mod replay_reference {
         }
     }
 
-    fn render(lines: &[Line], line: impl Fn(&Line) -> String) -> String {
-        lines.iter().map(|l| line(l) + "\n").collect()
+    fn render(lines: &[Line], line: impl Fn(&Line) -> String, eol: &str) -> String {
+        lines.iter().map(|l| line(l) + eol).collect()
     }
 
     fn insert(at: (usize, usize), text: &str) -> TextEdit {
@@ -5851,8 +5859,12 @@ mod replay_reference {
             .collect()
     }
 
-    fn rename(lines: &mut [Line], edits: &mut Vec<TextEdit>) {
+    /// Every `a` renamed, but on line `skip`.
+    fn rename(lines: &mut [Line], edits: &mut Vec<TextEdit>, skip: Option<usize>) {
         for (index, line) in lines.iter_mut().enumerate() {
+            if Some(index) == skip {
+                continue;
+            }
             if let Line::Text { text, .. } = line {
                 for at in names(text) {
                     edits.push(edit(
@@ -5878,7 +5890,7 @@ mod replay_reference {
 
     /// The edits making `change` to `lines`, and the lines it makes;
     /// `None` when it does not apply there.
-    fn make(change: &Change, lines: &[Line]) -> Option<(Vec<TextEdit>, Vec<Line>)> {
+    fn make(change: &Change, lines: &[Line], eol: &str) -> Option<(Vec<TextEdit>, Vec<Line>)> {
         let mut edits = Vec::new();
         let mut after = lines.to_vec();
         let text = |at: usize| match lines.get(at) {
@@ -5886,11 +5898,11 @@ mod replay_reference {
             _ => None,
         };
         match *change {
-            Change::Rename => rename(&mut after, &mut edits),
+            Change::Rename => rename(&mut after, &mut edits, None),
             Change::Import { at } => {
                 let at = at.min(lines.len());
-                rename(&mut after, &mut edits);
-                edits.push(insert((at, 0), "use m\n"));
+                rename(&mut after, &mut edits, None);
+                edits.push(insert((at, 0), &format!("use m{eol}")));
                 after.insert(
                     at,
                     Line::Text {
@@ -5900,17 +5912,19 @@ mod replay_reference {
                 );
             }
             Change::Wrap { from, to, one } => {
-                if to >= lines.len() || (from..=to).any(|at| text(at).is_none()) {
+                if text(from).is_none() || text(to).is_none() {
                     return None;
                 }
                 if one {
-                    edits.push(insert((from, 0), "if x:\n  "));
+                    edits.push(insert((from, 0), &format!("if x:{eol}  ")));
                 } else {
-                    edits.push(insert((from, 0), "if x:\n"));
+                    edits.push(insert((from, 0), &format!("if x:{eol}")));
                     edits.push(insert((from, 0), "  "));
                 }
                 for at in from + 1..=to {
-                    edits.push(insert((at, 0), "  "));
+                    if text(at).is_some() {
+                        edits.push(insert((at, 0), "  "));
+                    }
                 }
                 for line in &mut after[from..=to] {
                     if let Line::Text { text, .. } = line {
@@ -5925,13 +5939,24 @@ mod replay_reference {
                     },
                 );
             }
-            Change::Unwrap { at, one } => {
+            Change::Unwrap {
+                at,
+                one,
+                rename: renamed,
+            } => {
                 text(at)?;
-                let nested = (at + 1..lines.len())
-                    .take_while(|&line| text(line).is_some_and(|text| text.starts_with("  ")))
-                    .count();
-                if nested == 0 {
+                if !text(at + 1).is_some_and(|text| text.starts_with("  ")) {
                     return None;
+                }
+                // Through the last line of text nested deeper, blank lines
+                // among them.
+                let nested = (at + 1..lines.len())
+                    .take_while(|&line| text(line).is_none_or(|text| text.starts_with("  ")))
+                    .filter(|&line| text(line).is_some())
+                    .last()
+                    .map_or(0, |last| last - at);
+                if renamed {
+                    rename(&mut after, &mut edits, Some(at));
                 }
                 if one {
                     edits.push(edit((at as u32, 0), (at as u32 + 1, 2), ""));
@@ -5940,7 +5965,9 @@ mod replay_reference {
                     edits.push(edit((at as u32 + 1, 0), (at as u32 + 1, 2), ""));
                 }
                 for line in at + 2..at + 1 + nested {
-                    edits.push(edit((line as u32, 0), (line as u32, 2), ""));
+                    if text(line).is_some() {
+                        edits.push(edit((line as u32, 0), (line as u32, 2), ""));
+                    }
                 }
                 for line in &mut after[at + 1..at + 1 + nested] {
                     if let Line::Text { text, .. } = line {
@@ -5993,19 +6020,20 @@ mod replay_reference {
             prop::collection::vec(line(), 1..8),
             prop::sample::select(vec!["  ", "\t", "    "]),
             change(),
+            prop::sample::select(vec!["\n", "\r\n"]),
         );
         runner
-            .run(&strategy, |(lines, indent, (change, whole))| {
+            .run(&strategy, |(lines, indent, (change, whole), eol)| {
                 if !lines
                     .iter()
                     .any(|line| matches!(line, Line::Text { alone: false, .. }))
                 {
                     return Ok(());
                 }
-                let Some((mut edits, after)) = make(&change, &lines) else {
+                let Some((mut edits, after)) = make(&change, &lines, eol) else {
                     return Ok(());
                 };
-                let virtual_text = render(&lines, |line| virtual_line(line, indent));
+                let virtual_text = render(&lines, |line| virtual_line(line, indent), eol);
                 let changes: Vec<serde_json::Value> = lines
                     .iter()
                     .enumerate()
@@ -6025,7 +6053,7 @@ mod replay_reference {
                 let map = prepare(&virtual_text, json!(changes));
                 prop_assert_eq!(
                     map.prepared_text(),
-                    render(&lines, |l| prepared_line(l).to_string())
+                    render(&lines, |l| prepared_line(l).to_string(), eol)
                 );
                 // Which of several blank lines P shows alike went, one edit
                 // rewriting the whole document does not tell (nor does a
@@ -6041,10 +6069,10 @@ mod replay_reference {
                     edits = vec![edit(
                         (0, 0),
                         (lines.len() as u32, 0),
-                        &render(&after, |l| prepared_line(l).to_string()),
+                        &render(&after, |l| prepared_line(l).to_string(), eol),
                     )];
                 }
-                let expected = render(&after, |line| virtual_line(line, indent));
+                let expected = render(&after, |line| virtual_line(line, indent), eol);
                 let uneven = lines
                     .iter()
                     .any(|line| matches!(line, Line::Text { alone: true, .. }));
@@ -6086,17 +6114,21 @@ mod replay_reference {
             })
             .unwrap();
         let tallies = tallies.into_inner();
-        for (kind, tallies) in kinds.into_inner() {
-            for (name, tally) in ["replay", "extent", "whole diff"].iter().zip(&tallies) {
+        for (kind, tallies) in kinds.borrow().iter() {
+            for (name, tally) in ["replay", "extent", "whole diff"].iter().zip(tallies) {
                 eprintln!("{kind} {name}: even {:?}, uneven {:?}", tally[0], tally[1]);
             }
         }
         for (name, tally) in ["replay", "extent", "whole diff"].iter().zip(&tallies) {
             eprintln!("{name}: even {:?}, uneven {:?}", tally[0], tally[1]);
         }
+        let renames = kinds.borrow()["Rename"][0];
         let [replay, ..] = tallies;
-        // On evenly dedented documents every such change maps.
+        // On evenly dedented documents every such change maps; on unevenly
+        // dedented ones, every rename, which changes no line's layout.
         assert_eq!(replay[0].refused, 0, "{:?}", replay[0]);
+        assert_eq!(renames[1].refused, 0, "{:?}", renames[1]);
+        assert!(renames[1].exact > 0, "{:?}", renames[1]);
         assert!(replay[0].exact > 1000, "{:?}", replay[0]);
     }
 }
@@ -6122,5 +6154,18 @@ fn a_long_line_broken_at_many_places_replays_as_one_group() {
     assert_eq!(
         replayed(&virtual_text, &map, &edits).as_deref(),
         Some(expected.as_str())
+    );
+}
+
+#[test]
+fn a_replayed_cr_meeting_an_lf_of_p_is_diffed_with_that_lines_break() {
+    // `x\r` typed at an empty line's start: its CR and the line's LF are one
+    // line break of the edited P, which the group's span must not split.
+    let virtual_text = "  a\n\n  b\n";
+    let map = dedent_by_two(virtual_text);
+    assert_eq!(map.prepared_text(), "a\n\nb\n");
+    assert_eq!(
+        replayed(virtual_text, &map, &[edit((1, 0), (1, 0), "x\r")]).as_deref(),
+        Some("  a\n  x\r\n  b\n")
     );
 }
