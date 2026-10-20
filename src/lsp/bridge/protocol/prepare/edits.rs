@@ -2064,3 +2064,5 @@ fn is_line_end(text: &str, offset: usize) -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::exact_reference;

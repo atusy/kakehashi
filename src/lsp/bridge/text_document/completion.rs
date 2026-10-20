@@ -3649,4 +3649,420 @@ mod tests {
             transform_for_non_resolving_server(response, &plain, region_end, Some(4)).unwrap();
         assert_eq!(list.items.len(), 1, "all-zero regions keep no boundary");
     }
+
+    /// Snippet completions on generated prepared documents against a
+    /// reference built another way: the snippet generated as a tree and
+    /// expanded by its own rule (not [`Expansion`]), the expansion placed by
+    /// the exact-text reference for plain edits, and the snippet that goes
+    /// out read back by a parser of its own — expanded at its defaults, and
+    /// with text typed at each tabstop.
+    mod snippet_reference {
+        use super::*;
+        use crate::lsp::bridge::PreparedMap;
+        use crate::lsp::bridge::protocol::exact_reference::{
+            self, Document, apply_to, property_runner,
+        };
+        use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range as LspRange, TextEdit};
+
+        /// One node of a generated snippet.
+        #[derive(Debug, Clone, PartialEq)]
+        enum Node {
+            Text(String),
+            Tabstop(u8),
+            Placeholder(u8, String),
+            Choice(u8, Vec<String>),
+        }
+
+        /// Texts the nodes hold: words repeating the generated lines,
+        /// spaces, every character the grammar escapes somewhere, and line
+        /// breaks and tabs, which no client expands alike.
+        const TEXTS: [&str; 15] = [
+            "", "a", "b c", " ", "  ", "$", "}", "\\", ",", "|", "é", "{", "x\n", "\t", "a = 1",
+        ];
+
+        /// What the user types at a tabstop.
+        const TYPED: &str = "T";
+
+        fn text() -> impl Strategy<Value = String> {
+            prop::sample::select(TEXTS.to_vec()).prop_map(str::to_string)
+        }
+
+        fn node() -> impl Strategy<Value = Node> {
+            prop_oneof![
+                4 => text().prop_map(Node::Text),
+                2 => (0..3u8).prop_map(Node::Tabstop),
+                2 => (0..3u8, text()).prop_map(|(n, default)| Node::Placeholder(n, default)),
+                1 => (0..3u8, prop::collection::vec(text(), 1..3))
+                    .prop_map(|(n, options)| Node::Choice(n, options)),
+            ]
+        }
+
+        fn escape(text: &str, special: &[char]) -> String {
+            let mut escaped = String::new();
+            for c in text.chars() {
+                if special.contains(&c) {
+                    escaped.push('\\');
+                }
+                escaped.push(c);
+            }
+            escaped
+        }
+
+        /// The snippet text of `nodes`, every character the grammar would
+        /// read otherwise escaped where it stands.
+        fn render(nodes: &[Node]) -> String {
+            nodes
+                .iter()
+                .map(|node| match node {
+                    Node::Text(text) => escape(text, &['$', '}', '\\']),
+                    Node::Tabstop(n) => format!("${{{n}}}"),
+                    Node::Placeholder(n, default) => {
+                        format!("${{{n}:{}}}", escape(default, &['$', '}', '\\']))
+                    }
+                    Node::Choice(n, options) => format!(
+                        "${{{n}|{}|}}",
+                        options
+                            .iter()
+                            .map(|option| escape(option, &[',', '|', '\\']))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                })
+                .collect()
+        }
+
+        /// Whether every client expands `nodes` alike: no choice (VS Code
+        /// inserts its first option, Neovim nothing), at most one default
+        /// per tabstop, the final tabstop at most once, and nothing a
+        /// snippet engine rewrites (a line break, a tab).
+        fn alike(nodes: &[Node]) -> bool {
+            let mut defaults = HashMap::new();
+            let mut finals = 0;
+            for node in nodes {
+                match node {
+                    Node::Choice(..) => return false,
+                    Node::Text(text) if text.contains(['\n', '\r', '\t']) => return false,
+                    Node::Placeholder(n, default)
+                        if default.contains(['\n', '\r', '\t'])
+                            || defaults.insert(*n, ()).is_some() =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+                if matches!(node, Node::Tabstop(0) | Node::Placeholder(0, _)) {
+                    finals += 1;
+                }
+            }
+            finals <= 1
+        }
+
+        /// What a client inserts for `nodes` (alike), the user having typed
+        /// `typed` at tabstop `at` (its every occurrence) and nothing else.
+        fn expand(nodes: &[Node], at: Option<(u8, &str)>) -> String {
+            let defaults: HashMap<u8, &str> = nodes
+                .iter()
+                .filter_map(|node| match node {
+                    Node::Placeholder(n, default) => Some((*n, default.as_str())),
+                    _ => None,
+                })
+                .collect();
+            nodes
+                .iter()
+                .map(|node| match node {
+                    Node::Text(text) => text.as_str(),
+                    Node::Tabstop(n) | Node::Placeholder(n, _) | Node::Choice(n, _) => match at {
+                        Some((typed_at, typed)) if typed_at == *n => typed,
+                        _ => defaults.get(n).copied().unwrap_or(""),
+                    },
+                })
+                .collect()
+        }
+
+        /// `snippet` read back in the shapes [`render`] writes, `$n` too (a
+        /// `$` opens a tabstop, a `\` escapes the next character); `None`
+        /// for anything else.
+        fn parse(snippet: &str) -> Option<Vec<Node>> {
+            let mut chars = snippet.chars().peekable();
+            let mut nodes = Vec::new();
+            let mut text = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => text.push(chars.next()?),
+                    '$' => {
+                        if !text.is_empty() {
+                            nodes.push(Node::Text(std::mem::take(&mut text)));
+                        }
+                        let braced = chars.next_if_eq(&'{').is_some();
+                        let n = u8::try_from(chars.next()?.to_digit(10)?).ok()?;
+                        if !braced {
+                            nodes.push(Node::Tabstop(n));
+                            continue;
+                        }
+                        match chars.next()? {
+                            '}' => nodes.push(Node::Tabstop(n)),
+                            ':' => {
+                                let mut default = String::new();
+                                loop {
+                                    match chars.next()? {
+                                        '\\' => default.push(chars.next()?),
+                                        '}' => break,
+                                        '$' => return None,
+                                        c => default.push(c),
+                                    }
+                                }
+                                nodes.push(Node::Placeholder(n, default));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    c => text.push(c),
+                }
+            }
+            if !text.is_empty() {
+                nodes.push(Node::Text(text));
+            }
+            Some(nodes)
+        }
+
+        /// What `nodes` keeps whatever indentation goes into its texts: the
+        /// tabstops in order, with their defaults.
+        fn skeleton(nodes: &[Node]) -> Vec<Node> {
+            nodes
+                .iter()
+                .filter(|node| !matches!(node, Node::Text(_)))
+                .cloned()
+                .collect()
+        }
+
+        /// How the host holds a generated virtual document: as it is, or as
+        /// a list item's fence holds it (each non-empty row behind the
+        /// item's two-space indentation, recorded as its column; an empty
+        /// row recording none).
+        #[derive(Debug, Clone, Copy)]
+        enum Host {
+            Fence,
+            ListItem,
+        }
+
+        impl Host {
+            fn columns(self, virtual_text: &str) -> Vec<u32> {
+                match self {
+                    Host::Fence => vec![0],
+                    Host::ListItem => virtual_text
+                        .split('\n')
+                        .map(|line| if line.is_empty() { 0 } else { 2 })
+                        .collect(),
+                }
+            }
+
+            /// The host text holding `virtual_text`.
+            fn text(self, virtual_text: &str) -> String {
+                match self {
+                    Host::Fence => virtual_text.to_string(),
+                    Host::ListItem => virtual_text
+                        .split_inclusive('\n')
+                        .map(|line| {
+                            if line == "\n" {
+                                line.to_string()
+                            } else {
+                                format!("  {line}")
+                            }
+                        })
+                        .collect(),
+                }
+            }
+        }
+
+        /// One generated completion: the snippet `nodes` as a textEdit over
+        /// `range` of P. A kept item must be one every client expands alike,
+        /// go out as a snippet with the generated tabstops, and give the
+        /// reference host text both at its defaults and with text typed at
+        /// each tabstop. `Ok(Some(literal))` when kept.
+        fn check_one(
+            document: &Document,
+            map: &std::sync::Arc<PreparedMap>,
+            indent: &str,
+            host: Host,
+            nodes: &[Node],
+            range: LspRange,
+        ) -> Result<Option<bool>, TestCaseError> {
+            let snippet = render(nodes);
+            let mut completed = item(json!({
+                "label": "s",
+                "insertTextFormat": 2,
+                "textEdit": { "range": range, "newText": snippet }
+            }));
+            let virtual_text = exact_reference::virtual_text(document);
+            let host_text = host.text(virtual_text);
+            let region_end = crate::text::PositionMapper::new(&host_text)
+                .byte_to_position(host_text.len())
+                .unwrap();
+            let offset = RegionOffset::with_per_line_offsets(0, host.columns(virtual_text))
+                .with_prepared(map.clone());
+            if !transform_completion_item(
+                &mut completed,
+                &offset,
+                region_end,
+                None,
+                ClientInsertMode::AsIsSettable,
+            ) {
+                return Ok(None);
+            }
+            // Literal text goes out as the plain text it is, inserted as
+            // is; any other snippet must be one clients expand alike.
+            let literal = !snippet.contains(['$', '\\']);
+            prop_assert!(
+                literal || alike(nodes),
+                "kept though clients expand it apart: {:?}",
+                snippet
+            );
+            prop_assert_eq!(
+                completed.insert_text_format,
+                Some(if literal {
+                    tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT
+                } else {
+                    tower_lsp_server::ls_types::InsertTextFormat::SNIPPET
+                })
+            );
+            let Some(CompletionTextEdit::Edit(sent)) = &completed.text_edit else {
+                return Err(TestCaseError::fail(format!(
+                    "kept without its edit: {completed:?}"
+                )));
+            };
+            let parsed = parse(&sent.new_text);
+            prop_assert!(parsed.is_some(), "no snippet: {:?}", sent.new_text);
+            let parsed = parsed.unwrap();
+            prop_assert_eq!(skeleton(&parsed), skeleton(nodes), "{:?}", sent.new_text);
+            let numbers: Vec<Option<(u8, &str)>> = std::iter::once(None)
+                .chain(nodes.iter().filter_map(|node| match node {
+                    Node::Tabstop(n) | Node::Placeholder(n, _) => Some(Some((*n, TYPED))),
+                    _ => None,
+                }))
+                .collect();
+            for at in numbers {
+                let got = apply_to(
+                    &host_text,
+                    &[TextEdit {
+                        range: sent.range,
+                        new_text: expand(&parsed, at),
+                    }],
+                );
+                let expected = exact_reference::reference(
+                    document,
+                    map,
+                    &[TextEdit {
+                        range,
+                        new_text: expand(nodes, at),
+                    }],
+                    indent,
+                )
+                .map(|expected| host.text(&expected));
+                prop_assert_eq!(
+                    Some(&got),
+                    expected.as_ref(),
+                    "{:?} at {:?} typed {:?} on {:?} (P {:?}) sent {:?}",
+                    snippet,
+                    range,
+                    at,
+                    virtual_text,
+                    exact_reference::prepared_text(map),
+                    sent
+                );
+            }
+            Ok(Some(literal))
+        }
+
+        /// Generated documents (see `exact_reference`), each with one
+        /// snippet completion over a random range of P; how many snippets
+        /// with tabstops were kept.
+        fn check(cases: u32, host: Host) -> u32 {
+            let mut runner = property_runner(cases);
+            let kept = Cell::new(0);
+            let strategy = (
+                prop::collection::vec(exact_reference::line(), 1..6),
+                prop::sample::select(vec!["  ", "\t", "    "]),
+                (0..3usize, 0..3usize, any::<bool>()),
+                prop::collection::vec(node(), 1..5),
+                (any::<u16>(), any::<u16>()),
+            );
+            runner
+                .run(
+                    &strategy,
+                    |(lines, indent, (leading, trailing, closing), nodes, (a, b))| {
+                        let Some((document, map)) =
+                            exact_reference::prepared(&lines, indent, leading, trailing, closing)
+                        else {
+                            return Ok(());
+                        };
+                        let prepared = exact_reference::prepared_text(&map);
+                        let mapper = crate::text::PositionMapper::new(prepared);
+                        let boundaries: Vec<usize> = (0..=prepared.len())
+                            .filter(|&at| prepared.is_char_boundary(at))
+                            .collect();
+                        let a = boundaries[a as usize % boundaries.len()];
+                        let b = boundaries[b as usize % boundaries.len()];
+                        let range = LspRange::new(
+                            mapper.byte_to_position(a.min(b)).unwrap(),
+                            mapper.byte_to_position(a.max(b)).unwrap(),
+                        );
+                        if check_one(&document, &map, indent, host, &nodes, range)? == Some(false) {
+                            kept.set(kept.get() + 1);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            kept.get()
+        }
+
+        #[test]
+        fn kept_snippets_give_exactly_the_reference_host_text() {
+            let kept = check(8000, Host::Fence);
+            assert!(kept > 200, "kept {kept}");
+        }
+
+        /// On a list item's fence the empty rows record no indentation: a
+        /// snippet whose text lands on one, or text typed at its tabstop
+        /// there, would sit at the host's column 0, out of the item.
+        #[test]
+        #[ignore = "passes once the shared region guard protects a list-item fence's empty rows (the list-fence empty-row fix) in the base"]
+        fn kept_snippets_on_a_list_item_fence_give_exactly_the_reference_host_text() {
+            check(8000, Host::ListItem);
+        }
+
+        /// The list-item shape the property generates, a snippet completed
+        /// on an empty row of the item's fence: the text typed at its
+        /// tabstop must take the item's indentation.
+        #[test]
+        #[ignore = "passes once the shared region guard protects a list-item fence's empty rows (the list-fence empty-row fix) in the base"]
+        fn a_snippet_on_an_empty_row_of_a_list_item_fence_is_refused_or_lands_in_the_item() {
+            use crate::lsp::bridge::protocol::exact_reference::Line;
+            let lines = [
+                Line::Content { body: 0, gap: None },
+                Line::Empty,
+                Line::Content { body: 0, gap: None },
+            ];
+            let (document, map) = exact_reference::prepared(&lines, "  ", 0, 0, false).unwrap();
+            // P is `a\n\na\n`; the snippet goes on its empty row.
+            let at = Position::new(1, 0);
+            check_one(
+                &document,
+                &map,
+                "  ",
+                Host::ListItem,
+                &[
+                    Node::Text("f(".into()),
+                    Node::Tabstop(1),
+                    Node::Text(")".into()),
+                ],
+                LspRange::new(at, at),
+            )
+            .unwrap();
+        }
+    }
 }

@@ -44,7 +44,7 @@ pub(crate) use prepare::{
     VirtualLayout, apply_prepare_result_at, next_presentation, parse_prepare_response,
 };
 #[cfg(test)]
-pub(crate) use prepare::{CONVERSIONS, SegmentKind, apply_prepare_result};
+pub(crate) use prepare::{CONVERSIONS, SegmentKind, apply_prepare_result, exact_reference};
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
