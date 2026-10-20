@@ -806,6 +806,9 @@ mod tests {
 
         let edits = respond("b = 2\n");
         assert!(edits.is_empty(), "the list item would end: {edits:?}");
+        // A diff reusing the blank row writes onto it without a line break.
+        let edits = respond("b = 2");
+        assert!(edits.is_empty(), "the list item would end: {edits:?}");
 
         let edits = respond("  b = 2\n");
         assert_eq!(

@@ -360,10 +360,12 @@ pub(crate) fn text_edit_safe_in_region(
 ///   Unsafe iff the insertion point's neighborhood is prefixed (the start line
 ///   or the one after it has a non-zero prefix — a single-line inline/
 ///   blockquote region has no line after, so the start line's own offset is
-///   the only signal there). A blank row of the prefixed block records no
-///   prefix (a list item's fence leaves blank rows unindented); there the
-///   insertion is unsafe iff one of its non-blank lines is indented less
-///   than the block's widest recorded prefix.
+///   the only signal there).
+///
+/// A blank row of the prefixed block records no prefix (a list item's fence
+/// leaves blank rows unindented). An edit starting there, with or without a
+/// newline, is unsafe iff one of its non-blank lines is indented less than
+/// the block's widest recorded prefix: that line ends the block.
 ///
 /// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
 /// rules — every edit is prefix-safe there, which keeps the common case
@@ -490,9 +492,9 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // prefix, or the boundary row) in a content-prefixed region is a
         // blank row of the prefixed block: a list item's fence leaves its
         // blank rows unindented, and the opening fence above row 0 carries
-        // the prefix too. Text there starts at host column 0, so a line it
-        // creates that is indented less than the block's prefix ends the
-        // block. Only the prefix's width is recorded, not its text (`  ` vs
+        // the prefix too. Text there starts at host column 0, so a non-blank
+        // line it writes, on that row or on a new one, that is indented less
+        // than the block's prefix ends the block. Only the prefix's width is recorded, not its text (`  ` vs
         // `> `), so such an edit is refused rather than re-prefixed; blank
         // lines and lines indented at least as far still apply.
         let inside_prefixed_block = |host_line: u32| {
@@ -507,11 +509,16 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         let max_column = columns.iter().copied().max().unwrap_or(0);
         let inserts_unprefixed_line = !newline_splits_nothing
             && (e.new_text.contains('\n') || e.new_text.contains('\r'))
-            && (prefix_at(start.line)
-                || prefix_at(start.line.saturating_add(1))
-                || (inside_prefixed_block(start.line)
-                    && has_line_below_width(&e.new_text, max_column)));
-        !touches_boundary && !spans_prefixed_line && !inserts_unprefixed_line
+            && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
+        // With or without a line break: the first line lands on the blank
+        // row itself, and a range running on past it either ends on a zero
+        // row (nothing after it) or is refused as spanning a prefixed one.
+        let writes_below_block_prefix =
+            inside_prefixed_block(start.line) && has_line_below_width(&e.new_text, max_column);
+        !touches_boundary
+            && !spans_prefixed_line
+            && !inserts_unprefixed_line
+            && !writes_below_block_prefix
     }
 }
 
@@ -1191,9 +1198,9 @@ mod tests {
 
     /// A list item's fence indents its content rows, but its blank rows carry
     /// no indentation, so they record a zero offset. An edit that puts
-    /// unindented text onto new lines there ends the list item. The edits
-    /// below are all newline-bearing insertions on such a blank row, where
-    /// neither that row nor the next one records a prefix.
+    /// unindented text there, on the row itself or on new lines, ends the
+    /// list item. The edits below start on such a blank row, where neither
+    /// that row nor the next one records a prefix.
     #[rstest::rstest]
     // The trailing blank rows: "- item\n\n  ```py\n  a = 1\n\n\n  ```\n".
     #[case::trailing_blank_row("- item\n\n  ```py\n  a = 1\n\n\n  ```\n", vec![2, 0, 0, 0], 4, 6)]
@@ -1230,6 +1237,19 @@ mod tests {
             &offset,
             region_end
         ));
+        // Without a line break, the text lands at column 0 of the blank row
+        // itself, as a diff-based formatter reusing a blank line writes it.
+        assert!(!text_edit_safe_in_region(
+            &at_blank("b = 2"),
+            &offset,
+            region_end
+        ));
+        // So does a replacement merging the blank row with the next one.
+        let merging = TextEdit {
+            range: Range::new(Position::new(blank_row, 0), Position::new(blank_row + 1, 0)),
+            new_text: "b".to_string(),
+        };
+        assert!(!text_edit_safe_in_region(&merging, &offset, region_end));
         // A plain fence has no item to end: there the same edit is applied.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0, 0]);
         assert!(text_edit_safe_in_region(
@@ -1256,6 +1276,16 @@ mod tests {
             let expected = [before.join("\n"), line.to_string(), after.join("\n")].join("\n");
             assert_eq!(crate::text::edit::apply_text_edits(host, &[edit]), expected);
         }
+        // Text indented as far as the item's content, written onto the
+        // blank row itself, also stays inside the item.
+        let edit = at_blank("  b = 2");
+        assert!(text_edit_safe_in_region(&edit, &offset, region_end));
+        let mut lines: Vec<&str> = host.split('\n').collect();
+        lines[blank_row as usize] = "  b = 2";
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &[edit]),
+            lines.join("\n")
+        );
     }
 
     #[test]
