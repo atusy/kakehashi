@@ -54,25 +54,116 @@ pub(crate) fn transform_workspace_edit_to_host(
         return transform_prepared_workspace_edit(edit, request_virtual_uri, host_uri, offset);
     }
 
+    transform_edits(edit, request_virtual_uri, host_uri, &mut Ranges(offset))
+}
+
+/// How the request's virtual document's edits translate to the host
+/// (see [`transform_edits`]); `false` when refused.
+trait EditTranslation {
+    /// A `changes` entry's edits.
+    fn edits(&mut self, edits: &mut Vec<TextEdit>) -> bool;
+    /// A `documentChanges` entry's edits, annotated or not.
+    fn entry(&mut self, edits: &mut Vec<OneOf<TextEdit, AnnotatedTextEdit>>) -> bool;
+}
+
+/// An unprepared document's edits: each range translated on its own, in
+/// place, nothing refused.
+struct Ranges<'a>(&'a RegionOffset);
+
+impl EditTranslation for Ranges<'_> {
+    fn edits(&mut self, edits: &mut Vec<TextEdit>) -> bool {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, self.0);
+        }
+        true
+    }
+
+    fn entry(&mut self, edits: &mut Vec<OneOf<TextEdit, AnnotatedTextEdit>>) -> bool {
+        for one_of in edits.iter_mut() {
+            let text_edit = match one_of {
+                OneOf::Left(text_edit) => text_edit,
+                OneOf::Right(annotated_edit) => &mut annotated_edit.text_edit,
+            };
+            translate_virtual_range_to_host(&mut text_edit.range, self.0);
+        }
+        true
+    }
+}
+
+/// A prepared document's edits: one set the client applies together,
+/// replayed through its map ([`translate_virtual_replayed_edits_to_host`]);
+/// annotated edits, which must keep their identity, keep their extents,
+/// one mapped for each.
+struct Replayed<'a>(&'a RegionOffset);
+
+impl EditTranslation for Replayed<'_> {
+    fn edits(&mut self, edits: &mut Vec<TextEdit>) -> bool {
+        translate_virtual_replayed_edits_to_host(edits, self.0)
+    }
+
+    fn entry(&mut self, edits: &mut Vec<OneOf<TextEdit, AnnotatedTextEdit>>) -> bool {
+        if edits.iter().all(|one_of| matches!(one_of, OneOf::Left(_))) {
+            let mut plain: Vec<TextEdit> = std::mem::take(edits)
+                .into_iter()
+                .filter_map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => Some(text_edit),
+                    OneOf::Right(_) => None,
+                })
+                .collect();
+            let mapped = translate_virtual_replayed_edits_to_host(&mut plain, self.0);
+            *edits = plain.into_iter().map(OneOf::Left).collect();
+            return mapped;
+        }
+        let mut plain: Vec<TextEdit> = edits
+            .iter()
+            .map(|one_of| match one_of {
+                OneOf::Left(text_edit) => text_edit.clone(),
+                OneOf::Right(annotated) => annotated.text_edit.clone(),
+            })
+            .collect();
+        if !translate_virtual_text_edits_to_host(&mut plain, self.0, EditMode::Extent) {
+            return false;
+        }
+        for (one_of, text_edit) in edits.iter_mut().zip(plain) {
+            match one_of {
+                OneOf::Left(left) => *left = text_edit,
+                OneOf::Right(annotated) => annotated.text_edit = text_edit,
+            }
+        }
+        true
+    }
+}
+
+/// Re-key the request's virtual document's edits to `host_uri`, `map`
+/// translating them (`false` when it refuses them: then so is the whole
+/// edit), keep real-file URIs' as they are, and drop other (cross-region)
+/// virtual URIs': in the `changes` map, and in `documentChanges`, where the
+/// virtual document's entries also lose their version, which counted the
+/// virtual document.
+fn transform_edits(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    map: &mut impl EditTranslation,
+) -> bool {
+    let mut mapped = true;
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
-        transform_changes_map(changes, request_virtual_uri, host_uri, offset);
+        mapped &= transform_changes_map(changes, request_virtual_uri, host_uri, map);
     }
 
     // Transform documentChanges array
     if let Some(doc_changes) = &mut edit.document_changes {
-        transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
+        mapped &= transform_document_changes(doc_changes, request_virtual_uri, host_uri, map);
     }
 
-    true
+    mapped
 }
 
 /// [`transform_workspace_edit_to_host`] for a prepared document: the
 /// request's virtual document's edits go back through the prepared map as
-/// one set the client applies together
-/// ([`translate_virtual_replayed_edits_to_host`]; annotated edits, which
-/// must keep their identity, keeping their extents), re-keyed to the host
-/// URI as on any document. `false` — the whole edit refused — when a set is
+/// one set the client applies together ([`Replayed`]), re-keyed to the
+/// host URI as on any document. `false` — the whole edit refused — when a set is
 /// refused, or when the edit cannot be read as one set of host edits:
 ///
 /// - an edit made to the host URI directly reaches into the region's host
@@ -140,88 +231,7 @@ fn transform_prepared_workspace_edit(
         return false;
     }
 
-    if let Some(changes) = &mut edit.changes {
-        let mut mapped = None;
-        let mut refused = false;
-        changes.retain(|key, edits| {
-            if !VirtualDocumentUri::is_virtual_uri(key.as_str()) {
-                return true;
-            }
-            if key.as_str() == request_virtual_uri {
-                refused = !translate_virtual_replayed_edits_to_host(edits, offset);
-                mapped = Some(std::mem::take(edits));
-            }
-            false
-        });
-        if refused {
-            return false;
-        }
-        if let Some(mapped) = mapped {
-            let host_edits = changes.entry(host_uri.clone()).or_default();
-            host_edits.extend(mapped);
-            let mut ranges: Vec<&Range> = host_edits.iter().map(|edit| &edit.range).collect();
-            ranges.sort_by_key(|range| (range.start, range.end));
-            if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
-                return false;
-            }
-        }
-    }
-
-    let mut refused = false;
-    let mut transform_entry = |entry: &mut TextDocumentEdit| {
-        let uri = entry.text_document.uri.as_str();
-        if !VirtualDocumentUri::is_virtual_uri(uri) {
-            return true;
-        }
-        if uri != request_virtual_uri {
-            return false;
-        }
-        entry.text_document.uri = host_uri.clone();
-        entry.text_document.version = None;
-        refused |= !if entry
-            .edits
-            .iter()
-            .all(|one_of| matches!(one_of, OneOf::Left(_)))
-        {
-            let mut edits: Vec<TextEdit> = std::mem::take(&mut entry.edits)
-                .into_iter()
-                .filter_map(|one_of| match one_of {
-                    OneOf::Left(text_edit) => Some(text_edit),
-                    OneOf::Right(_) => None,
-                })
-                .collect();
-            let mapped = translate_virtual_replayed_edits_to_host(&mut edits, offset);
-            entry.edits = edits.into_iter().map(OneOf::Left).collect();
-            mapped
-        } else {
-            let mut edits: Vec<TextEdit> = entry
-                .edits
-                .iter()
-                .map(|one_of| match one_of {
-                    OneOf::Left(text_edit) => text_edit.clone(),
-                    OneOf::Right(annotated) => annotated.text_edit.clone(),
-                })
-                .collect();
-            let mapped = translate_virtual_text_edits_to_host(&mut edits, offset, EditMode::Extent);
-            for (one_of, edit) in entry.edits.iter_mut().zip(edits) {
-                match one_of {
-                    OneOf::Left(text_edit) => *text_edit = edit,
-                    OneOf::Right(annotated) => annotated.text_edit = edit,
-                }
-            }
-            mapped
-        };
-        true
-    };
-    match &mut edit.document_changes {
-        None => {}
-        Some(DocumentChanges::Edits(edits)) => edits.retain_mut(&mut transform_entry),
-        Some(DocumentChanges::Operations(ops)) => ops.retain_mut(|op| match op {
-            DocumentChangeOperation::Edit(entry) => transform_entry(entry),
-            DocumentChangeOperation::Op(_) => true,
-        }),
-    }
-    !refused
+    transform_edits(edit, request_virtual_uri, host_uri, &mut Replayed(offset))
 }
 
 /// An edit's range, annotated or not.
@@ -261,11 +271,12 @@ fn transform_changes_map(
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
-) {
+    map: &mut impl EditTranslation,
+) -> bool {
     // Filter and translate in one allocation-free pass, extracting the
     // request's own edits for re-keying afterwards (keys can't change in place).
     let mut rekeyed_edits: Option<Vec<TextEdit>> = None;
+    let mut mapped = true;
     changes.retain(|key, edits| {
         let uri_str = key.as_str();
 
@@ -276,9 +287,7 @@ fn transform_changes_map(
 
         // Case 2: Same virtual URI → transform ranges, re-key to host URI
         if uri_str == request_virtual_uri {
-            for edit in edits.iter_mut() {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-            }
+            mapped &= map.edits(edits);
             rekeyed_edits = Some(std::mem::take(edits));
             return false;
         }
@@ -295,6 +304,7 @@ fn transform_changes_map(
             changes.insert(host_uri.clone(), edits);
         }
     }
+    mapped
 }
 
 /// Transform the `documentChanges` array in a WorkspaceEdit.
@@ -308,23 +318,29 @@ fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
-) {
+    map: &mut impl EditTranslation,
+) -> bool {
+    let mut mapped = true;
     match doc_changes {
         DocumentChanges::Edits(edits) => {
             edits.retain_mut(|edit| {
-                transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
+                transform_text_document_edit(edit, request_virtual_uri, host_uri, map, &mut mapped)
             });
         }
         DocumentChanges::Operations(ops) => {
             ops.retain_mut(|op| match op {
-                DocumentChangeOperation::Edit(edit) => {
-                    transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
-                }
+                DocumentChangeOperation::Edit(edit) => transform_text_document_edit(
+                    edit,
+                    request_virtual_uri,
+                    host_uri,
+                    map,
+                    &mut mapped,
+                ),
                 DocumentChangeOperation::Op(_) => true, // Pre-validated real-file ops
             });
         }
     }
+    mapped
 }
 
 /// Whether a file operation references only real (non-virtual) URIs.
@@ -342,11 +358,14 @@ fn resource_op_targets_real_files_only(op: &ResourceOp) -> bool {
 /// Transform a single TextDocumentEdit's URI and edit ranges.
 ///
 /// Returns `true` if the edit should be kept, `false` if it should be filtered out.
+/// `map` translates the edits (`mapped` set `false` when it refuses
+/// them).
 fn transform_text_document_edit(
     edit: &mut TextDocumentEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
+    map: &mut impl EditTranslation,
+    mapped: &mut bool,
 ) -> bool {
     let uri_str = edit.text_document.uri.as_str();
 
@@ -361,13 +380,7 @@ fn transform_text_document_edit(
         // The version counted the virtual document; against the host URI it
         // would make clients reject the edit as stale.
         edit.text_document.version = None;
-        for one_of in &mut edit.edits {
-            let text_edit = match one_of {
-                OneOf::Left(text_edit) => text_edit,
-                OneOf::Right(annotated_edit) => &mut annotated_edit.text_edit,
-            };
-            translate_virtual_range_to_host(&mut text_edit.range, offset);
-        }
+        *mapped &= map.entry(&mut edit.edits);
         return true;
     }
 
@@ -1832,5 +1845,46 @@ mod tests {
                 &prepared_offset()
             ));
         }
+    }
+
+    #[test]
+    fn a_prepared_document_drops_other_regions_edits_and_takes_insertions_at_its_edges() {
+        let virtual_uri = make_virtual_uri_string();
+        let other_region =
+            VirtualDocumentUri::new(&make_host_uri(), "lua", "region-1").to_uri_string();
+        let host_uri = make_host_uri();
+        let mut edit = parse_workspace_edit(json!({
+            "changes": {
+                virtual_uri.clone(): [{"range": range_json((0, 6), (0, 7)), "newText": "xy"}],
+                other_region.clone(): [{"range": range_json((0, 0), (0, 1)), "newText": "q"}],
+                // Insertions right where the region starts and ends.
+                host_uri.as_str(): [
+                    {"range": range_json((10, 0), (10, 0)), "newText": "<"},
+                    {"range": range_json((12, 0), (12, 0)), "newText": ">"}
+                ]
+            },
+            "documentChanges": [
+                {"textDocument": {"uri": other_region, "version": 1}, "edits": [
+                    {"range": range_json((0, 0), (0, 1)), "newText": "q"}
+                ]},
+                {"textDocument": {"uri": virtual_uri.clone(), "version": 1}, "edits": [
+                    {"range": range_json((0, 6), (0, 7)), "newText": "xy"}
+                ]}
+            ]
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &prepared_offset()
+        ));
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes.keys().collect::<Vec<_>>(), vec![&host_uri]);
+        assert_eq!(changes[&host_uri].len(), 3);
+        let Some(DocumentChanges::Edits(entries)) = edit.document_changes else {
+            panic!("edits variant kept");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text_document.uri, host_uri);
     }
 }
