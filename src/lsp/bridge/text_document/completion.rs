@@ -3763,17 +3763,22 @@ mod tests {
         }
 
         /// Snippet text as servers write it, unescaped: an unbraced tabstop,
-        /// a backslash escaping nothing (text alike for every client), and
-        /// forms clients read apart or not at all (a `$` opening nothing, a
-        /// variable, a mirror or an odd escape in a default, a transform).
-        const RAW: [&str; 7] = [
+        /// and forms clients read apart or not at all (an escape of anything
+        /// but `$`, `}` or `\\`, a `$` opening nothing, a variable, a mirror
+        /// or an odd escape in a default, a transform, a tabstop number with
+        /// a leading zero or past 9999).
+        const RAW: [&str; 11] = [
             "$1",
             "\\q",
+            "\\.",
             "$",
             "$TM_X",
             "${1:$2}",
             "${1:a\\qb}",
             "${1/a/b/}",
+            "$01",
+            "${01:a}",
+            "$10000",
         ];
 
         /// Texts the nodes hold: words repeating the generated lines,
@@ -3838,14 +3843,30 @@ mod tests {
 
         /// Whether every client expands `nodes` alike: no choice (VS Code
         /// inserts its first option, Neovim nothing), at most one default
-        /// per tabstop, the final tabstop at most once, and nothing a
-        /// snippet engine rewrites (a line break, a tab).
+        /// per tabstop and only on its first occurrence (mini.snippets
+        /// mirrors no later one), the final tabstop at most once, nothing a
+        /// snippet engine rewrites (a line break, a tab), and, holding a
+        /// tabstop, a `$` opening a word after anything but a backslash
+        /// (mini.completion inserts other text as is).
         fn alike(nodes: &[Node]) -> bool {
             let mut defaults = HashMap::new();
+            let mut seen = std::collections::HashSet::new();
             let mut finals = 0;
             for node in nodes {
                 match node {
-                    Node::Raw("$1" | "\\q") => {}
+                    Node::Tabstop(n) | Node::Placeholder(n, _) | Node::Choice(n, _) => {
+                        if matches!(node, Node::Placeholder(..)) && seen.contains(n) {
+                            return false;
+                        }
+                        seen.insert(*n);
+                    }
+                    Node::Raw("$1") => {
+                        seen.insert(1);
+                    }
+                    _ => {}
+                }
+                match node {
+                    Node::Raw("$1") => {}
                     Node::Raw(_) | Node::Choice(..) => return false,
                     Node::Text(text) if text.contains(['\n', '\r', '\t']) => return false,
                     Node::Placeholder(n, default)
@@ -3860,7 +3881,15 @@ mod tests {
                     finals += 1;
                 }
             }
-            finals <= 1
+            let rendered = render(nodes).into_bytes();
+            let opens_word = |at: usize| rendered.get(at).is_some_and(u8::is_ascii_alphanumeric);
+            let read_as_snippet = (0..rendered.len()).any(|at| {
+                rendered[at] == b'$'
+                    && (at == 0 || rendered[at - 1] != b'\\')
+                    && (opens_word(at + 1)
+                        || (rendered.get(at + 1) == Some(&b'{') && opens_word(at + 2)))
+            });
+            finals <= 1 && (seen.is_empty() || read_as_snippet)
         }
 
         /// What a client inserts for `nodes` (alike), the user having typed
