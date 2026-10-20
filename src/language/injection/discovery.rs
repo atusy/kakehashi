@@ -362,11 +362,7 @@ fn extract_virtual_content_and_offsets(
         included_ranges.as_deref(),
         markdown_container_prefixes(&region.content_node, text),
     );
-    let opener_prefix = list_fence_opener_prefix(&region.content_node, text);
-    let opener_width = match opener_prefix.map(LinePrefix::continuation) {
-        Some(LinePrefix::Whitespace(width)) => width,
-        _ => 0,
-    };
+    let opener_width = list_fence_content_column(&region.content_node, text);
     let (protected_blank_rows, container_blank_rows) = container_blank_rows(
         &line_column_offsets,
         &line_prefixes,
@@ -381,20 +377,46 @@ fn extract_virtual_content_and_offsets(
     ))
 }
 
-/// The container continuation before a fenced code block's opening line,
-/// as tree-sitter-md parses it (the `block_continuation` right before the
-/// block): a list item's indentation, which a fence holding only blank rows
-/// has on no row of its own. O(1): one parent and one sibling.
-fn list_fence_opener_prefix<'a>(content_node: &Node<'_>, text: &'a str) -> Option<&'a str> {
-    let block = content_node
+/// The content column of the list item a fenced code block opens in, as
+/// tree-sitter-md parses the opening line: the width of the whitespace
+/// `block_continuation` right before the block (a fence on a later line of
+/// the item), or of the `list_marker_*` right before it, its following
+/// whitespace included (a fence on the item's own line), measured from the
+/// line start with tabs reaching the next multiple of 4. A fence holding
+/// only blank rows has that indentation on no row of its own. 0 when the
+/// block opens in no list item at a line start (a blockquote's marker, a
+/// plain fence). O(1): one parent and one sibling.
+fn list_fence_content_column(content_node: &Node<'_>, text: &str) -> u32 {
+    let Some(block) = content_node
         .parent()
-        .filter(|node| node.kind() == "fenced_code_block")?;
-    let continuation = block.prev_sibling().filter(|node| {
-        node.kind() == "block_continuation" && node.end_byte() == block.start_byte()
-    })?;
-    let start = continuation.start_byte();
-    let starts_line = start == 0 || matches!(text.as_bytes().get(start - 1), Some(b'\n' | b'\r'));
-    starts_line.then(|| clamped_slice(text, continuation.byte_range()))
+        .filter(|node| node.kind() == "fenced_code_block")
+    else {
+        return 0;
+    };
+    let Some(before) = block.prev_sibling().filter(|node| {
+        (node.kind() == "block_continuation" || node.kind().starts_with("list_marker_"))
+            && node.end_byte() == block.start_byte()
+    }) else {
+        return 0;
+    };
+    let start = before.start_byte();
+    if !(start == 0 || matches!(text.as_bytes().get(start - 1), Some(b'\n' | b'\r'))) {
+        return 0;
+    }
+    let span = clamped_slice(text, before.byte_range());
+    let mut width = 0u32;
+    for byte in span.bytes() {
+        match byte {
+            b'\t' => width = (width / 4).saturating_add(1).saturating_mul(4),
+            b' ' => width = width.saturating_add(1),
+            // A marker's own characters are one column each; a
+            // continuation holding anything but whitespace (a `>`) is no
+            // list item's indentation.
+            _ if before.kind() != "block_continuation" => width = width.saturating_add(1),
+            _ => return 0,
+        }
+    }
+    width
 }
 
 impl CacheableInjectionRegion {

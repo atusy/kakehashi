@@ -417,6 +417,10 @@ mod tests {
     #[case::blank_only_list_fence("- item\n\n  ```py\n\n  ```\n", FENCE_QUERY, vec![0])]
     #[case::two_blank_rows_only_list_fence("- item\n\n  ```py\n\n\n  ```\n", FENCE_QUERY, vec![0, 1])]
     #[case::blank_only_blockquote_fence("> ```py\n>\n> ```\n", FENCE_QUERY, vec![])]
+    // Opened on the item's own line: the marker gives the content column.
+    #[case::blank_only_fence_on_the_marker_line("- ```py\n\n  ```\n", FENCE_QUERY, vec![0])]
+    #[case::blank_only_fence_on_an_ordered_marker_line("10. ```py\n\n    ```\n", FENCE_QUERY, vec![0])]
+    #[case::blank_only_fence_on_an_indented_marker_line("  - ```py\n\n    ```\n", FENCE_QUERY, vec![0])]
     #[case::blank_only_plain_fence("```py\n\n```\n", FENCE_QUERY, vec![])]
     // A blank row keeping less whitespace than the item's indentation.
     #[case::list_fence_short_whitespace_row("- item\n\n  ```py\n  a\n \n  b\n  ```\n", FENCE_QUERY, vec![1])]
@@ -554,5 +558,20 @@ mod tests {
             read_back.first().map_or("", |r| r.virtual_content.as_str()),
             expected_virtual
         );
+    }
+
+    /// A fence opened on its list item's own line takes the item's content
+    /// column from the marker: text written on its blank row is refused, a
+    /// blank line still applies and reads back.
+    #[test]
+    fn a_blank_only_fence_on_the_marker_line_keeps_its_row_protected() {
+        let host = "- ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![0, 0]);
+        assert!(!accepts(resolved(), &edit((1, 0), (1, 0), "x")));
+        let change = edit((1, 0), (1, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n");
     }
 }
