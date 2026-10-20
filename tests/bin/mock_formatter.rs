@@ -2074,7 +2074,11 @@ fn main() {
                         let data = if mode == "inlay-hint-no-resolve-reserved-data" {
                             json!({ "kakehashi": { "origin": "downstream" } })
                         } else {
-                            json!({ "mock": "hint-1", "uri": uri })
+                            json!({
+                                "mock": "hint-1",
+                                "uri": uri,
+                                "receivedRange": message.pointer("/params/range")
+                            })
                         };
                         json!([{
                             "position": { "line": 0, "character": 1 },

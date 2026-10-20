@@ -1199,9 +1199,55 @@ fn e2e_inlay_hint_range_starting_before_regions_covers_every_intersected_region(
         "each hint is enveloped for the region that produced it"
     );
 
+    // Each region is asked for the range clipped to its content, which is
+    // one line in both fences: virtual (0,0)-(1,0).
+    let whole_line = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 1, "character": 0 }
+    });
+    for hint in &whole {
+        assert_eq!(
+            hint["data"]["kakehashi"]["inner"]["receivedRange"], whole_line,
+            "{hint}"
+        );
+    }
+
     let first_only = inlay_hints_once(&mut client, uri, 0, 6);
     let positions: Vec<&Value> = first_only.iter().map(|hint| &hint["position"]).collect();
     assert_eq!(positions, [&json!({ "line": 3, "character": 1 })]);
+
+    // A range from inside the first fence to inside the second is clipped at
+    // both ends: the first region keeps its start, the second its end.
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 4 },
+                "end": { "line": 9, "character": 5 }
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let received: Vec<&Value> = response["result"]
+        .as_array()
+        .expect("hints for both regions")
+        .iter()
+        .map(|hint| &hint["data"]["kakehashi"]["inner"]["receivedRange"])
+        .collect();
+    assert_eq!(
+        received,
+        [
+            &json!({
+                "start": { "line": 0, "character": 4 },
+                "end": { "line": 1, "character": 0 }
+            }),
+            &json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 5 }
+            })
+        ]
+    );
 
     // The resolve of the later region's hint routes back to that region.
     let response = client.send_request("inlayHint/resolve", whole[1].clone());
