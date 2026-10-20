@@ -2220,14 +2220,15 @@ mod tests {
 
     #[rstest]
     // The closing indent the peer removed after the last line.
-    #[case::closing_indent("  a\n  ", 2, "a", "  a\n  ")]
+    #[case::closing_indent("  a\n  ", 2, "a")]
     // nixfmt's: content deeper than the closing indent.
-    #[case::nixfmt("    a\n  ", 4, "a\nb", "    a\n  ")]
+    #[case::nixfmt("    a\n  ", 4, "a\nb")]
+    // The final break kept, text written after it (on the closing).
+    #[case::text_after_the_break("    a\n  ", 4, "a\nfoo")]
     fn an_on_type_answer_dropping_the_final_break_keeps_the_closing(
         #[case] virtual_content: &str,
         #[case] dedent: u32,
         #[case] answer: &str,
-        #[case] _host: &str,
     ) {
         let offset = prepared_offset(
             virtual_content,
@@ -2239,20 +2240,32 @@ mod tests {
         );
         let prepared = offset.prepared().unwrap().prepared_text().to_string();
         assert_eq!(prepared, "a\n");
-        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
-            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
-            "newText": answer
-        }]});
-        // Refused, not edited into the closing the peer deleted.
-        assert!(
-            transform_on_type_formatting_response_to_host(
-                response,
-                &offset,
-                &prepared,
-                region_host_end(&prepared, &offset),
-            )
-            .is_err()
-        );
+        let response = |answer: &str| {
+            json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": answer
+            }]})
+        };
+        // Refused as to its shape, not edited into the closing the peer
+        // deleted.
+        let error = transform_on_type_formatting_response_to_host(
+            response(answer),
+            &offset,
+            &prepared,
+            region_host_end(&prepared, &offset),
+        )
+        .unwrap_err();
+        assert_eq!(refusal(&error), Some(FormattingRefusal::Shape));
+        // The same answer ending with its line break maps, the closing kept.
+        let kept = transform_on_type_formatting_response_to_host(
+            response(&format!("{answer}\n")),
+            &offset,
+            &prepared,
+            region_host_end(&prepared, &offset),
+        )
+        .unwrap();
+        let host = crate::text::edit::apply_text_edits(virtual_content, &kept);
+        assert!(host.ends_with("\n  "), "{host:?}");
     }
 
     #[test]
