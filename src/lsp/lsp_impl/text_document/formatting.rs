@@ -1762,17 +1762,37 @@ fn fill_blank_row_prefixes<'a>(
     offset: &RegionOffset,
     original_virtual: &str,
 ) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
-    let recorded: Vec<String> = prefixes.iter().filter(|p| !p.is_empty()).cloned().collect();
-    let fill = longest_common_prefix(&recorded).to_string();
-    if offset.columns().len() <= 1 || fill.is_empty() {
+    if offset.columns().len() <= 1 {
         return (prefixes, None);
     }
+    // The longest common prefix of the recorded (non-empty) prefixes, and
+    // the last row recording one, each found in one pass over the rows.
+    let mut recorded = prefixes.iter().filter(|p| !p.is_empty());
+    let Some(first_recorded) = recorded.next() else {
+        return (prefixes, None);
+    };
+    let fill = recorded.fold(first_recorded.as_str(), |common, p| {
+        let len = common
+            .char_indices()
+            .zip(p.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((at, c), _)| at + c.len_utf8());
+        &common[..len]
+    });
+    if fill.is_empty() {
+        return (prefixes, None);
+    }
+    let fill = fill.to_string();
+    let last_recorded = prefixes.iter().rposition(|p| {
+        crate::text::count_row_scanned();
+        !p.is_empty()
+    });
     let ends_with_line_break = original_virtual.ends_with(['\n', '\r']);
     let last = prefixes.len().saturating_sub(1);
     let blank_row = |i: usize| {
         prefixes[i].is_empty()
-            && (prefixes[i + 1..].iter().any(|p| !p.is_empty())
-                || (ends_with_line_break && i < last))
+            && ((ends_with_line_break && i < last) || last_recorded.is_some_and(|at| i < at))
     };
     if !(0..prefixes.len()).any(blank_row) {
         return (prefixes, None);
@@ -2971,6 +2991,42 @@ mod tests {
         );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].virtual_content, formatted);
+    }
+
+    /// Filling the blank rows of a long list-item fence costs work linear in
+    /// its rows: each row is decided without rescanning the rows after it.
+    #[rstest::rstest]
+    // Closed by a fence row: the content ends with a line break.
+    #[case::closed_fence(String::new(), "\n")]
+    // A prefixed last row, the content ending mid-row on it.
+    #[case::prefixed_last_row("  ".to_string(), "b")]
+    fn pipeline_fills_the_blank_rows_of_a_long_fence_in_linear_work(
+        #[case] last_prefix: String,
+        #[case] last_text: &str,
+    ) {
+        use crate::text::ROWS_SCANNED;
+        const BLANK_ROWS: usize = 9_999;
+        let mut columns = vec![2];
+        columns.extend(std::iter::repeat_n(0, BLANK_ROWS));
+        columns.push(u32::from(!last_prefix.is_empty()) * 2);
+        let mut prefixes = vec!["  ".to_string()];
+        prefixes.extend(std::iter::repeat_n(String::new(), BLANK_ROWS));
+        prefixes.push(last_prefix);
+        let original = format!("a{}{}", "\n".repeat(BLANK_ROWS + 1), last_text.trim_end());
+        let formatted = format!("a\nc{}{}", "\n".repeat(BLANK_ROWS), last_text.trim_end());
+        ROWS_SCANNED.with(|rows| rows.set(0));
+
+        let text = pipeline_region_text(
+            &original,
+            &formatted,
+            &RegionOffset::with_per_line_offsets(3, columns),
+            &prefixes,
+        )
+        .expect("the region changed");
+
+        assert!(text.starts_with("a\n  c\n"), "{:?}", &text[..12]);
+        let scanned = ROWS_SCANNED.with(std::cell::Cell::get);
+        assert!(scanned <= 4 * (BLANK_ROWS + 2), "{scanned} rows scanned");
     }
 
     #[test]

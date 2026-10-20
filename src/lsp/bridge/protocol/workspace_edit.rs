@@ -504,8 +504,8 @@ pub(crate) fn text_edit_preserves_line_prefixes(
                 && host_line.checked_sub(offset.line()).is_some_and(|row| {
                     let row = row as usize;
                     columns.get(row) == Some(&0)
-                        && (columns[row + 1..].iter().any(|&column| column > 0)
-                            || (region_end.character == 0 && host_line < region_end.line))
+                        && ((region_end.character == 0 && host_line < region_end.line)
+                            || offset.last_prefixed_line().is_some_and(|last| row < last))
                 })
         };
         let inserts_unprefixed_line = !newline_splits_nothing
@@ -1305,6 +1305,38 @@ mod tests {
                 crate::text::edit::apply_text_edits(&virtual_text, &[edit])
             );
         }
+    }
+
+    /// Judging every blank row of a long list-item fence costs work linear
+    /// in its rows, not quadratic: each row is decided without rescanning
+    /// the rows after it.
+    #[rstest::rstest]
+    // Closed by a fence row: the boundary decides.
+    #[case::closed_fence(0, Position::new(3 + 10_001, 0))]
+    // A prefixed last row, the region ending mid-row on it.
+    #[case::prefixed_last_row(2, Position::new(3 + 10_000, 3))]
+    fn blank_rows_of_a_long_list_item_fence_are_judged_in_linear_work(
+        #[case] last_column: u32,
+        #[case] region_end: Position,
+    ) {
+        use crate::text::ROWS_SCANNED;
+        use tower_lsp_server::ls_types::Range;
+        const BLANK_ROWS: u32 = 9_999;
+        let mut columns = vec![2];
+        columns.extend(std::iter::repeat_n(0, BLANK_ROWS as usize));
+        columns.push(last_column);
+        ROWS_SCANNED.with(|rows| rows.set(0));
+        let offset = RegionOffset::with_per_line_offsets(3, columns);
+        for row in 1..=BLANK_ROWS {
+            let at = |new_text: &str| TextEdit {
+                range: Range::new(Position::new(3 + row, 0), Position::new(3 + row, 0)),
+                new_text: new_text.to_string(),
+            };
+            assert!(text_edit_safe_in_region(&at(" "), &offset, region_end));
+            assert!(!text_edit_safe_in_region(&at("x"), &offset, region_end));
+        }
+        let scanned = ROWS_SCANNED.with(std::cell::Cell::get);
+        assert!(scanned <= 4 * 10_001, "{scanned} rows scanned");
     }
 
     #[test]

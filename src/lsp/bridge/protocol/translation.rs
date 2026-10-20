@@ -27,20 +27,33 @@ pub(crate) struct RegionOffset {
     /// Per-virtual-line column offsets (UTF-16 code units).
     /// Index = virtual line number, value = column offset for that line.
     columns: Vec<u32>,
+    /// The last virtual line whose column offset is past 0, derived from
+    /// `columns` once so per-edit checks need not rescan them.
+    last_prefixed_line: Option<usize>,
 }
 
 impl RegionOffset {
     /// Construct a `RegionOffset` with a single column offset (non-blockquote case).
     pub(crate) fn new(line: u32, column: u32) -> Self {
-        Self {
-            line,
-            columns: vec![column],
-        }
+        Self::with_per_line_offsets(line, vec![column])
     }
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        Self { line, columns }
+        let last_prefixed_line = columns.iter().rposition(|&column| {
+            crate::text::count_row_scanned();
+            column > 0
+        });
+        Self {
+            line,
+            columns,
+            last_prefixed_line,
+        }
+    }
+
+    /// The last virtual line whose column offset is past 0, if any.
+    pub(crate) fn last_prefixed_line(&self) -> Option<usize> {
+        self.last_prefixed_line
     }
 
     /// Get the starting line of the injection region.
