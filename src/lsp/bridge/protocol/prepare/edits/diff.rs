@@ -38,7 +38,8 @@ impl Work {
 /// side holds can pair with nothing and are left out of the search first,
 /// so a side mostly new costs no more than its length. The table kept to
 /// read the pairs back grows with the square of the differences left,
-/// every cell of it spent from `work`, so the work bounds its memory too.
+/// every cell of it spent from `work`, so the work bounds its memory too;
+/// the frontier holds no more diagonals than the work left could reach.
 pub(super) fn myers_pairs<T: Eq + Hash>(
     a: &[T],
     b: &[T],
@@ -80,6 +81,12 @@ pub(super) fn myers_pairs<T: Eq + Hash>(
     Some(pairs)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The cells of the frontier [`myers_core`] last allocated.
+    static FRONTIER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [`myers_pairs`] for texts sharing no prefix or suffix.
 fn myers_core<T: PartialEq>(a: &[T], b: &[T], work: &mut Work) -> Option<Vec<(usize, usize)>> {
     let (n, m) = (a.len() as isize, b.len() as isize);
@@ -88,12 +95,17 @@ fn myers_core<T: PartialEq>(a: &[T], b: &[T], work: &mut Work) -> Option<Vec<(us
     }
     // The furthest x, kept as 4 bytes.
     u32::try_from(n).ok()?;
-    let max = (n + m) as usize;
-    let offset = max as isize;
+    // Step d spends 2d + 1, so the steps 0 to d spend (d + 1)^2: no
+    // further step than the square root of the work left can be reached,
+    // and the frontier holds no more diagonals than that.
+    let max = ((n + m) as usize).min(work.left.isqrt());
+    let offset = max as isize + 1;
     // v[k + offset]: the furthest x on diagonal k. `trace` holds, from
     // d * d on, the band of `v` before step d, diagonals -d to d: a cell
     // for each step spent on it, 4 bytes each.
-    let mut v = vec![0isize; 2 * max + 2];
+    let mut v = vec![0isize; 2 * max + 3];
+    #[cfg(test)]
+    FRONTIER.with(|cells| cells.set(v.len()));
     let mut trace: Vec<u32> = Vec::new();
     let mut reached = None;
     'search: for d in 0..=max as isize {
@@ -126,7 +138,11 @@ fn myers_core<T: PartialEq>(a: &[T], b: &[T], work: &mut Work) -> Option<Vec<(us
             k += 2;
         }
     }
-    let d_end = reached?;
+    // Out of steps before the end: the next would have spent past the work.
+    let Some(d_end) = reached else {
+        work.left = 0;
+        return None;
+    };
     // Read the snakes back from the end.
     let mut pairs = Vec::new();
     let (mut x, mut y) = (n, m);
@@ -322,6 +338,131 @@ pub(super) fn char_hunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The search as it sized its frontier before: by the texts, not the
+    /// work. Kept to check the bounded one gives the same results.
+    fn myers_core_by_length<T: PartialEq>(
+        a: &[T],
+        b: &[T],
+        work: &mut Work,
+    ) -> Option<Vec<(usize, usize)>> {
+        let (n, m) = (a.len() as isize, b.len() as isize);
+        if n == 0 || m == 0 {
+            return Some(Vec::new());
+        }
+        // The furthest x, kept as 4 bytes.
+        u32::try_from(n).ok()?;
+        let max = (n + m) as usize;
+        let offset = max as isize;
+        // v[k + offset]: the furthest x on diagonal k. `trace` holds, from
+        // d * d on, the band of `v` before step d, diagonals -d to d: a cell
+        // for each step spent on it, 4 bytes each.
+        let mut v = vec![0isize; 2 * max + 2];
+        let mut trace: Vec<u32> = Vec::new();
+        let mut reached = None;
+        'search: for d in 0..=max as isize {
+            work.spend(2 * d as usize + 1)?;
+            trace.extend(
+                v[(offset - d) as usize..=(offset + d) as usize]
+                    .iter()
+                    .map(|&x| x as u32),
+            );
+            let mut k = -d;
+            while k <= d {
+                let index = (k + offset) as usize;
+                let mut x = if k == -d || (k != d && v[index - 1] < v[index + 1]) {
+                    v[index + 1]
+                } else {
+                    v[index - 1] + 1
+                };
+                let mut y = x - k;
+                let start = x;
+                while x < n && y < m && a[x as usize] == b[y as usize] {
+                    x += 1;
+                    y += 1;
+                }
+                work.spend((x - start) as usize)?;
+                v[index] = x;
+                if x >= n && y >= m {
+                    reached = Some(d);
+                    break 'search;
+                }
+                k += 2;
+            }
+        }
+        let d_end = reached?;
+        // Read the snakes back from the end.
+        let mut pairs = Vec::new();
+        let (mut x, mut y) = (n, m);
+        for d in (1..=d_end).rev() {
+            let band = &trace[(d * d) as usize..];
+            let at = |k: isize| band[(k + d) as usize] as isize;
+            let k = x - y;
+            let previous_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) {
+                k + 1
+            } else {
+                k - 1
+            };
+            let previous_x = at(previous_k);
+            let previous_y = previous_x - previous_k;
+            // The snake after the step from (previous_x, previous_y).
+            let (step_x, step_y) = if previous_k == k + 1 {
+                (previous_x, previous_y + 1)
+            } else {
+                (previous_x + 1, previous_y)
+            };
+            while x > step_x && y > step_y {
+                x -= 1;
+                y -= 1;
+                pairs.push((x as usize, y as usize));
+            }
+            (x, y) = (previous_x, previous_y);
+        }
+        // The first snake, from (0, 0).
+        while x > 0 && y > 0 {
+            x -= 1;
+            y -= 1;
+            pairs.push((x as usize, y as usize));
+        }
+        pairs.reverse();
+        Some(pairs)
+    }
+
+    #[test]
+    fn the_frontier_is_sized_by_the_work_not_the_texts() {
+        // 100,000 elements against 100,000 others, nothing alike to the
+        // byte at the ends: the search can reach only as many diagonals as
+        // the work allows, and its frontier holds no more.
+        let a: Vec<u32> = (0..100_000).map(|at| at % 7).collect();
+        let b: Vec<u32> = (0..100_000).map(|at| at % 11).collect();
+        FRONTIER.with(|cells| cells.set(0));
+        assert_eq!(myers_core(&a, &b, &mut Work::new(10_000)), None);
+        let cells = FRONTIER.with(|cells| cells.get());
+        assert!(cells <= 2 * 100 + 3, "{cells}");
+    }
+
+    #[test]
+    fn the_bounded_search_finds_what_the_unbounded_one_did() {
+        let mut seed: u64 = 3;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % n) as usize
+        };
+        for _ in 0..3_000 {
+            let a: Vec<u8> = (0..next(40)).map(|_| next(4) as u8).collect();
+            let b: Vec<u8> = (0..next(40)).map(|_| next(4) as u8).collect();
+            let budget = next(400);
+            let (mut old, mut new) = (Work::new(budget), Work::new(budget));
+            assert_eq!(
+                myers_core(&a, &b, &mut new),
+                myers_core_by_length(&a, &b, &mut old),
+                "{a:?} {b:?} {budget}"
+            );
+            assert_eq!(new.left, old.left, "{a:?} {b:?} {budget}");
+        }
+    }
 
     fn pairs(a: &str, b: &str) -> Vec<(usize, usize)> {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
