@@ -1726,10 +1726,68 @@ fn pipeline_region_text(
     } else {
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
+    let (host_line_prefixes, first_row_blank) =
+        fill_blank_row_prefixes(host_line_prefixes, offset, original_virtual);
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    Some(reapply_host_line_prefixes(&final_text, &host_line_prefixes))
+    let text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
+    // The replacement starts after the first row's host prefix, so a first
+    // row with none (a leading blank row) takes the block's prefix here when
+    // the output puts text on it.
+    match first_row_blank {
+        Some(prefix)
+            if split_lsp_lines(&text)
+                .first()
+                .is_some_and(|(line, _)| !line.trim().is_empty()) =>
+        {
+            Some(format!("{prefix}{text}"))
+        }
+        _ => Some(text),
+    }
+}
+
+/// A list item's fence leaves its blank rows unindented, so a per-line
+/// region records no prefix for them, and output lines mapped there would
+/// start at host column 0 and end the item. A row with no prefix that comes
+/// before a prefixed row, or before the row after the content's final line
+/// break (the closing fence), is such a blank row: it takes the longest
+/// common prefix of the region's recorded prefixes instead. A region with
+/// one column offset has unprefixed later rows by design and is left as is.
+///
+/// Also returns the prefix the first row takes when it is a blank row, as
+/// the replacement range starts after that row's (empty) host prefix.
+fn fill_blank_row_prefixes<'a>(
+    prefixes: std::borrow::Cow<'a, [String]>,
+    offset: &RegionOffset,
+    original_virtual: &str,
+) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
+    let recorded: Vec<String> = prefixes.iter().filter(|p| !p.is_empty()).cloned().collect();
+    let fill = longest_common_prefix(&recorded).to_string();
+    if offset.columns().len() <= 1 || fill.is_empty() {
+        return (prefixes, None);
+    }
+    let ends_with_line_break = original_virtual.ends_with(['\n', '\r']);
+    let last = prefixes.len().saturating_sub(1);
+    let blank_row = |i: usize| {
+        prefixes[i].is_empty()
+            && (prefixes[i + 1..].iter().any(|p| !p.is_empty())
+                || (ends_with_line_break && i < last))
+    };
+    if !(0..prefixes.len()).any(blank_row) {
+        return (prefixes, None);
+    }
+    let first_row_blank = blank_row(0).then(|| fill.clone());
+    let filled = (0..prefixes.len())
+        .map(|i| {
+            if blank_row(i) {
+                fill.clone()
+            } else {
+                prefixes[i].clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    (std::borrow::Cow::Owned(filled), first_row_blank)
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -2821,6 +2879,118 @@ mod tests {
         );
 
         assert_eq!(text.as_deref(), Some("\n> x"));
+    }
+
+    /// A list item's fence records no prefix for its blank rows. Formatted
+    /// text the pipeline puts back must keep every non-blank line indented
+    /// as the item's content, or the list item ends. Each case applies the
+    /// pipeline's replacement to the host and compares the exact host text.
+    #[rstest::rstest]
+    // A blank line added between two content rows (line count changes).
+    #[case::interior_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n  b\n  ```\n",
+        vec![2, 0, 2, 0],
+        "a = 1\n\nb\n",
+        "a = 1\n\n\nb\n",
+        "- item\n\n  ```py\n  a = 1\n\n\n  b\n  ```\n"
+    )]
+    // A line added after a leading blank row (line count changes).
+    #[case::leading_blank_row(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "\na = 1\nb = 2\n",
+        "- item\n\n  ```py\n\n  a = 1\n  b = 2\n  ```\n"
+    )]
+    // The leading blank row dropped: the first line now opens the block.
+    #[case::leading_blank_row_dropped(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "a = 1\n",
+        "- item\n\n  ```py\n  a = 1\n  ```\n"
+    )]
+    // Content moved onto a trailing blank row (line count kept).
+    #[case::content_onto_trailing_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n\n  ```\n",
+        vec![2, 0, 0, 0],
+        "a = 1\n\n\n",
+        "a = 1\nb\n\n",
+        "- item\n\n  ```py\n  a = 1\n  b\n\n  ```\n"
+    )]
+    // Content moved onto the blank row (line count kept).
+    #[case::content_onto_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n  b\n  ```\n",
+        vec![2, 0, 2, 0],
+        "a = 1\n\nb\n",
+        "a = 1\nc\nb\n",
+        "- item\n\n  ```py\n  a = 1\n  c\n  b\n  ```\n"
+    )]
+    fn pipeline_keeps_a_list_item_fence_indented_past_its_blank_rows(
+        #[case] host: &str,
+        #[case] columns: Vec<u32>,
+        #[case] original_virtual: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: &str,
+    ) {
+        let offset = RegionOffset::with_per_line_offsets(3, columns.clone());
+        let mapper = crate::text::PositionMapper::new(host);
+        let prefixes = extract_host_line_prefixes(
+            &mapper,
+            host,
+            3,
+            &columns,
+            lsp_line_count(original_virtual),
+        );
+        let new_text = pipeline_region_text(original_virtual, formatted, &offset, &prefixes)
+            .expect("the region changed");
+        let range = region_replacement_range(original_virtual, &offset).unwrap();
+
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]),
+            expected_host
+        );
+    }
+
+    #[test]
+    fn pipeline_leaves_an_unprefixed_last_row_of_a_region_ending_mid_row() {
+        // A custom query's region ending mid-row on an unprefixed row: that
+        // row is content, not a blank row of a prefixed block.
+        let text = pipeline_region_text(
+            "x\ny",
+            "x\nz",
+            &RegionOffset::with_per_line_offsets(3, vec![4, 0]),
+            &["    ".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("x\nz"));
+    }
+
+    #[test]
+    fn pipeline_leaves_the_row_after_a_blockquoted_fence_content_unprefixed() {
+        // The row after the content's final line break is the closing
+        // fence's, whose own prefix follows the replacement.
+        let text = pipeline_region_text(
+            "a\nb\n",
+            "a\nc\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]),
+            &["> ".to_string(), "> ".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\n> c\n"));
+    }
+
+    #[test]
+    fn pipeline_leaves_the_later_rows_of_a_one_offset_region_unprefixed() {
+        // One column offset: only the first row is offset, by design.
+        let text = pipeline_region_text(
+            "x\ny\n",
+            "x\nz\n",
+            &RegionOffset::new(3, 4),
+            &["    ".to_string(), String::new(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("x\nz\n"));
     }
 
     #[test]
