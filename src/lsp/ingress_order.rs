@@ -1130,6 +1130,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn on_type_formatting_is_ordered_exactly_when_experimental_features_are_on() {
+        let gate = IngressOrderGate::new(MissingSaveInner);
+        assert_eq!(gate.order_on_type, crate::experimental::enabled());
+    }
+
     #[tokio::test]
     async fn on_type_formatting_waits_for_a_preceding_change_only_when_ordered() {
         for ordered in [true, false] {
