@@ -1,8 +1,9 @@
 //! Inlay hint methods for Kakehashi.
 //!
 //! `textDocument/inlayHint` walks the resolved layer order
-//! (cross-layer-aggregation): the virt layer bridges the injection region
-//! under the requested range, the host layer (host-document-bridge) bridges
+//! (cross-layer-aggregation): the virt layer bridges every injection region
+//! the requested range intersects and merges their hints in document order,
+//! the host layer (host-document-bridge) bridges
 //! the host document itself with the real URI and its coordinates verbatim.
 //! Either layer re-keys label-part commands for `workspace/executeCommand`
 //! routing and, when the producer advertises `inlayHint/resolve` (or its
@@ -20,14 +21,14 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, NumberOrString, Ran
 use super::super::Kakehashi;
 use super::super::region_offset::resolve_region_offset;
 use crate::lsp::aggregation::server::{
-    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    FanInResult, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
     HostDocument, InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
     extract_inlay_hint_envelope,
 };
 use crate::lsp::current_upstream_id;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{RangeRequestContext, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/inlayHint";
 
@@ -134,7 +135,10 @@ impl Kakehashi {
         .await
     }
 
-    /// Virt layer: bridge the injection region under the requested range.
+    /// Virt layer: bridge every injection region the requested range
+    /// intersects, each with the range clipped to it, and merge the hints in
+    /// document order. Editors ask for the visible or the whole document's
+    /// range, which usually starts in host text before any injection.
     async fn inlay_hint_virt_layer(
         &self,
         lsp_uri: &Uri,
@@ -157,23 +161,55 @@ impl Kakehashi {
         }) else {
             return Ok(None);
         };
-        let Some(mut ctx) = self
-            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
-            .await
-        else {
+        let contexts = self
+            .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
+            .await;
+        let Some(first) = contexts.first() else {
             return Ok(None);
         };
-        ctx.document.client_progress_token = client_progress_token;
 
+        // Every region shares this request's upstream id, so one cancel
+        // subscription covers the whole walk; the per-region dispatches get
+        // none of their own. Registry cleanup is left to the layer race's
+        // request-wide sweep, as the host layer shares the id.
         let (cancel_rx, _cancel_guard) =
-            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+            self.subscribe_cancel(first.document.upstream_request_id.as_ref());
 
-        // Fan-out inlay hint requests to all matching servers
+        // The regions are independent documents, so they are asked at once;
+        // `join_all` keeps document order. The work-done progress token is
+        // single-use, so only the first region carries it.
+        let mut progress_token = client_progress_token;
+        let walk = futures::future::join_all(contexts.into_iter().map(|mut ctx| {
+            ctx.document.client_progress_token = progress_token.take();
+            self.dispatch_virt_region_inlay_hint(ctx, revision)
+        }));
+        let result = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => FanInResult::Cancelled,
+                results = walk => merge_region_results(results),
+            },
+            None => merge_region_results(walk.await),
+        };
+
+        result
+            .handle(&self.notifier(), "inlay hint", None, Ok)
+            .await
+    }
+
+    /// Fan `textDocument/inlayHint` out across the servers bridging ONE
+    /// injection region (`preferred`). Cancellation is held by the caller for
+    /// the whole multi-region walk.
+    async fn dispatch_virt_region_inlay_hint(
+        &self,
+        ctx: RangeRequestContext,
+        revision: crate::lsp::bridge::HostRevision,
+    ) -> FanInResult<Option<Vec<InlayHint>>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        let result = dispatch_preferred(
+        dispatch_preferred(
             &ctx.document,
-            pool.clone(),
+            pool,
             |t| async move {
                 t.pool
                     .send_inlay_hint_request(
@@ -193,13 +229,9 @@ impl Kakehashi {
                     .await
             },
             |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
+            None,
         )
-        .await;
-
-        result
-            .handle(&self.notifier(), "inlay hint", None, Ok)
-            .await
+        .await
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {
@@ -372,6 +404,32 @@ fn inlay_hint_region_is_resolvable(
         && envelope.injection_language == live_language
 }
 
+/// Merge the per-region fan-in results of one request in document order.
+///
+/// Any region that answered makes the merge an answer, with the other
+/// regions' hints appended. Only when none answered does it report no result
+/// (once, counting every region's errors), so a request over several regions
+/// logs as one request. A single region's result passes through unchanged.
+fn merge_region_results<T>(
+    results: Vec<FanInResult<Option<Vec<T>>>>,
+) -> FanInResult<Option<Vec<T>>> {
+    let mut merged: Option<Vec<T>> = None;
+    let mut errors = None;
+    for result in results {
+        match result {
+            FanInResult::Done(Some(items)) => merged.get_or_insert_with(Vec::new).extend(items),
+            FanInResult::Done(None) => {}
+            FanInResult::NoResult { errors: e } => *errors.get_or_insert(0) += e,
+            FanInResult::Cancelled => return FanInResult::Cancelled,
+        }
+    }
+    match (merged, errors) {
+        (Some(items), _) => FanInResult::Done(Some(items)),
+        (None, Some(errors)) => FanInResult::NoResult { errors },
+        (None, None) => FanInResult::Done(None),
+    }
+}
+
 struct HostInlayHints {
     hints: Vec<InlayHint>,
     server_name: String,
@@ -418,6 +476,60 @@ mod tests {
             "inner": null
         }))
         .unwrap()
+    }
+
+    fn render(result: FanInResult<Option<Vec<u8>>>) -> String {
+        format!("{result:?}")
+    }
+
+    /// One region's result passes through as it is, so a range inside a
+    /// single region answers exactly as it did before regions were merged.
+    #[test]
+    fn merge_region_results_passes_a_single_region_through() {
+        for single in [
+            FanInResult::Done(Some(vec![1])),
+            FanInResult::Done(Some(vec![])),
+            FanInResult::Done(None),
+            FanInResult::NoResult { errors: 0 },
+            FanInResult::NoResult { errors: 2 },
+            FanInResult::Cancelled,
+        ] {
+            let expected = render(match &single {
+                FanInResult::Done(v) => FanInResult::Done(v.clone()),
+                FanInResult::NoResult { errors } => FanInResult::NoResult { errors: *errors },
+                FanInResult::Cancelled => FanInResult::Cancelled,
+            });
+            assert_eq!(render(merge_region_results(vec![single])), expected);
+        }
+    }
+
+    #[test]
+    fn merge_region_results_appends_answers_in_document_order() {
+        let merged = merge_region_results(vec![
+            FanInResult::Done(Some(vec![1, 2])),
+            FanInResult::NoResult { errors: 1 },
+            FanInResult::Done(None),
+            FanInResult::Done(Some(vec![3])),
+        ]);
+        assert_eq!(
+            render(merged),
+            render(FanInResult::Done(Some(vec![1, 2, 3])))
+        );
+    }
+
+    /// With no region answering, the request reports no result once, with
+    /// every region's errors, so its log level reflects any failure.
+    #[test]
+    fn merge_region_results_reports_no_result_once_with_all_errors() {
+        let merged = merge_region_results::<u8>(vec![
+            FanInResult::NoResult { errors: 1 },
+            FanInResult::Done(None),
+            FanInResult::NoResult { errors: 2 },
+        ]);
+        assert_eq!(render(merged), render(FanInResult::NoResult { errors: 3 }));
+        let merged =
+            merge_region_results::<u8>(vec![FanInResult::Done(None), FanInResult::Done(None)]);
+        assert_eq!(render(merged), render(FanInResult::Done(None)));
     }
 
     #[test]

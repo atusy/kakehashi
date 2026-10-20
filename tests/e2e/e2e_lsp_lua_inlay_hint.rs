@@ -165,6 +165,29 @@ fn inlay_hints_with_retry(
     panic!("timed out waiting for inlay hints");
 }
 
+fn inlay_hints_once(
+    client: &mut LspClient,
+    uri: &str,
+    start_line: u64,
+    end_line: u64,
+) -> Vec<Value> {
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": 0 },
+                "end": { "line": end_line, "character": 0 }
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected inlay hints: {response}"))
+        .clone()
+}
+
 /// Block until the mock resolver reports `inlay-hint-resolve-started`, the
 /// sent-state barrier the delayed and slow resolver modes raise on receipt.
 /// kakehashi forwards its own `window/logMessage` lines too (query loading,
@@ -1133,6 +1156,58 @@ fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
         json!(request_id),
         "the downstream must see its own request id, not the editor's"
     );
+
+    shutdown_client(&mut client);
+}
+
+/// Editors ask for the visible or the whole document's range, which starts
+/// in host text before any injection: every region the range intersects is
+/// bridged, and the hints are merged in document order. A range that stops
+/// before a later region does not reach it.
+#[test]
+fn e2e_inlay_hint_range_starting_before_regions_covers_every_intersected_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_whole_document.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal y = 2\n```\n"
+        }}),
+    );
+
+    // Warm both regions with in-region requests, so the assertions below see
+    // live virtual documents and never accept a partial merge on a retry.
+    inlay_hints_with_retry(&mut client, uri, 3, 4);
+    inlay_hints_with_retry(&mut client, uri, 9, 10);
+
+    let whole = inlay_hints_once(&mut client, uri, 0, 11);
+    let positions: Vec<&Value> = whole.iter().map(|hint| &hint["position"]).collect();
+    assert_eq!(
+        positions,
+        [
+            &json!({ "line": 3, "character": 1 }),
+            &json!({ "line": 9, "character": 1 })
+        ],
+        "{whole:?}"
+    );
+    assert_ne!(
+        whole[0]["data"]["kakehashi"]["region_id"], whole[1]["data"]["kakehashi"]["region_id"],
+        "each hint is enveloped for the region that produced it"
+    );
+
+    let first_only = inlay_hints_once(&mut client, uri, 0, 6);
+    let positions: Vec<&Value> = first_only.iter().map(|hint| &hint["position"]).collect();
+    assert_eq!(positions, [&json!({ "line": 3, "character": 1 })]);
+
+    // The resolve of the later region's hint routes back to that region.
+    let response = client.send_request("inlayHint/resolve", whole[1].clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
+    assert_eq!(response["result"]["position"], whole[1]["position"]);
 
     shutdown_client(&mut client);
 }

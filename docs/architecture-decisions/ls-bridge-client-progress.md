@@ -248,7 +248,8 @@ server at N = 1, highest-priority *named* anchor at N > 1; a wildcard `Rest`
 group that outranks the candidate yields no anchor), routes that downstream's
 `$/progress` onto the editor's token, and guarantees a terminal `End` on
 teardown. Coverage spans the **single-region** methods (`references`, the goto
-family, `inlayHint`) and the **multi-region** methods (`documentSymbol`,
+family), `inlayHint` (which fans out over every region its range intersects
+but hands the editor's token to the first region only), and the **multi-region** methods (`documentSymbol`,
 `formatting`, `rangeFormatting`, `codeLens` — whole-document except
 `rangeFormatting`, which is range-scoped): the latter fan out over several
 injection regions and so share **one** request-level aggregator and teardown

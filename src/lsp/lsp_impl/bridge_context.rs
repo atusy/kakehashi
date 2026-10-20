@@ -1798,8 +1798,8 @@ impl Kakehashi {
             .await?;
 
         // Dispatch must see the same defended endpoints the region was
-        // resolved with — this path (inlay hints, color presentations)
-        // forwards the range verbatim, with no later clamp. Both endpoints
+        // resolved with — this path (color presentations) forwards
+        // the range verbatim, with no later clamp. Both endpoints
         // are normalized by the preamble; `max` keeps the range well-formed
         // even for a degenerate all-overlong input.
         let end = end.unwrap_or(range.end);
