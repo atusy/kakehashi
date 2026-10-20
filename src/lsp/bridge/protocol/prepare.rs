@@ -1333,25 +1333,48 @@ impl LineMap {
 
     /// The positions of `offsets`, each as [`Self::position`] gives it, in
     /// one forward pass over each line they fall on (see
-    /// [`Self::offsets_clamped`]).
+    /// [`Self::offsets_clamped`]), each line found in a number of lookups
+    /// logarithmic in how far it lies past the line before.
     fn positions(&self, offsets: &[usize]) -> Vec<Position> {
         let mut order: Vec<usize> = (0..offsets.len()).collect();
         order.sort_by_key(|&index| offsets[index]);
         let mut positions = vec![Position::new(0, 0); offsets.len()];
         // The line reached so far, and the byte and UTF-16 column reached on
-        // it. Lines are stepped through in order (looking an offset's line
-        // up checks every non-ASCII character on it, as converting one does).
+        // it. An offset's line is found from the one reached by doubling the
+        // stride while that line still starts at or before the offset, then
+        // halving it back: a few lookups however far it lies (looking a line
+        // up by offset in the index checks every non-ASCII character on it,
+        // as converting an offset does).
+        let start = |line: u32| -> Option<usize> {
+            #[cfg(test)]
+            LINE_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+            self.index.0.line(line).map(|range| range.start().into())
+        };
         let (mut line, mut byte, mut column) = (0u32, 0usize, 0u32);
         for index in order {
             let offset = self
                 .text
                 .floor_char_boundary(offsets[index].min(self.text.len()));
-            while let Some(next) = self.index.0.line(line + 1) {
-                let next_start: usize = next.start().into();
-                if next_start > offset {
-                    break;
+            let reaches = |line: u32| start(line).is_some_and(|start| start <= offset);
+            if line.checked_add(1).is_some_and(reaches) {
+                let mut stride = 1u32;
+                while line
+                    .checked_add(stride.saturating_mul(2))
+                    .is_some_and(reaches)
+                {
+                    stride = stride.saturating_mul(2);
                 }
-                (line, byte, column) = (line + 1, next_start, 0);
+                let (mut low, mut high) =
+                    (line + stride, line.saturating_add(stride.saturating_mul(2)));
+                while low + 1 < high {
+                    let middle = low + (high - low) / 2;
+                    if reaches(middle) {
+                        low = middle;
+                    } else {
+                        high = middle;
+                    }
+                }
+                (line, byte, column) = (low, start(low).unwrap_or(offset), 0);
             }
             column += self.text[byte..offset]
                 .chars()
@@ -1390,6 +1413,8 @@ thread_local! {
     static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Bytes the batch conversions scanned (see `LineMap::positions`).
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Lines `LineMap::positions` looked up to find its offsets' lines.
+    static LINE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `LineIndex` is a pure function of the text, so two indexes over equal text
@@ -1918,6 +1943,20 @@ mod tests {
             "no such line"
         );
         assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
+
+    #[test]
+    fn positions_far_into_a_text_look_their_lines_up() {
+        // One offset near the end of 100,000 lines (an edit a completion
+        // or a hint maps): its line is found in a few lookups, not by
+        // stepping through every line before it.
+        let text = "x\n".repeat(100_000);
+        let lines = LineMap::new(text.clone());
+        LINE_LOOKUPS.with(|lookups| lookups.set(0));
+        let offset = text.len() - 3;
+        assert_eq!(lines.positions(&[offset]), vec![lines.position(offset)]);
+        let lookups = LINE_LOOKUPS.with(|lookups| lookups.get());
+        assert!(lookups <= 64, "{lookups}");
     }
 
     #[test]

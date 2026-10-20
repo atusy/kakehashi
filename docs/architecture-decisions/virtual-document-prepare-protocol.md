@@ -706,7 +706,8 @@ a hook per kind of change.
   costs a step for every 64 bytes of it (lines are numbered once, then
   compared as numbers), so the budget bounds the diff's time with long
   lines too, and the answer's positions and the result's convert to bytes
-  and UTF-16 columns in one pass over each line they fall on, uncharged:
+  and UTF-16 columns in one pass over each line they fall on, each line
+  found in a few lookups, uncharged:
   1 MB of 1 KB lines, each rewritten at its end, maps in some 60 ms; 4 MB
   of them is refused in some 200 ms, and a 4 MB answer to a 500 KB region
   in some 140 ms (release build, measured on a loaded machine).
