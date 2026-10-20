@@ -3732,6 +3732,48 @@ mod formatting {
     }
 
     #[test]
+    fn text_after_p_s_final_break_or_its_loss_is_told_apart_from_answers_that_keep_it() {
+        // `\t  x` dedented by three, then the closing indent `\t` the peer
+        // deleted, shallower than the content: P is `x\r\n`.
+        let virtual_text = "\t  x\r\n\t";
+        let map = dedent_lines(virtual_text, &[3, 1]);
+        assert_eq!(map.prepared_lines.text, "x\r\n");
+        // Text after P's final break, written in whole or inserted, or the
+        // break dropped: mapped, it would edit the closing (`\tfoo(a,b)`,
+        // not the content's `\t  foo(a,b)`), so an on-type answer, whose
+        // edges are not restored, is refused.
+        for answer in [
+            [edit((0, 0), (1, 0), "x\r\nfoo(a,b)")],
+            [edit((1, 0), (1, 0), "foo(a,b)")],
+            [edit((0, 1), (1, 0), "\r\nfoo(a,b)")],
+            [edit((0, 0), (1, 0), "y")],
+            [edit((0, 1), (1, 0), "")],
+        ] {
+            assert!(
+                map.drops_the_break_before_the_closing(&answer),
+                "{answer:?}"
+            );
+        }
+        // Answers ending with a line break, or not reaching P's end, keep it.
+        for answer in [
+            [edit((0, 0), (0, 1), "b")],
+            [edit((0, 0), (1, 0), "x\r\nfoo(a,b)\r\n")],
+            [edit((1, 0), (1, 0), "foo(a,b)\n")],
+            [edit((0, 1), (1, 0), "\n")],
+            [edit((0, 0), (0, 0), "w\r\n")],
+        ] {
+            assert!(
+                !map.drops_the_break_before_the_closing(&answer),
+                "{answer:?}"
+            );
+        }
+        // With no closing deleted after P, nothing there to edit.
+        let virtual_text = "\t  x\r\n";
+        let map = dedent_lines(virtual_text, &[3]);
+        assert!(!map.drops_the_break_before_the_closing(&[edit((1, 0), (1, 0), "foo(a,b)")]));
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.
