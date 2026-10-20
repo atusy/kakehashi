@@ -3774,6 +3774,113 @@ mod formatting {
     }
 
     #[test]
+    fn copies_and_rewrites_among_lines_left_alone_pair_by_what_they_hold() {
+        // Copies of `y` and `a = 1` around lines rewritten or written anew:
+        // each line keeps its own extra indentation.
+        let virtual_text = "  y\n \n    y\n  f('a')\n  foo(\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2, 2, 2]);
+        let answer = [edit((0, 0), (5, 0), "a = 1\n}\n  y\na = 1\n    a = 1\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a = 1\n  }\n    y\n  a = 1\n      a = 1\n")
+        );
+        let virtual_text = "  a = 1\n  x\n  f(\"a\");\n  a = 1,\n \n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2, 2, 0]);
+        let answer = [edit((0, 0), (5, 0), "}\n  a = 1,\na = 1\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  }\n    a = 1,\n  a = 1\n")
+        );
+        // A line written twice, its copy reindented: mapped, not refused.
+        let virtual_text = "  x\n  }\n    f(\"a\");\n  f(\"a\");\n \n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2, 2, 0]);
+        let answer = [edit(
+            (0, 0),
+            (5, 0),
+            "f(\"a\");\n  a = 1\n    f(\"a\");\n  f(\"a\");\n",
+        )];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  f(\"a\");\n    a = 1\n      f(\"a\");\n    f(\"a\");\n")
+        );
+    }
+
+    #[test]
+    fn long_lines_cost_their_length_in_every_pairing_stage() {
+        // 200-character lines: alike to the byte, alike in letters and
+        // digits (quotes rewritten), joined, copied and rewritten. Each
+        // stage that hashes or compares them charges their length: 1,138
+        // steps take the answer, 1,137 do not.
+        let long = |c: char| c.to_string().repeat(200);
+        let virtual_text: String = [
+            format!("{}1", long('a')),
+            format!("{}('x')", long('b')),
+            long('c'),
+            long('d'),
+            format!("{}1", long('a')),
+            format!("{}2", long('e')),
+        ]
+        .iter()
+        .map(|line| format!("  {line}\n"))
+        .collect();
+        let formatted: String = [
+            format!("{}1", long('a')),
+            format!("{}(\"x\");", long('b')),
+            format!("{} {}", long('c'), long('d')),
+            format!("{}1", long('a')),
+            format!("{}3", long('e')),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (6, 0), &formatted)];
+        assert!(map.map_formatting(&answer, 1_138).is_ok());
+        assert_eq!(
+            map.map_formatting(&answer, 1_137),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn the_budget_stops_at_its_cap_however_large_the_texts() {
+        // 1.2 MB of lines alike, then 4,100 lines rewritten with whitespace
+        // lines between: the blank line table needs more than 2^24 steps,
+        // which the allowance per byte of these texts would give, but the
+        // cap does not.
+        let count = 4_100;
+        let head = |indent: &str| -> String {
+            (0..12_000)
+                .map(|line| format!("{indent}{}{line}\n", "h".repeat(90)))
+                .collect()
+        };
+        let virtual_text = format!(
+            "{}{}",
+            head("  "),
+            (0..count)
+                .map(|line| format!("  a{line}\n  \n"))
+                .collect::<String>()
+        );
+        let formatted = format!(
+            "{}{}",
+            head(""),
+            (0..count)
+                .map(|line| format!("b{line}\n\n"))
+                .collect::<String>()
+        );
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), ((12_000 + 2 * count) as u32, 0), &formatted)];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::OutOfWork)
+        );
+        let uncapped = FORMATTING_DIFF_BUDGET
+            + FORMATTING_DIFF_WORK_PER_BYTE * (map.prepared_lines.text.len() + formatted.len());
+        assert!(uncapped > FORMATTING_DIFF_BUDGET_CAP);
+        assert!(map.map_formatting(&answer, uncapped).is_ok());
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.
@@ -5154,9 +5261,16 @@ mod formatting_reference {
                 },
             )
             .unwrap();
-        // Cases the host could take, refused: availability only, and rare.
+        // Cases the host could take, refused: none from the fixed seed;
+        // from another, availability only, and rare.
+        let fixed_seed = std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_none()
+            && std::env::var_os("PROPTEST_RNG_SEED").is_none();
         assert!(
-            over_refused.get() * 200 <= cases as usize,
+            if fixed_seed {
+                over_refused.get() == 0
+            } else {
+                over_refused.get() * 200 <= cases as usize
+            },
             "refused {} answers the host could take",
             over_refused.get()
         );
