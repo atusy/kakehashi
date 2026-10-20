@@ -3881,6 +3881,34 @@ mod formatting {
     }
 
     #[test]
+    fn long_whitespace_lines_cost_their_length_in_the_blank_line_table() {
+        // 50 whitespace lines of 10,000 spaces between two lines rewritten:
+        // nothing alike at the ends is set aside, and the blank lines pair
+        // among themselves. Comparing them costs their length, not a step
+        // a cell: the answer takes at least a step per 64 bytes of them.
+        let count = 50;
+        let blank = " ".repeat(10_000);
+        let virtual_text = format!("a\n{}z\n", format!("{blank}\n").repeat(count));
+        let formatted = format!("b\n{}c\n", format!("{blank}\n").repeat(count));
+        let map = dedent_lines(&virtual_text, &[]);
+        let answer = [edit((0, 0), (count as u32 + 2, 0), &formatted)];
+        let bytes = 2 * count * blank.len();
+        assert_eq!(
+            map.map_formatting(&answer, bytes / BYTES_PER_STEP),
+            Err(FormattingRefusal::OutOfWork)
+        );
+        // Mapped with the work their bytes and the table's cells take.
+        assert_eq!(
+            map.map_formatting(
+                &answer,
+                2 * bytes / BYTES_PER_STEP + 4 * (count + 1) * (count + 1)
+            )
+            .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(formatted.clone())
+        );
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.
@@ -4167,7 +4195,8 @@ mod formatting {
 
     #[test]
     fn pairing_blank_lines_takes_a_table_only_as_large_as_its_work() {
-        // Every cell of the table is spent before it is taken: a run of
+        // Every blank line's whitespace is numbered, a step each here, and
+        // every cell of the table is spent before it is taken: a run of
         // blank lines just within the budget pairs, one just past it
         // refuses at once, not held in memory.
         let keys = |count: usize| -> LineKeys {
@@ -4177,15 +4206,15 @@ mod formatting {
         let small = (keys(3), keys(2));
         let pairs =
             |budget| blank_lines(&small.0, &small.1, &(0..3), &(0..2), &mut Work::new(budget));
-        assert_eq!(pairs(12), Some(vec![(0, 0), (1, 1)]));
-        assert_eq!(pairs(11), None);
+        assert_eq!(pairs(5 + 12), Some(vec![(0, 0), (1, 1)]));
+        assert_eq!(pairs(5 + 11), None);
         // The largest square run the default budget holds pairs whole.
-        let side = (1 << 10) - 1;
+        let side = (1 << 10) - 2;
         let large = keys(side);
         let mut work = Work::new(FORMATTING_DIFF_BUDGET);
         let paired = blank_lines(&large, &large, &(0..side), &(0..side), &mut work);
         assert_eq!(paired.map(|pairs| pairs.len()), Some(side));
-        let side = 1 << 10;
+        let side = (1 << 10) - 1;
         let large = keys(side);
         let mut work = Work::new(FORMATTING_DIFF_BUDGET);
         assert_eq!(
