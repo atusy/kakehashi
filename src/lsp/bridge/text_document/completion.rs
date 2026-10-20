@@ -636,6 +636,23 @@ fn transform_prepared_completion_item(
             item.insert_text = sent;
         }
     }
+    // A client may insert an item of the snippet kind as a snippet whatever
+    // its format says (mini.completion does, for text with a line break, a
+    // tab or a `$` opening a word): plain text a prepared document sends
+    // could then be re-indented or read as tabstops. Such an item is
+    // refused rather than shown under another kind.
+    if item.kind == Some(tower_lsp_server::ls_types::CompletionItemKind::SNIPPET)
+        && item.insert_text_format != Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+    {
+        let sent = match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
+            None => item.insert_text.as_ref().unwrap_or(&item.label),
+        };
+        if sent.contains(['\n', '\r', '\t']) || super::snippet::reads_as_snippet(sent) {
+            return false;
+        }
+    }
     true
 }
 
@@ -1986,6 +2003,51 @@ mod tests {
                 completed.insert_text_format,
                 Some(InsertTextFormat::SNIPPET)
             );
+        }
+    }
+
+    /// An item of the snippet kind sent as plain text is refused where a
+    /// client inserting it as a snippet would read it otherwise: with a
+    /// line break (re-indented), or a `$` opening a word (a tabstop).
+    /// Unprepared, it goes as the server sent it.
+    #[rstest]
+    #[case::literal_lines(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "textEdit": {
+        "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+        "newText": "{\n}"
+    }}), false)]
+    #[case::plain_lines(json!({"label": "x", "kind": 15, "textEdit": {
+        "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+        "newText": "{\n}"
+    }}), false)]
+    #[case::escaped_dollar(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "price: \\$5"}), false)]
+    #[case::plain_dollar(json!({"label": "x", "kind": 15, "insertText": "a$b"}), false)]
+    #[case::one_line(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "x\\}"}), true)]
+    #[case::snippet(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "f($1)"}), true)]
+    #[case::other_kind(json!({"label": "x", "kind": 3, "insertTextFormat": 2, "insertText": "price: \\$5"}), true)]
+    fn a_prepared_item_of_the_snippet_kind_sent_as_plain_text_reads_alike(
+        #[case] completed: serde_json::Value,
+        #[case] kept: bool,
+    ) {
+        let offset = dedented_offset("  a\n");
+        for insert_mode in [ClientInsertMode::AsIsSettable, ClientInsertMode::AsIs] {
+            assert_eq!(
+                transform_completion_item(
+                    &mut item(completed.clone()),
+                    &offset,
+                    Position::new(11, 0),
+                    Some(Position::new(10, 3)),
+                    insert_mode,
+                ),
+                kept,
+                "{completed} {insert_mode:?}"
+            );
+            assert!(transform_completion_item(
+                &mut item(completed.clone()),
+                &RegionOffset::new(10, 0),
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                insert_mode,
+            ));
         }
     }
 
