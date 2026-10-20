@@ -35,7 +35,8 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
+//!   triple, the edit-producing formatting/rename/color-presentation/
+//!   willSaveWaitUntil/linkedEditingRange requests, and pull
 //!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
@@ -305,6 +306,10 @@ enum Role {
 /// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
 /// document), and pull diagnostics.
+/// `textDocument/willSaveWaitUntil` and `textDocument/linkedEditingRange` are
+/// edit-producing too: save-time edits are applied to the buffer as saved,
+/// which includes every edit sent before the request, and linked ranges drive
+/// the client's mirrored edits.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568), and so is `textDocument/inlayHint`, whose
@@ -365,6 +370,8 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/colorPresentation"
         | "textDocument/prepareCallHierarchy"
         | "textDocument/prepareTypeHierarchy"
+        | "textDocument/willSaveWaitUntil"
+        | "textDocument/linkedEditingRange"
         | "textDocument/diagnostic"
         | "kakehashi/captures/full"
         | "kakehashi/captures/full/delta"
@@ -823,6 +830,8 @@ mod tests {
             "kakehashi/node/text",
             "kakehashi/node/children",
             "kakehashi/node/descendantForPointRange",
+            "textDocument/willSaveWaitUntil",
+            "textDocument/linkedEditingRange",
         ] {
             let reader = classify(&notification(method, URI));
             assert!(
@@ -1233,6 +1242,58 @@ mod tests {
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
         );
+    }
+
+    /// Drive `method` behind a stalled didChange for the same document and
+    /// assert it runs only once that didChange completed.
+    async fn assert_runs_only_after_stalled_change(method: &'static str) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let change_fut = gate.call(notification("textDocument/didChange", URI));
+        let reader_fut = gate.call(notification(method, URI));
+        let mut change = tokio_test::task::spawn(change_fut);
+        let mut reader = tokio_test::task::spawn(reader_fut);
+
+        assert!(
+            reader.poll().is_pending(),
+            "{method} must not run before the preceding didChange"
+        );
+        assert!(
+            change.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        assert!(
+            reader.poll().is_pending(),
+            "{method} must remain behind the stalled didChange"
+        );
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(change.poll().is_ready());
+        assert!(reader.is_woken(), "didChange completion must wake {method}");
+        assert!(reader.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    /// Save-time edits are applied to the buffer as it is when saved, which
+    /// includes every edit sent before the willSaveWaitUntil request.
+    #[tokio::test]
+    async fn gate_runs_will_save_wait_until_only_after_preceding_change() {
+        assert_runs_only_after_stalled_change("textDocument/willSaveWaitUntil").await;
+    }
+
+    /// Linked ranges drive the client's mirrored edits, so ranges computed on
+    /// the text before the preceding edit mirror into the wrong spans.
+    #[tokio::test]
+    async fn gate_runs_linked_editing_range_only_after_preceding_change() {
+        assert_runs_only_after_stalled_change("textDocument/linkedEditingRange").await;
     }
 
     #[tokio::test]
