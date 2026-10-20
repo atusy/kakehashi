@@ -214,6 +214,9 @@ pub(crate) fn translate_virtual_text_edits_to_host(
         }
         return true;
     };
+    // Only a mode mapping one edit for each, in order: a replayed set may
+    // come back with others (see `translate_virtual_replayed_edits_to_host`).
+    debug_assert_eq!(mode, EditMode::Extent, "edits mapped one for each");
     let Some(mapped) = map_to_host(prepared, edits, offset, mode) else {
         return false;
     };
@@ -242,6 +245,43 @@ pub(crate) fn translate_virtual_formatting_edits_to_host(
     shift_to_host(&mut mapped, offset);
     *edits = mapped;
     Ok(())
+}
+
+/// [`translate_virtual_text_edits_to_host`] for one document's edits a
+/// client applies together (a rename's, a code action's workspace edit),
+/// replayed on a prepared document ([`EditMode::Replay`]). Mapped, the set
+/// may hold other edits than it came with: it is replaced whole; `false`,
+/// with `edits` left as they came, when refused.
+pub(crate) fn translate_virtual_replayed_edits_to_host(
+    edits: &mut Vec<TextEdit>,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = map_to_host(prepared, edits, offset, EditMode::Replay) else {
+        return false;
+    };
+    *edits = mapped;
+    true
+}
+
+/// Where a prepared document's virtual text starts and ends in the host,
+/// the edge lines its peer deleted included: the host text whose every
+/// edit must go through the map. `None` for an unprepared document.
+pub(crate) fn prepared_region_host_span(offset: &RegionOffset) -> Option<Range> {
+    let prepared = offset.prepared()?;
+    let virtual_text = prepared.virtual_text();
+    let mut start = Position::new(0, 0);
+    let mut end = crate::text::PositionMapper::new(virtual_text)
+        .byte_to_position(virtual_text.len())
+        .unwrap_or(start);
+    translate_unprepared_virtual_position_to_host(&mut start, offset);
+    translate_unprepared_virtual_position_to_host(&mut end, offset);
+    Some(Range { start, end })
 }
 
 /// [`translate_virtual_text_edits_to_host`] for one edit keeping its
