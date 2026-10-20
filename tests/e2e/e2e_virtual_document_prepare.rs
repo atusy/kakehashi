@@ -817,6 +817,53 @@ fn a_color_presentation_the_host_moved_under_is_dropped() {
 }
 
 #[test]
+fn a_formatting_request_cancelled_while_it_waits_ends_at_once() {
+    // The host layer answers only once released; the request waits on it,
+    // as it may wait on the host settling before its answer is judged, all
+    // in the request's own handler. `$/cancelRequest` ends that handler
+    // wherever it waits: the response is the cancelled error, at once.
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    for method in [
+        "textDocument/formatting",
+        "textDocument/rangeFormatting",
+        "textDocument/onTypeFormatting",
+    ] {
+        let (mut client, dir) = Setup {
+            slow_host: Some("preferred"),
+            host_mode: "empty-on-release",
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/cancelled.md";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let id = client.send_request_async(method, formatting_params(method, uri));
+        let wire = dir.path().join("wire.log");
+        let host_request = format!("{method}\t{uri}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == host_request)
+        {
+            assert!(Instant::now() < until, "{method}: host request not sent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cancelled = Instant::now();
+        client.send_notification("$/cancelRequest", json!({ "id": id }));
+        let response = client.receive_response_for_id_public(id);
+        assert_eq!(response["error"]["code"], -32800, "{method}: {response}");
+        assert!(
+            cancelled.elapsed() < Duration::from_secs(5),
+            "{method}: {:?}",
+            cancelled.elapsed()
+        );
+        std::fs::write(dir.path().join("release"), "").expect("release the host layer");
+    }
+}
+
+#[test]
 fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format-early.md";
