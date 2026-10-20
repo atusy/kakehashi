@@ -2485,6 +2485,39 @@ mod tests {
     }
 
     #[test]
+    fn an_import_at_a_blank_row_of_a_list_item_fence_disables_the_action() {
+        // A list item's fence opening with blank rows
+        // ("- item\n\n  ```py\n\n\n  a = 1\n  ```\n"): they record no
+        // prefix, so an import inserted at the first one lands at host
+        // column 0 and ends the list item.
+        let action = json!({
+            "title": "Add import",
+            "edit": { "changes": { make_virtual_uri_string(): [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                },
+                "newText": "import a\n"
+            }] } }
+        });
+        let actions = transform_impl_with_offset(
+            json!([action]),
+            caps(true),
+            false,
+            RegionOffset::with_per_line_offsets(10, vec![0, 0, 2, 0]),
+        )
+        .unwrap();
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("Expected CodeAction");
+        };
+        assert_eq!(
+            action.disabled.as_ref().unwrap().reason,
+            REASON_PREFIXED_REGION
+        );
+        assert!(action.edit.is_none(), "list-breaking edit must not leak");
+    }
+
+    #[test]
     fn unrepresentable_edit_drops_action_without_disabled_support() {
         let action = json!({
             "title": "Extract to new file",

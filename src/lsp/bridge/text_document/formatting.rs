@@ -782,6 +782,38 @@ mod tests {
         assert_eq!(edits[0].range.start.line, 4, "translated to host line");
     }
 
+    /// A list item's fence ("- item\n\n  ```py\n  a = 1\n\n\n  ```\n"): its
+    /// blank rows record no prefix. A response putting an unindented line
+    /// there would end the list item, so it drops whole; one indenting it
+    /// at least as far as the item keeps the item and still applies.
+    #[test]
+    fn transform_drops_a_response_ending_a_list_item_at_its_blank_row() {
+        let host = "- item\n\n  ```py\n  a = 1\n\n\n  ```\n";
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]);
+        let region_end = Position::new(6, 0);
+        let respond = |new_text: &str| {
+            let response = json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": [
+                    { "range": { "start": { "line": 1, "character": 0 },
+                                 "end": { "line": 1, "character": 0 } },
+                      "newText": new_text }
+                ]
+            });
+            transform_formatting_response_to_host(response, &offset, "a = 1\n\n\n", region_end)
+                .unwrap()
+        };
+
+        let edits = respond("b = 2\n");
+        assert!(edits.is_empty(), "the list item would end: {edits:?}");
+
+        let edits = respond("  b = 2\n");
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "- item\n\n  ```py\n  a = 1\n  b = 2\n\n\n  ```\n"
+        );
+    }
+
     fn default_options() -> FormattingOptions {
         FormattingOptions {
             tab_size: 4,

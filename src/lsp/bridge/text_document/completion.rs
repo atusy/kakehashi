@@ -1720,6 +1720,38 @@ mod tests {
     }
 
     #[test]
+    fn transform_drops_an_import_at_a_blank_row_of_a_list_item_fence() {
+        // A list item's fence ("- item\n\n  ```py\n  a = 1\n\n\n  ```\n"):
+        // its blank rows record no prefix, so an import inserted at one lands
+        // at host column 0 and ends the list item. The additional edits drop;
+        // the item and its own edit stay.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]);
+        let region_end = Position::new(6, 0);
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "item",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 4 },
+                                           "end": { "line": 0, "character": 5 } },
+                                "newText": "2" },
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 1, "character": 0 },
+                                   "end": { "line": 1, "character": 0 } },
+                        "newText": "import x\n" }
+                  ] }
+            ]
+        });
+
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
+
+        assert_eq!(list.items.len(), 1);
+        assert!(
+            list.items[0].additional_text_edits.is_none(),
+            "the import would end the list item"
+        );
+    }
+
+    #[test]
     fn transform_drops_prefix_breaking_insert_replace_items() {
         // InsertReplaceEdit variant: reject when EITHER range is unsafe.
         let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
