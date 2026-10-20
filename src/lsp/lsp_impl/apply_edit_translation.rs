@@ -18,6 +18,12 @@
 //! that touches exactly one virtual document is translated
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
+//! For a prepared document, that offset carries the map of the text the
+//! sending connection held as the request arrived (its watermark: a text
+//! recorded after it is not the one the edit was computed on, and none is
+//! placed), and the edit maps back through it as a rename's does; decided
+//! at once, never waited on, `applied: false` with the reason when it
+//! cannot be placed.
 //!
 //! **Version validation** (before the nulling): a downstream that versions a
 //! `TextDocumentEdit` for a VIRTUAL document pins the edit to the content
@@ -190,15 +196,9 @@ impl ApplyEditTranslator {
             );
         };
         ensure_editable_region(contiguous)?;
-        if offset.prepared().is_some() {
-            // An inbound edit is not mapped back through a prepared
-            // document: its WorkspaceEdit shapes go through no edit seam.
-            return Err(
-                "kakehashi: the edit targets a prepared virtual document; it cannot be \
-                 applied to the host document"
-                    .to_string(),
-            );
-        }
+        // Through a prepared document, the edit maps back through the map of
+        // the text its connection held as the request arrived (the offset
+        // carries it), as a rename's does; decided at once, never waited on.
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
@@ -408,9 +408,13 @@ fn transform_params_to_host(
     region_end: Position,
 ) -> Result<(), String> {
     if !transform_workspace_edit_to_host(&mut params.edit, virtual_uri, host_uri, offset) {
-        return Err(
-            "kakehashi: the edit performs file operations on a virtual document".to_string(),
-        );
+        return Err(if offset.prepared().is_some() {
+            "kakehashi: the edit performs file operations on a virtual document, or cannot be \
+             mapped back through the prepared virtual document it was computed on"
+                .to_string()
+        } else {
+            "kakehashi: the edit performs file operations on a virtual document".to_string()
+        });
     }
     // Bound the edit to the region on both ends, per line, so a pass-through
     // host-URI edit can't reach host text above/below the region or into a

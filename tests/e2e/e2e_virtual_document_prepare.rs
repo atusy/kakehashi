@@ -70,6 +70,9 @@ struct Setup {
     /// Have the echo mock answer code actions only once the test creates
     /// `release` in its directory.
     code_action_after_release: bool,
+    /// Have the echo mock ask to apply its save edit only once the test
+    /// creates `release` in its directory.
+    apply_edit_after_release: bool,
 }
 
 impl Default for Setup {
@@ -90,6 +93,7 @@ impl Default for Setup {
             color_after_release: false,
             rename_after_release: false,
             code_action_after_release: false,
+            apply_edit_after_release: false,
         }
     }
 }
@@ -160,6 +164,9 @@ impl Setup {
         }
         if self.code_action_after_release {
             builder = builder.env("MOCK_CODE_ACTION_AFTER_RELEASE", "1");
+        }
+        if self.apply_edit_after_release {
+            builder = builder.env("MOCK_APPLY_EDIT_AFTER_RELEASE", "1");
         }
         if self.wire_log {
             builder = builder.env(
@@ -1766,8 +1773,41 @@ fn a_show_document_selection_maps_through_the_prepared_text() {
     );
 }
 
+/// Save `uri`.
+fn save(client: &mut LspClient, uri: &str) {
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+}
+
+/// Answer the echo mock's applyEdit with `applied`, returning the
+/// request's params (`None` when the editor is never asked) and what the
+/// mock logged it was told.
+fn answer_apply_edit(client: &mut LspClient, applied: bool) -> (Option<Value>, String) {
+    let marker = "echo-document applied: ";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut asked = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = client
+            .try_receive_message(remaining)
+            .unwrap_or_else(|| panic!("no `{marker}` log"));
+        if message["method"] == "workspace/applyEdit" {
+            client.send_response(message["id"].clone(), json!({ "applied": applied }));
+            asked = Some(message["params"].clone());
+        } else if message["method"] == "window/logMessage"
+            && let Some((_, told)) = message["params"]["message"]
+                .as_str()
+                .and_then(|text| text.split_once(marker))
+        {
+            return (asked, told.to_string());
+        }
+    }
+}
+
 #[test]
-fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
+fn an_edit_a_server_computed_for_a_prepared_text_maps_back_through_it() {
     let (mut client, _dir) = Setup {
         capabilities: json!({ "workspace": { "applyEdit": true } }),
         ..Setup::default()
@@ -1778,33 +1818,60 @@ fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // On save the echo mock asks to apply an edit to its first line: no edit
-    // is mapped back through a prepared document, so the editor is never
-    // asked, and the server is told it was not applied.
-    client.send_notification(
-        "textDocument/didSave",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    let marker = "echo-document applied: ";
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let applied = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let message = client
-            .try_receive_message(remaining)
-            .unwrap_or_else(|| panic!("no `{marker}` log"));
-        assert_ne!(
-            message["method"], "workspace/applyEdit",
-            "the editor was asked to apply an edit: {message}"
-        );
-        if message["method"] == "window/logMessage"
-            && let Some((_, applied)) = message["params"]["message"]
-                .as_str()
-                .and_then(|text| text.split_once(marker))
-        {
-            break applied.to_string();
+    // On save the echo mock asks to apply an edit to its first line: the
+    // editor is asked to apply it where the host has that line, after its
+    // indentation, and the server told what the editor answered.
+    save(&mut client, uri);
+    let (asked, told) = answer_apply_edit(&mut client, true);
+    let asked = asked.expect("the editor is asked");
+    let edits = asked["edit"]["changes"][uri]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{asked}"));
+    assert_eq!(apply_edits(text, &edits), "# t\n\n```lua\n  edited\n```\n");
+    assert_eq!(told, "true");
+}
+
+#[test]
+fn an_edit_for_a_text_the_host_moved_from_is_refused() {
+    // The echo mock asks to apply its edit, pinned to the version it
+    // holds, only once released. Unmoved, it applies; the host's region
+    // edited meanwhile, the server sent its new text, the edit is refused:
+    // the editor never asked, the server told it was not applied.
+    for moved in [false, true] {
+        let (mut client, dir) = Setup {
+            capabilities: json!({ "workspace": { "applyEdit": true } }),
+            apply_edit_after_release: true,
+            wire_log: true,
+            ..Setup::default()
         }
-    };
-    assert_eq!(applied, "false");
+        .start();
+        let uri = "file:///prepare/apply-moved.md";
+        let text = "# t\n\n```lua\n  local x = 1 -- EDIT VERSIONED\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        save(&mut client, uri);
+        let wire = dir.path().join("wire.log");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("textDocument/didSave\t"))
+        {
+            assert!(Instant::now() < until, "save not forwarded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if moved {
+            change(&mut client, uri, 2, &text.replace("local x", "local y"));
+            // The new prepared text sent before the mock is released (the
+            // mock, held, reads it only after).
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        std::fs::write(dir.path().join("release"), "").expect("release");
+        let (asked, told) = answer_apply_edit(&mut client, true);
+        assert_eq!(asked.is_some(), !moved, "moved: {moved}: {asked:?}");
+        assert_eq!(told, (!moved).to_string(), "moved: {moved}");
+    }
 }
 
 #[test]

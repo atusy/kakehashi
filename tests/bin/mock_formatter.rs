@@ -43,7 +43,9 @@
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
-//!   there and logs `echo-document applied: <bool>` with the answer.
+//!   there (pinned to the version it holds when the text holds `VERSIONED`;
+//!   with `MOCK_APPLY_EDIT_AFTER_RELEASE`, once the release file exists) and
+//!   logs `echo-document applied: <bool>` with the answer.
 //! - `echo-document-push` — advertises only `hoverProvider` and full sync
 //!   with save: hover and the save hooks as `echo-document`, and instead of
 //!   pull diagnostics it pushes the first-line diagnostic on every
@@ -279,6 +281,8 @@ fn main() {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     let mut documents: HashMap<String, String> = HashMap::new();
+    // The version of each document as last opened or changed.
+    let mut versions: HashMap<String, i64> = HashMap::new();
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
@@ -735,6 +739,12 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if let Some(version) = message
+                        .pointer("/params/textDocument/version")
+                        .and_then(Value::as_i64)
+                    {
+                        versions.insert(uri.to_string(), version);
+                    }
                     if mode == "echo-document-push" {
                         notify(
                             &mut writer,
@@ -851,6 +861,12 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if let Some(version) = message
+                        .pointer("/params/textDocument/version")
+                        .and_then(Value::as_i64)
+                    {
+                        versions.insert(uri.to_string(), version);
+                    }
                     if mode == "echo-document-push" {
                         notify(
                             &mut writer,
@@ -1004,14 +1020,40 @@ fn main() {
                         );
                     }
                     if held.contains("EDIT") {
+                        // With `MOCK_APPLY_EDIT_AFTER_RELEASE` set, asked only
+                        // once the file `MOCK_RELEASE_FILE` names exists (or a
+                        // minute later): a barrier a test lifts after editing
+                        // the host, the edit still for the text saved.
+                        if std::env::var_os("MOCK_APPLY_EDIT_AFTER_RELEASE").is_some()
+                            && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                        {
+                            let until =
+                                std::time::Instant::now() + std::time::Duration::from_secs(60);
+                            while !std::path::Path::new(&release).exists()
+                                && std::time::Instant::now() < until
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                        }
+                        let edit = json!([{ "range": first_line, "newText": "edited" }]);
+                        // Holding `VERSIONED`: pinned to the version this
+                        // server holds.
+                        let edit = if held.contains("VERSIONED") {
+                            json!({ "documentChanges": [{
+                                "textDocument": {
+                                    "uri": saved_uri,
+                                    "version": versions.get(&saved_uri).copied()
+                                },
+                                "edits": edit
+                            }] })
+                        } else {
+                            json!({ "changes": { saved_uri: edit } })
+                        };
                         request_with_params(
                             &mut writer,
                             json!(7001),
                             "workspace/applyEdit",
-                            json!({ "edit": { "changes": { saved_uri: [{
-                                "range": first_line,
-                                "newText": "edited"
-                            }] } } }),
+                            json!({ "edit": edit }),
                         );
                     }
                 }
