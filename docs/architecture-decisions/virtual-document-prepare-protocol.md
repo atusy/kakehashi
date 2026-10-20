@@ -496,8 +496,9 @@ elsewhere (Neovim asks code actions once per keypress), and an answer
 dropped only for that would be asked again only on the next keypress.
 Completion and inlay hints, asked again as the caret moves, do not wait.
 A rename comes once per action, like formatting: it waits as formatting
-does, and dropped, it is answered as `ContentModified`, so that it is
-asked again rather than read as nothing to rename.
+does, and dropped, it is answered as `ContentModified`, so that the user
+can rename again rather than read it as nothing to rename (clients retry
+it on their own only where they list it to).
 prepareRename's range is display only, and its server's own rename is
 what is checked. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
@@ -829,8 +830,8 @@ a hook per kind of change.
   change annotations) whose edits add, remove or rewrite lines is refused:
   its edits cannot be replayed one for each.
 - A workspace edit editing the host document directly inside a prepared
-  region, or ordering its region's edits after other host entries, is
-  refused; edits a server makes to another region's virtual document are
+  region, or holding a `documentChanges` entry with edits for the host
+  beside its region's (or more than one for the region), is refused; edits a server makes to another region's virtual document are
   dropped, as on any document.
 - An unversioned `workspace/applyEdit` computed on a text before one
   already sent but not yet read by its server (no notification is

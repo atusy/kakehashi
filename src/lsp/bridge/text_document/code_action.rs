@@ -1179,9 +1179,6 @@ fn finalize_virt_resolved_action(
 }
 
 impl LanguageServerPool {
-    /// Send a `codeAction/resolve` request on an already-connected handle and
-    /// parse the response into a resolved `CodeAction`. Returns `None` on any
-    /// failure (register/send/wait/parse) so callers can fail soft.
     /// The map an action minted from a prepared document resolves through:
     /// the one its server holds for `virtual_uri` now, while that is the
     /// very text the action was listed on (the generation its envelope
@@ -1198,6 +1195,9 @@ impl LanguageServerPool {
             .and_then(|held| held.map)
     }
 
+    /// Send a `codeAction/resolve` request on an already-connected handle and
+    /// parse the response into a resolved `CodeAction`. Returns `None` on any
+    /// failure (register/send/wait/parse) so callers can fail soft.
     async fn send_code_action_resolve_on_handle(
         &self,
         handle: &Arc<ConnectionHandle>,

@@ -962,8 +962,9 @@ compare within the work its size allows, counts as its server failing, and
 on-type result that cannot be placed is no result, logged at debug). If the
 document is edited while a request is in flight, its answer brings no
 edits: the editor's next request answers for the edited text (a rename
-overtaken so is answered as `ContentModified`, so it can be asked again;
-a server's `workspace/applyEdit` is answered `applied: false`). Linked
+overtaken so is answered as `ContentModified`, so the user can rename
+again; a server's `workspace/applyEdit` is answered `applied: false` when
+it is versioned or seen to be stale). Linked
 editing ranges and a rename's range are offered only where they cover in
 the host exactly the text the server saw. On a region the prepare server
 dedented unevenly (a line left at its own indentation), a rename or code
