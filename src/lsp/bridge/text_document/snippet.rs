@@ -103,6 +103,13 @@ impl Expansion {
         if occurrences.get("0").is_some_and(|&count| count > 1) {
             return None;
         }
+        // A client may tell a snippet from plain text by its text alone:
+        // mini.completion takes an item for a snippet only when a `$` not
+        // after a backslash opens a word (`$1`, `${1`), and inserts any
+        // other as is, escapes and all (`a\\$1` with both backslashes).
+        if !occurrences.is_empty() && !reads_as_snippet(snippet) {
+            return None;
+        }
         // Mirrors repeat their default: bounded by the snippet's own size.
         let limit = snippet.len().saturating_mul(4).max(4096);
         let mut out = String::new();
@@ -144,6 +151,19 @@ impl Expansion {
         }
         Some(format!("{indent}{}", self.snippet))
     }
+}
+
+/// Whether `text` holds a `$` opening a word (`$1`, `${1`), at its start or
+/// after anything but a backslash: what mini.completion reads as snippet
+/// text (with a tab or a line break, which no expansion holds).
+pub(super) fn reads_as_snippet(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(at, &byte)| {
+        let opens_word = |from: usize| bytes.get(from).is_some_and(u8::is_ascii_alphanumeric);
+        byte == b'$'
+            && (at == 0 || bytes[at - 1] != b'\\')
+            && (opens_word(at + 1) || (bytes.get(at + 1) == Some(&b'{') && opens_word(at + 2)))
+    })
 }
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
@@ -279,6 +299,21 @@ mod tests {
         ] {
             assert_eq!(expanded(snippet), None, "{snippet:?}");
         }
+    }
+
+    /// A snippet whose every tabstop follows a backslash reads as plain
+    /// text to a client telling snippets by their text.
+    #[test]
+    fn a_snippet_reading_as_plain_text_has_no_expansion() {
+        assert_eq!(expanded("a\\\\$1"), None);
+        assert_eq!(expanded("a\\\\${1:x}"), None);
+        assert_eq!(expanded("a\\\\$1 $0").as_deref(), Some("a\\ "));
+        assert_eq!(expanded("$1").as_deref(), Some(""));
+        assert!(reads_as_snippet("x${1:a}"));
+        assert!(reads_as_snippet("price: $5"));
+        assert!(!reads_as_snippet("a\\$1"));
+        assert!(!reads_as_snippet("a $ b"));
+        assert!(!reads_as_snippet("${}"));
     }
 
     #[test]
