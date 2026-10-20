@@ -457,6 +457,19 @@ impl<T> Sourced<T> {
         self.prepared.is_some()
     }
 
+    /// Whether nothing has made this answer's region unable to become
+    /// current: its map unrevoked, and its region tracked under the host
+    /// lifetime it was made under. Always so without a map.
+    pub(crate) fn live(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
+        self.prepared
+            .as_ref()
+            .is_none_or(|source| source.live(pool, tracker))
+    }
+
     /// Whether whether this answer is current may still change while the
     /// host's content version stays put (see
     /// `LanguageServerPool::host_settling`): never so without a map, nor

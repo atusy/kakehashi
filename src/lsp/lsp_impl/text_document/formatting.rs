@@ -2390,15 +2390,23 @@ pub(super) async fn sources_verdict<'a, T: 'a>(
                 .clone()
                 .all(|source| source.still_current(pool, tracker, &current_version))
         },
+        // Moved only by an edit: a host gone (no version) is no move, and
+        // its answer, nothing left to settle, is stale.
         || {
-            let now = current_version();
-            sources.clone().any(|source| {
-                source
-                    .request_content_version()
-                    .is_some_and(|version| Some(version) != now)
+            current_version().is_some_and(|now| {
+                sources.clone().any(|source| {
+                    source
+                        .request_content_version()
+                        .is_some_and(|version| version != now)
+                })
             })
         },
-        || sources.clone().any(|source| source.settling(pool, tracker)),
+        // Settling while every region can still become current: one that
+        // never can makes the whole answer stale, whatever else settles.
+        || {
+            sources.clone().all(|source| source.live(pool, tracker))
+                && sources.clone().any(|source| source.settling(pool, tracker))
+        },
         crate::lsp::bridge::PREPARE_TIMEOUT,
     )
     .await
@@ -2596,6 +2604,74 @@ mod tests {
         )
         .await;
         assert_eq!(verdict, Verdict::Current);
+    }
+
+    /// An answer with a region nothing can make current (its map revoked)
+    /// is stale at once, though another region of it is still settling;
+    /// and one whose host closed while it waited is stale, not moved.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_some_region_of_which_cannot_become_current_is_stale_at_once() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        let prepared = || {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            (prepared, revocation)
+        };
+        for case in ["revoked beside a settling region", "host closed"] {
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            let host = url::Url::parse("file:///test/two-regions.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            pool.open_host_incarnation(&host, 1).await;
+            let mut sources = Vec::new();
+            let mut revocations = Vec::new();
+            for (start, end) in [(0, 6), (10, 16)] {
+                let region = tracker
+                    .get_or_create_for_incarnation(&host, start, end, "block", 1)
+                    .unwrap()
+                    .to_string();
+                let (prepared, revocation) = prepared();
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+                sources.push(
+                    crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                        (),
+                        &host,
+                        "lua",
+                        &region,
+                        &prepared.map,
+                        1,
+                        1,
+                    ),
+                );
+                revocations.push(revocation);
+            }
+            // Another fence edited to version 1, its pass not settled.
+            pool.note_host_edited(&host, 1, 1);
+            let current = if case == "host closed" {
+                pool.close_host_incarnation(&host, 1).await;
+                None
+            } else {
+                revocations[0].revoke(u64::MAX);
+                Some(1)
+            };
+            let start = tokio::time::Instant::now();
+            let verdict = sources_verdict(&pool, &tracker, || current, sources.iter()).await;
+            assert_eq!(verdict, Verdict::Stale, "{case}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
     }
 
     /// The judgement the formatting methods make as the final answer is
