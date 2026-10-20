@@ -540,10 +540,18 @@ impl PreparedMap {
         // A group reaching across lines takes the whole lines it reaches, in
         // P and alike in the edited P; groups whose lines meet or overlap are
         // one.
-        let line_start = |offset: usize| {
-            prepared[..offset]
+        // The start of the line `offset` is on, looked for back to `floor`
+        // only (the end of the unit before, which units visited in P's
+        // order never reach back past): `floor` itself when the line starts
+        // before it, the group then joining that unit, whose start is
+        // looked for in turn. Each stretch of P is so searched once, not
+        // once for each group on a long line.
+        let line_start = |offset: usize, floor: usize| {
+            // (A group starting inside the unit before joins it anyway.)
+            let floor = floor.min(offset);
+            prepared[floor..offset]
                 .rfind(['\n', '\r'])
-                .map_or(0, |at| at + 1)
+                .map_or(floor, |at| floor + at + 1)
         };
         // Past the line break ending the line `offset` is on (P's end on the
         // last line).
@@ -569,8 +577,9 @@ impl PreparedMap {
         };
         let mut units: Vec<Unit> = Vec::with_capacity(groups.len());
         for mut group in groups {
+            let floor = |units: &[Unit]| units.last().map_or(0, |unit| unit.old.end);
             if group.lines {
-                group.old.start = line_start(group.old.start);
+                group.old.start = line_start(group.old.start, floor(&units));
             }
             // Every unit the group's lines reach, before it on its first
             // line included, joins it first: only then does it hold every
@@ -581,7 +590,7 @@ impl PreparedMap {
             {
                 let last = units.pop().expect("a unit is there");
                 group = Unit {
-                    old: line_start(last.old.start.min(group.old.start))
+                    old: line_start(last.old.start.min(group.old.start), floor(&units))
                         ..last.old.end.max(group.old.end),
                     edits: last.edits.start..group.edits.end,
                     lines: true,
