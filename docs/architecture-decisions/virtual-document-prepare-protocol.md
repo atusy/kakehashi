@@ -640,8 +640,9 @@ Completion keeps to what the client inserts where it asked:
   its tabstop's first occurrence (mini.snippets mirrors the first), other
   escapes (Neovim reads them into a pattern), a `$` opening nothing (which
   Neovim's grammar does not read), and tabstop numbers with a leading zero
-  (mini.snippets reads `01` as another tabstop than `1`) or past 9999 (Lua
-  numbers lose integers). The expansion is what the map and the region's
+  (mini.snippets reads `01` as another tabstop than `1`) or past 9999 (a
+  bound every client reads alike: Lua numbers lose integers past 2^53).
+  The expansion is what the map and the region's
   checks read, with the additional edits, through each range the client
   may apply the main edit with; the snippet goes out with the indentation
   the expansion regained written before it — spaces only — and is dropped
