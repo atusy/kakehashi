@@ -2946,10 +2946,31 @@ mod tests {
             .expect("the region changed");
         let range = region_replacement_range(original_virtual, &offset).unwrap();
 
-        assert_eq!(
-            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]),
-            expected_host
+        let edited_host =
+            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]);
+        assert_eq!(edited_host, expected_host);
+        // Read back by injection discovery, the host holds the formatted text.
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(&edited_host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &md,
+            "((fenced_code_block (info_string (language) @injection.language) \
+              (code_fence_content) @injection.content))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            &edited_host,
+            &query,
+            0,
         );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, formatted);
     }
 
     #[test]

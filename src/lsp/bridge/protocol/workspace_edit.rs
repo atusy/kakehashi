@@ -362,10 +362,11 @@ pub(crate) fn text_edit_safe_in_region(
 ///   blockquote region has no line after, so the start line's own offset is
 ///   the only signal there).
 ///
-/// A blank row of the prefixed block records no prefix (a list item's fence
-/// leaves blank rows unindented). An edit starting there, with or without a
-/// newline, is unsafe iff one of its non-blank lines is indented less than
-/// the block's widest recorded prefix: that line ends the block.
+/// A blank row of the prefixed block that records no prefix (a list item's
+/// fence leaves blank rows unindented) maps virtual column 0 to host column
+/// 0, unlike the block's other rows. An edit starting there, with or without
+/// a newline, is unsafe iff it writes any non-whitespace text: that text
+/// reads back dedented by the block's prefix width, or ends the block.
 ///
 /// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
 /// rules — every edit is prefix-safe there, which keeps the common case
@@ -492,11 +493,12 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // prefix, or the boundary row) in a content-prefixed region is a
         // blank row of the prefixed block: a list item's fence leaves its
         // blank rows unindented, and the opening fence above row 0 carries
-        // the prefix too. Text there starts at host column 0, so a non-blank
-        // line it writes, on that row or on a new one, that is indented less
-        // than the block's prefix ends the block. Only the prefix's width is recorded, not its text (`  ` vs
-        // `> `), so such an edit is refused rather than re-prefixed; blank
-        // lines and lines indented at least as far still apply.
+        // the prefix too. Virtual column 0 maps to host column 0 there, but
+        // to the block's prefix on its other rows, so text written there
+        // reads back dedented by that width, or ends the block when it is
+        // indented less. Only the prefix's width is recorded, not its text
+        // (`  ` vs `> `), so such an edit is refused rather than re-prefixed;
+        // whitespace-only text and deletions still apply.
         let inside_prefixed_block = |host_line: u32| {
             content_prefixed
                 && host_line.checked_sub(offset.line()).is_some_and(|row| {
@@ -506,29 +508,19 @@ pub(crate) fn text_edit_preserves_line_prefixes(
                             || (region_end.character == 0 && host_line < region_end.line))
                 })
         };
-        let max_column = columns.iter().copied().max().unwrap_or(0);
         let inserts_unprefixed_line = !newline_splits_nothing
             && (e.new_text.contains('\n') || e.new_text.contains('\r'))
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         // With or without a line break: the first line lands on the blank
         // row itself, and a range running on past it either ends on a zero
         // row (nothing after it) or is refused as spanning a prefixed one.
-        let writes_below_block_prefix =
-            inside_prefixed_block(start.line) && has_line_below_width(&e.new_text, max_column);
+        let writes_on_blank_row =
+            inside_prefixed_block(start.line) && e.new_text.chars().any(|c| !c.is_whitespace());
         !touches_boundary
             && !spans_prefixed_line
             && !inserts_unprefixed_line
-            && !writes_below_block_prefix
+            && !writes_on_blank_row
     }
-}
-
-/// Whether some non-blank line of `text` starts fewer than `width`
-/// whitespace characters in (a tab counts as one, the narrowest it can be).
-fn has_line_below_width(text: &str, width: u32) -> bool {
-    text.split(['\n', '\r']).any(|line| {
-        let indent = line.chars().take_while(|c| c.is_whitespace()).count();
-        indent < line.chars().count() && indent < width as usize
-    })
 }
 
 /// Whether every text edit targeting `host_uri` (across both the `changes` map
@@ -1196,17 +1188,47 @@ mod tests {
         ));
     }
 
+    /// The virtual text of the one python fence in a markdown `host`, as
+    /// injection discovery extracts it.
+    fn extract_python_fence(host: &str) -> String {
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &md,
+            "((fenced_code_block (info_string (language) @injection.language) \
+              (code_fence_content) @injection.content))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        );
+        let [region] = resolved.as_slice() else {
+            panic!("one fence expected, got {}", resolved.len());
+        };
+        region.virtual_content.clone()
+    }
+
     /// A list item's fence indents its content rows, but its blank rows carry
-    /// no indentation, so they record a zero offset. An edit that puts
-    /// unindented text there, on the row itself or on new lines, ends the
-    /// list item. The edits below start on such a blank row, where neither
-    /// that row nor the next one records a prefix.
+    /// no indentation, so they record a zero offset. Virtual column 0 maps to
+    /// host column 0 there, while the item's other rows map it to the item's
+    /// indentation, so any text written onto such a row comes back dedented
+    /// by that width, and unindented text ends the list item. The edits
+    /// below start on such a blank row, where neither that row nor the next
+    /// one records a prefix.
     #[rstest::rstest]
     // The trailing blank rows: "- item\n\n  ```py\n  a = 1\n\n\n  ```\n".
     #[case::trailing_blank_row("- item\n\n  ```py\n  a = 1\n\n\n  ```\n", vec![2, 0, 0, 0], 4, 6)]
     // The leading blank rows: "- item\n\n  ```py\n\n\n  a = 1\n  ```\n".
     #[case::leading_blank_row("- item\n\n  ```py\n\n\n  a = 1\n  ```\n", vec![0, 0, 2, 0], 3, 6)]
-    fn a_line_of_unindented_text_on_a_blank_row_of_a_list_item_fence_is_refused(
+    fn text_on_a_blank_row_of_a_list_item_fence_is_refused(
         #[case] host: &str,
         #[case] columns: Vec<u32>,
         #[case] blank_row: u32,
@@ -1215,77 +1237,74 @@ mod tests {
         use tower_lsp_server::ls_types::Range;
         let offset = RegionOffset::with_per_line_offsets(3, columns);
         let region_end = Position::new(fence_line, 0);
-        let at_blank = |new_text: &str| TextEdit {
-            range: Range::new(Position::new(blank_row, 0), Position::new(blank_row, 0)),
+        let virtual_row = blank_row - 3;
+        let on_blank = |rows: u32, new_text: &str| TextEdit {
+            range: Range::new(
+                Position::new(virtual_row, 0),
+                Position::new(virtual_row + rows, 0),
+            ),
             new_text: new_text.to_string(),
         };
-
-        // Unindented text on a new line ends the list item.
-        assert!(!text_edit_safe_in_region(
-            &at_blank("b = 2\n"),
-            &offset,
-            region_end
-        ));
-        assert!(!text_edit_safe_in_region(
-            &at_blank("\nb = 2"),
-            &offset,
-            region_end
-        ));
-        // Indented less than the item's content is still outside it.
-        assert!(!text_edit_safe_in_region(
-            &at_blank(" b\n"),
-            &offset,
-            region_end
-        ));
-        // Without a line break, the text lands at column 0 of the blank row
-        // itself, as a diff-based formatter reusing a blank line writes it.
-        assert!(!text_edit_safe_in_region(
-            &at_blank("b = 2"),
-            &offset,
-            region_end
-        ));
-        // So does a replacement merging the blank row with the next one.
-        let merging = TextEdit {
-            range: Range::new(Position::new(blank_row, 0), Position::new(blank_row + 1, 0)),
-            new_text: "b".to_string(),
+        let to_host = |virtual_edit: &TextEdit| {
+            let mut edit = virtual_edit.clone();
+            super::super::translation::translate_virtual_range_to_host(&mut edit.range, &offset);
+            edit
         };
-        assert!(!text_edit_safe_in_region(&merging, &offset, region_end));
-        // A plain fence has no item to end: there the same edit is applied.
+        assert_eq!(
+            to_host(&on_blank(0, "")).range.start,
+            Position::new(blank_row, 0)
+        );
+
+        for edit in [
+            // Unindented text ends the list item, on new lines or on the
+            // blank row itself (a diff reusing a blank line writes it there).
+            on_blank(0, "b = 2\n"),
+            on_blank(0, "\nb = 2"),
+            on_blank(0, "b = 2"),
+            // So does a replacement merging the blank row with the next one.
+            on_blank(1, "b"),
+            // Indented text stays in the item but comes back dedented by its
+            // indentation: "    return" would read as "  return".
+            on_blank(0, "  b = 2\n"),
+            on_blank(0, "    return\n"),
+            on_blank(0, "  b = 2"),
+        ] {
+            assert!(
+                !text_edit_safe_in_region(&to_host(&edit), &offset, region_end),
+                "{edit:?} must be refused"
+            );
+        }
+        // The dedent, read back: "    return" written on the blank row.
+        let edited_host =
+            crate::text::edit::apply_text_edits(host, &[to_host(&on_blank(0, "    return\n"))]);
+        assert!(
+            extract_python_fence(&edited_host)
+                .lines()
+                .any(|line| line == "  return")
+        );
+        // A plain fence maps every row alike: there the same edit is applied.
         let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0, 0]);
         assert!(text_edit_safe_in_region(
-            &at_blank("b = 2\n"),
+            &to_host(&on_blank(0, "b = 2\n")),
             &plain,
             region_end
         ));
 
-        // Blank lines, and lines indented at least as far as the item's
-        // content, stay inside the item: those are still applied.
-        for (new_text, line) in [
-            ("\n", ""),
-            ("\n\n", "\n"),
-            ("  b = 2\n", "  b = 2"),
-            ("    return\n", "    return"),
-        ] {
-            let edit = at_blank(new_text);
+        // Blank lines added or removed read back as the server meant them:
+        // the edited host extracts to the edited virtual text.
+        let virtual_text = extract_python_fence(host);
+        for edit in [on_blank(0, "\n"), on_blank(0, "\n\n"), on_blank(1, "")] {
+            let host_edit = to_host(&edit);
             assert!(
-                text_edit_safe_in_region(&edit, &offset, region_end),
-                "{new_text:?} keeps the list item"
+                text_edit_safe_in_region(&host_edit, &offset, region_end),
+                "{edit:?} keeps the list item"
             );
-            let lines: Vec<&str> = host.split('\n').collect();
-            let (before, after) = lines.split_at(blank_row as usize);
-            let expected = [before.join("\n"), line.to_string(), after.join("\n")].join("\n");
-            assert_eq!(crate::text::edit::apply_text_edits(host, &[edit]), expected);
+            let edited_host = crate::text::edit::apply_text_edits(host, &[host_edit]);
+            assert_eq!(
+                extract_python_fence(&edited_host),
+                crate::text::edit::apply_text_edits(&virtual_text, &[edit])
+            );
         }
-        // Text indented as far as the item's content, written onto the
-        // blank row itself, also stays inside the item.
-        let edit = at_blank("  b = 2");
-        assert!(text_edit_safe_in_region(&edit, &offset, region_end));
-        let mut lines: Vec<&str> = host.split('\n').collect();
-        lines[blank_row as usize] = "  b = 2";
-        assert_eq!(
-            crate::text::edit::apply_text_edits(host, &[edit]),
-            lines.join("\n")
-        );
     }
 
     #[test]
