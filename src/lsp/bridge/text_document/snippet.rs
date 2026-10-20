@@ -177,13 +177,14 @@ type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 /// Read a tabstop number (digits only: `$0name` is tabstop 0, then text);
 /// `None` before anything else, and for a number written with a leading
 /// zero (`$01`): vim.snippet reads it as `1`, mini.snippets as the text
-/// `01`, another tabstop.
+/// `01`, another tabstop; and for one past 9999, a range every client
+/// reads alike (Lua numbers lose integers past 2^53).
 fn tabstop(chars: &mut Chars<'_>) -> Option<String> {
     let mut number = String::new();
     while let Some(digit) = chars.next_if(char::is_ascii_digit) {
         number.push(digit);
     }
-    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) {
+    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) || number.len() > 4 {
         return None;
     }
     Some(number)
@@ -255,6 +256,10 @@ mod tests {
         assert_eq!(expanded("$0x$0"), None);
         assert_eq!(expanded("${0:a}x$0"), None);
         assert_eq!(expanded("$0x${0}"), None);
+        // A tabstop number past 9999.
+        assert_eq!(expanded("$10000"), None);
+        assert_eq!(expanded("${99999999999999999999:a}"), None);
+        assert_eq!(expanded("$9999").as_deref(), Some(""));
         // A tabstop number with a leading zero, which clients read apart.
         assert_eq!(expanded("$00"), None);
         assert_eq!(expanded("$01"), None);
