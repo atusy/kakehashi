@@ -4030,19 +4030,23 @@ mod tests {
 
         /// On a list item's fence the empty rows record no indentation: a
         /// snippet whose text lands on one, or text typed at its tabstop
-        /// there, would sit at the host's column 0, out of the item.
+        /// there, would sit at the host's column 0, out of the item. Some
+        /// must still be kept (text on rows the item indents), lest a guard
+        /// refusing everything pass.
         #[test]
-        #[ignore = "passes once the shared region guard protects a list-item fence's empty rows (the list-fence empty-row fix) in the base"]
+        #[ignore = "needs the shared region guard's protected empty rows (the list-fence empty-row fix), the offset built with them"]
         fn kept_snippets_on_a_list_item_fence_give_exactly_the_reference_host_text() {
-            check(8000, Host::ListItem);
+            let kept = check(8000, Host::ListItem);
+            assert!(kept > 50, "kept {kept}");
         }
 
         /// The list-item shape the property generates, a snippet completed
-        /// on an empty row of the item's fence: the text typed at its
-        /// tabstop must take the item's indentation.
+        /// on an empty row of the item's fence: refused, as the row records
+        /// no indentation for its text (nor for what is typed at its
+        /// tabstop) to land behind.
         #[test]
-        #[ignore = "passes once the shared region guard protects a list-item fence's empty rows (the list-fence empty-row fix) in the base"]
-        fn a_snippet_on_an_empty_row_of_a_list_item_fence_is_refused_or_lands_in_the_item() {
+        #[ignore = "needs the shared region guard's protected empty rows (the list-fence empty-row fix), the offset built with them"]
+        fn a_snippet_on_an_empty_row_of_a_list_item_fence_is_refused() {
             use crate::lsp::bridge::protocol::exact_reference::Line;
             let lines = [
                 Line::Content { body: 0, gap: None },
@@ -4052,7 +4056,7 @@ mod tests {
             let (document, map) = exact_reference::prepared(&lines, "  ", 0, 0, false).unwrap();
             // P is `a\n\na\n`; the snippet goes on its empty row.
             let at = Position::new(1, 0);
-            check_one(
+            let kept = check_one(
                 &document,
                 &map,
                 "  ",
@@ -4065,6 +4069,7 @@ mod tests {
                 LspRange::new(at, at),
             )
             .unwrap();
+            assert_eq!(kept, None);
         }
     }
 }
