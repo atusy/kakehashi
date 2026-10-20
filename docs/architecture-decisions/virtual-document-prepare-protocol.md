@@ -342,8 +342,10 @@ from the refusals its shape decides. The tables quadratic in what they
 search (the line diff's trace, and pairing blank lines, 4 bytes a step)
 are spent before they are taken, so their memory is linear in the budget,
 which itself grows with the texts but stops at 2^24 steps: some 64 MiB at
-most. The rest (the line diff's frontier, the lines' keys and indexes,
-and the characters the character diff compares) is linear in the texts. Whole lines alike
+most. The line diff's frontier is no wider than the square root of the
+work, as no search reaches further. The rest (the lines' keys and
+indexes, and the characters the character diff compares) is linear in
+the texts. Whole lines alike
 at either end of P and the edited P are set aside first, uncharged, so the
 work follows what the answer changes, not the region's size: a one-line
 answer costs its line in any region, and a 20,000-line region of half a

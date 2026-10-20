@@ -82,9 +82,10 @@ const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 /// The most a formatting answer's diff may spend, the per-byte allowance
 /// included: the tables quadratic in what its searches compare (the line
 /// diff's trace, the blank-line table) take a cell per step (4 bytes),
-/// some 64 MiB at most however large the texts; what else the diff keeps
-/// (the line diff's frontier, the lines' keys and indexes) is linear in
-/// the texts.
+/// some 64 MiB at most however large the texts; the line diff's frontier
+/// is no wider than the square root of the work left (some 64 KiB), and
+/// what else the diff keeps (the lines' keys and indexes) is linear in the
+/// texts.
 const FORMATTING_DIFF_BUDGET_CAP: usize = 1 << 24;
 
 /// How many bytes a step of work covers where the searches hash or compare
