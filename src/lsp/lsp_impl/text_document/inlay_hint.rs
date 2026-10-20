@@ -211,7 +211,7 @@ impl Kakehashi {
         });
 
         // The regions are independent documents, so they are asked at once;
-        // `join_all` keeps document order.
+        // `join_all` keeps region order for the merge.
         let walk = futures::future::join_all(
             regions
                 .into_iter()
@@ -221,9 +221,9 @@ impl Kakehashi {
             Some(rx) => tokio::select! {
                 biased;
                 _ = rx => FanInResult::Cancelled,
-                results = walk => merge_region_results(results),
+                results = walk => merge_region_results(results, |hint: &InlayHint| hint.position),
             },
-            None => merge_region_results(walk.await),
+            None => merge_region_results(walk.await, |hint: &InlayHint| hint.position),
         };
         // Every region settled (or the walk was cancelled and dropped them):
         // end the editor's progress now, before the no-result log, in the
@@ -448,22 +448,37 @@ fn inlay_hint_region_is_resolvable(
 
 /// Merge the per-region fan-in results of one request in document order.
 ///
-/// Any region that answered makes the merge an answer, with the other
-/// regions' hints appended. Only when none answered does it report no result
-/// (once, counting every region's errors), so a request over several regions
-/// logs as one request. A single region's result passes through unchanged.
-fn merge_region_results<T>(
+/// Any region that answered makes the merge an answer, with every answering
+/// region's hints. Only when none answered does it report no result (once,
+/// counting every region's errors), so a request over several regions logs
+/// as one request. A single region's result passes through unchanged.
+///
+/// When several regions answered, the hints are stably sorted by `position`:
+/// regions come in document order of their starts, but overlapping
+/// same-depth regions interleave, so appending alone would not keep the
+/// hints in document order. Hints at one position keep their arrival order.
+fn merge_region_results<T, K: Ord>(
     results: Vec<FanInResult<Option<Vec<T>>>>,
+    position: impl Fn(&T) -> K,
 ) -> FanInResult<Option<Vec<T>>> {
     let mut merged: Option<Vec<T>> = None;
+    let mut answered = 0usize;
     let mut errors = None;
     for result in results {
         match result {
-            FanInResult::Done(Some(items)) => merged.get_or_insert_with(Vec::new).extend(items),
+            FanInResult::Done(Some(items)) => {
+                answered += 1;
+                merged.get_or_insert_with(Vec::new).extend(items);
+            }
             FanInResult::Done(None) => {}
             FanInResult::NoResult { errors: e } => *errors.get_or_insert(0) += e,
             FanInResult::Cancelled => return FanInResult::Cancelled,
         }
+    }
+    if answered > 1
+        && let Some(items) = merged.as_mut()
+    {
+        items.sort_by_key(|item| position(item));
     }
     match (merged, errors) {
         (Some(items), _) => FanInResult::Done(Some(items)),
@@ -541,36 +556,84 @@ mod tests {
                 FanInResult::NoResult { errors } => FanInResult::NoResult { errors: *errors },
                 FanInResult::Cancelled => FanInResult::Cancelled,
             });
-            assert_eq!(render(merge_region_results(vec![single])), expected);
+            assert_eq!(
+                render(merge_region_results(vec![single], |item| *item)),
+                expected
+            );
         }
     }
 
     #[test]
     fn merge_region_results_appends_answers_in_document_order() {
-        let merged = merge_region_results(vec![
-            FanInResult::Done(Some(vec![1, 2])),
-            FanInResult::NoResult { errors: 1 },
-            FanInResult::Done(None),
-            FanInResult::Done(Some(vec![3])),
-        ]);
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![1, 2])),
+                FanInResult::NoResult { errors: 1 },
+                FanInResult::Done(None),
+                FanInResult::Done(Some(vec![3])),
+            ],
+            |item| *item,
+        );
         assert_eq!(
             render(merged),
             render(FanInResult::Done(Some(vec![1, 2, 3])))
         );
     }
 
+    /// Overlapping same-depth regions (#350) interleave their hints, so
+    /// appending them region by region would break document order: the
+    /// merge sorts by position, stably, so hints at one position keep the
+    /// order they arrived in (region order, then each response's order).
+    #[test]
+    fn merge_region_results_orders_interleaved_regions_by_position() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![(3, 'a'), (9, 'a')])),
+                FanInResult::Done(Some(vec![(4, 'b'), (3, 'b'), (8, 'b')])),
+            ],
+            |&(line, _)| line,
+        );
+        let FanInResult::Done(Some(items)) = merged else {
+            panic!("expected merged hints");
+        };
+        assert_eq!(items, [(3, 'a'), (3, 'b'), (4, 'b'), (8, 'b'), (9, 'a')]);
+    }
+
+    /// A single region's hints keep the server's own order, even unsorted,
+    /// as they did before regions were merged.
+    #[test]
+    fn merge_region_results_leaves_a_single_regions_order_alone() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![9, 3])),
+                FanInResult::Done(None),
+                FanInResult::NoResult { errors: 0 },
+            ],
+            |item| *item,
+        );
+        assert_eq!(render(merged), render(FanInResult::Done(Some(vec![9, 3]))));
+    }
+
     /// With no region answering, the request reports no result once, with
     /// every region's errors, so its log level reflects any failure.
     #[test]
     fn merge_region_results_reports_no_result_once_with_all_errors() {
-        let merged = merge_region_results::<u8>(vec![
-            FanInResult::NoResult { errors: 1 },
-            FanInResult::Done(None),
-            FanInResult::NoResult { errors: 2 },
-        ]);
+        let merged = merge_region_results(
+            vec![
+                FanInResult::<Option<Vec<u8>>>::NoResult { errors: 1 },
+                FanInResult::Done(None),
+                FanInResult::NoResult { errors: 2 },
+            ],
+            |item| *item,
+        );
         assert_eq!(render(merged), render(FanInResult::NoResult { errors: 3 }));
-        let merged =
-            merge_region_results::<u8>(vec![FanInResult::Done(None), FanInResult::Done(None)]);
+        let merged = merge_region_results(
+            vec![
+                FanInResult::<Option<Vec<u8>>>::Done(None),
+                FanInResult::Done(None),
+            ],
+            |item| *item,
+        );
         assert_eq!(render(merged), render(FanInResult::Done(None)));
     }
 
