@@ -51,8 +51,9 @@ impl Expansion {
     /// decides at insert time (a variable), that this expansion does not
     /// compute (a transform), or that clients resolve differently (several
     /// defaults for one tabstop, defaults holding defaults, a choice
-    /// escaping anything but `,`, `|` or `\`); and for an expansion far
-    /// longer than the snippet (one default mirrored many times).
+    /// escaping anything but `,`, `|` or `\`, a default escaping anything
+    /// but `$`, `}` or `\`, a `$` opening nothing); and for an expansion
+    /// far longer than the snippet (one default mirrored many times).
     pub(super) fn of(snippet: &str) -> Option<Self> {
         let mut chars = snippet.char_indices().peekable();
         let mut pieces = Vec::new();
@@ -93,17 +94,11 @@ impl Expansion {
                             return None;
                         }
                         number
-                    } else if let Some(number) = tabstop(&mut chars) {
-                        number
-                    } else if chars
-                        .peek()
-                        .is_some_and(|&(_, c)| c.is_ascii_alphabetic() || c == '_')
-                    {
-                        // A variable.
-                        return None;
                     } else {
-                        text.push('$');
-                        continue;
+                        // `None` for a variable, or a `$` opening nothing,
+                        // which Neovim's grammar does not read (VS Code
+                        // takes it as text).
+                        tabstop(&mut chars)?
                     };
                     *occurrences.entry(number.clone()).or_default() += 1;
                     pieces.push(Piece::Text(
@@ -270,15 +265,11 @@ fn placeholder(chars: &mut Chars<'_>) -> Option<Default> {
     loop {
         let (at, c) = chars.next()?;
         match c {
-            '\\' => match chars.next()? {
-                (_, escaped @ ('$' | '}' | '\\')) => text.push(escaped),
-                (other_at, other) => {
-                    text.push('\\');
-                    text.push(other);
-                    if is_break(other) {
-                        breaks.push((text.len(), other_at + other.len_utf8()));
-                    }
-                }
+            '\\' => match chars.next()?.1 {
+                escaped @ ('$' | '}' | '\\') => text.push(escaped),
+                // VS Code keeps the backslash; Neovim's grammar reads no
+                // other escape in a default.
+                _ => return None,
             },
             '}' => break,
             // A nested placeholder, a mirror or a variable in a default.
@@ -345,10 +336,10 @@ mod tests {
             Some("a,b|\\c")
         );
         assert_eq!(expanded("\\$1 \\} \\x").as_deref(), Some("$1 } \\x"));
-        assert_eq!(expanded("cost: $").as_deref(), Some("cost: $"));
         assert_eq!(expanded("$0name\n").as_deref(), Some("name\n"));
         assert_eq!(expanded("${1}x$12y").as_deref(), Some("xy"));
         assert_eq!(expanded("${1:a\\}b\\$c}").as_deref(), Some("a}b$c"));
+        assert_eq!(expanded("a}b\\").as_deref(), Some("a}b\\"));
         // Every occurrence mirrors its tabstop's default, ahead of it too.
         assert_eq!(expanded("$1x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$01x${1:\n}").as_deref(), Some("\nx\n"));
@@ -361,6 +352,13 @@ mod tests {
         assert_eq!(expanded("${1|a\\$b|}"), None);
         assert_eq!(expanded("${1|a\\}b|}"), None);
         assert_eq!(expanded("${1|a\\qb|}"), None);
+        // A `$` opening nothing, an escape a default holds of anything but
+        // `$`, `}` or `\`: Neovim's grammar reads neither (VS Code reads
+        // them as text).
+        assert_eq!(expanded("cost: $"), None);
+        assert_eq!(expanded("a $ b"), None);
+        assert_eq!(expanded("$$1"), None);
+        assert_eq!(expanded("${1:a\\qb}"), None);
         // A choice whose options break a line, the first or another.
         assert_eq!(expanded("${1|a,b\nc|}"), None);
         assert_eq!(expanded("${1|a\n,b|}"), None);
