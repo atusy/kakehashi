@@ -69,19 +69,22 @@ pub(crate) enum LinePrefix {
 }
 
 impl LinePrefix {
-    fn of(text: &str) -> Self {
-        if text.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-            Self::Whitespace
-        } else if text.bytes().all(|byte| {
-            matches!(
-                byte,
-                b' ' | b'\t' | b'>' | b'-' | b'+' | b'*' | b'.' | b')' | b'0'..=b'9'
-            )
-        }) {
-            Self::Container
-        } else {
-            Self::Other
+    /// The prefix of the host line ending at byte `end`, read backward from
+    /// `end` to the line's start (after an LF or a lone CR; the CR of a CRLF
+    /// is never reached, as its LF comes first). The read stops at the first
+    /// byte that is neither whitespace nor a container marker, so a region
+    /// opening after a delimiter costs one byte, however long its line.
+    fn before(bytes: &[u8], end: usize) -> Self {
+        let mut prefix = Self::Whitespace;
+        for &byte in bytes[..end.min(bytes.len())].iter().rev() {
+            match byte {
+                b'\n' | b'\r' => break,
+                b' ' | b'\t' => {}
+                b'>' | b'-' | b'+' | b'*' | b'.' | b')' | b'0'..=b'9' => prefix = Self::Container,
+                _ => return Self::Other,
+            }
         }
+        prefix
     }
 }
 
@@ -122,23 +125,13 @@ pub(super) fn compute_line_prefixes(
                     }
                 }
             };
-            // The host line the region opens on starts before the region.
-            let first_line_start = bytes[..byte_range.start.min(bytes.len())]
-                .iter()
-                .rposition(|&byte| byte == b'\n' || byte == b'\r')
-                .map_or(0, |at| at + 1);
             let mut offsets = Vec::new();
             let mut prefixes = Vec::new();
             for range in ranges {
                 let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
                 advance_to(gap_abs_byte, &mut line, &mut line_start);
                 let gap_start_line = line;
-                let prefix_start = if gap_start_line == 0 {
-                    first_line_start
-                } else {
-                    line_start
-                };
-                let prefix = LinePrefix::of(clamped_slice(host_text, prefix_start..gap_abs_byte));
+                let prefix = LinePrefix::before(bytes, gap_abs_byte);
                 // The column offset is the gap's start column within the host line.
                 // For the first line of the content node, use start_column
                 // (which accounts for the full prefix from the line start).
@@ -787,6 +780,40 @@ mod tests {
         // Included sub-ranges past the end of the (clamped) content are skipped.
         let oversized = [range_at(0, 999, 0, 0)];
         assert_eq!(extract_clean_content("hi", 0..2, Some(&oversized)), "hi");
+    }
+
+    /// Classifying the prefix of each region on one long host line takes
+    /// time linear in the regions, not in the line before each: a region
+    /// opening mid-line after a delimiter is no container from its first
+    /// byte back. Scanning back to the line start for each of the 20k regions
+    /// below would take seconds (about 2e9 byte checks); the bound leaves a
+    /// wide margin for a loaded machine.
+    #[test]
+    fn regions_on_one_long_line_classify_their_prefixes_in_linear_time() {
+        const REGIONS: usize = 20_000;
+        let host = "f`ab`, ".repeat(REGIONS);
+        let gap = tree_sitter::Range {
+            start_byte: 0,
+            end_byte: 2,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 2),
+        };
+        let started = std::time::Instant::now();
+        for region in 0..REGIONS {
+            let start = region * 7 + 2;
+            let (offsets, prefixes) = compute_line_prefixes(
+                &host,
+                start..start + 2,
+                start as u32,
+                Some(std::slice::from_ref(&gap)),
+            );
+            assert_eq!((offsets.len(), prefixes[0]), (1, LinePrefix::Other));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
     }
 
     #[test]
