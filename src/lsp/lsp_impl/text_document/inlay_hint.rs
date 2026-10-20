@@ -199,13 +199,21 @@ impl Kakehashi {
         // The editor's work-done progress spans the whole request: ONE
         // aggregator and ONE teardown guard, with each region's tracked
         // source minted into it, so the aggregator's winner rule shows one
-        // `Begin → … → End` and the synthetic terminal `End` fires only after
-        // every region settled (ls-bridge-client-progress). `None` when the
-        // request carries no `workDoneToken`.
+        // `Begin → … → End` (ls-bridge-client-progress). Over several regions
+        // the winner's own `End` is held and relayed only at teardown, after
+        // every region settled, so a fast region cannot close the editor's
+        // progress while another is in flight; a single region relays it as
+        // it arrives. `None` when the request carries no `workDoneToken`.
         let pool = self.bridge.pool_arc();
+        let several_regions = contexts.len() > 1;
         let shared_progress = client_progress_token.map(|client_token| {
+            let aggregator = if several_regions {
+                ClientProgressAggregator::deferring_end(client_token)
+            } else {
+                ClientProgressAggregator::new(client_token)
+            };
             (
-                Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                Arc::new(Mutex::new(aggregator)),
                 Arc::clone(pool.client_progress_registry()),
             )
         });

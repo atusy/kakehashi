@@ -2063,8 +2063,8 @@ fn main() {
                 // sends that only after closing and reopening the host, so
                 // the reply lands after the reopen was processed upstream.
                 // `inlay-hint-progress`: a request carrying a work-done token
-                // either reports progress on it (Begin, then Report, never an
-                // End of its own) and answers, or, for a document containing
+                // either reports progress on it (Begin, Report, then its own
+                // End) and answers, or, for a document containing
                 // `slow`, is parked unanswered until the next request WITHOUT
                 // a token releases it. Token-carrying requests never release
                 // it: they are the parked request's own siblings, which can
@@ -2103,7 +2103,15 @@ fn main() {
                         "$/progress",
                         json!({
                             "token": token,
-                            "value": { "kind": "report", "message": "fast region done" }
+                            "value": { "kind": "report", "message": "fast region working" }
+                        }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "end", "message": "fast region done" }
                         }),
                     );
                 }

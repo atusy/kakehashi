@@ -253,7 +253,11 @@ family) and the **multi-region** methods (`documentSymbol`, `formatting`,
 `rangeFormatting` and `inlayHint`, which are range-scoped): the latter fan out over several
 injection regions and so share **one** request-level aggregator and teardown
 guard, joined by the **winner-token rule** (the first source to relay a `Begin`
-owns the lifecycle), instead of a per-dispatch aggregator. (`documentColor` is
+owns the lifecycle), instead of a per-dispatch aggregator. Over several
+regions, `inlayHint` also holds the winner's own `End` and relays it at
+teardown, once every region settled, so a fast region cannot close the
+editor's progress while another is in flight; the other multi-region methods
+relay the winner's `End` as it arrives. (`documentColor` is
 not yet wired — it still passes no client token.) Per-method plumbing and
 remaining capability-advertisement gaps are tracked under #437/#447/#457.
 

@@ -1358,8 +1358,9 @@ fn start_held_progress_request(client: &mut LspClient, uri: &str) -> (i64, Vec<S
         );
         record_progress(&message, &mut kinds);
     }
-    // The fast region has reported; its answer follows on the same pipe. A
-    // lifecycle tied to that region would end now, while the other is held.
+    // The fast region has reported and sent its own End; its answer follows
+    // on the same pipe. A lifecycle that relayed that End, or that was tied to
+    // that region, would end now, while the other region is held.
     let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(700);
     loop {
         let remaining = quiet_until.saturating_duration_since(std::time::Instant::now());
@@ -1386,12 +1387,14 @@ fn start_held_progress_request(client: &mut LspClient, uri: &str) -> (i64, Vec<S
 
 fn record_progress(message: &Value, kinds: &mut Vec<String>) {
     if message["method"] == "$/progress" && message["params"]["token"] == PROGRESS_TOKEN {
-        kinds.push(
-            message["params"]["value"]["kind"]
-                .as_str()
-                .expect("progress kind")
-                .to_string(),
-        );
+        let value = &message["params"]["value"];
+        let kind = value["kind"].as_str().expect("progress kind");
+        // An End records its message, so a test can tell the server's own End
+        // (relayed late) from a synthetic one.
+        kinds.push(match value["message"].as_str() {
+            Some(text) if kind == "end" => format!("end:{text}"),
+            _ => kind.to_string(),
+        });
     }
 }
 
@@ -1407,7 +1410,10 @@ fn finish_held_progress_request(
     let mut response = None;
     let mut pending: Vec<i64> = also.to_vec();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while response.is_none() || !pending.is_empty() || !kinds.iter().any(|kind| kind == "end") {
+    while response.is_none()
+        || !pending.is_empty()
+        || !kinds.iter().any(|kind| kind.starts_with("end"))
+    {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         let message = client.receive_any_message(remaining).unwrap_or_else(|| {
             panic!("no answer or no End: {kinds:?} {response:?} pending {pending:?}")
@@ -1428,8 +1434,9 @@ fn finish_held_progress_request(
 }
 
 /// The editor's work-done progress is one lifecycle for the whole request:
-/// the region that reports first owns it, and the bridge's terminal End
-/// comes only after the last region settles, not when the first one does.
+/// the region that reports first owns it, and its End, even the server's own,
+/// reaches the editor only after the last region settles, not when the first
+/// one does.
 #[test]
 fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
     let (mut client, _config_dir) =
@@ -1455,7 +1462,11 @@ fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
         Some(2),
         "{response}"
     );
-    assert_eq!(kinds, ["begin", "report", "end"]);
+    assert_eq!(
+        kinds,
+        ["begin", "report", "end:fast region done"],
+        "the fast region's own End is relayed once the held region settled"
+    );
 
     shutdown_client(&mut client);
 }
@@ -1472,7 +1483,7 @@ fn e2e_inlay_hint_work_done_progress_ends_on_cancel() {
     client.send_notification("$/cancelRequest", json!({ "id": id }));
     let response = finish_held_progress_request(&mut client, id, &[], &mut kinds);
     assert_eq!(response["error"]["code"], -32800, "{response}");
-    assert_eq!(kinds, ["begin", "report", "end"]);
+    assert_eq!(kinds, ["begin", "report", "end:fast region done"]);
 
     shutdown_client(&mut client);
 }
