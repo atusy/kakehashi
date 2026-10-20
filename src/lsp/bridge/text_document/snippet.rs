@@ -60,11 +60,10 @@ impl Expansion {
             match c {
                 '\\' => match chars.next() {
                     Some(escaped @ ('$' | '}' | '\\')) => text.push(escaped),
-                    Some(other) => {
-                        text.push('\\');
-                        text.push(other);
-                    }
-                    None => text.push('\\'),
+                    // Neovim's vim.snippet reads other escapes into a
+                    // pattern (`x\%$0` fails), and VS Code keeps their
+                    // backslash; a trailing one escapes nothing.
+                    _ => return None,
                 },
                 '$' => {
                     let number = if chars.next_if_eq(&'{').is_some() {
@@ -222,11 +221,11 @@ mod tests {
     fn a_snippet_expands_to_its_defaults() {
         assert_eq!(expanded("f(${1})$0").as_deref(), Some("f()"));
         assert_eq!(expanded("f(${1:x}, ${2:y})").as_deref(), Some("f(x, y)"));
-        assert_eq!(expanded("\\$1 \\} \\x").as_deref(), Some("$1 } \\x"));
+        assert_eq!(expanded("\\$1 \\} \\\\").as_deref(), Some("$1 } \\"));
         assert_eq!(expanded("$0name").as_deref(), Some("name"));
         assert_eq!(expanded("${1}x$12y").as_deref(), Some("xy"));
         assert_eq!(expanded("${1:a\\}b\\$c}").as_deref(), Some("a}b$c"));
-        assert_eq!(expanded("a}b\\").as_deref(), Some("a}b\\"));
+        assert_eq!(expanded("a}b").as_deref(), Some("a}b"));
         // Every later occurrence mirrors the default of its first.
         assert_eq!(expanded("${1:y}x$1").as_deref(), Some("yxy"));
         // Other tabstops mirror however often they occur.
@@ -240,6 +239,11 @@ mod tests {
         assert_eq!(expanded("${1|a,b|}c"), None);
         assert_eq!(expanded("${1:x}-${2|a,b|}"), None);
         assert_eq!(expanded("${1|a\\,b\\|\\\\c,d|}"), None);
+        // An escape of anything but `$`, `}` or `\\`, or of nothing.
+        assert_eq!(expanded("x\\.$0"), None);
+        assert_eq!(expanded("x\\%$0"), None);
+        assert_eq!(expanded("x\\[$0"), None);
+        assert_eq!(expanded("a\\"), None);
         // A `$` opening nothing, an escape a default holds of anything but
         // `$`, `}` or `\`: Neovim's grammar reads neither (VS Code reads
         // them as text).
