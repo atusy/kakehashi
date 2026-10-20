@@ -1796,9 +1796,26 @@ mod exact_reference {
         Fence,
     }
 
-    const BODIES: [&str; 4] = ["a", "é", "𝄞x", "b c"];
+    /// Line bodies, shared between lines and with the inserted texts, so
+    /// that an edit's text can repeat the lines around it (as a formatter's
+    /// or a completion's does).
+    const BODIES: [&str; 7] = ["a", "é", "𝄞x", "b c", "}", "a = 1", "f('a')"];
     const PLACEHOLDERS: [Option<&str>; 4] = [None, Some(""), Some("1"), Some("x\n")];
-    const INSERTS: [&str; 9] = ["", "z", "\n", "q\n", "\nw", "é𝄞", "  ", "\n\n", "\nw\n"];
+    const INSERTS: [&str; 13] = [
+        "",
+        "z",
+        "\n",
+        "q\n",
+        "\nw",
+        "é𝄞",
+        "  ",
+        "\n\n",
+        "\nw\n",
+        "a = 1,",
+        "\n}",
+        "f('a')\n",
+        "a = 1\na = 1,",
+    ];
 
     /// A generated document: its pieces and the text the reference puts
     /// back around the edited content.
