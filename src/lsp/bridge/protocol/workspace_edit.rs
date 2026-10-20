@@ -365,8 +365,9 @@ pub(crate) fn text_edit_safe_in_region(
 /// A blank row of the prefixed block that records no prefix (a list item's
 /// fence leaves blank rows unindented) maps virtual column 0 to host column
 /// 0, unlike the block's other rows. An edit starting there, with or without
-/// a newline, is unsafe iff it writes any non-whitespace text: that text
-/// reads back dedented by the block's prefix width, or ends the block.
+/// a newline, is unsafe iff it writes anything but spaces, tabs and line
+/// breaks (what markdown counts as blank): that text reads back dedented by
+/// the block's prefix width, or ends the block.
 ///
 /// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
 /// rules — every edit is prefix-safe there, which keeps the common case
@@ -498,7 +499,8 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // reads back dedented by that width, or ends the block when it is
         // indented less. Only the prefix's width is recorded, not its text
         // (`  ` vs `> `), so such an edit is refused rather than re-prefixed;
-        // whitespace-only text and deletions still apply.
+        // text of only spaces, tabs and line breaks, and deletions, still
+        // apply.
         let inside_prefixed_block = |host_line: u32| {
             content_prefixed
                 && host_line.checked_sub(offset.line()).is_some_and(|row| {
@@ -515,7 +517,7 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // row itself, and a range running on past it either ends on a zero
         // row (nothing after it) or is refused as spanning a prefixed one.
         let writes_on_blank_row =
-            inside_prefixed_block(start.line) && e.new_text.chars().any(|c| !c.is_whitespace());
+            inside_prefixed_block(start.line) && !crate::text::is_markdown_blank(&e.new_text);
         !touches_boundary
             && !spans_prefixed_line
             && !inserts_unprefixed_line
@@ -1268,6 +1270,10 @@ mod tests {
             on_blank(0, "  b = 2\n"),
             on_blank(0, "    return\n"),
             on_blank(0, "  b = 2"),
+            // Markdown counts only spaces and tabs as blank: a no-break
+            // space is text, at column 0.
+            on_blank(0, "\u{a0}"),
+            on_blank(0, "\u{a0}\n"),
         ] {
             assert!(
                 !text_edit_safe_in_region(&to_host(&edit), &offset, region_end),

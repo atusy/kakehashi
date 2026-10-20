@@ -1739,7 +1739,7 @@ fn pipeline_region_text(
         Some(prefix)
             if split_lsp_lines(&text)
                 .first()
-                .is_some_and(|(line, _)| !line.trim().is_empty()) =>
+                .is_some_and(|(line, _)| !crate::text::is_markdown_blank(line)) =>
         {
             Some(format!("{prefix}{text}"))
         }
@@ -2926,6 +2926,14 @@ mod tests {
         "\na = 1\n",
         "a = 1\n",
         "- item\n\n  ```py\n  a = 1\n  ```\n"
+    )]
+    // A no-break space is text to markdown, not a blank line.
+    #[case::no_break_space_onto_leading_blank_row(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "\u{a0}\na = 1\n",
+        "- item\n\n  ```py\n  \u{a0}\n  a = 1\n  ```\n"
     )]
     // Content moved onto a trailing blank row (line count kept).
     #[case::content_onto_trailing_blank_row(

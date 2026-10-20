@@ -19,9 +19,9 @@
 //! duplicate or lose content. All-safe responses (single-line edits and
 //! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
 //! through (a newline-bearing `new_text` in a prefixed region still rejects).
-//! A list item's fence records no prefix for its blank rows, so any
-//! non-whitespace text written onto one is unsafe too: it would read back
-//! dedented by the item's indentation, or end the item.
+//! A list item's fence records no prefix for its blank rows, so any text
+//! other than spaces, tabs and line breaks written onto one is unsafe too:
+//! it would read back dedented by the item's indentation, or end the item.
 //! Unprefixed regions are exempt from the prefix rules but still subject to
 //! region containment and the fence-boundary EOL rule. Re-applying prefixes to `new_text` (which would let these
 //! edits APPLY instead of dropping) means rewriting it per embedded newline;
