@@ -50,51 +50,55 @@ pub(super) fn compute_line_column_offsets(
     start_column: u32,
     included_ranges: Option<&[tree_sitter::Range]>,
 ) -> Vec<u32> {
-    compute_line_prefixes(host_text, byte_range, start_column, included_ranges).0
+    compute_line_prefixes(
+        host_text,
+        byte_range,
+        start_column,
+        included_ranges,
+        |_, _| LinePrefix::Other,
+    )
+    .0
 }
 
 /// What the host text before a virtual line's content is made of: the text
-/// a column offset skips. Only whitespace and markdown container markers
-/// make a prefix that repeats on every line of a block; anything else (the
-/// code before a string that opens mid-line, an excluded escape sequence)
-/// is no container prefix.
+/// a column offset skips. Only a markdown container's continuation (the
+/// `> ` of a blockquote, a list item's indentation, as tree-sitter-md parses
+/// them) repeats on every line of a block; anything else (the code before a
+/// string that opens mid-line, an excluded escape sequence) is no container
+/// prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinePrefix {
-    /// Spaces and tabs only, or nothing: list-item indentation.
+    /// No text, or a container continuation of spaces and tabs only: list-item
+    /// indentation.
     Whitespace,
-    /// Whitespace and container markers (`>`, `-`, `+`, `*`, `1.`, `1)`).
+    /// A container continuation holding markers (`>`).
     Container,
     /// Any other text.
     Other,
 }
 
 impl LinePrefix {
-    /// The prefix of the host line ending at byte `end`, read backward from
-    /// `end` to the line's start (after an LF or a lone CR; the CR of a CRLF
-    /// is never reached, as its LF comes first). The read stops at the first
-    /// byte that is neither whitespace nor a container marker, so a region
-    /// opening after a delimiter costs one byte, however long its line.
-    fn before(bytes: &[u8], end: usize) -> Self {
-        let mut prefix = Self::Whitespace;
-        for &byte in bytes[..end.min(bytes.len())].iter().rev() {
-            match byte {
-                b'\n' | b'\r' => break,
-                b' ' | b'\t' => {}
-                b'>' | b'-' | b'+' | b'*' | b'.' | b')' | b'0'..=b'9' => prefix = Self::Container,
-                _ => return Self::Other,
-            }
+    /// The class of a container continuation spanning `text`.
+    pub(super) fn continuation(text: &str) -> Self {
+        if text.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+            Self::Whitespace
+        } else {
+            Self::Container
         }
-        prefix
     }
 }
 
-/// [`compute_line_column_offsets`], with what each line's prefix is made of.
-/// Lines without a recorded offset have an empty prefix.
+/// [`compute_line_column_offsets`], with what each line's prefix is made of,
+/// as `classify` reads the host span before the line's gap: from the LSP
+/// line start (`None` on the region's first line, whose start lies before
+/// the region) to the gap's start byte. Gaps arrive in document order. Lines
+/// without a recorded offset have an empty prefix.
 pub(super) fn compute_line_prefixes(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
     start_column: u32,
     included_ranges: Option<&[tree_sitter::Range]>,
+    mut classify: impl FnMut(Option<usize>, usize) -> LinePrefix,
 ) -> (Vec<u32>, Vec<LinePrefix>) {
     match included_ranges {
         None => (vec![start_column], Vec::new()),
@@ -131,7 +135,7 @@ pub(super) fn compute_line_prefixes(
                 let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
                 advance_to(gap_abs_byte, &mut line, &mut line_start);
                 let gap_start_line = line;
-                let prefix = LinePrefix::before(bytes, gap_abs_byte);
+                let prefix = classify((gap_start_line > 0).then_some(line_start), gap_abs_byte);
                 // The column offset is the gap's start column within the host line.
                 // For the first line of the content node, use start_column
                 // (which accounts for the full prefix from the line start).
@@ -782,10 +786,9 @@ mod tests {
         assert_eq!(extract_clean_content("hi", 0..2, Some(&oversized)), "hi");
     }
 
-    /// Classifying the prefix of each region on one long host line takes
-    /// time linear in the regions, not in the line before each: a region
-    /// opening mid-line after a delimiter is no container from its first
-    /// byte back. Scanning back to the line start for each of the 20k regions
+    /// Splitting each region on one long host line into lines takes time
+    /// linear in the regions, not in the line before each: nothing reads
+    /// back to the line start. Scanning back for each of the 20k regions
     /// below would take seconds (about 2e9 byte checks); the bound leaves a
     /// wide margin for a loaded machine.
     #[test]
@@ -806,6 +809,7 @@ mod tests {
                 start..start + 2,
                 start as u32,
                 Some(std::slice::from_ref(&gap)),
+                |_, _| LinePrefix::Other,
             );
             assert_eq!((offsets.len(), prefixes[0]), (1, LinePrefix::Other));
         }

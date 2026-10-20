@@ -7,7 +7,9 @@ use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingI
 use ulid::Ulid;
 use url::Url;
 
-use super::content::{compute_line_prefixes, extract_clean_content, protected_blank_rows};
+use super::content::{
+    LinePrefix, compute_line_prefixes, extract_clean_content, protected_blank_rows,
+};
 use super::language::extract_injection_language;
 use super::offset::InjectionOffset;
 use super::ranges::{
@@ -261,6 +263,64 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
     start..end
 }
 
+/// Classify each line prefix of a region by the host parse: a prefix is a
+/// container continuation only in a markdown host, where it is exactly the
+/// `block_continuation` tree-sitter-md parses at the start of that line (for
+/// the region's first line, the one right before the content node; for
+/// later lines, the content node's excluded children). Every other prefix,
+/// in any other host or span, is other text. The children are walked once,
+/// in the order the gaps arrive.
+fn markdown_container_prefixes<'a>(
+    content_node: &Node<'a>,
+    text: &'a str,
+) -> impl FnMut(Option<usize>, usize) -> LinePrefix + 'a {
+    let markdown = content_node.language().name() == Some("markdown");
+    let bytes = text.as_bytes();
+    let starts_line = move |at: usize| at == 0 || matches!(bytes.get(at - 1), Some(b'\n' | b'\r'));
+    let first_line = content_node
+        .prev_sibling()
+        .filter(|node| node.kind() == "block_continuation" && starts_line(node.start_byte()))
+        .map(|node| node.byte_range());
+    let mut cursor = content_node.walk();
+    let children: Vec<std::ops::Range<usize>> = if markdown {
+        content_node
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() == "block_continuation")
+            .map(|node| node.byte_range())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut next = 0;
+    move |line_start, gap| {
+        if !markdown {
+            return LinePrefix::Other;
+        }
+        let span = match line_start {
+            None => {
+                if starts_line(gap) {
+                    return LinePrefix::Whitespace;
+                }
+                match &first_line {
+                    Some(range) if range.end == gap => range.clone(),
+                    _ => return LinePrefix::Other,
+                }
+            }
+            Some(start) if start == gap => return LinePrefix::Whitespace,
+            Some(start) => {
+                while children.get(next).is_some_and(|range| range.start < start) {
+                    next += 1;
+                }
+                match children.get(next) {
+                    Some(range) if range.start == start && range.end == gap => range.clone(),
+                    _ => return LinePrefix::Other,
+                }
+            }
+        };
+        LinePrefix::continuation(clamped_slice(text, span))
+    }
+}
+
 /// Compute clean virtual content, per-line column offsets and protected
 /// blank rows for an injection region.
 ///
@@ -301,6 +361,7 @@ fn extract_virtual_content_and_offsets(
         cacheable.byte_range.clone(),
         cacheable.start_column,
         included_ranges.as_deref(),
+        markdown_container_prefixes(&region.content_node, text),
     );
     let protected_blank_rows =
         protected_blank_rows(&line_column_offsets, &line_prefixes, &virtual_content);

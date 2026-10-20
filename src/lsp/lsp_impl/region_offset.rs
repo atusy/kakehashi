@@ -438,4 +438,28 @@ mod tests {
         // Deleting the row's content still applies.
         assert!(accepts(resolved(), &edit((4, 1), (4, 1), "")));
     }
+
+    /// A host that is not markdown never protects a row, even where an
+    /// excluded child at a line start reads like a list marker (`123`,
+    /// `1.`): only tree-sitter-md's container continuations are prefixes.
+    #[rstest::rstest]
+    #[case::digits("const a = [\n123,\n\n456];\n", "[\n,\n,\n]")]
+    #[case::ordered_marker_like("const a = [\n1.,\n\n2.];\n", "[\n,\n,\n]")]
+    fn a_non_markdown_host_with_list_like_children_protects_nothing(
+        #[case] host: &str,
+        #[case] expected_virtual: &str,
+    ) {
+        let query = "((array) @injection.content (#set! injection.language \"json\"))";
+        let discover =
+            |host: &str| discover_in(tree_sitter_javascript::LANGUAGE.into(), host, query);
+        let resolved = discover(host).swap_remove(0);
+        assert!(resolved.line_column_offsets.len() > 1 && resolved.line_column_offsets[1] > 0);
+        assert_eq!(resolved.protected_blank_rows, Vec::<u32>::new());
+
+        // A comma (no child node of its own) written on the blank row.
+        let change = edit((2, 0), (2, 0), ",");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited)[0].virtual_content, expected_virtual);
+    }
 }
