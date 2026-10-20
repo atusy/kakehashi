@@ -165,6 +165,7 @@ fn envelope_host_action(
             line: 0,
             column: 0,
             line_column_offsets: None,
+            protected_blank_rows: Vec::new(),
         },
         original_title: action.title.clone(),
         inner: None,
@@ -2504,7 +2505,7 @@ mod tests {
             json!([action]),
             caps(true),
             false,
-            RegionOffset::with_per_line_offsets(10, vec![0, 0, 2, 0]),
+            RegionOffset::with_content(10, vec![0, 0, 2, 0], "\n\na = 1\n"),
         )
         .unwrap();
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {

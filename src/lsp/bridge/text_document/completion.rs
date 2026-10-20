@@ -487,6 +487,11 @@ pub(crate) struct EnvelopeOffset {
     /// `None` for non-blockquote injections (backwards-compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_column_offsets: Option<Vec<u32>>,
+    /// The virtual lines that are blank rows of a prefixed block (see
+    /// `RegionOffset::with_content`), carried so a resolve judges edits as
+    /// the original response was. Empty for most regions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_blank_rows: Vec<u32>,
 }
 
 impl From<&RegionOffset> for EnvelopeOffset {
@@ -495,6 +500,7 @@ impl From<&RegionOffset> for EnvelopeOffset {
             line: o.line(),
             column: o.column_for_line(0),
             line_column_offsets: Some(o.columns().to_vec()),
+            protected_blank_rows: o.protected_blank_row_list(),
         }
     }
 }
@@ -502,7 +508,9 @@ impl From<&RegionOffset> for EnvelopeOffset {
 impl From<&EnvelopeOffset> for RegionOffset {
     fn from(o: &EnvelopeOffset) -> Self {
         match &o.line_column_offsets {
-            Some(columns) => Self::with_per_line_offsets(o.line, columns.clone()),
+            Some(columns) => {
+                Self::with_protected_blank_rows(o.line, columns.clone(), &o.protected_blank_rows)
+            }
             None => Self::new(o.line, o.column),
         }
     }
@@ -607,6 +615,7 @@ pub(super) fn envelope_host_item(
             line: 0,
             column: 0,
             line_column_offsets: None,
+            protected_blank_rows: Vec::new(),
         },
         region_end: None,
         host_layer: true,
@@ -1275,7 +1284,8 @@ mod tests {
             EnvelopeOffset {
                 line: 3,
                 column: 4,
-                line_column_offsets: Some(vec![4])
+                line_column_offsets: Some(vec![4]),
+                protected_blank_rows: Vec::new(),
             }
         );
 
@@ -1628,6 +1638,7 @@ mod tests {
             line: 5,
             column: 2,
             line_column_offsets: Some(vec![2, 2, 2]),
+            protected_blank_rows: Vec::new(),
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         let deserialized: EnvelopeOffset =
@@ -1642,6 +1653,7 @@ mod tests {
             line: 5,
             column: 0,
             line_column_offsets: None,
+            protected_blank_rows: Vec::new(),
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         assert!(json.get("line_column_offsets").is_none());
@@ -1725,7 +1737,7 @@ mod tests {
         // its blank rows record no prefix, so an import inserted at one lands
         // at host column 0 and ends the list item. The additional edits drop;
         // the item and its own edit stay.
-        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]);
+        let offset = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
         let region_end = Position::new(6, 0);
         let response = json!({
             "jsonrpc": "2.0", "id": 1,

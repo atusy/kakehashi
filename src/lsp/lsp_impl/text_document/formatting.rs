@@ -956,9 +956,10 @@ async fn dispatch_concatenated_formatting(
     cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
 ) -> Option<Vec<TextEdit>> {
-    let offset = RegionOffset::with_per_line_offsets(
+    let offset = RegionOffset::with_content(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
+        &region_ctx.resolved.virtual_content,
     );
     let original_virtual = region_ctx.resolved.virtual_content.clone();
     // Precompute the host replacement range now, while we still hold

@@ -134,9 +134,10 @@ where
             uri: ctx.uri.clone(),
             injection_language: ctx.resolved.injection_language.clone(),
             region_id: ctx.resolved.region.region_id.clone(),
-            offset: RegionOffset::with_per_line_offsets(
+            offset: RegionOffset::with_content(
                 ctx.resolved.region.line_range.start,
                 ctx.resolved.line_column_offsets.clone(),
+                &ctx.resolved.virtual_content,
             ),
             virtual_content: ctx.resolved.virtual_content.clone(),
             region_end_cell: std::sync::Arc::clone(&region_end_cell),

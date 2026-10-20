@@ -27,9 +27,10 @@ pub(crate) struct RegionOffset {
     /// Per-virtual-line column offsets (UTF-16 code units).
     /// Index = virtual line number, value = column offset for that line.
     columns: Vec<u32>,
-    /// The last virtual line whose column offset is past 0, derived from
-    /// `columns` once so per-edit checks need not rescan them.
-    last_prefixed_line: Option<usize>,
+    /// Per virtual line, whether it is a blank row of a prefixed block (see
+    /// [`Self::with_content`]); empty when the region has none or its
+    /// content was not given.
+    protected_blank_rows: Vec<bool>,
 }
 
 impl RegionOffset {
@@ -39,18 +40,71 @@ impl RegionOffset {
     }
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
+    ///
+    /// Without the region's content, no row is known to be a blank row of a
+    /// prefixed block; [`Self::with_content`] tells them apart.
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        let last_prefixed_line = columns.iter().rposition(|&column| column > 0);
         Self {
             line,
             columns,
-            last_prefixed_line,
+            protected_blank_rows: Vec::new(),
         }
     }
 
-    /// The last virtual line whose column offset is past 0, if any.
-    pub(crate) fn last_prefixed_line(&self) -> Option<usize> {
-        self.last_prefixed_line
+    /// Construct a `RegionOffset` for a region whose virtual text is
+    /// `virtual_content`, marking the blank rows of its prefixed blocks.
+    ///
+    /// A list item's fence leaves its blank rows unindented, so they record
+    /// no prefix, and virtual column 0 maps to host column 0 there instead of
+    /// past the item's indentation. Such a row is one that records no prefix,
+    /// is blank in the virtual text (only spaces and tabs, as markdown
+    /// counts it), and whose nearest non-blank row before it records a prefix
+    /// (or, with none before, the nearest after it). A row recording no
+    /// prefix that holds text (a lazy continuation line, a plain fence
+    /// following a blockquoted one in a combined region) is content, and so
+    /// is a blank row next to it. The row after the content's final line
+    /// break is the closing fence's, which the edit checks treat apart.
+    pub(crate) fn with_content(line: u32, columns: Vec<u32>, virtual_content: &str) -> Self {
+        let protected_blank_rows = protected_blank_rows(&columns, virtual_content);
+        Self {
+            line,
+            columns,
+            protected_blank_rows,
+        }
+    }
+
+    /// Construct a `RegionOffset` whose protected blank rows are the given
+    /// virtual lines (as [`Self::protected_blank_row_list`] lists them).
+    pub(crate) fn with_protected_blank_rows(line: u32, columns: Vec<u32>, rows: &[u32]) -> Self {
+        let mut protected_blank_rows = vec![false; columns.len()];
+        for &row in rows {
+            if let Some(slot) = protected_blank_rows.get_mut(row as usize) {
+                *slot = true;
+            }
+        }
+        let protected_blank_rows = trim_protected_rows(protected_blank_rows);
+        Self {
+            line,
+            columns,
+            protected_blank_rows,
+        }
+    }
+
+    /// Whether `virtual_line` is a blank row of a prefixed block (see
+    /// [`Self::with_content`]).
+    pub(crate) fn is_protected_blank_row(&self, virtual_line: usize) -> bool {
+        self.protected_blank_rows
+            .get(virtual_line)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// The protected blank rows, as virtual line numbers.
+    pub(crate) fn protected_blank_row_list(&self) -> Vec<u32> {
+        (0u32..)
+            .zip(&self.protected_blank_rows)
+            .filter_map(|(row, &protected)| protected.then_some(row))
+            .collect()
     }
 
     /// Get the starting line of the injection region.
@@ -83,6 +137,79 @@ impl RegionOffset {
             .copied()
             .unwrap_or(0)
     }
+}
+
+/// Mark the blank rows of a region's prefixed blocks; see
+/// [`RegionOffset::with_content`]. One pass each way over the rows.
+fn protected_blank_rows(columns: &[u32], virtual_content: &str) -> Vec<bool> {
+    let has_prefix = columns.iter().any(|&column| column > 0);
+    let has_unprefixed = columns.contains(&0);
+    if columns.len() <= 1 || !has_prefix || !has_unprefixed {
+        return Vec::new();
+    }
+    // Whether each LSP line (a lone CR ends one too, as the offsets count
+    // them) is blank as markdown reads it.
+    let mut blank = Vec::with_capacity(columns.len());
+    let bytes = virtual_content.as_bytes();
+    let mut line_blank = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                blank.push(line_blank);
+                line_blank = true;
+            }
+            b'\r' => {
+                blank.push(line_blank);
+                line_blank = true;
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b' ' | b'\t' => {}
+            _ => line_blank = false,
+        }
+        i += 1;
+    }
+    let ends_with_line_break = virtual_content.ends_with(['\n', '\r']);
+    // The row after the final line break is the closing fence's.
+    if !ends_with_line_break {
+        blank.push(line_blank);
+    }
+    let rows = columns.len().min(blank.len());
+    // A row "anchors" when it records a prefix or holds text; its value is
+    // whether it records a prefix.
+    let anchor = |row: usize| (columns[row] > 0 || !blank[row]).then_some(columns[row] > 0);
+    let mut next_anchor = vec![None; rows];
+    let mut next = None;
+    for row in (0..rows).rev() {
+        next_anchor[row] = next;
+        if let Some(prefixed) = anchor(row) {
+            next = Some(prefixed);
+        }
+    }
+    let mut previous = None;
+    let mut protected = vec![false; rows];
+    for row in 0..rows {
+        if columns[row] == 0 && blank[row] {
+            protected[row] = previous.or(next_anchor[row]).unwrap_or(false);
+        }
+        if let Some(prefixed) = anchor(row) {
+            previous = Some(prefixed);
+        }
+    }
+    trim_protected_rows(protected)
+}
+
+/// The canonical form of a protected-row table, so offsets built either way
+/// compare equal: it ends at its last protected row, empty when none is.
+fn trim_protected_rows(mut protected: Vec<bool>) -> Vec<bool> {
+    let len = protected
+        .iter()
+        .rposition(|&row| row)
+        .map_or(0, |last| last + 1);
+    protected.truncate(len);
+    protected
 }
 
 // =============================================================================
@@ -196,19 +323,43 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::one_offset_past_zero(RegionOffset::new(3, 4), Some(0))]
-    #[case::one_zero_offset(RegionOffset::new(3, 0), None)]
-    #[case::last_row_prefixed(RegionOffset::with_per_line_offsets(3, vec![0, 2, 0, 2]), Some(3))]
-    #[case::trailing_zero_rows(RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]), Some(0))]
-    #[case::all_zero(RegionOffset::with_per_line_offsets(3, vec![0, 0]), None)]
-    fn last_prefixed_line_is_the_last_line_offset_past_zero(
-        #[case] offset: RegionOffset,
-        #[case] expected: Option<usize>,
+    // A list item's fence: trailing, leading and interior blank rows.
+    #[case::trailing_blank_rows(vec![2, 0, 0, 0], "a = 1\n\n\n", vec![1, 2])]
+    #[case::leading_blank_rows(vec![0, 0, 2, 0], "\n\na = 1\n", vec![0, 1])]
+    #[case::interior_blank_row(vec![2, 0, 2, 0], "a = 1\n\nb\n", vec![1])]
+    // A lone CR ends a line, as the offsets count them.
+    #[case::lone_cr(vec![2, 0, 2], "a\r\rb", vec![1])]
+    // A tab-only row is blank; a no-break space is text.
+    #[case::tab_row(vec![2, 0, 2], "a\n\t\nb", vec![1])]
+    #[case::no_break_space_row(vec![2, 0, 2], "a\n\u{a0}\nb", vec![])]
+    // Lazy continuation: a row recording no prefix that holds text.
+    #[case::lazy_continuation(vec![2, 0, 2], "a\nb\nc", vec![])]
+    // A combined region: blockquoted fence, layout rows, then a plain fence
+    // whose rows (and blank row) follow its own unprefixed text.
+    #[case::plain_fence_after_a_blockquoted_one(
+        vec![2, 0, 0, 0, 0, 0, 0, 0],
+        "a = 1\n\n\n\nb = 2\n\nc = 3\n",
+        vec![1, 2, 3]
+    )]
+    // No prefixed row, or one row only: nothing to protect.
+    #[case::all_zero(vec![0, 0, 0], "a\n\nb", vec![])]
+    #[case::single_row(vec![4], "", vec![])]
+    fn with_content_marks_the_blank_rows_of_prefixed_blocks(
+        #[case] columns: Vec<u32>,
+        #[case] virtual_content: &str,
+        #[case] expected: Vec<u32>,
     ) {
-        assert_eq!(offset.last_prefixed_line(), expected);
+        let offset = RegionOffset::with_content(3, columns.clone(), virtual_content);
+        assert_eq!(offset.protected_blank_row_list(), expected);
+        // The envelope form round-trips to an equal offset.
         assert_eq!(
-            offset.last_prefixed_line(),
-            offset.columns().iter().rposition(|&column| column > 0)
+            RegionOffset::with_protected_blank_rows(3, columns.clone(), &expected),
+            offset
+        );
+        // Without content, no row is protected.
+        assert_eq!(
+            RegionOffset::with_per_line_offsets(3, columns).protected_blank_row_list(),
+            Vec::<u32>::new()
         );
     }
 

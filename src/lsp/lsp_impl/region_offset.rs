@@ -212,7 +212,11 @@ pub(super) fn resolved_region_geometry(
     resolved: ResolvedInjection,
 ) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
-    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
+    let offset = RegionOffset::with_content(
+        start_line,
+        resolved.line_column_offsets,
+        &resolved.virtual_content,
+    );
     let region_end = region_host_end(&resolved.virtual_content, &offset);
     (
         offset,
@@ -247,5 +251,129 @@ mod tests {
         let (_, region_end, _, _) = resolved_region_geometry(resolved);
 
         assert_eq!(region_end, Position::new(2, 4));
+    }
+
+    const FENCE_QUERY: &str = "((fenced_code_block (info_string (language) @injection.language) \
+        (code_fence_content) @injection.content))";
+    const COMBINED_FENCE_QUERY: &str = "((fenced_code_block (info_string (language) \
+        @injection.language) (code_fence_content) @injection.content) \
+        (#set! injection.combined))";
+    const COMBINED_HOST: &str = "> ```py\n> a = 1\n> ```\n\n```py\nb = 2\n\nc = 3\n```\n";
+    const INLINE_QUERY: &str =
+        "((inline) @injection.content (#set! injection.language \"markdown_inline\"))";
+
+    /// The regions injection discovery finds in a markdown `host`.
+    fn discover(host: &str, query: &str) -> Vec<ResolvedInjection> {
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(&md, query).unwrap();
+        crate::language::InjectionResolver::resolve_all(
+            &LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+    }
+
+    /// Whether the edit checks the bridge applies take a host `edit` on the
+    /// region discovered from `host`, through the production geometry.
+    fn accepts(resolved: ResolvedInjection, edit: &tower_lsp_server::ls_types::TextEdit) -> bool {
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
+        let workspace_edit = tower_lsp_server::ls_types::WorkspaceEdit {
+            changes: Some(
+                [(host_uri.clone(), vec![edit.clone()])]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let (offset, region_end, _, _) = resolved_region_geometry(resolved);
+        crate::lsp::bridge::workspace_edit_within_region(
+            &workspace_edit,
+            &host_uri,
+            &offset,
+            region_end,
+        ) && crate::lsp::bridge::workspace_edit_preserves_line_prefixes(
+            &workspace_edit,
+            &host_uri,
+            &offset,
+            region_end,
+        )
+    }
+
+    fn edit(
+        start: (u32, u32),
+        end: (u32, u32),
+        new_text: &str,
+    ) -> tower_lsp_server::ls_types::TextEdit {
+        tower_lsp_server::ls_types::TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            ),
+            new_text: new_text.to_string(),
+        }
+    }
+
+    /// Edits on rows recording no prefix that are not blank rows of a
+    /// prefixed block are judged as on any content row. Each accepted edit
+    /// is applied to the host, and discovery reads back the edited text.
+    #[rstest::rstest]
+    // A blockquote paragraph's lazy continuation row "b".
+    #[case::lazy_continuation_in_a_blockquote(
+        "> a\nb\n> c\n", INLINE_QUERY, 0, ((1, 0), (1, 1), "x"), "a\nx\nc"
+    )]
+    // A list item paragraph's lazy continuation row "b".
+    #[case::lazy_continuation_in_a_list_item(
+        "- a\nb\n  c\n", INLINE_QUERY, 0, ((1, 0), (1, 1), "x"), "a\nx\nc"
+    )]
+    // A combined region: a blockquoted fence, then a plain fence whose rows
+    // record no prefix. Its code row "b = 2" ...
+    #[case::plain_fence_row_after_a_blockquoted_fence(
+        COMBINED_HOST,
+        COMBINED_FENCE_QUERY,
+        0,
+        ((5, 0), (5, 1), "z"),
+        "a = 1\n\n\n\nz = 2\n\nc = 3\n"
+    )]
+    // ... and its own blank row.
+    #[case::plain_fence_blank_row_after_a_blockquoted_fence(
+        COMBINED_HOST,
+        COMBINED_FENCE_QUERY,
+        0,
+        ((6, 0), (6, 0), "x"),
+        "a = 1\n\n\n\nb = 2\nx\nc = 3\n"
+    )]
+    fn an_edit_on_an_unprefixed_content_row_is_accepted(
+        #[case] host: &str,
+        #[case] query: &str,
+        #[case] region: usize,
+        #[case] change: ((u32, u32), (u32, u32), &str),
+        #[case] expected_virtual: &str,
+    ) {
+        let resolved = discover(host, query).swap_remove(region);
+        let change = edit(change.0, change.1, change.2);
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(
+            discover(&edited, query)[region].virtual_content,
+            expected_virtual
+        );
+    }
+
+    /// Discovery's list-item fence: its blank rows stay protected through
+    /// the production geometry, and a blank line added there still applies.
+    #[test]
+    fn a_list_item_fence_keeps_its_blank_rows_protected() {
+        let host = "- item\n\n  ```py\n  a = 1\n\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert!(!accepts(resolved(), &edit((4, 0), (4, 0), "b = 2")));
+        assert!(!accepts(resolved(), &edit((5, 0), (5, 0), "b = 2\n")));
+        assert!(accepts(resolved(), &edit((4, 0), (4, 0), "\n")));
     }
 }

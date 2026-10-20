@@ -792,7 +792,7 @@ mod tests {
     #[test]
     fn transform_drops_a_response_writing_on_a_list_item_blank_row() {
         let host = "- item\n\n  ```py\n  a = 1\n\n\n  ```\n";
-        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]);
+        let offset = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
         let region_end = Position::new(6, 0);
         let respond = |start: (u32, u32), end: (u32, u32), new_text: &str| {
             let response = json!({

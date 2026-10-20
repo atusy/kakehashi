@@ -490,32 +490,29 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // the host line continues past the region and a newline would split
         // it, so line 0's offset still rejects there.
         let newline_splits_nothing = columns.len() == 1 && region_end.line > offset.line();
-        // A row recording no prefix BEFORE a prefixed one (a recorded
-        // prefix, or the boundary row) in a content-prefixed region is a
-        // blank row of the prefixed block: a list item's fence leaves its
-        // blank rows unindented, and the opening fence above row 0 carries
-        // the prefix too. Virtual column 0 maps to host column 0 there, but
-        // to the block's prefix on its other rows, so text written there
+        // A blank row of a prefixed block (a list item's fence leaves its
+        // blank rows unindented; `RegionOffset::with_content` marks them from
+        // the region's text) maps virtual column 0 to host column 0, but the
+        // block's other rows map it past the prefix, so text written there
         // reads back dedented by that width, or ends the block when it is
         // indented less. Only the prefix's width is recorded, not its text
         // (`  ` vs `> `), so such an edit is refused rather than re-prefixed;
         // text of only spaces, tabs and line breaks, and deletions, still
-        // apply.
+        // apply. Rows recording no prefix that hold text (lazy continuation
+        // lines, a plain fence after a blockquoted one) are content.
         let inside_prefixed_block = |host_line: u32| {
             content_prefixed
-                && host_line.checked_sub(offset.line()).is_some_and(|row| {
-                    let row = row as usize;
-                    columns.get(row) == Some(&0)
-                        && ((region_end.character == 0 && host_line < region_end.line)
-                            || offset.last_prefixed_line().is_some_and(|last| row < last))
-                })
+                && host_line
+                    .checked_sub(offset.line())
+                    .is_some_and(|row| offset.is_protected_blank_row(row as usize))
         };
         let inserts_unprefixed_line = !newline_splits_nothing
             && (e.new_text.contains('\n') || e.new_text.contains('\r'))
             && (prefix_at(start.line) || prefix_at(start.line.saturating_add(1)));
         // With or without a line break: the first line lands on the blank
-        // row itself, and a range running on past it either ends on a zero
-        // row (nothing after it) or is refused as spanning a prefixed one.
+        // row itself, and a range running on past it either ends on a row
+        // recording no prefix, whose rest already sits at column 0, or is
+        // refused as spanning a prefixed one.
         let writes_on_blank_row =
             inside_prefixed_block(start.line) && !crate::text::is_markdown_blank(&e.new_text);
         !touches_boundary
@@ -1237,7 +1234,7 @@ mod tests {
         #[case] fence_line: u32,
     ) {
         use tower_lsp_server::ls_types::Range;
-        let offset = RegionOffset::with_per_line_offsets(3, columns);
+        let offset = RegionOffset::with_content(3, columns, &extract_python_fence(host));
         let region_end = Position::new(fence_line, 0);
         let virtual_row = blank_row - 3;
         let on_blank = |rows: u32, new_text: &str| TextEdit {
@@ -1318,12 +1315,13 @@ mod tests {
     /// 200k-row fence below take a minute or more (about 2e10 row checks);
     /// the bound leaves a wide margin for a loaded machine.
     #[rstest::rstest]
-    // Closed by a fence row: the boundary decides.
-    #[case::closed_fence(0, Position::new(3 + 200_001, 0))]
+    // Closed by a fence row.
+    #[case::closed_fence(0, "\n", Position::new(3 + 200_001, 0))]
     // A prefixed last row, the region ending mid-row on it.
-    #[case::prefixed_last_row(2, Position::new(3 + 200_000, 3))]
+    #[case::prefixed_last_row(2, "bbb", Position::new(3 + 200_000, 3))]
     fn blank_rows_of_a_long_list_item_fence_are_judged_in_linear_time(
         #[case] last_column: u32,
+        #[case] last_row: &str,
         #[case] region_end: Position,
     ) {
         use tower_lsp_server::ls_types::Range;
@@ -1331,8 +1329,9 @@ mod tests {
         let mut columns = vec![2];
         columns.extend(std::iter::repeat_n(0, BLANK_ROWS as usize));
         columns.push(last_column);
+        let virtual_content = format!("a{}{last_row}", "\n".repeat(BLANK_ROWS as usize + 1));
         let started = std::time::Instant::now();
-        let offset = RegionOffset::with_per_line_offsets(3, columns);
+        let offset = RegionOffset::with_content(3, columns, &virtual_content);
         for row in 1..=BLANK_ROWS {
             let at = |new_text: &str| TextEdit {
                 range: Range::new(Position::new(3 + row, 0), Position::new(3 + row, 0)),
