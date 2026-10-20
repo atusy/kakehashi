@@ -3442,6 +3442,32 @@ mod formatting {
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("    import e\n    }\n    import e\n\n      }\n")
         );
+        // Copies on an evenly dedented region: once the lines found once are
+        // placed, copies found as many times on each side pair in order,
+        // and those found more often on one side do not; each answer below
+        // maps to the one text every reading of it writes.
+        let cases: [(&str, &[usize], &str, &str); 3] = [
+            // `x` twice, one rewritten and one written over the kept ` `.
+            ("x\nx\n \n", &[0, 0, 0], "xx\nx\nx\n", "xx\nx\nx\n"),
+            // `}` twice, reindented and copied, `x` beside the kept ` `.
+            (
+                "  }\n  }\n \n",
+                &[2, 2, 0],
+                " }\n}\n}\nx\n",
+                "   }\n  }\n  }\n  x\n",
+            ),
+            // `\t}` twice, one rewritten, the kept ` ` removed.
+            (" \n\t}\n\t}\n", &[0, 0, 0], "}x\n}\n", "}x\n}\n"),
+        ];
+        for (virtual_text, removed, answer, expected) in cases {
+            let map = dedent_lines(virtual_text, removed);
+            let answer = [edit((0, 0), (4, 0), answer)];
+            assert_eq!(
+                formatted_either_way(&map, virtual_text, &answer).as_deref(),
+                Some(expected),
+                "{virtual_text:?}"
+            );
+        }
     }
 
     #[test]
@@ -4373,6 +4399,9 @@ mod formatting_reference {
         Empty,
         /// A single space the peer left alone: shorter than any indent.
         Space,
+        /// The indent and a space, the peer removing the indent: a
+        /// whitespace line kept with whitespace past the indent.
+        IndentedSpace,
     }
 
     fn line() -> impl Strategy<Value = Line> {
@@ -4389,6 +4418,7 @@ mod formatting_reference {
                 }),
             1 => Just(Line::Empty),
             1 => Just(Line::Space),
+            1 => Just(Line::IndentedSpace),
         ]
     }
 
@@ -4452,6 +4482,12 @@ mod formatting_reference {
                 Line::Space => {
                     text.push(' ');
                     removed.push(Some(""));
+                }
+                Line::IndentedSpace => {
+                    dedented_lines.push(text.len());
+                    text.push_str(indent);
+                    text.push(' ');
+                    removed.push(Some(indent));
                 }
             }
             text.push_str(line_break);
@@ -4518,6 +4554,9 @@ mod formatting_reference {
         SwitchBreak,
         /// Text written on it, after this many spaces, if it is blank.
         Write(usize),
+        /// Its text replaced by other letters, its leading whitespace kept,
+        /// if it is not blank.
+        Rename,
     }
 
     /// Added to the origin of a line no answer places for sure (see
@@ -4535,6 +4574,7 @@ mod formatting_reference {
             1 => Just(Rewrite::JoinNext),
             1 => (0..3usize).prop_map(Rewrite::Write),
             1 => Just(Rewrite::SwitchBreak),
+            1 => Just(Rewrite::Rename),
         ]
     }
 
@@ -4656,6 +4696,11 @@ mod formatting_reference {
                     output.push((written, line_break, origin))
                 }
                 Rewrite::Write(_) => output.push((text, line_break, origin)),
+                Rewrite::Rename if !is_blank(index) => {
+                    let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+                    output.push((format!("{}r{index}", &text[..lead]), line_break, origin))
+                }
+                Rewrite::Rename => output.push((text, line_break, origin)),
                 Rewrite::LineAfter(spaces) => {
                     output.push((text, some_break, origin));
                     output.push((format!("{}w", " ".repeat(spaces)), line_break, None));
@@ -4904,7 +4949,10 @@ mod formatting_reference {
         let mut runner = property_runner(cases);
         let (mapped_sets, changing, over_refused) = (Cell::new(0), Cell::new(0), Cell::new(0));
         let strategy = (
-            prop::collection::vec(line(), 1..6),
+            (
+                prop::collection::vec(line(), 1..6),
+                prop::bool::weighted(0.75),
+            ),
             prop::sample::select(vec!["  ", "\t", "    "]),
             prop::sample::select(vec!["\n", "\r\n", "\r"]),
             (0..3usize, 0..3usize, any::<bool>()),
@@ -4914,7 +4962,20 @@ mod formatting_reference {
         runner
             .run(
                 &strategy,
-                |(lines, indent, line_break, edges, rewrites, (flip, shape, shuffle))| {
+                |((mut lines, even), indent, line_break, edges, rewrites, (flip, shape, shuffle))| {
+                    // Mostly peers dedenting evenly: every line of text
+                    // dedented as the first is.
+                    let first = lines.iter().find_map(|line| match line {
+                        Line::Content { dedented, .. } => Some(*dedented),
+                        _ => None,
+                    });
+                    if let (true, Some(first)) = (even, first) {
+                        for line in &mut lines {
+                            if let Line::Content { dedented, .. } = line {
+                                *dedented = first;
+                            }
+                        }
+                    }
                     let Some(document) = document(&lines, indent, line_break, edges) else {
                         return Ok(());
                     };
