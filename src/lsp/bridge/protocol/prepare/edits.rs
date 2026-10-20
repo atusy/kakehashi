@@ -361,12 +361,21 @@ impl PreparedMap {
         .then_some(removed_at_start)
         .flatten();
         // Text without a line break replacing whole lines up to partway into
-        // a later one is the start of that later line: the text left there
-        // is its own, and takes its removed indent (none, for a line the
-        // peer did not dedent), not the one of the line the change starts in.
+        // a later one that keeps text after it is the start of that later
+        // line: the text left there is its own, and takes its removed indent
+        // (none, for a line the peer did not dedent), not the one of the line
+        // the change starts in. With nothing but whitespace left after it
+        // (or nothing), the later line is gone, and the text is the start
+        // line's.
         let ends_in_later_line = prepared[old.clone()].contains(['\n', '\r'])
             && !is_line_start(prepared, old.end)
-            && !new_text.contains(['\n', '\r']);
+            && !new_text.contains(['\n', '\r'])
+            && !prepared[old.end..]
+                .split(['\n', '\r'])
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .all(|c| matches!(c, ' ' | '\t'));
         let end_line_indent = ends_in_later_line.then(|| {
             let line_start = prepared[..old.end]
                 .rfind(['\n', '\r'])
@@ -443,6 +452,19 @@ impl PreparedMap {
             _ if whole_lines && let Some(indent) = end_line_indent => FirstIndent::Exact(indent),
             // Text on a blank line is a line of the content.
             Some(_) if blank_at_start.is_some() => FirstIndent::Uniform,
+            // Likewise replacing whole lines from a whitespace-only line the
+            // peer kept as is: that whitespace says nothing of the indent.
+            None if whole_lines
+                && is_line_start(virtual_text, virtual_start)
+                && virtual_text[virtual_start..]
+                    .split(['\n', '\r'])
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t')) =>
+            {
+                FirstIndent::Uniform
+            }
             // The replaced line's own removed indent comes back.
             Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
             // Text landing at a V line start that kept no indent before it

@@ -2650,6 +2650,68 @@ fn text_replacing_lines_from_a_blank_one_takes_the_indent_of_where_it_lands() {
 }
 
 #[test]
+fn text_replacing_lines_from_a_kept_whitespace_line_keeps_the_indent_where_it_lands() {
+    // A one-space line the peer kept, between dedented ones: replacing from
+    // it to within the last line leaves that line's text, which regains its
+    // removed indent, the line's own indent after it kept.
+    let virtual_text = "  a = 1\n \n    foo(\n    f('a')\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "a = 1\n \n  foo(\n  f('a')\n");
+    let mapped =
+        |edit: TextEdit| apply_to(virtual_text, &[map.map_one_with_extent(&edit).unwrap()]);
+    // To the end of that line (what replacing the whole text with
+    // "    a = 1\na = 1,\n" leaves once common text is kept).
+    assert_eq!(
+        mapped(edit((1, 0), (3, 8), "a = 1,")),
+        "  a = 1\n  a = 1,\n"
+    );
+    // Within its content, after its kept indent, and within that indent.
+    assert_eq!(
+        mapped(edit((1, 0), (3, 4), "a = 1,")),
+        "  a = 1\n  a = 1,'a')\n"
+    );
+    assert_eq!(
+        mapped(edit((1, 0), (3, 2), "a = 1,")),
+        "  a = 1\n  a = 1,f('a')\n"
+    );
+    assert_eq!(
+        mapped(edit((1, 0), (3, 1), "a = 1,")),
+        "  a = 1\n  a = 1, f('a')\n"
+    );
+    // Lines before it regain the content's indent, as created lines do.
+    assert_eq!(
+        mapped(edit((1, 0), (3, 4), "x\na = 1,")),
+        "  a = 1\n  x\n  a = 1,'a')\n"
+    );
+}
+
+#[test]
+fn text_replacing_lines_up_to_a_whitespace_only_rest_stays_the_start_lines() {
+    // The later line keeps nothing but whitespace after the change (here
+    // the indentation-only last line the peer kept): the text is the start
+    // line's, regaining its removed indent.
+    let virtual_text = " \tdef f(x):\r\n\t";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "def f(x):\r\n\t");
+    let replaced = map
+        .map_one_with_extent(&edit((0, 0), (1, 1), "end"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), " \tend");
+}
+
+#[test]
 fn text_typed_on_an_emptied_blank_line_is_content() {
     // A one-space line under a two-space indent, emptied by the peer: text
     // typed there is a line of the content, which its space says nothing
