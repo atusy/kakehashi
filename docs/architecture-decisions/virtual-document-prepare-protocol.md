@@ -699,8 +699,9 @@ a hook per kind of change.
   to one), from about 770 text lines. Hashing or comparing a line's text
   costs a step for every 64 bytes of it (lines are numbered once, then
   compared as numbers), so the budget bounds time with long lines too:
-  1 MB of 1 KB lines alike but for their ends is refused in some 90 ms,
-  a 4 MB answer in some 300 ms (release build, measured under load).
+  1 MB of 1 KB lines, each rewritten at its end, maps in some 60 ms; 4 MB
+  of them is refused in some 200 ms, and a 4 MB answer to a 500 KB region
+  in some 140 ms (release build).
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
@@ -726,8 +727,8 @@ a hook per kind of change.
   more or fewer lines there, text starting with exactly that line's
   whitespace; text indented otherwise is a line of the content. Where an
   answer reads as well as a line of its own beside the blank lines, that
-  reading is taken. On documents with kept whitespace lines, a geometry
-  sweep sees some 6 such refusals per 20,000 answers (about 0.03%); the
+  reading is taken. A geometry sweep of mixed documents sees 13 such
+  refusals in 15,000 answers (about 0.09%); the
   exact-text property, which writes on kept whitespace lines on purpose,
   about 0.2% of its answers.
 - A peer must be bridged for the languages it prepares, so it receives
