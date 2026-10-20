@@ -1356,9 +1356,9 @@ const ALIGNMENTS: [Alignment; 8] = [
 /// part. Its table is quadratic in the blank lines, every cell spent from
 /// `work` before it is taken: `None`, to refuse the answer, when there is
 /// not as much.
-fn blank_lines(
-    old_keys: &LineKeys,
-    new_keys: &LineKeys,
+fn blank_lines<'a>(
+    old_keys: &'a LineKeys,
+    new_keys: &'a LineKeys,
     old_range: &Range<usize>,
     new_range: &Range<usize>,
     work: &mut Work,
@@ -1370,12 +1370,26 @@ fn blank_lines(
             .collect()
     };
     let (old, new) = (blanks(old_keys, old_range), blanks(new_keys, new_range));
-    work.spend((old.len() + 1).saturating_mul(new.len() + 1))?;
-    // Alike to the whitespace, holding some: empty lines are all alike, and
-    // say nothing of which is which.
-    let alike = |old_line: usize, new_line: usize| {
-        !old_keys[0][old_line].is_empty() && old_keys[0][old_line] == new_keys[0][new_line]
+    // Each blank line's whitespace numbered once, its bytes charged: the
+    // table's cells then compare numbers, a step each whatever a line's
+    // length. Empty lines are numbered `None`: all alike, they say nothing
+    // of which is which.
+    let mut ids: HashMap<&str, u32> = HashMap::new();
+    let mut numbered = |keys: &'a LineKeys, lines: &[usize]| -> Option<Vec<Option<u32>>> {
+        let mut numbers = Vec::with_capacity(lines.len());
+        for &line in lines {
+            let key = keys[0][line].as_str();
+            work.spend(1 + key.len() / BYTES_PER_STEP)?;
+            let next = ids.len() as u32;
+            numbers.push((!key.is_empty()).then(|| *ids.entry(key).or_insert(next)));
+        }
+        Some(numbers)
     };
+    let old_ids = numbered(old_keys, &old)?;
+    let new_ids = numbered(new_keys, &new)?;
+    work.spend((old.len() + 1).saturating_mul(new.len() + 1))?;
+    // Alike to the whitespace, holding some.
+    let alike = |i: usize, j: usize| old_ids[i].is_some() && old_ids[i] == new_ids[j];
     // score[i][j]: the best of old[i..] against new[j..], by the count of
     // pairs, then of pairs alike: a pair counts `pair`, more than every
     // pair alike together, and a pair alike 1 more. A score is at most
@@ -1387,7 +1401,7 @@ fn blank_lines(
     let mut score = vec![vec![0u32; new.len() + 1]; old.len() + 1];
     for i in (0..old.len()).rev() {
         for j in (0..new.len()).rev() {
-            let alike = alike(old[i], new[j]);
+            let alike = alike(i, j);
             let paired = score[i + 1][j + 1] + pair + u32::from(alike);
             score[i][j] = paired.max(score[i + 1][j]).max(score[i][j + 1]);
         }
@@ -1395,7 +1409,7 @@ fn blank_lines(
     let mut pairs = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < old.len() && j < new.len() {
-        let alike = alike(old[i], new[j]);
+        let alike = alike(i, j);
         if score[i][j] == score[i + 1][j + 1] + pair + u32::from(alike) {
             pairs.push((old[i], new[j]));
             (i, j) = (i + 1, j + 1);
@@ -1587,21 +1601,24 @@ fn runs_to_diff(
         // starts with exactly that whitespace) is refused, as line for
         // line: the new lines' leading whitespace is gathered once, and
         // each kept line looks its own up.
-        work.spend(old_range.len() + new_range.len())
-            .ok_or(FormattingRefusal::OutOfWork)?;
-        let leading: std::collections::HashSet<&str> = new_range
-            .clone()
-            .map(|new_line| {
-                let line = new_lines[new_line].1;
-                &line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
-            })
-            .filter(|whitespace| !whitespace.is_empty())
-            .collect();
-        if old_range
-            .clone()
-            .any(|old_line| leading.contains(old_keys[0][old_line].as_str()))
-        {
-            return Err(FormattingRefusal::Shape);
+        // Each hash costs the whitespace it reads: a step per 64 bytes.
+        let mut leading = std::collections::HashSet::new();
+        for new_line in new_range.clone() {
+            let line = new_lines[new_line].1;
+            let whitespace = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
+            work.spend(1 + whitespace.len() / BYTES_PER_STEP)
+                .ok_or(FormattingRefusal::OutOfWork)?;
+            if !whitespace.is_empty() {
+                leading.insert(whitespace);
+            }
+        }
+        for old_line in old_range.clone() {
+            let kept = old_keys[0][old_line].as_str();
+            work.spend(1 + kept.len() / BYTES_PER_STEP)
+                .ok_or(FormattingRefusal::OutOfWork)?;
+            if leading.contains(kept) {
+                return Err(FormattingRefusal::Shape);
+            }
         }
         let (start, end) = (old_range.start, new_range.end);
         vec![
