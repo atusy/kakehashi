@@ -186,6 +186,8 @@ impl Expansion {
             (starts[index], end)
         };
         let mut writes: Vec<(usize, &str)> = Vec::new();
+        // Line starts and line breaks both ascend: one walk over the breaks.
+        let mut breaks = self.breaks.iter().peekable();
         for index in 0..ours.len() {
             let (start, end) = line(&self.text, &ours, index);
             let (mapped_start, mapped_end) = line(mapped, &theirs, index);
@@ -201,10 +203,11 @@ impl Expansion {
             let at = if start == 0 {
                 0
             } else {
-                self.breaks
-                    .iter()
-                    .find(|&&(end, _)| end == start)
-                    .and_then(|&(_, raw)| raw)?
+                while breaks.next_if(|&&(end, _)| end < start).is_some() {}
+                match breaks.peek() {
+                    Some(&&(end, raw)) if end == start => raw?,
+                    _ => return None,
+                }
             };
             writes.push((at, indent));
         }
@@ -410,6 +413,24 @@ mod tests {
         assert_eq!(carried("a\n$0b", "a\n"), None);
         assert_eq!(carried("a\n$0b", "a\nb\n"), None);
         assert_eq!(carried("a$0b", "a b"), None);
+    }
+
+    /// Every line of a long snippet regaining an indent: work linear in its
+    /// size, bounded by time far above what it takes (well under 0.2 s).
+    #[test]
+    fn carrying_an_indent_into_every_line_takes_linear_work() {
+        let lines = 80_000;
+        let snippet = format!("{}$0", "a\n".repeat(lines));
+        let mapped = format!("a\n{}  ", "  a\n".repeat(lines - 1));
+        let expansion = Expansion::of(&snippet).unwrap();
+        let started = std::time::Instant::now();
+        let carried = expansion.carry(&mapped).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(carried, format!("a\n{}  $0", "  a\n".repeat(lines - 1)));
     }
 
     #[test]
