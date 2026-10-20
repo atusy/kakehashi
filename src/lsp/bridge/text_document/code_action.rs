@@ -522,20 +522,21 @@ impl LanguageServerPool {
                 .filter(|held| PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared)))
                 .map(|held| held.generation)
         });
-        let upstream_caps = if offset.prepared().is_some() && held_generation.is_none() {
+        let listed_on_held = offset.prepared().is_none() || held_generation.is_some();
+        let upstream_caps = if listed_on_held {
+            upstream_caps
+        } else {
             UpstreamCodeActionCaps {
                 data_support: false,
                 ..upstream_caps
             }
-        } else {
-            upstream_caps
         };
 
         // Phase 2: eager-resolve fallback. A client without resolve+data
         // support can never complete a lazy action and may strip our routing
         // envelope, so resolve those actions downstream now (bounded: only the
         // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
-        if !upstream_caps.can_envelope() {
+        if resolves_within_request(upstream_caps, listed_on_held) {
             // Only noted with the prepare layer (see `note_held`).
             let virtual_uri = self
                 .prepares()
@@ -1495,6 +1496,16 @@ impl VirtLayerContext<'_> {
     }
 }
 
+/// Whether a list's lazy actions are resolved within its request: for an
+/// editor that cannot resolve them itself — but not for a prepared list its
+/// server no longer holds the text of (`listed_on_held` false: another text
+/// was sent since), whose every reply the resolve's text check would
+/// discard, the list waiting for each meanwhile. Those are dropped or
+/// disabled as unresolvable.
+fn resolves_within_request(upstream_caps: UpstreamCodeActionCaps, listed_on_held: bool) -> bool {
+    !upstream_caps.can_envelope() && listed_on_held
+}
+
 /// Upstream client capabilities that gate the bridge action policy
 /// (LSP 3.15/3.16 `isPreferredSupport` / `disabledSupport`): fields the
 /// client did not advertise must not reach it.
@@ -2138,6 +2149,20 @@ mod tests {
             pool.prepared_action_held_map(&uri, &key, &envelope)
                 .is_none()
         );
+    }
+
+    /// Lazy actions are resolved within their request for an editor that
+    /// cannot resolve them, never for a prepared list whose text its server
+    /// no longer holds.
+    #[test]
+    fn lazy_actions_resolve_within_the_request_only_on_the_text_held() {
+        let cannot = UpstreamCodeActionCaps {
+            data_support: false,
+            ..caps_resolve()
+        };
+        assert!(resolves_within_request(cannot, true));
+        assert!(!resolves_within_request(cannot, false));
+        assert!(!resolves_within_request(caps_resolve(), true));
     }
 
     #[tokio::test]
