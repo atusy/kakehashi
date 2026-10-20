@@ -1108,10 +1108,25 @@ fn diff_hunks(
     if lines_alike_tell_no_indent(old, &old_keys, &new_keys, indents) {
         return Err(FormattingRefusal::Shape);
     }
+    // The lines of text whose own removed indent is not the content's: one
+    // written anew would take the content's instead.
+    work.spend(old_lines.len())
+        .ok_or(FormattingRefusal::OutOfWork)?;
+    let own: Vec<bool> = old_lines
+        .iter()
+        .enumerate()
+        .map(|(line, &(start, _))| {
+            !old_keys[1][line].is_empty() && {
+                let (own, uniform) = indents(start);
+                uniform.as_deref() != Some(own.as_str())
+            }
+        })
+        .collect();
     let mut aligned = Vec::new();
     align_lines(
         &old_keys,
         &new_keys,
+        &own,
         0,
         0..old_lines.len(),
         0..new_lines.len(),
@@ -1119,6 +1134,9 @@ fn diff_hunks(
         &mut aligned,
     )
     .ok_or(FormattingRefusal::OutOfWork)?;
+    if moves_a_line_off_its_indent(&old_keys, &new_keys, &own, &aligned, work)? {
+        return Err(FormattingRefusal::Shape);
+    }
     let mut runs = Vec::new();
     for (old_range, new_range) in aligned {
         runs.extend(runs_to_diff(
@@ -1275,6 +1293,10 @@ enum Alignment {
     /// on each side are diffed further only when `true` (see
     /// [`patience_pairs`]).
     Diff(usize, fn(&str) -> bool, bool),
+    /// [`Alignment::Diff`] (no further diff) among the old lines of text
+    /// whose own removed indent is not the content's, and every new line of
+    /// text.
+    Own(usize),
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
@@ -1289,9 +1311,17 @@ enum Alignment {
 
 /// How [`align_lines`] pairs lines, from the surest to the loosest:
 ///
+/// - Lines of text whose own removed indent is not the content's (a line
+///   the peer left alone, or dedented otherwise), alike to the byte, then
+///   but for the whitespace around their text, each found once in each
+///   text: of two lines swapped, either reading moves as many, and the one
+///   moving the line of the content's indent loses nothing (a line written
+///   anew takes that indent), where moving the other would lose its own.
 /// - Lines of text alike to the byte, a line found once in each text
 ///   anchoring the rest (patience): of lines alike but for whitespace, the
-///   one written as it was is that line.
+///   one written as it was is that line. Not where as many on each side
+///   are alike but for whitespace: reindented, one copy may read as another
+///   did, and they pair in order below.
 /// - Lines of text alike but for the whitespace around it, a line found
 ///   once in each text anchoring the rest (patience): a reindented line is
 ///   the line it was, and a blank line cannot pair with it instead.
@@ -1318,7 +1348,9 @@ enum Alignment {
 /// lines alike a line was written on, or which went, no answer tells; text
 /// the run's diff writes on a whitespace line the peer kept gains no
 /// indent, as typed text there does.
-const ALIGNMENTS: [Alignment; 8] = [
+const ALIGNMENTS: [Alignment; 10] = [
+    Alignment::Own(0),
+    Alignment::Own(1),
     Alignment::Diff(0, |key| !key.trim_matches([' ', '\t']).is_empty(), false),
     Alignment::Diff(1, |key| !key.is_empty(), false),
     Alignment::Diff(2, |key| !key.is_empty(), false),
@@ -1599,9 +1631,11 @@ fn runs_to_diff(
 /// [`LineKeys`]). A line joined onto
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
+#[allow(clippy::too_many_arguments)]
 fn align_lines(
     old_keys: &LineKeys,
     new_keys: &LineKeys,
+    own: &[bool],
     level: usize,
     old_range: Range<usize>,
     new_range: Range<usize>,
@@ -1620,15 +1654,55 @@ fn align_lines(
         Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, work)?,
         Alignment::AlikeEnds => alike_ends(old_keys, new_keys, &old_range, &new_range, work)?,
         Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, work)?,
-        Alignment::Diff(keys, takes_part, fall_back) => {
-            let candidates = |all: &[String], range: &Range<usize>| -> Vec<usize> {
-                range
-                    .clone()
-                    .filter(|&index| takes_part(&all[index]))
-                    .collect()
+        Alignment::Own(_) if !old_range.clone().any(|line| own[line]) => Vec::new(),
+        Alignment::Diff(keys, _, _) | Alignment::Own(keys) => {
+            let (takes_part, fall_back, only_own): (fn(&str) -> bool, bool, bool) = match alignment
+            {
+                Alignment::Diff(_, takes_part, fall_back) => (takes_part, fall_back, false),
+                _ => (|key| !key.trim_matches([' ', '\t']).is_empty(), false, true),
             };
-            let old_candidates = candidates(&old_keys[keys], &old_range);
-            let new_candidates = candidates(&new_keys[keys], &new_range);
+            // To the byte, a line alike but for whitespace to several, as
+            // many on each side, is no surer than by its order: reindented,
+            // one copy may be written as another was (the copies' removed
+            // indents then decide which is which). Those are left to pair
+            // in order (see `ALIGNMENTS`).
+            let mut copies: HashMap<&str, (usize, usize)> = HashMap::new();
+            if keys == 0 && old_range.len() > 1 && new_range.len() > 1 {
+                for line in old_range.clone() {
+                    work.spend(1 + old_keys[1][line].len() / BYTES_PER_STEP)?;
+                    copies.entry(old_keys[1][line].as_str()).or_default().0 += 1;
+                }
+                for line in new_range.clone() {
+                    work.spend(1 + new_keys[1][line].len() / BYTES_PER_STEP)?;
+                    copies.entry(new_keys[1][line].as_str()).or_default().1 += 1;
+                }
+                copies.retain(|_, &mut (old, new)| old == new && old > 1);
+            }
+            let old_candidates: Vec<usize> = old_range
+                .clone()
+                .filter(|&index| {
+                    takes_part(&old_keys[keys][index])
+                        && (!only_own || own[index])
+                        && !copies.contains_key(old_keys[1][index].as_str())
+                })
+                .collect();
+            // A line written as an old line was, to the byte, is that line
+            // rather than one alike but for whitespace.
+            let mut exact = std::collections::HashSet::new();
+            if only_own && keys > 0 {
+                for line in old_range.clone() {
+                    work.spend(1 + old_keys[0][line].len() / BYTES_PER_STEP)?;
+                    exact.insert(old_keys[0][line].as_str());
+                }
+            }
+            let new_candidates: Vec<usize> = new_range
+                .clone()
+                .filter(|&index| {
+                    takes_part(&new_keys[keys][index])
+                        && !exact.contains(new_keys[0][index].as_str())
+                        && !copies.contains_key(new_keys[1][index].as_str())
+                })
+                .collect();
             // Keys interned once, their bytes charged: the searches then
             // compare and hash numbers, a step each whatever a line's length.
             let mut ids: HashMap<&str, u32> = HashMap::new();
@@ -1657,6 +1731,7 @@ fn align_lines(
         align_lines(
             old_keys,
             new_keys,
+            own,
             level + 1,
             old_at..old_line,
             new_at..new_line,
@@ -1669,12 +1744,71 @@ fn align_lines(
     align_lines(
         old_keys,
         new_keys,
+        own,
         level + 1,
         old_at..old_range.end,
         new_at..new_range.end,
         work,
         aligned,
     )
+}
+
+/// Whether the alignment `aligned` moves a line of text whose own removed
+/// indent is not the content's (`own`): an old line of one entry (a pair,
+/// or a run left between pairs) whose text, but for whitespace, a new line
+/// of another entry writes, no old line of that entry holding it. Written anew, that line would take the
+/// content's indent rather than its own; and where reading the answer so
+/// moves no more lines than another reading, which line moved no answer
+/// tells. `Err` when `work` runs out.
+fn moves_a_line_off_its_indent(
+    old_keys: &LineKeys,
+    new_keys: &LineKeys,
+    own: &[bool],
+    aligned: &[(Range<usize>, Range<usize>)],
+    work: &mut Work,
+) -> Result<bool, FormattingRefusal> {
+    if !own.contains(&true) {
+        return Ok(false);
+    }
+    // The entry writing each text no old line of that entry holds (a line
+    // left there as it was, or reindented, is that line), or `usize::MAX`
+    // for more than one.
+    let mut written: HashMap<&str, usize> = HashMap::new();
+    for (entry, (old_range, new_range)) in aligned.iter().enumerate() {
+        let mut held = std::collections::HashSet::new();
+        for line in old_range.clone() {
+            let key = old_keys[2][line].as_str();
+            work.spend(1 + key.len() / BYTES_PER_STEP)
+                .ok_or(FormattingRefusal::OutOfWork)?;
+            held.insert(key);
+        }
+        for line in new_range.clone() {
+            let key = new_keys[2][line].as_str();
+            work.spend(1 + key.len() / BYTES_PER_STEP)
+                .ok_or(FormattingRefusal::OutOfWork)?;
+            if !key.is_empty() && !held.contains(key) {
+                written
+                    .entry(key)
+                    .and_modify(|at| {
+                        if *at != entry {
+                            *at = usize::MAX;
+                        }
+                    })
+                    .or_insert(entry);
+            }
+        }
+    }
+    for (entry, (old_range, _)) in aligned.iter().enumerate() {
+        for line in old_range.clone().filter(|&line| own[line]) {
+            let key = old_keys[2][line].as_str();
+            work.spend(1 + key.len() / BYTES_PER_STEP)
+                .ok_or(FormattingRefusal::OutOfWork)?;
+            if written.get(key).is_some_and(|&at| at != entry) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Whether lines alike leave the answer's copies without an indent of

@@ -271,9 +271,18 @@ past P's last naming P's end, as whole-document answers do), the region's
 edge layout of P restored as for any document (but for an on-type answer,
 which keeps the edges as it writes them, typing being an edit, not a
 reformatting of the region), and the result diffed against P. Lines are
-paired first: a line of text with the line it was rewritten from (alike to
-the byte, then alike but for the whitespace around its text, a line found
-once in each text anchoring the rest), then one alike but for whitespace
+paired first: a line of text whose own removed indentation is not the
+content's (one the peer left alone, or dedented otherwise) with the line it
+was rewritten from, alike to the byte, then alike but for the whitespace
+around its text, each found once in each text — of two lines swapped,
+either reading moves as many, and moving the one with the content's
+indentation loses nothing (a line written anew takes it), where moving
+the other would lose its own; then a line of text with the line it was
+rewritten from (alike to the byte, then alike but for the whitespace
+around its text, a line found once in each text anchoring the rest; a line
+alike but for whitespace to several, as many on each side, is not paired
+to the byte, since reindented one copy may read as another did, but in
+order with the lines alike to several below), then one alike but for whitespace
 anywhere in it, the same way; then, between those, lines found as many
 times on each side (a `}` among several), by the fewest changes; then a
 line other lines were joined onto (found by looking up the old lines'
@@ -290,7 +299,10 @@ punctuation a formatter rewrote is the line it was). An answer that writes
 a line of P more or fewer times, yet still writes it, is refused where P's
 copies of it have removed indents that differ, or one that is not the
 content's: which copy was kept, and which written anew, decides each one's
-indent, and no answer tells. A formatting answer breaking a line inside
+indent, and no answer tells. So is one that, as paired, moves such a line
+(its text, but for whitespace, written elsewhere than where it was):
+written anew it would take the content's indentation, and which of the
+lines moved, where another reading moves as many, no answer tells. A formatting answer breaking a line inside
 its text is refused where that line's own removed indent is not the
 content's, lest its rest move from where the line kept it (edits keeping
 their extents state where they go and are not so refused). Each pair, and
@@ -704,7 +716,10 @@ a hook per kind of change.
   holds, a line the answer leaves unchanged is read as itself, and one
   rewritten in place as the line it was, though with same-text lines
   around a line the peer left alone another reading may be what the
-  formatter meant. Peers dedenting evenly meet neither.
+  formatter meant. Lines reordered keep their indentation where only
+  lines of the content's indentation need move; an answer that moves a
+  line of its own indentation (two such lines swapped) is refused. Peers
+  dedenting evenly meet none of these.
 - Text a formatter writes where a whitespace-only line the peer kept was is
   refused, typed after its whitespace or not: a whole-text answer does not
   tell text typed on that line from a line written in its place. That is
