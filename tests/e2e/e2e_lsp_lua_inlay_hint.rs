@@ -1558,3 +1558,71 @@ fn e2e_inlay_hint_range_inside_a_stripped_prefix_asks_no_region() {
 
     shutdown_client(&mut client);
 }
+
+/// The closing-fence line's stripped prefix (a blockquote's `> `, a list
+/// item's indent) is outside the virtual document, whose last line is the
+/// empty one after the final line break. A whole-document range is asked
+/// up to that virtual end, never past it, and a range wholly inside the
+/// closing prefix asks no region.
+#[test]
+fn e2e_inlay_hint_range_stops_at_the_virtual_end_before_a_closing_prefix() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    // (uri, text, closing-fence line, its prefix width)
+    let cases = [
+        (
+            "file:///test_inlay_hint_blockquote_eof.md",
+            "> ```lua\n> local x = 1\n> ```\n",
+            2,
+            2,
+        ),
+        (
+            "file:///test_inlay_hint_list_eof.md",
+            "- item\n\n  ```lua\n  local x = 1\n  ```\n",
+            4,
+            2,
+        ),
+    ];
+    for (uri, text, closing, prefix) in cases {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": "markdown", "version": 1, "text": text
+            }}),
+        );
+        inlay_hints_with_retry(&mut client, uri, closing - 1, closing);
+        let request = |client: &mut LspClient, start: (u64, u64), end: (u64, u64)| {
+            client.send_request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    }
+                }),
+            )
+        };
+
+        let whole = request(&mut client, (0, 0), (closing + 1, 0));
+        let hints = whole["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: {whole}"));
+        assert_eq!(
+            hints[0]["data"]["kakehashi"]["inner"]["receivedRange"],
+            json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
+            }),
+            "{uri}: the request must stop at the virtual end"
+        );
+
+        let in_closing_prefix = request(&mut client, (closing, 0), (closing, prefix - 1));
+        assert!(
+            in_closing_prefix["result"].is_null(),
+            "{uri}: {in_closing_prefix}"
+        );
+    }
+
+    shutdown_client(&mut client);
+}

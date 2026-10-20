@@ -166,11 +166,13 @@ impl Kakehashi {
         }) else {
             return Ok(None);
         };
-        // A region's per-line stripped prefixes (a blockquote's `> `) carry
-        // no embedded text: each endpoint is moved to where its line's text
-        // starts, and a region the range meets only inside prefixes is not
-        // asked at all, as translation would otherwise saturate the range
-        // onto text it does not cover.
+        // A region's stripped prefixes (a blockquote's `> `, a list item's
+        // indent) carry no embedded text: each endpoint is moved to where its
+        // line's text starts, the end stops at the virtual document's end
+        // (before the closing-fence line's prefix), and a region the range
+        // meets only there is not asked at all, as translation would
+        // otherwise saturate the range onto text it does not cover or past
+        // the virtual EOF.
         let contexts: Vec<_> = self
             .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
             .await
@@ -181,7 +183,10 @@ impl Kakehashi {
                     resolved.region.line_range.start,
                     resolved.line_column_offsets.clone(),
                 );
-                ctx.range = clip_to_line_text(ctx.range, &offset)?;
+                let text_end = ctx.document.region_end.unwrap_or_else(|| {
+                    crate::lsp::bridge::region_host_end(&resolved.virtual_content, &offset)
+                });
+                ctx.range = clip_to_region_text(ctx.range, &offset, text_end)?;
                 Some(ctx)
             })
             .collect();
@@ -470,11 +475,22 @@ fn inlay_hint_region_is_resolvable(
         && envelope.injection_language == live_language
 }
 
-/// Move each endpoint of a host `range` inside a region to where its line's
-/// embedded text starts, past the line's stripped prefix (`offset`'s
-/// per-line column). `None` when nothing but prefix bytes remains: a
-/// non-empty range covering only a prefix, or a caret inside one.
-fn clip_to_line_text(range: Range, offset: &crate::lsp::bridge::RegionOffset) -> Option<Range> {
+/// Clip a host `range` already clamped to a region to the region's embedded
+/// text. Each endpoint moves past its line's stripped prefix (`offset`'s
+/// per-line column), and the end stops at `text_end`, the host position of
+/// the virtual document's end: the closing-fence line's prefix lies past it
+/// (the virtual document's last line is the empty one after the final line
+/// break), and an end there would translate past the virtual EOF. `None`
+/// when no embedded text remains: a range starting past `text_end`, a
+/// non-empty range covering only prefix bytes, or a caret inside a prefix.
+fn clip_to_region_text(
+    range: Range,
+    offset: &crate::lsp::bridge::RegionOffset,
+    text_end: tower_lsp_server::ls_types::Position,
+) -> Option<Range> {
+    if range.start > text_end {
+        return None;
+    }
     let snap = |position: tower_lsp_server::ls_types::Position| {
         let text_start = position
             .line
@@ -485,10 +501,12 @@ fn clip_to_line_text(range: Range, offset: &crate::lsp::bridge::RegionOffset) ->
             ..position
         }
     };
-    let clipped = Range {
-        start: snap(range.start),
-        end: snap(range.end),
-    };
+    let start = snap(range.start);
+    let end = snap(range.end.min(text_end)).min(text_end);
+    if start > end {
+        return None;
+    }
+    let clipped = Range { start, end };
     let emptied = clipped.start == clipped.end && (range.start != range.end || clipped != range);
     (!emptied).then_some(clipped)
 }
@@ -691,26 +709,89 @@ mod tests {
         }
     }
 
+    /// A virtual end past every range the prefix tests use.
+    const FAR: tower_lsp_server::ls_types::Position = tower_lsp_server::ls_types::Position {
+        line: 9,
+        character: 0,
+    };
+
+    /// `> ```lua` / `> local x = 1` / `> ````: content at host line 1, and
+    /// the virtual document's empty last line maps to the closing line with
+    /// offset 0, so its end is host (2,0), before the closing `> `.
+    fn blockquoted() -> (
+        crate::lsp::bridge::RegionOffset,
+        tower_lsp_server::ls_types::Position,
+    ) {
+        (
+            crate::lsp::bridge::RegionOffset::with_per_line_offsets(1, vec![2, 0]),
+            tower_lsp_server::ls_types::Position::new(2, 0),
+        )
+    }
+
+    #[test]
+    fn clip_to_region_text_stops_at_the_virtual_end() {
+        let (offset, text_end) = blockquoted();
+        assert_eq!(
+            clip_to_region_text(range((1, 2), (2, 2)), &offset, text_end),
+            Some(range((1, 2), (2, 0)))
+        );
+        assert_eq!(
+            clip_to_region_text(range((1, 4), (1, 6)), &offset, text_end),
+            Some(range((1, 4), (1, 6)))
+        );
+    }
+
+    #[test]
+    fn clip_to_region_text_drops_a_range_inside_the_closing_prefix() {
+        let (offset, text_end) = blockquoted();
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 1)), &offset, text_end),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 2)), &offset, text_end),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 1), (2, 1)), &offset, text_end),
+            None
+        );
+        // A caret exactly at the virtual end is a valid position there.
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 0)), &offset, text_end),
+            Some(range((2, 0), (2, 0)))
+        );
+    }
+
     /// A region at host line 1 whose lines carry a two-column prefix.
     fn prefixed() -> crate::lsp::bridge::RegionOffset {
         crate::lsp::bridge::RegionOffset::with_per_line_offsets(1, vec![2, 2, 2])
     }
 
     #[test]
-    fn clip_to_line_text_drops_a_range_inside_a_prefix() {
-        assert_eq!(clip_to_line_text(range((2, 0), (2, 1)), &prefixed()), None);
-        assert_eq!(clip_to_line_text(range((2, 0), (2, 2)), &prefixed()), None);
-        assert_eq!(clip_to_line_text(range((2, 1), (2, 1)), &prefixed()), None);
+    fn clip_to_region_text_drops_a_range_inside_a_prefix() {
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 1)), &prefixed(), FAR),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 2)), &prefixed(), FAR),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 1), (2, 1)), &prefixed(), FAR),
+            None
+        );
     }
 
     #[test]
-    fn clip_to_line_text_moves_prefix_endpoints_to_the_text() {
+    fn clip_to_region_text_moves_prefix_endpoints_to_the_text() {
         assert_eq!(
-            clip_to_line_text(range((2, 1), (2, 5)), &prefixed()),
+            clip_to_region_text(range((2, 1), (2, 5)), &prefixed(), FAR),
             Some(range((2, 2), (2, 5)))
         );
         assert_eq!(
-            clip_to_line_text(range((1, 4), (3, 0)), &prefixed()),
+            clip_to_region_text(range((1, 4), (3, 0)), &prefixed(), FAR),
             Some(range((1, 4), (3, 2)))
         );
     }
@@ -719,17 +800,17 @@ mod tests {
     /// start and any range in a region without prefixes, are kept as they
     /// are.
     #[test]
-    fn clip_to_line_text_keeps_ranges_on_text() {
+    fn clip_to_region_text_keeps_ranges_on_text() {
         for kept in [
             range((2, 2), (2, 2)),
             range((1, 2), (3, 7)),
             range((2, 3), (2, 4)),
         ] {
-            assert_eq!(clip_to_line_text(kept, &prefixed()), Some(kept));
+            assert_eq!(clip_to_region_text(kept, &prefixed(), FAR), Some(kept));
         }
         let unprefixed = crate::lsp::bridge::RegionOffset::with_per_line_offsets(3, vec![0, 0]);
         for kept in [range((3, 0), (4, 0)), range((4, 0), (4, 0))] {
-            assert_eq!(clip_to_line_text(kept, &unprefixed), Some(kept));
+            assert_eq!(clip_to_region_text(kept, &unprefixed, FAR), Some(kept));
         }
     }
 
