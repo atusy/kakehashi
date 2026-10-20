@@ -115,6 +115,11 @@ impl Expansion {
             }
         }
         pieces.push(Piece::Text(text, text_breaks));
+        // The final tabstop is where the cursor ends: Neovim refuses a
+        // snippet holding it more than once (VS Code takes the first).
+        if occurrences.get("0").is_some_and(|&count| count > 1) {
+            return None;
+        }
         // Mirrors repeat their default: bounded by the snippet's own size.
         let limit = snippet.len().saturating_mul(4).max(4096);
         let mut out = String::new();
@@ -306,6 +311,8 @@ mod tests {
         assert_eq!(expanded("$1x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$01x${1:\n}").as_deref(), Some("\nx\n"));
         assert_eq!(expanded("$00").as_deref(), Some(""));
+        // Other tabstops mirror however often they occur.
+        assert_eq!(expanded("$1x$1${1:y}$0").as_deref(), Some("yxyy"));
     }
 
     #[test]
@@ -322,6 +329,10 @@ mod tests {
         assert_eq!(expanded("a $ b"), None);
         assert_eq!(expanded("$$1"), None);
         assert_eq!(expanded("${1:a\\qb}"), None);
+        // The final tabstop more than once, however it is numbered.
+        assert_eq!(expanded("$0x$0"), None);
+        assert_eq!(expanded("${0:a}x$0"), None);
+        assert_eq!(expanded("$00x${0}"), None);
         // Several defaults for one tabstop.
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:\n}"), None);
