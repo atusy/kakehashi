@@ -2979,22 +2979,7 @@ mod formatting {
     }
 
     #[test]
-    fn lines_the_formatter_left_alone_keep_their_own_indent() {
-        // `b` was left at column 0; the formatter changed the lines around
-        // it. A coarser diff would cover `b` and indent it as content.
-        let virtual_text = "  a\nb\n  c\n";
-        let map = prepare(
-            virtual_text,
-            json!([
-                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
-                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
-            ]),
-        );
-        let answer = [edit((0, 0), (3, 0), "A\nb\nC\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  A\nb\n  C\n")
-        );
+    fn a_whitespace_line_the_peer_kept_shorter_than_the_indent_keeps_it() {
         // A whitespace-only line the peer kept, shorter than the indent.
         let virtual_text = "    if x:\n \n";
         let map = prepare(
@@ -3020,32 +3005,6 @@ mod formatting {
             })
             .collect();
         prepare(virtual_text, json!(changes))
-    }
-
-    #[test]
-    fn a_line_keeps_its_indent_when_the_line_before_it_goes() {
-        // `0b c0` (left alone) deleted, `1a1` reindented: the remaining
-        // line is `1a1`, not `0b c0` rewritten.
-        let virtual_text = "0b c0\n  1a1\n";
-        let map = dedent_lines(virtual_text, &[0, 2]);
-        let answer = [edit((0, 0), (2, 0), " 1a1\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("   1a1\n")
-        );
-    }
-
-    #[test]
-    fn a_line_of_text_is_not_given_up_for_a_blank_line() {
-        // A blank line written after the content could pair with the blank
-        // line above `2x`, leaving `2x` to be written anew, indented.
-        let virtual_text = "    0x\n\n2x\n";
-        let map = dedent_lines(virtual_text, &[4]);
-        let answer = [edit((0, 0), (3, 0), "0x\n  w\n\n2x\n\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    0x\n      w\n\n2x\n\n")
-        );
     }
 
     #[test]
@@ -3099,19 +3058,6 @@ mod formatting {
         assert_eq!(
             map.map_formatting_answer(&answer),
             Err(FormattingRefusal::Shape)
-        );
-    }
-
-    #[test]
-    fn a_line_break_changed_above_a_line_left_alone_keeps_that_lines_indent() {
-        // `q` was left alone (no indent removed), `b` dedented: the break
-        // above `q` turned CRLF and `q` written at column 0 keep apart.
-        let virtual_text = "x\n  q\n  b\n";
-        let map = dedent_lines(virtual_text, &[0, 0, 2]);
-        let answer = [edit((0, 0), (3, 0), "x\r\nq\nb\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("x\r\nq\n  b\n")
         );
     }
 
@@ -3254,60 +3200,7 @@ mod formatting {
     }
 
     #[test]
-    fn a_line_the_peer_left_alone_keeps_its_indent_beside_a_blank_line_removed() {
-        // The peer dedented only the lines holding four spaces: `  a=…`
-        // stays as it is. The answer writes `  }` above it and removes the
-        // kept whitespace line after it: `a=…` is the line it was, not one
-        // broken off a line written anew.
-        let virtual_text = "    y\n  a=f('q')\n      \n";
-        let map = dedent_lines(virtual_text, &[4, 0, 4]);
-        let answer = [edit((0, 0), (3, 0), "y\n  }\n  a=f(\"q\")\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    y\n      }\n  a=f(\"q\")\n")
-        );
-    }
-
-    #[test]
-    fn lines_alike_with_indents_of_their_own_are_refused_when_the_answer_cannot_tell_them_apart() {
-        // `let s = "é";` twice, once dedented by two tabs (with a space
-        // after), once left alone: the answer keeps the copy written as
-        // it was, the one with the space, whose indent comes back.
-        let virtual_text = "\t\ta\rlet s = \"é\";\r\t\tlet s = \"é\"; \r\t\t)\r\t\tpass  \r";
-        let map = dedent_lines(virtual_text, &[2, 0, 2, 2, 2]);
-        let answer = [edit((0, 0), (5, 0), "let s = \"é\"; \r\n)\r\npass  \r\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("\t\tlet s = \"é\"; \r\n\t\t)\r\n\t\tpass  \r\n")
-        );
-        // ` }` left alone, the answer writing it twice: which copy is the
-        // line the peer left alone no answer tells.
-        let virtual_text = "    a\n }\n    b\n";
-        let map = dedent_lines(virtual_text, &[4, 0, 4]);
-        let answer = [edit((0, 0), (3, 0), "a\n }\n }\nb\n")];
-        assert_eq!(
-            map.map_formatting_answer(&answer),
-            Err(FormattingRefusal::Shape)
-        );
-        // Two lines of P alike but for the whitespace before them, each
-        // left as it was: no copy is in doubt.
-        let virtual_text = "    x='a'\n    }\n  }\n    y='b'\n";
-        let map = dedent_lines(virtual_text, &[4, 4, 0, 4]);
-        let answer = [edit((0, 0), (4, 0), "x = \"a\"\n}\n  }\ny = \"b\"\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    x = \"a\"\n    }\n  }\n    y = \"b\"\n")
-        );
-        // One of two copies with indents of their own removed, the other
-        // kept among lines alike at the end: which was kept no answer
-        // tells.
-        let virtual_text = "\t\ta\nlet s;\n\t\tlet s;\n\t\tb\n";
-        let map = dedent_lines(virtual_text, &[2, 0, 2, 2]);
-        let answer = [edit((0, 0), (4, 0), "let s;\nb\n")];
-        assert_eq!(
-            map.map_formatting_answer(&answer),
-            Err(FormattingRefusal::Shape)
-        );
+    fn alike_lines_with_the_same_indent_stay_mapped() {
         // Alike lines with the same indent stay mapped.
         let virtual_text = "  }\n  a\n  }\n";
         let map = dedent_lines(virtual_text, &[2, 2, 2]);
@@ -3497,55 +3390,6 @@ mod formatting {
     }
 
     #[test]
-    fn a_line_swapped_with_one_of_the_contents_indent_keeps_its_own() {
-        // `k` left alone by the peer, the `}` around it dedented; the
-        // answer swaps `k` and the second `}`. Either reading moves one
-        // line: moving `}` loses nothing (a line written anew takes the
-        // content's indent, its own), moving `k` would lose its column 0.
-        let virtual_text = "  }\nk\n  }\n";
-        let map = dedent_lines(virtual_text, &[2, 0, 2]);
-        let answer = [edit((0, 0), (3, 0), "}\n}\nk\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  }\n  }\nk\n")
-        );
-        // Reindented as well: still the line it was, its own indent kept.
-        let answer = [edit((0, 0), (3, 0), "}\n}\n k\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  }\n  }\n k\n")
-        );
-    }
-
-    #[test]
-    fn copies_reindented_alike_pair_in_order() {
-        // `foo(` twice, the first left alone, the second dedented: P holds
-        // `    foo(` and `  foo(`. Both reindented by four, the second now
-        // reads as the first did: in order, each is the line it was.
-        let virtual_text = "  x\n    foo(\n    foo(\n";
-        let map = dedent_lines(virtual_text, &[2, 0, 2]);
-        let answer = [edit((0, 0), (3, 0), "x\n        foo(\n    foo(\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  x\n        foo(\n      foo(\n")
-        );
-    }
-
-    #[test]
-    fn lines_of_their_own_indents_swapped_are_refused() {
-        // `a` and `b` both left alone, `c` dedented: swapping `a` and `b`
-        // moves one of them, written anew with the content's indent, and
-        // which one no answer tells.
-        let virtual_text = "a\nb\n  c\n";
-        let map = dedent_lines(virtual_text, &[0, 0, 2]);
-        let answer = [edit((0, 0), (3, 0), "b\na\nc\n")];
-        assert_eq!(
-            map.map_formatting_answer(&answer),
-            Err(FormattingRefusal::Shape)
-        );
-    }
-
-    #[test]
     fn blank_lines_removed_whole_go_where_the_answer_leaves_them() {
         // `   ` dedented to ` ` between two lines of the content.
         let virtual_text = "  a\n   \n  b\n";
@@ -3598,36 +3442,6 @@ mod formatting {
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("    import e\n    }\n    import e\n\n      }\n")
         );
-        // Lines found once placed first, then those found as many times on
-        // each side: `y` (left alone) twice, `f(a)` (dedented) twice in P,
-        // once in the answer. Each `y` is a `y` of P, its column 0 kept.
-        let virtual_text = "  f(a)\ny\ny\n  f(a)\n";
-        let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
-        let answer = [edit((0, 0), (5, 0), "y\nf(a)\ny\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("y\n  f(a)\ny\n")
-        );
-        // `x` (dedented) written twice where `}` (left alone) went: the
-        // copy is a line of the content, not `}` rewritten (`x` and `}`
-        // are not alike), so it takes the content's indent.
-        let virtual_text = "}\n  x\n   \n";
-        let map = dedent_lines(virtual_text, &[0, 2, 2]);
-        let answer = [edit((0, 0), (4, 0), "x\nx\n\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  x\n  x\n\n")
-        );
-        // `}` three times, two left alone: `x` goes and the last `}` is
-        // reindented. Lines alike to the byte pair as found once, before
-        // `}` alike to several takes one: each keeps its own indent.
-        let virtual_text = "  }\n}\n  x\n}\n\n";
-        let map = dedent_lines(virtual_text, &[0, 0, 2, 0, 0]);
-        let answer = [edit((0, 0), (6, 0), "}\n}\n }\n\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("}\n}\n }\n\n")
-        );
     }
 
     #[test]
@@ -3648,6 +3462,146 @@ mod formatting {
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("  a\n        c\n  d\n  b\n")
+        );
+    }
+
+    #[test]
+    fn answers_on_a_peer_dedenting_unevenly_are_refused() {
+        // A line of the content the peer left alone, or dedented otherwise
+        // than the rest: which line of a whole answer is which old one,
+        // and so which indent each regains, only a pairing reads, and a
+        // reading can cross copies or move a line off its own indent. Each
+        // shape below is one a pairing once mapped, some to the wrong text.
+        let cases: [(&str, &[usize], u32, &str); 22] = [
+            // A line left alone deleted, the next reindented.
+            ("0b c0\n  1a1\n", &[0, 2], 2, " 1a1\n"),
+            // A blank line written after the content, a line left alone.
+            ("    0x\n\n2x\n", &[4, 0, 0], 3, "0x\n  w\n\n2x\n\n"),
+            // A line break turned CRLF above a line left alone.
+            ("x\n  q\n  b\n", &[0, 0, 2], 3, "x\r\nq\nb\n"),
+            // A line left alone beside a kept whitespace line removed.
+            (
+                "    y\n  a=f('q')\n      \n",
+                &[4, 0, 4],
+                3,
+                "y\n  }\n  a=f(\"q\")\n",
+            ),
+            // A line left alone swapped with one of the content, also
+            // reindented; two lines left alone swapped.
+            ("  }\nk\n  }\n", &[2, 0, 2], 3, "}\n}\nk\n"),
+            ("  }\nk\n  }\n", &[2, 0, 2], 3, "}\n}\n k\n"),
+            ("a\nb\n  c\n", &[0, 0, 2], 3, "b\na\nc\n"),
+            // Copies reindented so one reads as the other did.
+            (
+                "  x\n    foo(\n    foo(\n",
+                &[2, 0, 2],
+                3,
+                "x\n        foo(\n    foo(\n",
+            ),
+            // Copies, one given punctuation and the other an indent.
+            (
+                "  x\na = 1\n  y\n    a = 1\n",
+                &[2, 0, 2, 2],
+                4,
+                "x\na = 1,\ny\n    a = 1\n",
+            ),
+            (
+                "  x\n\ta = 1\n  y\n  \t\ta = 1\n",
+                &[2, 0, 2, 2],
+                4,
+                "x\n  a = 1,\ny\n    a = 1\n",
+            ),
+            // Copies of a line left alone written more or fewer times.
+            (
+                "\t\ta\rlet s = \"é\";\r\t\tlet s = \"é\"; \r\t\t)\r\t\tpass  \r",
+                &[2, 0, 2, 2, 2],
+                5,
+                "let s = \"é\"; \r\n)\r\npass  \r\n",
+            ),
+            ("    a\n }\n    b\n", &[4, 0, 4], 3, "a\n }\n }\nb\n"),
+            (
+                "\t\ta\nlet s;\n\t\tlet s;\n\t\tb\n",
+                &[2, 0, 2, 2],
+                4,
+                "let s;\nb\n",
+            ),
+            ("  f(a)\ny\ny\n  f(a)\n", &[2, 0, 0, 2], 5, "y\nf(a)\ny\n"),
+            ("}\n  x\n   \n", &[0, 2, 2], 4, "x\nx\n\n"),
+            // Lines alike but for whitespace, each left as it was.
+            (
+                "    x='a'\n    }\n  }\n    y='b'\n",
+                &[4, 4, 0, 4],
+                4,
+                "x = \"a\"\n}\n  }\ny = \"b\"\n",
+            ),
+            // Lines joined, deleted or rewritten beside a line left alone.
+            (" \n    1a1\n2a2\n", &[0, 2, 0], 3, "  1a1 2a2\n"),
+            ("  0a0\r\n\t1b c1\r\n", &[2, 0], 2, "1b c1\r\n"),
+            ("a\n  ab\n", &[0, 2], 2, "ab\n"),
+            ("a\n  \tb\n", &[0, 2], 2, "  b\n"),
+            ("0a0\n  1a1\n", &[0, 2], 2, "0a0\r\n"),
+            (
+                "0if x:0\n    1if x:1\n    2if x:2\n",
+                &[0, 4, 4],
+                3,
+                "1if x:1 2if x:2\n",
+            ),
+        ];
+        for (virtual_text, removed, lines, answer) in cases {
+            let map = dedent_lines(virtual_text, removed);
+            let answer = [edit((0, 0), (lines, 0), answer)];
+            assert_eq!(
+                map.map_formatting_answer(&answer),
+                Err(FormattingRefusal::Shape),
+                "{virtual_text:?}"
+            );
+        }
+        // Indents removed that differ (no uniform one), even with every
+        // line kept in place.
+        let virtual_text = "  a\n    b\n";
+        let map = dedent_lines(virtual_text, &[2, 4]);
+        assert_eq!(
+            map.map_formatting_answer(&[edit((0, 0), (2, 0), "A\nb\n")]),
+            Err(FormattingRefusal::Shape)
+        );
+        // An answer changing nothing is no edit; whitespace lines left alone,
+        // and a line starting with a gap's text, do not count.
+        assert_eq!(
+            map.map_formatting_answer(&[edit((0, 0), (2, 0), "a\nb\n")]),
+            Ok(Vec::new())
+        );
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &[edit((0, 0), (3, 0), "a\n\nB\n")])
+                .as_deref(),
+            Some("  a\n\n  B\n")
+        );
+        let virtual_text = "  a\n     c\n  b\n";
+        let dedent = |line: u32| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""});
+        let prepared = prepare_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${x}".to_string()),
+                (SegmentKind::Content, 8..15, String::new()),
+            ],
+            json!({"segments": [
+                {"type": "content", "changes": [dedent(0)]},
+                {"type": "gap", "content": "None"},
+                {"type": "content", "changes": [dedent(1)]}
+            ]}),
+        );
+        let map = std::sync::Arc::try_unwrap(prepared.map).unwrap();
+        assert_eq!(map.prepared_lines.text, "a\nNone c\nb\n");
+        assert_eq!(
+            formatted_either_way(
+                &map,
+                virtual_text,
+                &[edit((0, 0), (3, 0), "a\nNone c\nB\n")]
+            )
+            .as_deref(),
+            Some("  a\n     c\n  B\n")
         );
     }
 
@@ -3695,17 +3649,6 @@ mod formatting {
             map.map_formatting(&answer, 50_000)
                 .map(|mapped| apply_to(&virtual_text, &mapped)),
             Ok(format!("  {spaced}\n"))
-        );
-    }
-
-    #[test]
-    fn a_line_joined_onto_another_is_written_on_it() {
-        let virtual_text = " \n    1a1\n2a2\n";
-        let map = dedent_lines(virtual_text, &[0, 2, 0]);
-        let answer = [edit((0, 0), (3, 0), "  1a1 2a2\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    1a1 2a2\n")
         );
     }
 
@@ -3998,46 +3941,6 @@ mod formatting {
     }
 
     #[test]
-    fn a_line_deleted_above_one_losing_its_own_indent_keeps_them_apart() {
-        // `0a0` (dedented) deleted, `\t1b c1` (left alone, a tab of its own)
-        // brought to column 0: the deletion and the tab's touch at the line
-        // start, and the line keeps its removed indent (none).
-        let virtual_text = "  0a0\r\n\t1b c1\r\n";
-        let map = dedent_lines(virtual_text, &[2, 0]);
-        let answer = [edit((0, 0), (2, 0), "1b c1\r\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("1b c1\r\n")
-        );
-    }
-
-    #[test]
-    fn a_rewritten_line_pairs_with_its_own_text_before_any_it_starts_with() {
-        // `ab` (dedented) stays, `a` (left alone) goes: `ab` starts with
-        // `a`, but is itself, not `a` with text joined onto it.
-        let virtual_text = "a\n  ab\n";
-        let map = dedent_lines(virtual_text, &[0, 2]);
-        let answer = [edit((0, 0), (2, 0), "ab\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("  ab\n")
-        );
-    }
-
-    #[test]
-    fn a_line_reindented_from_a_tab_is_the_line_it_was() {
-        // `\tb` (dedented, a tab of its own past it) reindented with
-        // spaces: the same line of text, keeping the removed indent.
-        let virtual_text = "a\n  \tb\n";
-        let map = dedent_lines(virtual_text, &[0, 2]);
-        let answer = [edit((0, 0), (2, 0), "  b\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    b\n")
-        );
-    }
-
-    #[test]
     fn a_lone_cr_turned_crlf_and_back_maps_whole() {
         let virtual_text = "  a\r  b\r";
         let map = dedent_lines(virtual_text, &[2, 2]);
@@ -4052,19 +3955,6 @@ mod formatting {
         assert_eq!(
             formatted_either_way(&map, virtual_text, &answer).as_deref(),
             Some("  a\r  b\r")
-        );
-    }
-
-    #[test]
-    fn a_line_deleted_after_a_changed_line_break_goes_with_it() {
-        // The break turned CRLF, the dedented line after it deleted: the
-        // deletion takes the line's removed indent, so the two go together.
-        let virtual_text = "0a0\n  1a1\n";
-        let map = dedent_lines(virtual_text, &[0, 2]);
-        let answer = [edit((0, 0), (2, 0), "0a0\r\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("0a0\r\n")
         );
     }
 
@@ -4208,18 +4098,6 @@ mod formatting {
     }
 
     #[test]
-    fn lines_joined_keep_the_first_ones_indent() {
-        // `0x` deleted and `1x` joined with `2x`: the joined line is `1x`.
-        let virtual_text = "0if x:0\n    1if x:1\n    2if x:2\n";
-        let map = dedent_lines(virtual_text, &[0, 4, 4]);
-        let answer = [edit((0, 0), (3, 0), "1if x:1 2if x:2\n")];
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &answer).as_deref(),
-            Some("    1if x:1 2if x:2\n")
-        );
-    }
-
-    #[test]
     fn a_line_break_changed_before_text_written_on_a_line_keeps_them_apart() {
         // CRLF turned to LF on `a`, text written where the empty line below
         // it was: that text is a line of the content, not one the changed
@@ -4295,7 +4173,9 @@ mod formatting {
 
     #[test]
     fn lines_created_without_one_indent_to_regain_are_refused() {
-        // Line 0 lost two spaces, line 1 four: no indent for a new line.
+        // Line 0 lost two spaces, line 1 four: no indent for a new line
+        // (nor, a formatting answer, for any line: see
+        // `answers_on_a_peer_dedenting_unevenly_are_refused`).
         let virtual_text = "  a\n    b\n";
         let map = prepare(
             virtual_text,
@@ -4306,11 +4186,6 @@ mod formatting {
         );
         let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
         assert_eq!(map.map_formatting_answer(&answer).ok(), None);
-        // Changing text within a line needs no indent.
-        assert_eq!(
-            formatted_either_way(&map, virtual_text, &[edit((0, 0), (2, 0), "A\nb\n")]).as_deref(),
-            Some("  A\n    b\n")
-        );
     }
 
     #[test]
@@ -4874,11 +4749,9 @@ mod formatting_reference {
         ))
     }
 
-    /// `output` with two lines of text the formatter left as they were
-    /// swapped (as sorting imports does) when `shuffle` says, each keeping
-    /// its own line break; and whether a line whose removed indent is not
-    /// the content's moved, which the map may refuse (when either of the two
-    /// could be the one moved, see `moves_a_line_off_its_indent`). (A line
+    /// `output` with two lines of text the formatter left as they were,
+    /// the content's indent removed from both, swapped (as sorting imports
+    /// does) when `shuffle` says, each keeping its own line break. (A line
     /// written twice is left out: beside lines removed, which copy is the
     /// old line no answer tells.)
     fn shuffled(
@@ -4886,19 +4759,16 @@ mod formatting_reference {
         prepared: &str,
         mut output: Vec<Output>,
         shuffle: u8,
-    ) -> (Vec<Output>, bool) {
+    ) -> Vec<Output> {
         let lines: Vec<&str> = lines_of(prepared);
         let movable = |(text, line_break, origin): &Output| {
             !text.trim_matches([' ', '\t']).is_empty()
                 && !line_break.is_empty()
                 && origin.is_some_and(|line| {
                     line < AMBIGUOUS
-                        && document.removed[line].is_some()
+                        && document.removed[line] == Some(document.uniform)
                         && lines.get(line) == Some(&text.as_str())
                 })
-        };
-        let own = |(_, _, origin): &Output| {
-            origin.is_some_and(|line| document.removed[line] != Some(document.uniform))
         };
         let pick = |candidates: Vec<usize>| {
             (!candidates.is_empty())
@@ -4924,14 +4794,12 @@ mod formatting_reference {
                     })
                     .collect();
                 if let Some(at) = pick(candidates) {
-                    let moved_own = own(&output[at]) || own(&output[at + 1]);
                     output.swap(at, at + 1);
-                    return (output, moved_own);
                 }
             }
             _ => {}
         }
-        (output, false)
+        output
     }
 
     /// `text`'s lines without their breaks (LF, CRLF or a lone CR).
@@ -5016,12 +4884,19 @@ mod formatting_reference {
                     let Some(document) = document(&lines, indent, line_break, edges) else {
                         return Ok(());
                     };
+                    // Some line of text dedented and another left alone.
+                    let dedented = |want: bool| {
+                        lines.iter().any(
+                            |line| matches!(line, Line::Content { dedented, .. } if *dedented == want),
+                        )
+                    };
+                    let uneven = dedented(true) && dedented(false);
                     let map = prepare(
                         &document.virtual_text,
                         serde_json::Value::from(document.changes.clone()),
                     );
                     let prepared = map.prepared_lines.text.clone();
-                    let (output, moved_own) = shuffled(
+                    let output = shuffled(
                         &document,
                         &prepared,
                         format(&prepared, &rewrites, flip),
@@ -5048,17 +4923,16 @@ mod formatting_reference {
                         let sure = output
                             .iter()
                             .all(|(_, _, origin)| origin.is_none_or(|line| line < AMBIGUOUS));
-                        if budget > 0
-                            && sure
-                            && !moved_own
-                            && reference(&document, &output).is_some()
-                        {
+                        if budget > 0 && sure && !uneven && reference(&document, &output).is_some() {
                             over_refused.set(over_refused.get() + 1);
                         }
                         return Ok(());
                     };
                     mapped_sets.set(mapped_sets.get() + 1);
                     if formatted != prepared {
+                        // A peer dedenting unevenly: refused whatever the
+                        // answer changes.
+                        prop_assert!(!uneven, "{:?} mapped on {:?}", edits, document.virtual_text);
                         changing.set(changing.get() + 1);
                     }
                     let got = apply(&document.virtual_text, &mapped);

@@ -270,8 +270,15 @@ edit: its edits are applied to P (an end at the start of the line just
 past P's last naming P's end, as whole-document answers do), the region's
 edge layout of P restored as for any document (but for an on-type answer,
 which keeps the edges as it writes them, typing being an edit, not a
-reformatting of the region), and the result diffed against P. Lines are
-paired first: a line of text whose own removed indentation is not the
+reformatting of the region), and the result diffed against P. An answer
+changing a region whose peer dedented it unevenly — a line of text (not
+whitespace alone, nor starting with a gap's text) the peer left alone, or
+dedented otherwise than the rest of its segment — is refused before any
+pairing: every line of a whole answer is rewritten text, and which old
+line each is, and so which indentation it regains, only a pairing reads;
+with one indentation for every line of the content, no reading decides an
+indentation. (Edits that keep their extents state where they go, and
+still map there.) Lines are paired first: a line of text whose own removed indentation is not the
 content's (one the peer left alone, or dedented otherwise) with the line it
 was rewritten from, alike to the byte, then alike but for the whitespace
 around its text, each found once in each text — of two lines swapped,
@@ -709,17 +716,21 @@ a hook per kind of change.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
-- With a peer that dedents unevenly (leaving some lines as they were), an
-  answer that writes a line of P more or fewer times is refused when P's
-  copies of it have different removed indents, or one that is not the
-  content's: which copy it kept no answer tells. Where every copy count
-  holds, a line the answer leaves unchanged is read as itself, and one
-  rewritten in place as the line it was, though with same-text lines
-  around a line the peer left alone another reading may be what the
-  formatter meant. Lines reordered keep their indentation where only
-  lines of the content's indentation need move; an answer that moves a
-  line of its own indentation (two such lines swapped) is refused. Peers
-  dedenting evenly meet none of these.
+- Formatting, range and on-type formatting refuse a region whose peer
+  dedented it unevenly (a line of text left alone, or dedented otherwise
+  than the rest), whatever the answer changes; completions, hints and
+  other edits that keep their extents still map there. Reading a whole
+  answer back onto lines that kept indentations of their own met one
+  ambiguity after another (copies crossing, a line moved off its own
+  indentation, one copy reindented into another's text), several mapped
+  to wrong text before they were found; a refusal is the safe side. The
+  usual peers dedent evenly: a Nix `''` string strips the least
+  indentation of its lines (a line opening with an interpolation counts,
+  so one at column 0 strips none), `textwrap.dedent`, `indoc!` and `<<~`
+  the common prefix, and a YAML block scalar requires its indentation. A
+  CommonMark fence strips up to its opener's own indentation from each
+  line, so a line less indented than an indented fence's opener is
+  dedented unevenly, and that block is not formatted through its peer.
 - Text a formatter writes where a whitespace-only line the peer kept was is
   refused, typed after its whitespace or not: a whole-text answer does not
   tell text typed on that line from a line written in its place. That is
