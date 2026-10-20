@@ -5736,3 +5736,367 @@ fn random_replayed_edit_sets_give_p_edited_and_indented() {
         .unwrap();
     assert!(mapped.get() > 2000, "mapped {}", mapped.get());
 }
+
+/// A rename's or a code action's edit set replayed (see [`EditMode::Replay`])
+/// against a reference built without the map: documents are generated as
+/// lines of text over one indentation, the edits as a server would send
+/// them for each kind of change, and the expected host text by making the
+/// same change to those lines and indenting the result. Extent mapping and
+/// a whole-text diff of the same sets are judged alike, to compare them.
+mod replay_reference {
+    use super::*;
+    use proptest::prelude::*;
+    use std::cell::RefCell;
+
+    /// One line of a generated document.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Line {
+        /// Text over the content's indentation, or at column 0 where the
+        /// peer left it alone (its region then dedented unevenly).
+        Text { text: String, alone: bool },
+        /// An empty line.
+        Empty,
+        /// A whitespace-only line: the content's indentation, which the peer
+        /// empties, or when `kept` a single space the peer keeps.
+        Blank { kept: bool },
+    }
+
+    /// Line texts, as P shows them: some nested deeper than the content,
+    /// most naming `a`, which renames rename.
+    const TEXTS: [&str; 7] = ["a = 1", "f(a)", "  g(a)", "}", "return a", "b", "  a"];
+
+    fn line() -> impl Strategy<Value = Line> {
+        prop_oneof![
+            6 => (0..TEXTS.len()).prop_map(|text| Line::Text { text: TEXTS[text].into(), alone: false }),
+            1 => (0..TEXTS.len()).prop_map(|text| Line::Text { text: TEXTS[text].into(), alone: true }),
+            1 => Just(Line::Empty),
+            1 => any::<bool>().prop_map(|kept| Line::Blank { kept }),
+        ]
+    }
+
+    /// The change a server makes, on the lines of P.
+    #[derive(Debug, Clone)]
+    enum Change {
+        /// Every `a` renamed.
+        Rename,
+        /// An import inserted above line `at`, and every `a` renamed.
+        Import { at: usize },
+        /// Lines `from..=to` wrapped in a block: a header inserted before
+        /// them and each indented, the header and the first indent sent as
+        /// one edit or two.
+        Wrap { from: usize, to: usize, one: bool },
+        /// The block line `at` opens unwrapped: it goes, and the lines after
+        /// it nested deeper lose that nesting, the line's deletion and the
+        /// first one's sent as one edit or two.
+        Unwrap { at: usize, one: bool },
+        /// Line `at` deleted, blank or not.
+        Delete { at: usize },
+    }
+
+    fn change() -> impl Strategy<Value = (Change, bool)> {
+        (
+            prop_oneof![
+                Just(Change::Rename),
+                (0..8usize).prop_map(|at| Change::Import { at }),
+                (0..8usize, 0..8usize, any::<bool>()).prop_map(|(a, b, one)| Change::Wrap {
+                    from: a.min(b),
+                    to: a.max(b),
+                    one
+                }),
+                (0..8usize, any::<bool>()).prop_map(|(at, one)| Change::Unwrap { at, one }),
+                (0..8usize).prop_map(|at| Change::Delete { at }),
+            ],
+            // Sent as one edit replacing the whole document (a fix-all).
+            any::<bool>(),
+        )
+    }
+
+    fn prepared_line(line: &Line) -> &str {
+        match line {
+            Line::Text { text, .. } => text,
+            Line::Empty | Line::Blank { kept: false } => "",
+            Line::Blank { kept: true } => " ",
+        }
+    }
+
+    fn virtual_line(line: &Line, indent: &str) -> String {
+        match line {
+            Line::Text { text, alone: false } => format!("{indent}{text}"),
+            Line::Text { text, alone: true } => text.clone(),
+            Line::Empty => String::new(),
+            Line::Blank { kept: false } => indent.to_string(),
+            Line::Blank { kept: true } => " ".to_string(),
+        }
+    }
+
+    fn render(lines: &[Line], line: impl Fn(&Line) -> String) -> String {
+        lines.iter().map(|l| line(l) + "\n").collect()
+    }
+
+    fn insert(at: (usize, usize), text: &str) -> TextEdit {
+        edit((at.0 as u32, at.1 as u32), (at.0 as u32, at.1 as u32), text)
+    }
+
+    /// Where `a` stands as a word in `text`.
+    fn names(text: &str) -> Vec<usize> {
+        let bytes = text.as_bytes();
+        (0..bytes.len())
+            .filter(|&at| {
+                bytes[at] == b'a'
+                    && (at == 0 || !bytes[at - 1].is_ascii_alphanumeric())
+                    && bytes
+                        .get(at + 1)
+                        .is_none_or(|next| !next.is_ascii_alphanumeric())
+            })
+            .collect()
+    }
+
+    fn rename(lines: &mut [Line], edits: &mut Vec<TextEdit>) {
+        for (index, line) in lines.iter_mut().enumerate() {
+            if let Line::Text { text, .. } = line {
+                for at in names(text) {
+                    edits.push(edit(
+                        (index as u32, at as u32),
+                        (index as u32, at as u32 + 1),
+                        "xy",
+                    ));
+                }
+                *text = text
+                    .split(' ')
+                    .map(|word| {
+                        let mut word = word.to_string();
+                        for at in names(&word).into_iter().rev() {
+                            word.replace_range(at..at + 1, "xy");
+                        }
+                        word
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+        }
+    }
+
+    /// The edits making `change` to `lines`, and the lines it makes;
+    /// `None` when it does not apply there.
+    fn make(change: &Change, lines: &[Line]) -> Option<(Vec<TextEdit>, Vec<Line>)> {
+        let mut edits = Vec::new();
+        let mut after = lines.to_vec();
+        let text = |at: usize| match lines.get(at) {
+            Some(Line::Text { text, .. }) => Some(text.as_str()),
+            _ => None,
+        };
+        match *change {
+            Change::Rename => rename(&mut after, &mut edits),
+            Change::Import { at } => {
+                let at = at.min(lines.len());
+                rename(&mut after, &mut edits);
+                edits.push(insert((at, 0), "use m\n"));
+                after.insert(
+                    at,
+                    Line::Text {
+                        text: "use m".into(),
+                        alone: false,
+                    },
+                );
+            }
+            Change::Wrap { from, to, one } => {
+                if to >= lines.len() || (from..=to).any(|at| text(at).is_none()) {
+                    return None;
+                }
+                if one {
+                    edits.push(insert((from, 0), "if x:\n  "));
+                } else {
+                    edits.push(insert((from, 0), "if x:\n"));
+                    edits.push(insert((from, 0), "  "));
+                }
+                for at in from + 1..=to {
+                    edits.push(insert((at, 0), "  "));
+                }
+                for line in &mut after[from..=to] {
+                    if let Line::Text { text, .. } = line {
+                        text.insert_str(0, "  ");
+                    }
+                }
+                after.insert(
+                    from,
+                    Line::Text {
+                        text: "if x:".into(),
+                        alone: false,
+                    },
+                );
+            }
+            Change::Unwrap { at, one } => {
+                text(at)?;
+                let nested = (at + 1..lines.len())
+                    .take_while(|&line| text(line).is_some_and(|text| text.starts_with("  ")))
+                    .count();
+                if nested == 0 {
+                    return None;
+                }
+                if one {
+                    edits.push(edit((at as u32, 0), (at as u32 + 1, 2), ""));
+                } else {
+                    edits.push(edit((at as u32, 0), (at as u32 + 1, 0), ""));
+                    edits.push(edit((at as u32 + 1, 0), (at as u32 + 1, 2), ""));
+                }
+                for line in at + 2..at + 1 + nested {
+                    edits.push(edit((line as u32, 0), (line as u32, 2), ""));
+                }
+                for line in &mut after[at + 1..at + 1 + nested] {
+                    if let Line::Text { text, .. } = line {
+                        text.replace_range(..2, "");
+                    }
+                }
+                after.remove(at);
+            }
+            Change::Delete { at } => {
+                // Blank lines too: those P shows alike may stand for other
+                // whitespace in the host, which the line named tells.
+                lines.get(at)?;
+                edits.push(edit((at as u32, 0), (at as u32 + 1, 0), ""));
+                after.remove(at);
+            }
+        }
+        (!edits.is_empty()).then_some((edits, after))
+    }
+
+    /// How a variant fared on one case.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct Tally {
+        exact: usize,
+        wrong: usize,
+        refused: usize,
+    }
+
+    impl Tally {
+        fn judge(&mut self, got: Option<String>, expected: &str) -> bool {
+            match got {
+                Some(got) if got == expected => self.exact += 1,
+                Some(_) => {
+                    self.wrong += 1;
+                    return false;
+                }
+                None => self.refused += 1,
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn replayed_edit_sets_give_exactly_the_reference_host_text() {
+        let mut runner = property_runner(6000);
+        // Per variant (replay, extent, whole-text diff), on evenly and
+        // unevenly dedented documents, and per kind of change.
+        let tallies = RefCell::new([[Tally::default(); 2]; 3]);
+        let kinds = RefCell::new(std::collections::BTreeMap::<String, [[Tally; 2]; 3]>::new());
+        let strategy = (
+            prop::collection::vec(line(), 1..8),
+            prop::sample::select(vec!["  ", "\t", "    "]),
+            change(),
+        );
+        runner
+            .run(&strategy, |(lines, indent, (change, whole))| {
+                if !lines
+                    .iter()
+                    .any(|line| matches!(line, Line::Text { alone: false, .. }))
+                {
+                    return Ok(());
+                }
+                let Some((mut edits, after)) = make(&change, &lines) else {
+                    return Ok(());
+                };
+                let virtual_text = render(&lines, |line| virtual_line(line, indent));
+                let changes: Vec<serde_json::Value> = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        matches!(
+                            line,
+                            Line::Text { alone: false, .. } | Line::Blank { kept: false }
+                        )
+                    })
+                    .map(|(at, _)| {
+                        json!({"range": {
+                            "start": {"line": at, "character": 0},
+                            "end": {"line": at, "character": indent.len()}
+                        }, "newText": ""})
+                    })
+                    .collect();
+                let map = prepare(&virtual_text, json!(changes));
+                prop_assert_eq!(
+                    map.prepared_text(),
+                    render(&lines, |l| prepared_line(l).to_string())
+                );
+                // Which of several blank lines P shows alike went, one edit
+                // rewriting the whole document does not tell (nor does a
+                // formatting answer): the host text of such a deletion is not
+                // the edit's to state.
+                if whole
+                    && let Change::Delete { at } = change
+                    && !matches!(lines[at], Line::Text { .. })
+                {
+                    return Ok(());
+                }
+                if whole {
+                    edits = vec![edit(
+                        (0, 0),
+                        (lines.len() as u32, 0),
+                        &render(&after, |l| prepared_line(l).to_string()),
+                    )];
+                }
+                let expected = render(&after, |line| virtual_line(line, indent));
+                let uneven = lines
+                    .iter()
+                    .any(|line| matches!(line, Line::Text { alone: true, .. }));
+                let applied = |mapped: Option<Vec<TextEdit>>| {
+                    mapped.map(|mapped| apply_to(&virtual_text, &mapped))
+                };
+                let got = [
+                    applied(map.map_edits(&edits, EditMode::Replay)),
+                    applied(map.map_edits(&edits, EditMode::Extent)),
+                    applied(map.map_formatting_answer(&edits).ok()),
+                ];
+                let kind = format!(
+                    "{}{}",
+                    format!("{change:?}")
+                        .split([' ', '{'])
+                        .next()
+                        .unwrap_or_default(),
+                    if whole { " (whole)" } else { "" }
+                );
+                let mut kinds = kinds.borrow_mut();
+                let by_kind = kinds.entry(kind).or_default();
+                let mut tallies = tallies.borrow_mut();
+                for (variant, got) in got.iter().enumerate() {
+                    by_kind[variant][uneven as usize].judge(got.clone(), &expected);
+                }
+                let exact = tallies[0][uneven as usize].judge(got[0].clone(), &expected);
+                tallies[1][uneven as usize].judge(got[1].clone(), &expected);
+                tallies[2][uneven as usize].judge(got[2].clone(), &expected);
+                prop_assert!(
+                    exact,
+                    "{:?} on {:?}: {:?} -> {:?}, expected {:?}",
+                    change,
+                    virtual_text,
+                    edits,
+                    applied(map.map_edits(&edits, EditMode::Replay)),
+                    expected
+                );
+                Ok(())
+            })
+            .unwrap();
+        let tallies = tallies.into_inner();
+        for (kind, tallies) in kinds.into_inner() {
+            for (name, tally) in ["replay", "extent", "whole diff"].iter().zip(&tallies) {
+                eprintln!("{kind} {name}: even {:?}, uneven {:?}", tally[0], tally[1]);
+            }
+        }
+        for (name, tally) in ["replay", "extent", "whole diff"].iter().zip(&tallies) {
+            eprintln!("{name}: even {:?}, uneven {:?}", tally[0], tally[1]);
+        }
+        let [replay, ..] = tallies;
+        // On evenly dedented documents every such change maps.
+        assert_eq!(replay[0].refused, 0, "{:?}", replay[0]);
+        assert!(replay[0].exact > 1000, "{:?}", replay[0]);
+    }
+}
