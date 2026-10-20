@@ -497,83 +497,102 @@ impl PreparedMap {
         }
         edited.push_str(&prepared[cursor..]);
 
-        // Groups of touching edits, in order: P range, edited range, and
-        // whether it stays within one line.
+        // How far each edit, in order, and the ones before it moved the text
+        // after them: where a P offset outside every edit lands in the
+        // edited P is read from it, never added up from distances in P,
+        // which other edits on the same lines would make stale.
+        let mut shifts = Vec::with_capacity(order.len() + 1);
+        shifts.push(0isize);
+        for &index in &order {
+            let moved = landed[index].len() as isize - ranges[index].len() as isize;
+            shifts.push(shifts.last().expect("starts with one") + moved);
+        }
+
+        // Groups of touching edits, in order: P range, the edits it holds
+        // (as positions in `order`), and whether it reaches across lines.
         struct Unit {
             old: Range<usize>,
-            new: Range<usize>,
+            edits: Range<usize>,
             lines: bool,
         }
+        // The edited P a unit's P range became: its edits are every edit
+        // within it.
+        let new_of = |unit: &Unit| {
+            let at =
+                |offset: usize, shift: isize| offset.checked_add_signed(shift).expect("in text");
+            at(unit.old.start, shifts[unit.edits.start])..at(unit.old.end, shifts[unit.edits.end])
+        };
         let mut groups: Vec<Unit> = Vec::new();
-        for &index in &order {
-            let (old, new) = (ranges[index].clone(), landed[index].clone());
+        for (at, &index) in order.iter().enumerate() {
+            let old = ranges[index].clone();
             match groups.last_mut() {
                 Some(group) if group.old.end == old.start => {
                     group.old.end = old.end;
-                    group.new.end = new.end;
+                    group.edits.end = at + 1;
                 }
                 _ => groups.push(Unit {
                     old,
-                    new,
+                    edits: at..at + 1,
                     lines: false,
                 }),
             }
         }
         let breaks = |text: &str| text.contains(['\n', '\r']);
         for group in &mut groups {
-            group.lines =
-                breaks(&prepared[group.old.clone()]) || breaks(&edited[group.new.clone()]);
+            group.lines = breaks(&prepared[group.old.clone()]) || breaks(&edited[new_of(group)]);
         }
         // A group reaching across lines takes the whole lines it reaches, in
-        // P and alike in the edited P (the text before and after the group
-        // on them is P's, unchanged); groups whose lines meet or overlap are
+        // P and alike in the edited P; groups whose lines meet or overlap are
         // one.
         let line_start = |offset: usize| {
             prepared[..offset]
                 .rfind(['\n', '\r'])
                 .map_or(0, |at| at + 1)
         };
+        // Past the line break ending the line `offset` is on (P's end on the
+        // last line).
+        let line_end = |offset: usize| {
+            let rest = &prepared[offset..];
+            rest.find(['\n', '\r']).map_or(prepared.len(), |at| {
+                offset + at + if rest[at..].starts_with("\r\n") { 2 } else { 1 }
+            })
+        };
         // An end both texts have a line boundary at: a line start (not
         // inside a CRLF the group's text completes) or the text's end.
         let boundary = |text: &str, at: usize| {
             at == text.len() || is_line_start(text, at) && !splits_crlf(text, at)
         };
-        let whole_lines = |unit: Unit| {
-            let start = line_start(unit.old.start);
-            let end = if boundary(prepared, unit.old.end) && boundary(&edited, unit.new.end) {
+        // A unit's end, past the line it ends on unless both texts have a
+        // line boundary there; read once the unit holds every edit up to it.
+        let line_end_of = |unit: &Unit| {
+            if boundary(prepared, unit.old.end) && boundary(&edited, new_of(unit).end) {
                 unit.old.end
             } else {
-                lines_with_breaks(&prepared[unit.old.end..])
-                    .first()
-                    .map_or(unit.old.end, |(_, line)| unit.old.end + line.len())
-            };
-            Unit {
-                new: unit.new.start - (unit.old.start - start)..unit.new.end + (end - unit.old.end),
-                old: start..end,
-                lines: true,
+                line_end(unit.old.end)
             }
         };
         let mut units: Vec<Unit> = Vec::with_capacity(groups.len());
         for mut group in groups {
             if group.lines {
-                group = whole_lines(group);
+                group.old.start = line_start(group.old.start);
             }
+            // Every unit the group's lines reach, before it on its first
+            // line included, joins it first: only then does it hold every
+            // edit within it.
             while let Some(last) = units.last()
                 && (group.lines || last.lines)
                 && group.old.start <= last.old.end
             {
                 let last = units.pop().expect("a unit is there");
-                // The later end, in both texts: the unit reaching further.
-                let new_end = match last.old.end.cmp(&group.old.end) {
-                    std::cmp::Ordering::Greater => last.new.end,
-                    std::cmp::Ordering::Less => group.new.end,
-                    std::cmp::Ordering::Equal => last.new.end.max(group.new.end),
-                };
-                group = whole_lines(Unit {
-                    old: last.old.start..last.old.end.max(group.old.end),
-                    new: last.new.start..new_end,
+                group = Unit {
+                    old: line_start(last.old.start.min(group.old.start))
+                        ..last.old.end.max(group.old.end),
+                    edits: last.edits.start..group.edits.end,
                     lines: true,
-                });
+                };
+            }
+            if group.lines {
+                group.old.end = line_end_of(&group);
             }
             units.push(group);
         }
@@ -581,7 +600,7 @@ impl PreparedMap {
         let diffed_bytes: usize = units
             .iter()
             .filter(|unit| unit.lines)
-            .map(|unit| unit.old.len() + unit.new.len())
+            .map(|unit| unit.old.len() + new_of(unit).len())
             .sum();
         let mut work = Work::new(
             FORMATTING_DIFF_BUDGET
@@ -591,21 +610,19 @@ impl PreparedMap {
         let mut unevenly = None;
         let mut mapped = Vec::with_capacity(units.len());
         for unit in units {
+            let new = new_of(&unit);
             if !unit.lines {
                 let following = prepared[unit.old.end..].chars().next();
-                mapped.push(self.hunk_to_virtual(unit.old, &edited[unit.new], following, false)?);
+                mapped.push(self.hunk_to_virtual(unit.old, &edited[new], following, false)?);
                 continue;
             }
-            if prepared[unit.old.clone()] == edited[unit.new.clone()] {
+            if prepared[unit.old.clone()] == edited[new.clone()] {
                 continue;
             }
             if *unevenly.get_or_insert_with(|| self.dedents_unevenly()) {
                 return None;
             }
-            mapped.extend(
-                self.map_span_diff(unit.old, &edited, unit.new, &mut work)
-                    .ok()?,
-            );
+            mapped.extend(self.map_span_diff(unit.old, &edited, new, &mut work).ok()?);
         }
         self.to_text_edits(mapped)
     }

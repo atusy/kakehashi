@@ -5608,3 +5608,131 @@ fn replayed_lines_in_a_crlf_document_past_its_first_line_map() {
         Some("  a\r\n  b\r\n  q\r\n  C\r\n")
     );
 }
+
+#[test]
+fn edits_on_the_lines_a_replayed_group_reaches_are_replayed_with_it() {
+    let cases: [(&str, Vec<TextEdit>, &str); 5] = [
+        // A single-line edit after a multi-line one, on its last line.
+        (
+            "  a\n  bcd\n",
+            vec![edit((0, 0), (1, 1), "X"), edit((1, 2), (1, 3), "DDD")],
+            "  XcDDD\n",
+        ),
+        (
+            "  x\n  foo(a, b)\n  z\n",
+            vec![edit((0, 1), (1, 3), "\nbar"), edit((1, 7), (1, 8), "bbbb")],
+            "  x\n  bar(a, bbbb)\n  z\n",
+        ),
+        (
+            "  x\n  y = 1\n  zz\n",
+            vec![edit((0, 1), (1, 1), "1\nY"), edit((1, 4), (1, 5), "22")],
+            "  x1\n  Y = 22\n  zz\n",
+        ),
+        (
+            "  bcaba\n  aaaa\n  cbcab\n  cc\n  a\n",
+            vec![
+                edit((0, 5), (1, 1), "yy"),
+                edit((1, 4), (2, 0), "zx"),
+                edit((2, 1), (2, 1), "x\nz"),
+            ],
+            "  bcabayyaaazxcx\n  zbcab\n  cc\n  a\n",
+        ),
+        // Single-line edits before one, on its first line.
+        (
+            "  ab = cd\n  e\n",
+            vec![
+                edit((0, 0), (0, 1), "AAA"),
+                edit((0, 2), (0, 2), "BB"),
+                edit((0, 5), (0, 5), "\n"),
+            ],
+            "  AAAbBB = \n  cd\n  e\n",
+        ),
+    ];
+    for (virtual_text, edits, expected) in cases {
+        let map = dedent_by_two(virtual_text);
+        assert_eq!(
+            replayed(virtual_text, &map, &edits).as_deref(),
+            Some(expected),
+            "{edits:?} on {virtual_text:?}"
+        );
+    }
+}
+
+/// Random edit sets replayed on a document dedented evenly, without
+/// whitespace-only lines, against the edits applied to P and every line of
+/// text indented: what the host takes there whatever the edits' shape.
+#[test]
+fn random_replayed_edit_sets_give_p_edited_and_indented() {
+    use proptest::prelude::*;
+    const TEXTS: [&str; 9] = ["", "x", "\n", "y\nz", "  ", "q\n", "\nr", "a\n", "\r\n"];
+    let mut runner = property_runner(4000);
+    let mapped = std::cell::Cell::new(0);
+    let strategy = (
+        prop::collection::vec("[a-h =]{1,6}", 2..7),
+        prop::collection::vec((any::<u16>(), any::<u16>(), 0..TEXTS.len()), 1..5),
+    );
+    runner
+        .run(&strategy, |(lines, specs)| {
+            let prepared: String = lines
+                .iter()
+                .map(|line| line.trim_matches(' ').to_string())
+                .filter(|line| !line.is_empty())
+                .map(|line| line + "\n")
+                .collect();
+            if prepared.is_empty() {
+                return Ok(());
+            }
+            let virtual_text: String = prepared.lines().map(|line| format!("  {line}\n")).collect();
+            let map = dedent_by_two(&virtual_text);
+            prop_assert_eq!(map.prepared_text(), prepared.as_str());
+            // Sorted edits apart from one another (touching allowed).
+            let mut cuts: Vec<usize> = specs
+                .iter()
+                .flat_map(|&(a, b, _)| {
+                    [
+                        a as usize % (prepared.len() + 1),
+                        b as usize % (prepared.len() + 1),
+                    ]
+                })
+                .collect();
+            cuts.sort_unstable();
+            let lines_map = LineMap::new(prepared.clone());
+            let edits: Vec<TextEdit> = cuts
+                .chunks(2)
+                .zip(&specs)
+                .map(|(pair, &(_, _, text))| TextEdit {
+                    range: LspRange::new(lines_map.position(pair[0]), lines_map.position(pair[1])),
+                    new_text: TEXTS[text].to_string(),
+                })
+                .collect();
+            let edited = apply_to(&prepared, &edits);
+            let indented: String = edited
+                .split_inclusive(['\n'])
+                .map(|line| {
+                    if line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+                        line.trim_start_matches([' ', '\t']).to_string()
+                    } else {
+                        format!("  {line}")
+                    }
+                })
+                .collect();
+            if let Some(got) = replayed(&virtual_text, &map, &edits) {
+                mapped.set(mapped.get() + 1);
+                let blank_free = |text: &str| -> String {
+                    text.split_inclusive('\n')
+                        .map(|line| {
+                            if line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+                                line.trim_start_matches([' ', '\t']).to_string()
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect()
+                };
+                prop_assert_eq!(blank_free(&got), indented, "{:?} on {:?}", edits, prepared);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(mapped.get() > 2000, "mapped {}", mapped.get());
+}
