@@ -1060,9 +1060,10 @@ impl PreparedMap {
     /// Whether a P range, mapped as ranges are (its start as positions, its
     /// end after any run it ends inside), covers in V exactly the text it
     /// covers in P: no indentation the peer removed, no hidden line nor gap
-    /// text inside it. A range a client edits through in place (a symbol
-    /// renamed where it stands, linked ranges typed into together) is safe
-    /// only so: what it replaces in the host is what the server saw.
+    /// text inside it. A range a client shows as the text an action works
+    /// on (the symbol a rename will replace) or edits through in place
+    /// (linked ranges typed into together) is right only so: what it
+    /// stands for in the host is what the server saw.
     pub(crate) fn range_reads_alike(&self, range: tower_lsp_server::ls_types::Range) -> bool {
         if range.start > range.end {
             return false;

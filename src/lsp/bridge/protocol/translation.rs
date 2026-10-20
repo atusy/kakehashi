@@ -193,11 +193,13 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
     }
 }
 
-/// [`translate_virtual_range_to_host`] for a range a client edits through
-/// in place, keeping its text (a symbol renamed where it stands, linked
-/// ranges typed into together): `false`, with `range` left as it came, when
-/// on a prepared document it would cover other host text than it covers
-/// there (see [`PreparedMap::range_reads_alike`]).
+/// [`translate_virtual_range_to_host`] for a range that stands for its
+/// text: one a client shows as what an action works on (prepareRename's,
+/// which the client highlights and fills the new name in from) or edits
+/// through in place (linked ranges typed into together). `false`, with
+/// `range` left as it came, when on a prepared document it would cover
+/// other host text than it covers there (see
+/// [`PreparedMap::range_reads_alike`]).
 pub(crate) fn translate_editable_virtual_range_to_host(
     range: &mut Range,
     offset: &RegionOffset,

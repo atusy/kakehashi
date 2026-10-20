@@ -174,9 +174,11 @@ fn transform_edits(
 /// - `documentChanges` holds more than one entry with edits for the virtual
 ///   document, or one besides another with edits for the host URI: entries
 ///   apply in order, each to the text the ones before it left, while every
-///   edit of the region maps through its map as the server's text was;
-/// - the region's edits and the host URI's direct ones, in `changes`, would
-///   overlap.
+///   edit of the region maps through its map as the server's text was.
+///
+/// The region's mapped edits and the host URI's direct ones never overlap:
+/// those reaching into the region are refused, and mapped ones stay inside
+/// it, so the two can at most meet at its edges.
 fn transform_prepared_workspace_edit(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,

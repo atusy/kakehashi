@@ -141,8 +141,9 @@ fn transform_prepare_rename_response_to_host(
     };
 
     // Transform range coordinates for variants that contain a Range: the
-    // range the client renames in place, so on a prepared document it must
-    // cover the host text the server saw there; otherwise no answer.
+    // symbol the client shows as what the rename replaces (the rename's own
+    // edit comes with its answer), so on a prepared document it must cover
+    // the host text the server saw there; otherwise no answer.
     let mapped = match &mut prepare_rename {
         PrepareRenameResponse::Range(range)
         | PrepareRenameResponse::RangeWithPlaceholder { range, .. } => {
