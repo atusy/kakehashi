@@ -3695,7 +3695,23 @@ mod tests {
             Tabstop(u8),
             Placeholder(u8, String),
             Choice(u8, Vec<String>),
+            /// Snippet text written as is, unescaped (see [`RAW`]).
+            Raw(&'static str),
         }
+
+        /// Snippet text as servers write it, unescaped: an unbraced tabstop,
+        /// a backslash escaping nothing (text alike for every client), and
+        /// forms clients read apart or not at all (a `$` opening nothing, a
+        /// variable, a mirror or an odd escape in a default, a transform).
+        const RAW: [&str; 7] = [
+            "$1",
+            "\\q",
+            "$",
+            "$TM_X",
+            "${1:$2}",
+            "${1:a\\qb}",
+            "${1/a/b/}",
+        ];
 
         /// Texts the nodes hold: words repeating the generated lines,
         /// spaces, every character the grammar escapes somewhere, and line
@@ -3713,6 +3729,7 @@ mod tests {
 
         fn node() -> impl Strategy<Value = Node> {
             prop_oneof![
+                1 => prop::sample::select(RAW.to_vec()).prop_map(Node::Raw),
                 4 => text().prop_map(Node::Text),
                 2 => (0..3u8).prop_map(Node::Tabstop),
                 2 => (0..3u8, text()).prop_map(|(n, default)| Node::Placeholder(n, default)),
@@ -3738,6 +3755,7 @@ mod tests {
             nodes
                 .iter()
                 .map(|node| match node {
+                    Node::Raw(raw) => raw.to_string(),
                     Node::Text(text) => escape(text, &['$', '}', '\\']),
                     Node::Tabstop(n) => format!("${{{n}}}"),
                     Node::Placeholder(n, default) => {
@@ -3764,7 +3782,8 @@ mod tests {
             let mut finals = 0;
             for node in nodes {
                 match node {
-                    Node::Choice(..) => return false,
+                    Node::Raw("$1" | "\\q") => {}
+                    Node::Raw(_) | Node::Choice(..) => return false,
                     Node::Text(text) if text.contains(['\n', '\r', '\t']) => return false,
                     Node::Placeholder(n, default)
                         if default.contains(['\n', '\r', '\t'])
@@ -3795,6 +3814,11 @@ mod tests {
                 .iter()
                 .map(|node| match node {
                     Node::Text(text) => text.as_str(),
+                    Node::Raw("$1") => match at {
+                        Some((1, typed)) => typed,
+                        _ => defaults.get(&1).copied().unwrap_or(""),
+                    },
+                    Node::Raw(raw) => raw,
                     Node::Tabstop(n) | Node::Placeholder(n, _) | Node::Choice(n, _) => match at {
                         Some((typed_at, typed)) if typed_at == *n => typed,
                         _ => defaults.get(n).copied().unwrap_or(""),
@@ -3804,15 +3828,18 @@ mod tests {
         }
 
         /// `snippet` read back in the shapes [`render`] writes, `$n` too (a
-        /// `$` opens a tabstop, a `\` escapes the next character); `None`
-        /// for anything else.
+        /// `$` opens a tabstop, a `\` escapes `$`, `}` or `\` and is text
+        /// before anything else); `None` for anything else.
         fn parse(snippet: &str) -> Option<Vec<Node>> {
             let mut chars = snippet.chars().peekable();
             let mut nodes = Vec::new();
             let mut text = String::new();
             while let Some(c) = chars.next() {
                 match c {
-                    '\\' => text.push(chars.next()?),
+                    '\\' => match chars.peek() {
+                        Some('$' | '}' | '\\') => text.push(chars.next()?),
+                        _ => text.push('\\'),
+                    },
                     '$' => {
                         if !text.is_empty() {
                             nodes.push(Node::Text(std::mem::take(&mut text)));
@@ -3854,8 +3881,11 @@ mod tests {
         fn skeleton(nodes: &[Node]) -> Vec<Node> {
             nodes
                 .iter()
-                .filter(|node| !matches!(node, Node::Text(_)))
-                .cloned()
+                .filter_map(|node| match node {
+                    Node::Text(_) | Node::Raw("\\q") => None,
+                    Node::Raw("$1") => Some(Node::Tabstop(1)),
+                    other => Some(other.clone()),
+                })
                 .collect()
         }
 
@@ -3937,7 +3967,10 @@ mod tests {
             // for, inserted as is; any other snippet must be one clients
             // expand alike.
             let literal = !snippet.contains(['$', '\\'])
-                || (alike(nodes) && nodes.iter().all(|node| matches!(node, Node::Text(_))));
+                || (alike(nodes)
+                    && nodes
+                        .iter()
+                        .all(|node| matches!(node, Node::Text(_) | Node::Raw("\\q"))));
             prop_assert!(
                 literal || alike(nodes),
                 "kept though clients expand it apart: {:?}",
@@ -3956,6 +3989,12 @@ mod tests {
                     "kept without its edit: {completed:?}"
                 )));
             };
+            // Nothing in a snippet a snippet engine rewrites.
+            prop_assert!(
+                literal || !sent.new_text.contains(['\t', '\n', '\r']),
+                "sent {:?}",
+                sent.new_text
+            );
             let parsed = if literal {
                 Some(vec![Node::Text(sent.new_text.clone())])
             } else {
@@ -3967,6 +4006,7 @@ mod tests {
             let numbers: Vec<Option<(u8, &str)>> = std::iter::once(None)
                 .chain(nodes.iter().filter_map(|node| match node {
                     Node::Tabstop(n) | Node::Placeholder(n, _) => Some(Some((*n, TYPED))),
+                    Node::Raw("$1") => Some(Some((1, TYPED))),
                     _ => None,
                 }))
                 .collect();
