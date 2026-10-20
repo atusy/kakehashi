@@ -950,8 +950,9 @@ export default async () => ({
 kakehashi translates every position and range between the prepared and the
 original document: hovers, definitions, diagnostics, folding ranges and the
 like work as on any document. The edits of completion items, inlay hints,
-color presentations and formatting (including range and on-type
-formatting, and `kakehashi format`) are mapped back too: lines they add
+color presentations, formatting (including range and on-type
+formatting, and `kakehashi format`), renames, code actions (resolved or
+not) and a server's own `workspace/applyEdit` are mapped back too: lines they add
 regain the indentation the prepare server removed, and edits that would reach
 into host text the prepared document does not show are dropped (completion
 snippets are offered only when they are literal text; a formatting result
@@ -960,10 +961,16 @@ compare within the work its size allows, counts as its server failing, and
 `kakehashi format` exits 2 when no other server formats the region; an
 on-type result that cannot be placed is no result, logged at debug). If the
 document is edited while a request is in flight, its answer brings no
-edits: the editor's next request answers for the edited text. Code actions, rename and
-the other edit-producing methods are not available on a prepared document,
-nor is any on a prepared document whose injection is combined from separate
-pieces. Items listed from a prepared document are not resolved further:
+edits: the editor's next request answers for the edited text (a rename
+overtaken so is answered as `ContentModified`, so it can be asked again;
+a server's `workspace/applyEdit` is answered `applied: false`). Linked
+editing ranges and a rename's range are offered only where they cover in
+the host exactly the text the server saw. On a region the prepare server
+dedented unevenly (a line left at its own indentation), a rename or code
+action that adds, removes or rewrites lines is refused. None of the
+edit-producing methods is available on a prepared document whose
+injection is combined from separate pieces. Items listed from a prepared
+document other than code actions are not resolved further:
 `*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
 calls, supertypes and subtypes), return nothing more. A document the server fails to prepare is not sent downstream at
 all; answer `null` to keep a document unchanged.

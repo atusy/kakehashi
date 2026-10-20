@@ -33,8 +33,9 @@ advertises the request; tsudoi-language-server is the intended one, since
 its handlers are user code.
 
 Edits a downstream server makes to a prepared document are mapped back
-through the same map (see Edits); methods whose edits are not mapped that
-way are not available on one (see Coordinates).
+through the same map (see Edits); on a prepared document with gaps, where
+they are not, edit-producing methods are not available (see
+Coordinates).
 
 ### Configuration and Discovery
 
@@ -196,17 +197,16 @@ as a selection lying only in a host prefix is not.
 
 The methods closed to a non-contiguous combined document — codeAction,
 colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
-onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
-prepared one too, as is an inbound `workspace/applyEdit` computed for a
-prepared text, but for completion, inlay hints, color presentations,
-formatting, range formatting and on-type formatting: they stay available on
-a contiguous prepared document, their edits mapped as Edits describes. A
-non-contiguous prepared document (one with gaps) stays closed to all of
-them: on a map with gaps the indentation lines regain is not exact in every
-shape.
-A `*/resolve` envelope minted from a prepared document never resolves,
-nor does a call or type hierarchy item minted from one answer its
-follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
+onTypeFormatting, prepareRename, rangeFormatting, rename — stay available
+on a contiguous prepared document, their edits mapped as Edits describes,
+and so does an inbound `workspace/applyEdit` computed for a prepared text.
+A non-contiguous prepared document (one with gaps) stays closed to all of
+them, and an inbound edit to one is refused: on a map with gaps the
+indentation lines regain is not exact in every shape.
+A `*/resolve` envelope minted from a prepared document never resolves —
+but for a code action's (see Workspace Edits) — nor does a call or type
+hierarchy item minted from one answer its follow-ups
+(`callHierarchy/incomingCalls`, `outgoingCalls`,
 `typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
 not carried.
 
@@ -357,6 +357,80 @@ diff runs where the answer arrives. The budget decides only which answers
 are refused, never what an accepted one writes; a large region heavily
 rewritten may be refused.
 
+### Workspace Edits
+
+A rename's or a code action's workspace edit, and a server's
+`workspace/applyEdit`, are one set of edits per document the client
+applies together. The request's virtual document's edits are **replayed**:
+taken in P's order and grouped where they touch (one ending where the next
+starts, two inserting at one place). A group within one line (neither what
+it replaces nor its text holds a line break) creates no line and regains no
+indentation: it maps as the one edit it makes, keeping its extent, as a
+completion's does — on any region, an unevenly dedented one included. Any
+other group is replayed on the whole lines it reaches (groups whose lines
+meet are one) and diffed there against P exactly as a formatting answer is,
+with its budget and refusals: what it leaves alike stays as the host has it
+(a whitespace line's whitespace, a line the peer left alone), and its new
+lines regain the content's indentation. Such a group is refused, with the
+whole edit, on a region the peer dedented unevenly, as a formatting answer
+is. Groups are diffed apart, never as one text: a whole-text diff could move
+a change onto another line reading the same in P (the first of two alike
+lines deleted, a whitespace line below the second going with it), against
+what the edits state. The mapped set is then checked as a whole, as above.
+Annotated edits, which must keep their identity and count, keep their
+extents one by one.
+
+The choice was made on an exact-text property built without the map:
+documents generated as lines of text over one indentation (some left at
+column 0, blank lines emptied or kept, LF and CRLF), edits as a server
+sends them for a rename, an import with a rename, a block wrapped or
+unwrapped (the header and the first indent one edit or two, blank lines in
+the block left alone), a line deleted, each also as one edit rewriting the
+whole document; the expected host text is the same change made to those
+lines. Its default run (6000 cases) gives, on evenly dedented documents:
+replayed, 1835 exact, none wrong or refused; each edit keeping its extent,
+318 wrong (every whole-document form rewriting a blank or left-alone line
+as created) and 8 refused (touching edits at a line start); diffed as one
+whole text, 2 wrong (a blank line deleted by name, the diff picking another
+P shows alike). On unevenly dedented documents replay maps every in-line
+change and refuses every one reaching across lines; extent maps many of
+those, but is wrong on 548. Which of several blank lines alike a whole
+document rewritten deletes no edit of that shape tells, and is left out.
+
+Beside the region's edits, the edit is refused whole when it cannot be read
+as one set of host edits: an edit made to the host URI directly reaching
+into the region's host text (meeting it at an edge is not reaching in) —
+it never went through the map, so nothing keeps it off the text P hides,
+nor tells which text it was computed on; more than one `documentChanges`
+entry with edits for the virtual document, or one beside an entry with
+edits for the host URI — entries apply in turn, each to the text the ones
+before left, while the region's edits map as the server's text was. A file
+operation on a virtual document refuses the whole edit, and other regions'
+virtual documents are dropped, as on any document.
+
+prepareRename's range, which the client shows as what a rename replaces,
+and linked editing ranges, which it types into together, are offered only
+where they cover in the host exactly the text they cover in P (no removed
+indentation, no hidden line inside): otherwise no answer (for linked
+ranges, none of them).
+
+A code action's diagnostics and range go host to V to P as positions do. A
+lazy action from a prepared document is resolved through the map its
+server holds when it is picked, only while it holds the very text the
+action was listed on: its envelope records that text's generation (not the
+map); the reply must be computed on that text (noted, with the map, as the
+resolve is queued, and unchanged as it answers), and the final check below
+must hold for the region. Otherwise the action comes back unresolved. For
+an editor that cannot resolve actions, they are resolved within the list
+request, through its map, the same way.
+
+A server's `workspace/applyEdit` maps through the map of the text its
+connection held as the request was read: a text recorded after that is
+not the one the edit was computed on, and the edit is refused; so is a
+versioned edit naming another version than the one its connection was
+sent. Decided at once, never waited on: refused, the server is answered
+`applied: false` with the reason, and the editor is never asked.
+
 An answer's edits are mapped only while they would land where the server
 meant them. This is read where an answer is chosen, not as each reply
 arrives: the servers' fan-in or the layer race can hold an answer while
@@ -390,8 +464,8 @@ The answer is checked against:
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
   host's newer text waits for its prepare answer — dropped, but for the
-  formatting methods and color presentations, which wait for that to
-  clear (see below);
+  formatting methods, renames and color presentations, which wait for
+  that to clear (see below);
 - the peer failed the request's input (see Failure; a reply arriving
   after that is refused whole, and one the failure lands under keeps no
   edit) — dropped;
@@ -404,15 +478,22 @@ The answer is checked against:
   region rerouted to another language) — dropped.
 
 Dropped, completion answers nothing (an empty incomplete list when it
-asked to re-query), color presentations answer nothing, and inlay hints
-stay shown without their edits. Formatting reads whether the host moved
+asked to re-query), color presentations answer nothing, inlay hints
+stay shown without their edits, code actions answer without the stale
+region's actions (the host layer's and other regions' stay), and linked
+editing ranges answer nothing: asked again as the caret moves, none of
+them waits. A rename comes once per action, like formatting: it waits as
+formatting does (below), and dropped, it is answered as `ContentModified`,
+so that it is asked again rather than read as nothing to rename.
+prepareRename's range is display only, and its server's own rename is
+what is checked. Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
 fan-in would fall through to a server ranked below it whose reply came
-once the host settled. Nor do formatting and color presentations drop an answer for the host's
+once the host settled. Nor do formatting, renames and color presentations drop an answer for the host's
 last edit not having settled yet, or a region held for its prepare answer:
-formatting, range and on-type formatting each come once per action (an
-on-type trigger, a save), and a color presentation once per picker
+formatting, range and on-type formatting and renames each come once per
+action (an on-type trigger, a save, a rename), and a color presentation once per picker
 interaction, so an answer dropped for that would not be asked again. The final check waits, as a request waits for its text (up to the
 prepare timeout), until the edit settles and the hold clears, then judges
 the answer as above; the host edited meanwhile, it is dropped at once as
@@ -466,10 +547,11 @@ host has and P never showed. Completion answers dropped this way come back
 as an empty incomplete list, which the client asks again for, and inlay
 hints stay shown with only their edits stripped: the answer for the latest
 text still arrives, the cost availability (an answer within a keystroke's
-parse and prepare round-trip), never a misplaced edit. Color presentations
-are asked once per picker interaction, and the formatting methods once per
-action: they wait for the host to settle instead, as the final check
-described above does.
+parse and prepare round-trip), never a misplaced edit; code actions and
+linked editing ranges, asked again as the caret moves, likewise. Color
+presentations are asked once per picker interaction, and the formatting
+methods and renames once per action: they wait for the host to settle
+instead, as the final check described above does.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
@@ -710,8 +792,8 @@ a hook per kind of change.
   (tsudoi handlers) instead of kakehashi and its query vocabulary.
 - Read-only features — hover, definitions, diagnostics, folding, inlay
   hints — work on embedded code its servers could not parse as written.
-- So do completion and formatting, their edits placed back with the
-  indentation the peer removed.
+- So do completion, formatting, rename and code actions, their edits
+  placed back with the indentation the peer removed.
 
 ### Negative
 
@@ -720,12 +802,27 @@ a hook per kind of change.
 - With experimental features on, a language's first document waits for its
   servers' handshakes to learn whether any prepares it, even when none
   does.
-- Edit-producing methods other than completion, inlay hints, color
-  presentations and the formatting methods (code actions, rename and the
-  others listed in Coordinates) and inbound `workspace/applyEdit` are not
-  available on prepared documents, nor is any on a prepared document with
-  gaps; completion items there are snippets only as literal text, and are
-  not resolved.
+- No edit-producing method (those listed in Coordinates) nor inbound
+  `workspace/applyEdit` is available on a prepared document with gaps;
+  completion items are snippets only as literal text, and are not
+  resolved.
+- A rename's or code action's edit adding, removing or rewriting lines on a
+  region the peer dedented unevenly is refused whole (in-line edits, a
+  rename's, still map): the property above refuses every such change
+  there, where mapping each edit keeping its extent would map many of them
+  rightly but none of the whole-document forms.
+- A workspace edit editing the host document directly inside a prepared
+  region, or ordering its region's edits after other host entries, is
+  refused; edits a server makes to another region's virtual document are
+  dropped, as on any document.
+- An unversioned `workspace/applyEdit` computed on a text before one
+  already sent but not yet read by its server (no notification is
+  acknowledged) maps through the newer text's map: nothing tells the two
+  apart. A versioned edit is refused instead, as on any document, where a
+  stale unversioned edit lands as stale.
+- A lazy code action whose server was sent another text since it was
+  listed (a re-prepare, an edit) resolves to nothing; it is listed again on
+  the next request.
 - A formatting answer whose diff runs out of its work budget is refused, so a
   large region heavily reformatted may be left as it is (counted a failure
   by `kakehashi format`). The common case costs work linear in the region:
