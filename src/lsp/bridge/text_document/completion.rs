@@ -1616,7 +1616,8 @@ mod tests {
         #[case] snippet: &str,
         #[case] sent: Option<&str>,
     ) {
-        // A blank line among dedented ones, with a textEdit and without.
+        // A blank line among dedented ones, with a textEdit, an insertText
+        // or only a label.
         let offset = dedented_offset("  a\n\n  b\n");
         for completed in [
             json!({"label": "x", "insertTextFormat": 2, "textEdit": {
@@ -1624,6 +1625,7 @@ mod tests {
                 "newText": snippet
             }}),
             json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+            json!({"label": snippet, "insertTextFormat": 2}),
         ] {
             let mut transformed = item(completed.clone());
             let kept = transform_completion_item(
