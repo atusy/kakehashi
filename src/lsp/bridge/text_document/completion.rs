@@ -1607,6 +1607,7 @@ mod tests {
     /// tabstop.
     #[rstest]
     #[case::tabstop("$1", None)]
+    #[case::braced_tabstop("${1}", None)]
     #[case::final_tabstop("$0", None)]
     #[case::space_default("${1: }", None)]
     #[case::text_after("$1x", Some("  $1x"))]
@@ -1615,20 +1616,25 @@ mod tests {
         #[case] snippet: &str,
         #[case] sent: Option<&str>,
     ) {
-        // A blank line among dedented ones.
+        // A blank line among dedented ones, with a textEdit and without.
         let offset = dedented_offset("  a\n\n  b\n");
-        let mut completed = item(json!({"label": "x", "insertTextFormat": 2, "textEdit": {
-            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
-            "newText": snippet
-        }}));
-        let kept = transform_completion_item(
-            &mut completed,
-            &offset,
-            Position::new(13, 0),
-            Some(Position::new(11, 0)),
-            ClientInsertMode::default(),
-        );
-        assert_eq!(kept.then(|| sent_text(&completed)), sent);
+        for completed in [
+            json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+                "newText": snippet
+            }}),
+            json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+        ] {
+            let mut transformed = item(completed.clone());
+            let kept = transform_completion_item(
+                &mut transformed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                ClientInsertMode::default(),
+            );
+            assert_eq!(kept.then(|| sent_text(&transformed)), sent, "{completed}");
+        }
     }
 
     /// Without a textEdit, a snippet inserted at a caret regaining an
@@ -1910,6 +1916,56 @@ mod tests {
             Some(Position::new(10, 7)),
             ClientInsertMode::default(),
         ));
+    }
+
+    /// Unprepared, a snippet goes as the server sent it, its ranges
+    /// translated only, whatever it holds and the client declares: no
+    /// expansion, no indent, no insert mode set, a variable refused only
+    /// where a prefixed line would take its expansion.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    fn an_unprepared_snippet_goes_as_the_server_sent_it(#[case] insert_mode: ClientInsertMode) {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextFormat, Range};
+        let offset = RegionOffset::new(10, 2);
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        for (snippet, text_edit) in [
+            ("do\n\t${1:body}\n$0end", true),
+            ("{\n$0\n}", true),
+            ("\tf(${1|a,b|})$0$0", true),
+            ("f(${1:x})$0", false),
+            ("cost: $ ${1:a\\qb}", false),
+        ] {
+            let mut completed = item(if text_edit {
+                json!({"label": "s", "insertTextFormat": 2, "textEdit": {
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+                    "newText": snippet
+                }})
+            } else {
+                json!({"label": "s", "insertTextFormat": 2, "insertText": snippet})
+            });
+            let came = completed.clone();
+            assert!(transform(&mut completed), "{snippet:?}");
+            let mut expected = came;
+            if let Some(CompletionTextEdit::Edit(edit)) = &mut expected.text_edit {
+                edit.range = Range::new(Position::new(11, 0), Position::new(11, 0));
+            }
+            assert_eq!(completed, expected, "{snippet:?}");
+            assert_eq!(completed.insert_text_mode, None);
+            assert_eq!(
+                completed.insert_text_format,
+                Some(InsertTextFormat::SNIPPET)
+            );
+        }
     }
 
     /// An insert/replace snippet maps through both ranges as its expansion,

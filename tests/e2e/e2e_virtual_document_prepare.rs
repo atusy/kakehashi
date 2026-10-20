@@ -1618,6 +1618,52 @@ fn without_experimental_features_formatting_answers_as_unprepared() {
 }
 
 #[test]
+fn without_experimental_features_snippet_completions_go_as_the_server_sent_them() {
+    // Nothing is prepared: a snippet keeps its text and insert mode
+    // whatever the editor declares, its range translated only.
+    for capabilities in [
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true,
+            "insertTextModeSupport": { "valueSet": [1, 2] }
+        }}}}),
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true
+        }}}}),
+    ] {
+        let (mut client, _dir) = Setup {
+            capabilities,
+            experimental: false,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/flag-off-snippet.md";
+        let text = "# t\n\n```lua\n  local SNIPPET_EDIT = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 24 } }),
+        );
+        let at = json!({
+            "start": { "line": 3, "character": 24 },
+            "end": { "line": 3, "character": 24 }
+        });
+        assert_eq!(
+            response["result"]["items"],
+            json!([
+                {"label": "call", "insertTextFormat": 2, "textEdit": {
+                    "range": at, "newText": "f(${1:x})$0"
+                }},
+                {"label": "block", "insertTextFormat": 2, "textEdit": {
+                    "range": at, "newText": "do\n\t${1:body}\n$0end"
+                }}
+            ]),
+            "{response}"
+        );
+    }
+}
+
+#[test]
 fn without_experimental_features_nothing_is_prepared() {
     // The peer advertises the request and is configured to prepare lua, but
     // with experimental features off it is never asked: the document goes
