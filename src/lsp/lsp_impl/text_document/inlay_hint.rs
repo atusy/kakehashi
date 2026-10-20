@@ -15,16 +15,21 @@
 //! forwards to the exact producing connection, and re-checks the content
 //! version and host incarnation after the response.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, NumberOrString, Range, Uri};
 
 use super::super::Kakehashi;
 use super::super::region_offset::resolve_region_offset;
 use crate::lsp::aggregation::server::{
-    FanInResult, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    FanInResult, FanOutTask, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    dispatch_preferred_with_tokens, mint_region_progress_source,
 };
 use crate::lsp::bridge::{
-    HostDocument, InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
+    ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument,
+    InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
     extract_inlay_hint_envelope,
 };
 use crate::lsp::current_upstream_id;
@@ -175,14 +180,43 @@ impl Kakehashi {
         let (cancel_rx, _cancel_guard) =
             self.subscribe_cancel(first.document.upstream_request_id.as_ref());
 
+        // The editor's work-done progress spans the whole request: ONE
+        // aggregator and ONE teardown guard, with each region's tracked
+        // source minted into it, so the aggregator's winner rule shows one
+        // `Begin → … → End` and the synthetic terminal `End` fires only after
+        // every region settled (ls-bridge-client-progress). `None` when the
+        // request carries no `workDoneToken`.
+        let pool = self.bridge.pool_arc();
+        let shared_progress = client_progress_token.map(|client_token| {
+            (
+                Arc::new(Mutex::new(ClientProgressAggregator::new(client_token))),
+                Arc::clone(pool.client_progress_registry()),
+            )
+        });
+        let mut minted = Vec::new();
+        let regions: Vec<_> = contexts
+            .into_iter()
+            .map(|ctx| {
+                let tokens = shared_progress.as_ref().and_then(|(aggregator, registry)| {
+                    mint_region_progress_source(&ctx.document, registry, aggregator)
+                });
+                if let Some(tokens) = &tokens {
+                    minted.extend(tokens.values().cloned());
+                }
+                (ctx, tokens)
+            })
+            .collect();
+        let progress_guard = shared_progress.map(|(aggregator, registry)| {
+            ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx())
+        });
+
         // The regions are independent documents, so they are asked at once;
-        // `join_all` keeps document order. The work-done progress token is
-        // single-use, so only the first region carries it.
-        let mut progress_token = client_progress_token;
-        let walk = futures::future::join_all(contexts.into_iter().map(|mut ctx| {
-            ctx.document.client_progress_token = progress_token.take();
-            self.dispatch_virt_region_inlay_hint(ctx, revision)
-        }));
+        // `join_all` keeps document order.
+        let walk = futures::future::join_all(
+            regions
+                .into_iter()
+                .map(|(ctx, tokens)| self.dispatch_virt_region_inlay_hint(ctx, tokens, revision)),
+        );
         let result = match cancel_rx {
             Some(rx) => tokio::select! {
                 biased;
@@ -191,6 +225,10 @@ impl Kakehashi {
             },
             None => merge_region_results(walk.await),
         };
+        // Every region settled (or the walk was cancelled and dropped them):
+        // end the editor's progress now, before the no-result log, in the
+        // order a single dispatch tears its own guard down.
+        drop(progress_guard);
 
         result
             .handle(&self.notifier(), "inlay hint", None, Ok)
@@ -198,40 +236,44 @@ impl Kakehashi {
     }
 
     /// Fan `textDocument/inlayHint` out across the servers bridging ONE
-    /// injection region (`preferred`). Cancellation is held by the caller for
-    /// the whole multi-region walk.
+    /// injection region (`preferred`). Cancellation and the client-progress
+    /// teardown are held by the caller for the whole multi-region walk;
+    /// `progress_tokens` routes this region's tracked source into the
+    /// request's shared aggregator.
     async fn dispatch_virt_region_inlay_hint(
         &self,
         ctx: RangeRequestContext,
+        progress_tokens: Option<HashMap<String, NumberOrString>>,
         revision: crate::lsp::bridge::HostRevision,
     ) -> FanInResult<Option<Vec<InlayHint>>> {
         let pool = self.bridge.pool_arc();
         let range = ctx.range;
-        dispatch_preferred(
-            &ctx.document,
-            pool,
-            |t| async move {
-                t.pool
-                    .send_inlay_hint_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        range,
-                        t.region_end(),
-                        &t.injection_language,
-                        &t.region_id,
-                        t.offset,
-                        &t.virtual_content,
-                        revision,
-                        t.upstream_id,
-                        t.client_progress_token,
-                    )
+        let send = |t: FanOutTask| async move {
+            t.pool
+                .send_inlay_hint_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    range,
+                    t.region_end(),
+                    &t.injection_language,
+                    &t.region_id,
+                    t.offset,
+                    &t.virtual_content,
+                    revision,
+                    t.upstream_id,
+                    t.client_progress_token,
+                )
+                .await
+        };
+        let is_nonempty = |opt: &Option<Vec<InlayHint>>| matches!(opt, Some(v) if !v.is_empty());
+        match progress_tokens {
+            Some(tokens) => {
+                dispatch_preferred_with_tokens(&ctx.document, pool, send, is_nonempty, None, tokens)
                     .await
-            },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            None,
-        )
-        .await
+            }
+            None => dispatch_preferred(&ctx.document, pool, send, is_nonempty, None).await,
+        }
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {

@@ -1257,3 +1257,56 @@ fn e2e_inlay_hint_range_starting_before_regions_covers_every_intersected_region(
 
     shutdown_client(&mut client);
 }
+
+/// The editor's work-done progress covers the whole request: every region
+/// routes its downstream's progress into the one lifecycle on the editor's
+/// token, so the progress ends only once every region settles rather than
+/// when the first one does.
+#[test]
+fn e2e_inlay_hint_work_done_progress_spans_every_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal y = 2\n```\n"
+        }}),
+    );
+    inlay_hints_with_retry(&mut client, uri, 3, 4);
+    inlay_hints_with_retry(&mut client, uri, 9, 10);
+
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 11, "character": 0 }
+            },
+            "workDoneToken": "editor-inlay-progress"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let hints = response["result"]
+        .as_array()
+        .expect("hints for both regions");
+    assert_eq!(hints.len(), 2, "{response}");
+    for hint in hints {
+        let token = &hint["data"]["kakehashi"]["inner"]["receivedWorkDoneToken"];
+        assert!(
+            token.is_string() || token.is_number(),
+            "every region's downstream must get a bridge progress token: {hint}"
+        );
+        assert_ne!(
+            token,
+            &json!("editor-inlay-progress"),
+            "the downstream gets a bridge token, not the editor's"
+        );
+    }
+
+    shutdown_client(&mut client);
+}

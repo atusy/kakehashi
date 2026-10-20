@@ -2077,7 +2077,8 @@ fn main() {
                             json!({
                                 "mock": "hint-1",
                                 "uri": uri,
-                                "receivedRange": message.pointer("/params/range")
+                                "receivedRange": message.pointer("/params/range"),
+                                "receivedWorkDoneToken": message.pointer("/params/workDoneToken")
                             })
                         };
                         json!([{
