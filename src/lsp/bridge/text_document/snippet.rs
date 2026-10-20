@@ -159,6 +159,11 @@ impl Expansion {
         &self.text
     }
 
+    /// The snippet itself.
+    pub(super) fn snippet(&self) -> &str {
+        &self.snippet
+    }
+
     /// Whether the snippet breaks a line where it is inserted (a client may
     /// re-indent such a snippet's lines whatever the item asks, see the
     /// caller).

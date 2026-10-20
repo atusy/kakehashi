@@ -615,6 +615,14 @@ fn transform_prepared_completion_item(
             let Some(snippet) = expansion.carry(mapped) else {
                 return false;
             };
+            // A snippet engine may turn the tabs of a snippet into spaces
+            // (Neovim's, with `expandtab`): an indent of tabs written in
+            // goes only to a client inserting as is when told to.
+            if insert_mode != ClientInsertMode::AsIsSettable
+                && snippet.matches('\t').count() != expansion.snippet().matches('\t').count()
+            {
+                return false;
+            }
             *mapped = snippet;
         }
         if let Some(sent) = insert_text_sent {
@@ -1577,6 +1585,57 @@ mod tests {
 
     /// Without a textEdit, a snippet inserted at a caret regaining an
     /// indent goes out as that edit, the snippet in it.
+    /// A tab indent the map writes into a snippet reaches only a client
+    /// inserting as is when told to: Neovim's snippet engine turns a
+    /// snippet's tabs into spaces under `expandtab`, which may not reach the
+    /// tab's column.
+    #[test]
+    fn a_tab_indent_written_into_a_snippet_goes_only_to_a_client_inserting_as_is() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::CompletionTextEdit;
+        // `\ta\n\n\tb\n`, dedented by a tab; the caret on the blank line.
+        let virtual_text = "\ta\n\n\tb\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let transform = |completed: &mut CompletionItem, insert_mode| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        let snippet = json!({"label": "f", "insertTextFormat": 2, "insertText": "f(${1:x})$0"});
+        let mut settable = item(snippet.clone());
+        assert!(transform(&mut settable, ClientInsertMode::AsIsSettable));
+        let Some(CompletionTextEdit::Edit(edit)) = &settable.text_edit else {
+            panic!("made an edit: {settable:?}");
+        };
+        assert_eq!(edit.new_text, "\tf(${1:x})$0");
+        for insert_mode in [ClientInsertMode::AsIs, ClientInsertMode::AdjustsIndentation] {
+            assert!(
+                !transform(&mut item(snippet.clone()), insert_mode),
+                "{insert_mode:?}"
+            );
+        }
+        // A literal one goes out as plain text, which no engine rewrites.
+        let mut literal = item(json!({"label": "f", "insertTextFormat": 2, "insertText": "f()"}));
+        assert!(transform(&mut literal, ClientInsertMode::AsIs));
+        assert_eq!(sent_text(&literal), "\tf()");
+    }
+
     #[test]
     fn an_implicit_snippet_made_an_edit_keeps_its_tabstops() {
         use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextFormat};
