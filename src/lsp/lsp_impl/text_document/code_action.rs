@@ -41,6 +41,11 @@ use crate::lsp::bridge::{
 
 const METHOD: &str = "textDocument/codeAction";
 
+/// A layer's actions, part by part: each region's (or the host layer's),
+/// with the prepared region it was mapped through, if any, for the final
+/// check.
+type ActionParts = Vec<(CodeActionResponse, Option<Sourced<()>>)>;
+
 /// Why [`Kakehashi::code_action_region_end_if_fresh`] produced no region end,
 /// so the caller logs staleness once and skips it for already-warned
 /// malformed envelopes.
@@ -98,7 +103,7 @@ impl Kakehashi {
             let actions = self
                 .code_action_host_layer(&lsp_uri, raw_params, upstream_caps)
                 .await?;
-            Ok(actions.map(|actions| (actions, Vec::new())))
+            Ok(actions.map(|actions| vec![(actions, None)]))
         };
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
@@ -112,33 +117,37 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |(actions, _): &(CodeActionResponse, Vec<Sourced<()>>)| !actions.is_empty(),
-                |(mut actions, mut sources), (next, next_sources)| {
-                    actions.extend(next);
-                    sources.extend(next_sources);
-                    (actions, sources)
+                |parts: &ActionParts| parts.iter().any(|(actions, _)| !actions.is_empty()),
+                |mut parts: ActionParts, next| {
+                    parts.extend(next);
+                    parts
                 },
             )
             .await;
-        // The final answer chosen: the edits of every prepared region's
-        // actions checked once more against the host text, which may have
-        // moved while it was held. Asked again as the caret moves, like
-        // completion: a stale answer is none, not waited on.
+        // The final answer chosen: each prepared region's actions checked
+        // once more against the host text, which may have moved while they
+        // were held. Asked again as the caret moves, like completion: a
+        // stale region's actions are dropped, not waited on; the others (the
+        // host layer's, an unprepared region's, a current one's) stay.
         let pool = self.bridge.pool();
         let tracker = self.bridge.node_tracker();
         let result = result.map(|answer| {
-            answer.and_then(|(actions, sources)| {
-                let current = sources.iter().all(|source| {
-                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-                });
-                if !current {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "codeAction result for {} dropped: a prepared virtual document it was mapped through is no longer the host's text",
-                        lsp_uri.as_str()
-                    );
+            answer.and_then(|parts| {
+                let mut kept: CodeActionResponse = Vec::new();
+                for (actions, source) in parts {
+                    if source.is_none_or(|source| {
+                        source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+                    }) {
+                        kept.extend(actions);
+                    } else {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
+                            lsp_uri.as_str()
+                        );
+                    }
                 }
-                current.then_some(actions)
+                (!kept.is_empty()).then_some(kept)
             })
         });
         // Collapse the cross-source isPreferred collision on the FINAL menu,
@@ -337,6 +346,9 @@ impl Kakehashi {
         self.document_revision_is_current(host_url, envelope.content_version)
             && self.host_incarnation_is_current(host_url, envelope.incarnation)
             && (envelope.is_host_layer()
+                // Minted from a prepared document, it was mapped through
+                // the map its server held, checked as it answered.
+                || envelope.offset.prepared
                 || !self.bridge.region_coordinates_may_be_prepared(
                     host_url,
                     &envelope.injection_language,
@@ -406,13 +418,29 @@ impl Kakehashi {
         // Re-resolve the region from the LIVE parse (the same construction the
         // goto/showDocument/applyEdit offset paths use), yielding the current
         // per-line offset and the exact mapped host end.
-        let (live_offset, region_end, contiguous, live_language) = resolve_region_offset(
-            &self.documents,
-            &self.language,
-            &self.bridge,
-            host_url,
-            &envelope.region_id,
-        )?;
+        // An action minted from a prepared document is mapped through the
+        // map its server holds as it resolves (see the bridge's resolve):
+        // only the region's geometry is compared here. Any other must find
+        // the region as is.
+        let (live_offset, region_end, contiguous, live_language) = if envelope.offset.prepared {
+            super::super::region_offset::resolved_region_geometry(
+                super::super::region_offset::resolve_region(
+                    &self.documents,
+                    &self.language,
+                    &self.bridge,
+                    host_url,
+                    &envelope.region_id,
+                )?,
+            )
+        } else {
+            resolve_region_offset(
+                &self.documents,
+                &self.language,
+                &self.bridge,
+                host_url,
+                &envelope.region_id,
+            )?
+        };
         // The action may have been created while a single combined capture was
         // contiguous, then resolved after another capture introduced a masked
         // host gap. The stable first-region ID/offset alone cannot detect that
@@ -432,7 +460,12 @@ impl Kakehashi {
         // per-line column offset (e.g. a blockquote-prefix edit that left the
         // start line intact) would translate the resolved edit to wrong host
         // columns. Fail soft on any divergence.
-        if !envelope.offset.describes(&live_offset) {
+        let describes = if envelope.offset.prepared {
+            crate::lsp::bridge::RegionOffset::from(&envelope.offset) == live_offset
+        } else {
+            envelope.offset.describes(&live_offset)
+        };
+        if !describes {
             return None;
         }
         Some(region_end)
@@ -446,7 +479,7 @@ impl Kakehashi {
         context: CodeActionContext,
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
-    ) -> Result<Option<(CodeActionResponse, Vec<Sourced<()>>)>> {
+    ) -> Result<Option<ActionParts>> {
         // Before the text is read: see `Sourced::from_region`.
         let prepared_revision = self.prepared_request_revision(lsp_uri);
         // EVERY injection region the range overlaps (usually one). A range
@@ -491,10 +524,9 @@ impl Kakehashi {
 
         let mut progress_token = client_progress_token;
         let walk = async {
-            let mut merged: CodeActionResponse = Vec::new();
-            // Where each region's actions were mapped through, for the final
-            // check.
-            let mut sources = Vec::new();
+            // Each region's actions, with where they were mapped through
+            // when prepared, for the final check.
+            let mut parts: ActionParts = Vec::new();
             for mut ctx in contexts {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
@@ -508,15 +540,15 @@ impl Kakehashi {
                     .dispatch_virt_region_code_action(ctx, &context, upstream_caps, revision)
                     .await?
                 {
-                    merged.extend(actions);
                     // An unprepared region's actions are current as they
                     // are: nothing kept for them.
-                    if source.is_prepared() {
-                        sources.push(source);
-                    }
+                    parts.push((actions, source.is_prepared().then_some(source)));
                 }
             }
-            Ok((!merged.is_empty()).then_some((merged, sources)))
+            Ok(parts
+                .iter()
+                .any(|(actions, _)| !actions.is_empty())
+                .then_some(parts))
         };
 
         // Cancel aborts the walk (dropping the in-flight region's dispatch) and
