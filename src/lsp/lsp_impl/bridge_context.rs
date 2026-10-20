@@ -1855,16 +1855,6 @@ impl Kakehashi {
             return Vec::new();
         };
 
-        let regions = crate::language::InjectionResolver::resolve_all(
-            &self.language,
-            self.bridge.node_tracker(),
-            &uri,
-            snapshot.tree(),
-            snapshot.text(),
-            injection_query.as_ref(),
-            snapshot.incarnation(),
-        );
-
         // One upstream request ID for the whole scan: every overlapping
         // region's context shares it — with the OTHER layers too, so nothing
         // in the virt walk may wipe the registry for it; `run_layer_race`'s
@@ -1884,6 +1874,23 @@ impl Kakehashi {
         let Some(range) = normalize_range_endpoints(&mapper, range) else {
             return Vec::new();
         };
+        // Only the regions the range can touch are materialized (virtual
+        // content, offsets, region id): a visible-range request over a
+        // document with many injections pays for the few it covers. The exact
+        // per-region intersection is still `clamp_range_to_region` below.
+        let host_bytes = mapper.position_to_byte_clamped(range.start)
+            ..mapper.position_to_byte_clamped(range.end);
+        let regions = crate::language::InjectionResolver::resolve_intersecting(
+            &self.language,
+            self.bridge.node_tracker(),
+            &uri,
+            snapshot.tree(),
+            snapshot.text(),
+            injection_query.as_ref(),
+            snapshot.incarnation(),
+            host_bytes,
+        );
+
         let mut contexts = Vec::new();
         for resolved in regions {
             if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
