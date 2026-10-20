@@ -27,7 +27,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
-use super::super::bridge_context::RangeRequestContext;
+use super::super::bridge_context::{RangeRequestContext, Sourced};
 use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
 use crate::lsp::aggregation::server::{
@@ -94,7 +94,12 @@ impl Kakehashi {
 
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
-        let host = self.code_action_host_layer(&lsp_uri, raw_params, upstream_caps);
+        let host = async {
+            let actions = self
+                .code_action_host_layer(&lsp_uri, raw_params, upstream_caps)
+                .await?;
+            Ok(actions.map(|actions| (actions, Vec::new())))
+        };
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
         // non-empty layer; `concatenated` merges every layer's actions in priority
@@ -107,13 +112,35 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |actions: &CodeActionResponse| !actions.is_empty(),
-                |mut acc: CodeActionResponse, next| {
-                    acc.extend(next);
-                    acc
+                |(actions, _): &(CodeActionResponse, Vec<Sourced<()>>)| !actions.is_empty(),
+                |(mut actions, mut sources), (next, next_sources)| {
+                    actions.extend(next);
+                    sources.extend(next_sources);
+                    (actions, sources)
                 },
             )
             .await;
+        // The final answer chosen: the edits of every prepared region's
+        // actions checked once more against the host text, which may have
+        // moved while it was held. Asked again as the caret moves, like
+        // completion: a stale answer is none, not waited on.
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        let result = result.map(|answer| {
+            answer.and_then(|(actions, sources)| {
+                let current = sources.iter().all(|source| {
+                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+                });
+                if !current {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "codeAction result for {} dropped: a prepared virtual document it was mapped through is no longer the host's text",
+                        lsp_uri.as_str()
+                    );
+                }
+                current.then_some(actions)
+            })
+        });
         // Collapse the cross-source isPreferred collision on the FINAL menu,
         // regardless of the cross-layer strategy: WITHIN-layer concatenation can
         // merge several servers' actions into one layer even when the cross-layer
@@ -419,7 +446,9 @@ impl Kakehashi {
         context: CodeActionContext,
         client_progress_token: Option<NumberOrString>,
         upstream_caps: UpstreamCodeActionCaps,
-    ) -> Result<Option<CodeActionResponse>> {
+    ) -> Result<Option<(CodeActionResponse, Vec<Sourced<()>>)>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let prepared_revision = self.prepared_request_revision(lsp_uri);
         // EVERY injection region the range overlaps (usually one). A range
         // spanning several fences dispatches to each and the results are merged
         // into one menu (#628 multi-region), in document order. Latency scales
@@ -463,17 +492,31 @@ impl Kakehashi {
         let mut progress_token = client_progress_token;
         let walk = async {
             let mut merged: CodeActionResponse = Vec::new();
+            // Where each region's actions were mapped through, for the final
+            // check.
+            let mut sources = Vec::new();
             for mut ctx in contexts {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
+                let source = Sourced::from_region(
+                    &ctx.document,
+                    (),
+                    self.bridge.node_tracker(),
+                    prepared_revision,
+                );
                 if let Some(actions) = self
                     .dispatch_virt_region_code_action(ctx, &context, upstream_caps, revision)
                     .await?
                 {
                     merged.extend(actions);
+                    // An unprepared region's actions are current as they
+                    // are: nothing kept for them.
+                    if source.is_prepared() {
+                        sources.push(source);
+                    }
                 }
             }
-            Ok((!merged.is_empty()).then_some(merged))
+            Ok((!merged.is_empty()).then_some((merged, sources)))
         };
 
         // Cancel aborts the walk (dropping the in-flight region's dispatch) and
