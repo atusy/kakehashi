@@ -78,7 +78,10 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 /// edits are mapped back through the prepared map
 /// (`translate_virtual_text_edits_to_host` and
 /// `translate_virtual_text_edit_to_host` for edits keeping their extents,
-/// `translate_virtual_formatting_edits_to_host` for a formatter's answer).
+/// `translate_virtual_formatting_edits_to_host` for a formatter's answer,
+/// `translate_virtual_replayed_edits_to_host` for a workspace edit), or the
+/// ranges a client edits through in place must read alike in the host
+/// (`translate_editable_virtual_range_to_host`, prepareRename's).
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
@@ -87,7 +90,9 @@ fn method_maps_prepared_edits(method: &str) -> bool {
             | "textDocument/formatting"
             | "textDocument/inlayHint"
             | "textDocument/onTypeFormatting"
+            | "textDocument/prepareRename"
             | "textDocument/rangeFormatting"
+            | "textDocument/rename"
     )
 }
 
@@ -3377,10 +3382,11 @@ mod tests {
                 .ok()
                 .flatten()
         };
-        for method in ["textDocument/rename", "textDocument/codeAction"] {
+        for method in ["textDocument/codeAction"] {
             assert!(for_method(method).await.is_none(), "{method} closes");
         }
         for method in [
+            "textDocument/rename",
             "textDocument/inlayHint",
             "textDocument/completion",
             "textDocument/formatting",
@@ -3554,12 +3560,7 @@ mod tests {
         // Every edit method whose edits are not mapped back stays closed
         // (inbound applyEdit is refused on its own path: the region's offset
         // carries a map).
-        for method in [
-            "textDocument/rename",
-            "textDocument/codeAction",
-            "textDocument/prepareRename",
-            "textDocument/linkedEditingRange",
-        ] {
+        for method in ["textDocument/codeAction", "textDocument/linkedEditingRange"] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
         }
@@ -3570,6 +3571,8 @@ mod tests {
             "textDocument/formatting",
             "textDocument/rangeFormatting",
             "textDocument/onTypeFormatting",
+            "textDocument/prepareRename",
+            "textDocument/rename",
         ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }
