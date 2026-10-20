@@ -24,12 +24,13 @@
 //!   Decision point 3.2).
 //! - `echo-document` — advertises `hoverProvider`, `completionProvider`,
 //!   `inlayHintProvider`, `colorProvider`, `documentFormattingProvider`,
-//!   `documentRangeFormattingProvider`, `renameProvider`,
+//!   `documentRangeFormattingProvider`, `renameProvider`, `linkedEditingRangeProvider`,
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting, range and on-type
 //!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
-//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists); a pull diagnostic
+//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists); linked
+//!   editing ranges are every occurrence of the word at the position; a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -389,6 +390,7 @@ fn main() {
                         "documentRangeFormattingProvider": true,
                         "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
                         "renameProvider": true,
+                        "linkedEditingRangeProvider": true,
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
                             "interFileDependencies": false,
@@ -2844,6 +2846,58 @@ fn main() {
                     "params": message.get("params"),
                 }),
             ),
+            "textDocument/linkedEditingRange" if mode == "echo-document" => {
+                // Every occurrence, as a word, of the word at the position,
+                // in this server's own text and coordinates.
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let line = message
+                    .pointer("/params/position/line")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let character = message
+                    .pointer("/params/position/character")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let text = documents.get(uri).cloned().unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                let word = lines.get(line).and_then(|text| {
+                    let chars: Vec<char> = text.chars().collect();
+                    let start = (0..character.min(chars.len()))
+                        .rev()
+                        .take_while(|&at| is_word(chars[at]))
+                        .last()
+                        .unwrap_or(character);
+                    let end = (character..chars.len())
+                        .take_while(|&at| is_word(chars[at]))
+                        .last()
+                        .map_or(character, |at| at + 1);
+                    (start < end).then(|| chars[start..end].iter().collect::<String>())
+                });
+                let result = word.map_or(Value::Null, |word| {
+                    let mut ranges = Vec::new();
+                    for (index, text) in lines.iter().enumerate() {
+                        let chars: Vec<char> = text.chars().collect();
+                        let width = word.chars().count();
+                        for at in 0..chars.len() {
+                            if chars[at..].iter().take(width).collect::<String>() == word
+                                && (at == 0 || !is_word(chars[at - 1]))
+                                && chars.get(at + width).is_none_or(|&next| !is_word(next))
+                            {
+                                ranges.push(json!({
+                                    "start": { "line": index, "character": at },
+                                    "end": { "line": index, "character": at + width }
+                                }));
+                            }
+                        }
+                    }
+                    json!({ "ranges": ranges })
+                });
+                respond(&mut writer, id, result);
+            }
             "textDocument/rename" if mode == "echo-document" => {
                 // With `MOCK_RENAME_AFTER_RELEASE` set, answered only once
                 // the file `MOCK_RELEASE_FILE` names exists (or a minute

@@ -81,7 +81,8 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 /// `translate_virtual_formatting_edits_to_host` for a formatter's answer,
 /// `translate_virtual_replayed_edits_to_host` for a workspace edit), or the
 /// ranges standing for their text must read alike in the host
-/// (`translate_editable_virtual_range_to_host`: prepareRename's).
+/// (`translate_editable_virtual_range_to_host`: prepareRename's and
+/// linkedEditingRange's).
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
@@ -89,6 +90,7 @@ fn method_maps_prepared_edits(method: &str) -> bool {
             | "textDocument/completion"
             | "textDocument/formatting"
             | "textDocument/inlayHint"
+            | "textDocument/linkedEditingRange"
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
             | "textDocument/rangeFormatting"
@@ -3560,10 +3562,9 @@ mod tests {
         // Every edit method whose edits are not mapped back stays closed
         // (inbound applyEdit is refused on its own path: the region's offset
         // carries a map).
-        for method in ["textDocument/codeAction", "textDocument/linkedEditingRange"] {
-            assert!(!method_closed_to(&resolved, method, false), "{method}");
-            assert!(method_closed_to(&resolved, method, true), "{method}");
-        }
+        let method = "textDocument/codeAction";
+        assert!(!method_closed_to(&resolved, method, false), "{method}");
+        assert!(method_closed_to(&resolved, method, true), "{method}");
         for method in [
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
@@ -3573,6 +3574,7 @@ mod tests {
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
             "textDocument/rename",
+            "textDocument/linkedEditingRange",
         ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }

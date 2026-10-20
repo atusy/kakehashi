@@ -16,7 +16,7 @@ use tower_lsp_server::ls_types::{LinkedEditingRanges, Position, TextDocumentPosi
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::translate_editable_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
     response_has_jsonrpc_error,
@@ -121,13 +121,15 @@ fn transform_linked_editing_range_response_to_host(
         return None;
     }
 
-    // Never through a prepared text: the method is closed to prepared
-    // documents (see `bridge_context::method_closed_to`).
-    for range in &mut linked.ranges {
-        translate_virtual_range_to_host(range, offset);
-    }
-
-    Some(linked)
+    // The client types into every range at once, the same text in each: on
+    // a prepared document each must cover in the host exactly the text it
+    // covers there, or the answer is none (one range typed into elsewhere
+    // than the server meant would desynchronize the others).
+    linked
+        .ranges
+        .iter_mut()
+        .all(|range| translate_editable_virtual_range_to_host(range, offset))
+        .then_some(linked)
 }
 
 #[cfg(test)]
@@ -262,6 +264,47 @@ mod tests {
             linked.ranges[0].start.line,
             u32::MAX,
             "Should saturate, not panic"
+        );
+    }
+
+    #[test]
+    fn a_prepared_documents_linked_ranges_map_only_all_alike() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  <a>\n  </a>\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(5, 0).with_prepared(prepared.map);
+        let response = |second: serde_json::Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"ranges": [
+                {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                second
+            ]}})
+        };
+        let linked = transform_linked_editing_range_response_to_host(
+            response(
+                json!({"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 3}}),
+            ),
+            &offset,
+        )
+        .expect("both ranges read alike");
+        assert_eq!(linked.ranges[0].start, Position::new(5, 3));
+        assert_eq!(linked.ranges[1].start, Position::new(6, 4));
+        // One range reaching across a line break, into the host's indent.
+        assert!(
+            transform_linked_editing_range_response_to_host(
+                response(json!({"start": {"line": 0, "character": 4}, "end": {"line": 1, "character": 1}})),
+                &offset,
+            )
+            .is_none()
         );
     }
 }

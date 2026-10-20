@@ -1026,6 +1026,29 @@ fn a_rename_the_host_moved_under_is_answered_as_content_modified() {
 }
 
 #[test]
+fn linked_editing_ranges_map_back_through_the_prepared_document() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/linked.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/linkedEditingRange",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+    );
+    // `x` where the host has it: past each line's indent, which the server
+    // never saw.
+    assert_eq!(
+        response["result"]["ranges"],
+        json!([
+            { "start": { "line": 3, "character": 8 }, "end": { "line": 3, "character": 9 } },
+            { "start": { "line": 4, "character": 9 }, "end": { "line": 4, "character": 10 } }
+        ]),
+        "{response}"
+    );
+}
+
+#[test]
 fn downstream_sees_edge_blank_lines_deleted_and_the_host_keeps_them() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/edges.md";
