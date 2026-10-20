@@ -4511,6 +4511,10 @@ mod formatting_reference {
 
     const BODIES: [&str; 5] = ["a", "é", "𝄞x", "b c", "if x:"];
 
+    /// Bodies written as they are, unnumbered: lines alike to the byte,
+    /// copies a pairing must tell apart as formatters write them.
+    const SHARED: [&str; 3] = ["}", "a = 1", "f('a')"];
+
     /// Byte offsets of every line start in `text` (LF, CRLF and a lone CR
     /// each end a line).
     fn line_starts(text: &str) -> Vec<usize> {
@@ -4603,7 +4607,7 @@ mod formatting_reference {
     /// One line of a generated document.
     #[derive(Debug, Clone, Copy)]
     enum Line {
-        /// Text (`BODIES`), indented and dedented by the peer, or left at
+        /// Text (`BODIES`, numbered, or `SHARED`), indented and dedented by the peer, or left at
         /// column 0 and alone.
         Content {
             body: usize,
@@ -4621,7 +4625,7 @@ mod formatting_reference {
 
     fn line() -> impl Strategy<Value = Line> {
         prop_oneof![
-            5 => (0..BODIES.len(), prop::bool::weighted(0.8))
+            5 => (0..BODIES.len() + SHARED.len(), prop::bool::weighted(0.8))
                 .prop_flat_map(|(body, dedented)| {
                     prop_oneof![4 => Just(0usize), 1 => Just(1usize), 1 => Just(2usize)].prop_map(
                         move |deeper| Line::Content {
@@ -4658,8 +4662,9 @@ mod formatting_reference {
         uniform: &'static str,
     }
 
-    /// `lines` indented by `indent` (text made unique per line, so a diff
-    /// has one way to align lines), broken by `line_break`, between
+    /// `lines` indented by `indent` (numbered text made unique per line, so
+    /// a diff has one way to align it; shared text repeated as it is),
+    /// broken by `line_break`, between
     /// `leading` and `trailing` blank lines, optionally ending with the
     /// indent alone.
     fn document(
@@ -4690,7 +4695,10 @@ mod formatting_reference {
                         text.push_str(indent);
                     }
                     text.push_str(["", "\t", "  "][deeper]);
-                    text.push_str(&format!("{number}{}{number}", BODIES[body]));
+                    match BODIES.get(body) {
+                        Some(body) => text.push_str(&format!("{number}{body}{number}")),
+                        None => text.push_str(SHARED[body - BODIES.len()]),
+                    }
                     removed.push(Some(if dedented { indent } else { "" }));
                 }
                 Line::Empty => removed.push(None),
@@ -4968,16 +4976,31 @@ mod formatting_reference {
     /// the closing lines would not start a line.
     /// Every host text [`reference`] gives for `output`, each line no
     /// answer places for sure read both ways: none when it refuses all.
-    /// A line written last with no line break, where an empty line was, is
-    /// read both ways too when the last line holds only an indent: written
-    /// on the empty line (the last line's break and indent going), or on
-    /// the last line (the empty line going), both empty in P.
-    fn readings(document: &Document, output: &[Output]) -> Vec<String> {
+    /// A line written last with no line break, where an empty line was, as
+    /// other text than its line held, or with `copies` of text about (which
+    /// copy it is no answer tells), is read both ways too when the
+    /// last line holds only an indent: written on that line (the last
+    /// line's break and indent going), or on the last line (that line
+    /// going), which P shows empty.
+    fn readings(
+        document: &Document,
+        prepared: &str,
+        output: &[Output],
+        copies: bool,
+    ) -> Vec<String> {
         let last = output.len().wrapping_sub(1);
-        let on_empty_line_last = output.last().is_some_and(|(_, line_break, origin)| {
+        let prepared_lines = lines_of(prepared);
+        let on_empty_line_last = output.last().is_some_and(|(text, line_break, origin)| {
             document.indent_only_last_line
                 && line_break.is_empty()
-                && origin.is_some_and(|line| line < AMBIGUOUS && document.removed[line].is_none())
+                && origin.is_some_and(|line| {
+                    line < AMBIGUOUS
+                        && (copies
+                            || document.removed[line].is_none()
+                            || prepared_lines
+                                .get(line)
+                                .is_none_or(|old| old.trim() != text.trim()))
+                })
         });
         [(true, false), (false, false), (true, true)]
             .into_iter()
@@ -5246,9 +5269,46 @@ mod formatting_reference {
                         changing.set(changing.get() + 1);
                     }
                     let got = apply(&document.virtual_text, &mapped);
-                    let expected = readings(&document, &output);
+                    let copies = lines.iter().enumerate().any(|(at, line)| {
+                        matches!(line, Line::Content { body, .. } if *body >= BODIES.len()
+                            && lines[at + 1..].iter().any(|other| {
+                                matches!(other, Line::Content { body: other, .. } if other == body)
+                            }))
+                    });
+                    let expected = readings(&document, &prepared, &output, copies);
+                    // With shared text written twice, which copy was kept
+                    // can move a whitespace line's own whitespace (kept as
+                    // it was, or written anew with the content's indent): a
+                    // blank line's whitespace no answer places.
+                    // So can it move the indentation-only last line's indent
+                    // onto a last line written without a break (written on
+                    // it, or on a copy's line). `text` with its
+                    // whitespace-only lines emptied, and the indent of a
+                    // last line without a break dropped, every other
+                    // character kept.
+                    let blanks_emptied = |text: &str| -> String {
+                        let starts = line_starts(text);
+                        (0..starts.len())
+                            .map(|line| {
+                                let end = content_end(text, &starts, line);
+                                let next = starts.get(line + 1).copied().unwrap_or(text.len());
+                                let content = &text[starts[line]..end];
+                                if content.trim_matches([' ', '\t']).is_empty() {
+                                    text[end..next].to_string()
+                                } else if next == end && document.indent_only_last_line {
+                                    content.trim_start_matches([' ', '\t']).to_string()
+                                } else {
+                                    text[starts[line]..next].to_string()
+                                }
+                            })
+                            .collect()
+                    };
                     prop_assert!(
-                        expected.contains(&got),
+                        expected.contains(&got)
+                            || copies
+                                && expected
+                                    .iter()
+                                    .any(|text| blanks_emptied(text) == blanks_emptied(&got)),
                         "{:?} -> {:?} on {:?} (P {:?}): {:?} not in {:?}",
                         edits,
                         mapped,
