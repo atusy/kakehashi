@@ -299,14 +299,14 @@ fn markdown_container_prefixes<'a>(
         let span = match line_start {
             None => {
                 if starts_line(gap) {
-                    return LinePrefix::Whitespace;
+                    return LinePrefix::Whitespace(0);
                 }
                 match &first_line {
                     Some(range) if range.end == gap => range.clone(),
                     _ => return LinePrefix::Other,
                 }
             }
-            Some(start) if start == gap => return LinePrefix::Whitespace,
+            Some(start) if start == gap => return LinePrefix::Whitespace(0),
             Some(start) => {
                 while children.get(next).is_some_and(|range| range.start < start) {
                     next += 1;

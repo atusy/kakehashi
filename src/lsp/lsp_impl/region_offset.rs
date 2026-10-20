@@ -415,7 +415,14 @@ mod tests {
     // A blank row keeping less whitespace than the item's indentation.
     #[case::list_fence_short_whitespace_row("- item\n\n  ```py\n  a\n \n  b\n  ```\n", FENCE_QUERY, vec![1])]
     #[case::list_fence_short_whitespace_row_crlf("- item\r\n\r\n  ```py\r\n  a\r\n \r\n  b\r\n  ```\r\n", FENCE_QUERY, vec![1])]
-    #[case::list_fence_tab_row("- item\n\n  ```py\n  a\n\t\n  b\n  ```\n", FENCE_QUERY, vec![1])]
+    // A tab reaches the next tab stop (column 4), past a two-space item's
+    // content, but short of a six-space item's.
+    #[case::list_fence_tab_row("- item\n\n  ```py\n  a\n\t\n  b\n  ```\n", FENCE_QUERY, vec![])]
+    #[case::six_space_list_fence_tab_row(
+        "10.   item\n\n      ```py\n      a\n\t\n      b\n      ```\n",
+        FENCE_QUERY,
+        vec![1]
+    )]
     // A blank row keeping the item's whole indentation is a content row.
     #[case::list_fence_full_whitespace_row("- item\n\n  ```py\n  a\n  \n  b\n  ```\n", FENCE_QUERY, vec![])]
     #[case::lazy_continuation("> a\nb\n> c\n", INLINE_QUERY, vec![])]
@@ -461,5 +468,41 @@ mod tests {
         assert!(accepts(resolved, &change), "{change:?} must be accepted");
         let edited = crate::text::edit::apply_text_edits(host, &[change]);
         assert_eq!(discover(&edited)[0].virtual_content, expected_virtual);
+    }
+
+    /// A blank row holding a tab gives a two-space item its indentation:
+    /// text written after the tab stays in the item and reads back as
+    /// written.
+    #[test]
+    fn a_tab_blank_row_of_a_two_space_list_item_fence_takes_text() {
+        let host = "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n";
+        let resolved = discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![2, 1, 2, 0]);
+        let change = edit((4, 1), (4, 1), "x");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(
+            discover(&edited, FENCE_QUERY)[0].virtual_content,
+            "a\nx\nb\n"
+        );
+    }
+
+    /// In a six-space item a tab reaches column 4, short of the content: text
+    /// written after it would leave the item, so it is refused.
+    #[test]
+    fn a_tab_blank_row_of_a_six_space_list_item_fence_is_protected() {
+        let host = "10.   item\n\n      ```py\n      a\n\t\n      b\n      ```\n";
+        let resolved = discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![6, 1, 6, 0]);
+        let change = edit((4, 1), (4, 1), "x");
+        assert!(!accepts(resolved, &change));
+        // Applied anyway, the text does not read back as written.
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_ne!(
+            discover(&edited, FENCE_QUERY)
+                .first()
+                .map(|r| r.virtual_content.as_str()),
+            Some("a\nx\nb\n")
+        );
     }
 }

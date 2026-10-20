@@ -69,8 +69,9 @@ pub(super) fn compute_line_column_offsets(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinePrefix {
     /// No text, or a container continuation of spaces and tabs only: list-item
-    /// indentation.
-    Whitespace,
+    /// indentation, as wide as markdown reads it (a tab reaches the next
+    /// multiple of 4 from the line start, CommonMark §2.2).
+    Whitespace(u32),
     /// A container continuation holding markers (`>`).
     Container,
     /// Any other text.
@@ -80,11 +81,15 @@ pub(crate) enum LinePrefix {
 impl LinePrefix {
     /// The class of a container continuation spanning `text`.
     pub(super) fn continuation(text: &str) -> Self {
-        if text.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
-            Self::Whitespace
-        } else {
-            Self::Container
+        let mut width = 0u32;
+        for byte in text.bytes() {
+            match byte {
+                b' ' => width = width.saturating_add(1),
+                b'\t' => width = (width / 4).saturating_add(1).saturating_mul(4),
+                _ => return Self::Container,
+            }
         }
+        Self::Whitespace(width)
     }
 }
 
@@ -156,7 +161,7 @@ pub(super) fn compute_line_prefixes(
                 // its spanned lines stay at the default 0.
                 if offsets.len() <= line {
                     offsets.resize(line + 1, 0);
-                    prefixes.resize(line + 1, LinePrefix::Whitespace);
+                    prefixes.resize(line + 1, LinePrefix::Whitespace(0));
                 }
                 if let Some(slot) = offsets.get_mut(gap_start_line) {
                     *slot = column;
@@ -180,8 +185,9 @@ pub(super) fn compute_line_prefixes(
 /// of the item's indentation. Such a row is blank in `virtual_content`
 /// (spaces and tabs only, as markdown counts it), and its nearest row that
 /// holds text (before it, or after it when none is before) records a
-/// container prefix wider than the row's own: none, or whitespace only and
-/// shorter (a blank row keeping one space of a two-space item). A prefix of
+/// container prefix wider than the row's own: none, or whitespace only that
+/// markdown reads as narrower (a blank row keeping one space of a two-space
+/// item; a tab, which reaches column 4, is wide enough there). A prefix of
 /// other text (a string opening mid-line) is no
 /// container, and a row recording no prefix that holds text (a lazy
 /// continuation line) anchors nothing. The row after the content's final
@@ -224,12 +230,18 @@ pub(crate) fn protected_blank_rows(
         blank.push(line_blank);
     }
     let rows = columns.len().min(blank.len());
-    let prefix = |row: usize| prefixes.get(row).copied().unwrap_or(LinePrefix::Whitespace);
+    let prefix = |row: usize| {
+        prefixes
+            .get(row)
+            .copied()
+            .unwrap_or(LinePrefix::Whitespace(0))
+    };
     // A row holding text anchors the blank rows near it with the width of
     // its container prefix (0 when it has none).
     let anchor = |row: usize| {
         (!blank[row]).then(|| match prefix(row) {
-            LinePrefix::Whitespace | LinePrefix::Container => columns[row],
+            LinePrefix::Whitespace(width) => width,
+            LinePrefix::Container => columns[row],
             LinePrefix::Other => 0,
         })
     };
@@ -246,10 +258,11 @@ pub(crate) fn protected_blank_rows(
     for row in 0..rows {
         if blank[row] {
             let width = previous.or(next_anchor[row]).unwrap_or(0);
-            // No prefix, or whitespace short of the container's: virtual
-            // column 0 lands short of the block's content there.
+            // No prefix, or whitespace markdown reads short of the
+            // container's: virtual column 0 lands short of the block's
+            // content there. A tab reaching the content's column is enough.
             let short = columns[row] == 0
-                || (prefix(row) == LinePrefix::Whitespace && columns[row] < width);
+                || matches!(prefix(row), LinePrefix::Whitespace(own) if own < width);
             if width > 0 && short {
                 protected.push(row as u32);
             }

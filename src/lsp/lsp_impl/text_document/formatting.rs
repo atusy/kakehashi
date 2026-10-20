@@ -1728,11 +1728,13 @@ fn pipeline_region_text(
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
     let first_row_prefix = host_line_prefixes.first().cloned().unwrap_or_default();
-    let (host_line_prefixes, first_row_blank) = fill_blank_row_prefixes(host_line_prefixes, offset);
+    let common = block_common_prefix(&host_line_prefixes, original_virtual);
+    let (host_line_prefixes, first_row_blank) =
+        fill_blank_row_prefixes(host_line_prefixes, offset, &common);
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    let text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
+    let text = reapply_host_line_prefixes_with(&final_text, &host_line_prefixes, &common);
     // The replacement starts after the first row's host prefix, so a first
     // row that is a blank row (none, or a short part of the indentation)
     // takes the rest of the block's prefix here when the output puts text on
@@ -1751,12 +1753,49 @@ fn pipeline_region_text(
     }
 }
 
+/// The region's common host prefix, which continuation lines take when the
+/// line count changes: the longest prefix shared by its rows, past the
+/// trailing empty entries (the closing fence's row) and past the blank rows
+/// whose prefix is only whitespace. A list item's blank row keeps none, a
+/// part, or a tab of the item's indentation, and none of those may narrow
+/// the prefix the item's content takes. Blockquote blank rows keep their
+/// `>`, so they count as before.
+fn block_common_prefix(prefixes: &[String], original_virtual: &str) -> String {
+    let lines = split_lsp_lines(original_virtual);
+    let mut content = prefixes;
+    while let [rest @ .., last] = content {
+        if !last.is_empty() {
+            break;
+        }
+        content = rest;
+    }
+    let mut kept = content.iter().enumerate().filter(|(row, prefix)| {
+        let blank_row = lines
+            .get(*row)
+            .is_some_and(|(line, _)| crate::text::is_markdown_blank(line));
+        !(blank_row && crate::text::is_markdown_blank(prefix))
+    });
+    let Some((_, first)) = kept.next() else {
+        return String::new();
+    };
+    kept.fold(first.as_str(), |common, (_, prefix)| {
+        let len = common
+            .char_indices()
+            .zip(prefix.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((at, c), _)| at + c.len_utf8());
+        &common[..len]
+    })
+    .to_string()
+}
+
 /// A list item's fence leaves its blank rows unindented, so a per-line
 /// region records no prefix for them, and output lines mapped there would
 /// start at host column 0 and end the item; a blank row keeping part of the
 /// indentation records a short prefix, with the same effect. Such a blank
-/// row, as discovery marks it on `offset`, takes the longest common prefix
-/// of the other rows' recorded prefixes instead. Rows
+/// row, as discovery marks it on `offset`, takes the block's common prefix
+/// (`common`, see [`block_common_prefix`]) instead. Rows
 /// recording no prefix that hold text (a lazy continuation line) keep none,
 /// and a region with one column offset has unprefixed later rows by design.
 ///
@@ -1765,33 +1804,16 @@ fn pipeline_region_text(
 fn fill_blank_row_prefixes<'a>(
     prefixes: std::borrow::Cow<'a, [String]>,
     offset: &RegionOffset,
+    common: &str,
 ) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
     let blank_row = |i: usize| offset.is_protected_blank_row(i);
     if !offset.has_protected_blank_rows() || !(0..prefixes.len()).any(blank_row) {
         return (prefixes, None);
     }
-    // The longest common prefix of the recorded (non-empty) prefixes, past
-    // the blank rows: one keeping a short part of the indentation must not
-    // narrow it.
-    let mut recorded = (0..prefixes.len())
-        .filter(|&i| !blank_row(i))
-        .map(|i| &prefixes[i])
-        .filter(|p| !p.is_empty());
-    let Some(first_recorded) = recorded.next() else {
-        return (prefixes, None);
-    };
-    let fill = recorded.fold(first_recorded.as_str(), |common, p| {
-        let len = common
-            .char_indices()
-            .zip(p.chars())
-            .take_while(|((_, a), b)| a == b)
-            .last()
-            .map_or(0, |((at, c), _)| at + c.len_utf8());
-        &common[..len]
-    });
-    if fill.is_empty() {
+    if common.is_empty() {
         return (prefixes, None);
     }
+    let fill = common;
     let first_row_blank = blank_row(0).then(|| fill.to_string());
     let filled = (0..prefixes.len())
         .map(|i| {
@@ -1829,7 +1851,29 @@ fn fill_blank_row_prefixes<'a>(
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
+#[cfg(test)]
 fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -> String {
+    let mut content = host_line_prefixes;
+    while let [rest @ .., last] = content {
+        if !last.is_empty() {
+            break;
+        }
+        content = rest;
+    }
+    reapply_host_line_prefixes_with(
+        final_text,
+        host_line_prefixes,
+        longest_common_prefix(content),
+    )
+}
+
+/// [`reapply_host_line_prefixes`] with the region's common prefix `lcp`
+/// given, as [`block_common_prefix`] computes it.
+fn reapply_host_line_prefixes_with(
+    final_text: &str,
+    host_line_prefixes: &[String],
+    lcp: &str,
+) -> String {
     let lines = split_lsp_lines(final_text);
     if lines.len() <= 1 {
         // Single-line output sits entirely after the first line's host prefix.
@@ -1837,24 +1881,7 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
     }
 
     let line_count_preserved = lines.len() == host_line_prefixes.len();
-    let lcp = if line_count_preserved {
-        ""
-    } else {
-        // A region whose content ends with '\n' carries a trailing
-        // empty-prefix entry for the synthetic line bucket after the final
-        // newline; that host line's own prefix sits OUTSIDE the replacement
-        // range (the range ends at its column 0). Including it would
-        // collapse the LCP to "" for a uniformly prefixed blockquote, so the
-        // LCP is computed over the content lines' prefixes only.
-        let mut content_prefixes = host_line_prefixes;
-        while let [rest @ .., last] = content_prefixes {
-            if !last.is_empty() {
-                break;
-            }
-            content_prefixes = rest;
-        }
-        longest_common_prefix(content_prefixes)
-    };
+    let lcp = if line_count_preserved { "" } else { lcp };
 
     // Reserve for the prefixes being prepended too (slight over-reserve when
     // empty lines get a trimmed prefix), so the string never reallocates.
@@ -1930,6 +1957,7 @@ fn lsp_line_count(text: &str) -> usize {
 /// Longest common prefix of all strings, on char boundaries. Empty input or
 /// any empty string yields the empty prefix. Returns a slice of the first
 /// string (the prefix is by definition a substring of it), so no allocation.
+#[cfg(test)]
 fn longest_common_prefix(strings: &[String]) -> &str {
     let mut iter = strings.iter();
     let Some(first) = iter.next() else {
@@ -3125,8 +3153,25 @@ mod tests {
         "a\n",
         Some("- item\n\n  ```py\n  a\n  ```\n")
     )]
-    // A leading tab row the item's spaces do not extend: left as is.
-    #[case::leading_tab_row_dropped("- item\n\n  ```py\n\t\n  a\n  ```\n", "a\n", None)]
+    // A leading tab row already gives the item its indentation: the
+    // output's first line keeps the tab.
+    #[case::leading_tab_row_dropped(
+        "- item\n\n  ```py\n\t\n  a\n  ```\n",
+        "a\n",
+        Some("- item\n\n  ```py\n\ta\n  ```\n")
+    )]
+    // An interior tab row neither narrows the prefix new lines take nor
+    // takes one itself.
+    #[case::tab_row_line_added(
+        "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n",
+        "a\n\nb\nc\n",
+        Some("- item\n\n  ```py\n  a\n\n  b\n  c\n  ```\n")
+    )]
+    #[case::text_onto_a_tab_row(
+        "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n",
+        "a\nz\nb\n",
+        Some("- item\n\n  ```py\n  a\n\tz\n  b\n  ```\n")
+    )]
     fn pipeline_indents_a_short_whitespace_blank_row_of_a_list_item_fence(
         #[case] host: &str,
         #[case] formatted: &str,
