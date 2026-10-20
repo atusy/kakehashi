@@ -340,6 +340,24 @@ struct PreparedSource {
     content_version: Option<u64>,
 }
 
+impl PreparedSource {
+    /// Whether the map is unrevoked and the region still tracked under the
+    /// host lifetime it was tracked under as the answer was made, which the
+    /// host's store is open for.
+    fn live(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
+        !self.map.revoked()
+            && self.incarnation.is_some_and(|incarnation| {
+                tracked_region_incarnation(tracker, &self.host_uri, &self.region_id)
+                    == Some(incarnation)
+                    && pool.current_host_incarnation(&self.host_uri) == Some(incarnation)
+            })
+    }
+}
+
 /// The host lifetime `region_id` of `host_uri` is tracked under now, if it
 /// is tracked at all: a region deleted, invalidated by an edit, or of a
 /// closed host is not.
@@ -441,10 +459,19 @@ impl<T> Sourced<T> {
 
     /// Whether whether this answer is current may still change while the
     /// host's content version stays put (see
-    /// `LanguageServerPool::host_settling`): never so without a map.
-    pub(crate) fn settling(&self, pool: &crate::lsp::bridge::LanguageServerPool) -> bool {
+    /// `LanguageServerPool::host_settling`): never so without a map, nor
+    /// once nothing can make it current again: its map revoked, or its
+    /// region no longer live under the lifetime it was made under (a hold
+    /// on such a region, as the lifecycle pass leaves on a failed prepare,
+    /// is cleared by no text ever recorded).
+    pub(crate) fn settling(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
         self.prepared.as_ref().is_some_and(|source| {
-            pool.host_settling(&source.host_uri, &source.language, &source.region_id)
+            source.live(pool, tracker)
+                && pool.host_settling(&source.host_uri, &source.language, &source.region_id)
         })
     }
 
@@ -487,11 +514,7 @@ impl<T> Sourced<T> {
             source
                 .content_version
                 .is_some_and(|version| current_version() == Some(version))
-                && source.incarnation.is_some_and(|incarnation| {
-                    tracked_region_incarnation(tracker, &source.host_uri, &source.region_id)
-                        == Some(incarnation)
-                        && pool.current_host_incarnation(&source.host_uri) == Some(incarnation)
-                })
+                && source.live(pool, tracker)
                 && pool.host_text_still_current(
                     &source.host_uri,
                     &source.language,

@@ -2398,7 +2398,7 @@ pub(super) async fn sources_verdict<'a, T: 'a>(
                     .is_some_and(|version| Some(version) != now)
             })
         },
-        || sources.clone().any(|source| source.settling(pool)),
+        || sources.clone().any(|source| source.settling(pool, tracker)),
         crate::lsp::bridge::PREPARE_TIMEOUT,
     )
     .await
@@ -2497,7 +2497,7 @@ mod tests {
             let verdict = settled_verdict(
                 || held.still_current(&pool, &tracker, || Some(version.load(Ordering::SeqCst))),
                 || version.load(Ordering::SeqCst) != 1,
-                || held.settling(&pool),
+                || held.settling(&pool, &tracker),
                 std::time::Duration::from_secs(5),
             )
             .await;
@@ -2536,6 +2536,8 @@ mod tests {
                 .unwrap()
                 .set_revocation(Arc::clone(&revocation));
             let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            // The prepare layer's table, which holds are kept in.
+            pool.prepare_failures_for_test();
             let host = url::Url::parse("file:///test/stale.md").unwrap();
             let tracker = crate::language::NodeTracker::new();
             tracker.open_incarnation(&host, 1);
@@ -2559,12 +2561,15 @@ mod tests {
                 "revoked" => revocation.revoke(u64::MAX),
                 _ => pool.open_host_incarnation(&host, 2).await,
             }
-            assert!(!held.settling(&pool), "{case}");
+            // The lifecycle pass then holds the region on the failure, a
+            // hold no text recorded will clear: still nothing to wait for.
+            pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+            assert!(!held.settling(&pool, &tracker), "{case}");
             let start = tokio::time::Instant::now();
             let verdict = settled_verdict(
                 || held.still_current(&pool, &tracker, || Some(0)),
                 || false,
-                || held.settling(&pool),
+                || held.settling(&pool, &tracker),
                 crate::lsp::bridge::PREPARE_TIMEOUT,
             )
             .await;
@@ -2598,6 +2603,8 @@ mod tests {
                 .unwrap()
                 .set_revocation(Arc::clone(&revocation));
             let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            // The prepare layer's table, which holds are kept in.
+            pool.prepare_failures_for_test();
             let host = url::Url::parse("file:///test/final-check.md").unwrap();
             let tracker = crate::language::NodeTracker::new();
             tracker.open_incarnation(&host, 1);
@@ -2632,6 +2639,9 @@ mod tests {
                 "revoked" => {
                     pool.note_host_settled(&host, 1, 1);
                     revocation.revoke(u64::MAX);
+                    // Held on the failure the revocation brings: a hold
+                    // nothing clears.
+                    pool.hold_latest_virtual_content(&host, 1, "lua", &region);
                 }
                 _ => {}
             }
