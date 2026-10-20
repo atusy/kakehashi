@@ -2454,7 +2454,7 @@ mod tests {
     /// text unchanged by it: another fence edited) is kept once the edit
     /// settles, not dropped; one the host moved under while it waited is
     /// dropped as moved.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_answer_is_judged_once_the_hosts_last_edit_settles() {
         use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
         use std::sync::Arc;
@@ -2672,6 +2672,111 @@ mod tests {
             assert_eq!(verdict, Verdict::Stale, "{case}");
             assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
         }
+    }
+
+    /// A prepared map for `text` (dedented by two), revocable.
+    fn revocable_prepared(
+        text: &str,
+    ) -> (
+        crate::lsp::bridge::PreparedDocument,
+        std::sync::Arc<crate::lsp::bridge::Revocation>,
+    ) {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let mut prepared =
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap();
+        let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+        Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        (prepared, revocation)
+    }
+
+    /// Every region of an answer must be current: one current and one
+    /// whose recorded text is no longer the request's, nothing left to
+    /// settle, is stale at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_current_only_when_every_region_is() {
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/every-region.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        pool.open_host_incarnation(&host, 1).await;
+        let mut sources = Vec::new();
+        for (start, end, recorded) in [(0, 6, "  red\n"), (10, 16, "  blue\n")] {
+            let region = tracker
+                .get_or_create_for_incarnation(&host, start, end, "block", 1)
+                .unwrap()
+                .to_string();
+            let (requested, _) = revocable_prepared("  red\n");
+            let (recorded, _) = revocable_prepared(recorded);
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &recorded);
+            sources.push(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host,
+                    "lua",
+                    &region,
+                    &requested.map,
+                    1,
+                    0,
+                ),
+            );
+        }
+        let start = tokio::time::Instant::now();
+        let verdict = sources_verdict(&pool, &tracker, || Some(0), sources.iter()).await;
+        assert_eq!(verdict, Verdict::Stale);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// A region held for its prepare answer, the host otherwise settled, is
+    /// waited for: once the request's text is recorded, the answer is
+    /// current.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_waits_for_a_held_region_alone() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host = url::Url::parse("file:///test/held.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        pool.open_host_incarnation(&host, 1).await;
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+            .unwrap()
+            .to_string();
+        let (requested, _) = revocable_prepared("  red\n");
+        let (older, _) = revocable_prepared("  old\n");
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &older);
+        pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+        let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+            (),
+            &host,
+            "lua",
+            &region,
+            &requested.map,
+            1,
+            0,
+        );
+        {
+            let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &requested);
+            });
+        }
+        let start = tokio::time::Instant::now();
+        let verdict = sources_verdict(&pool, &tracker, || Some(0), std::iter::once(&held)).await;
+        assert_eq!(verdict, Verdict::Current);
+        assert!(start.elapsed() >= std::time::Duration::from_secs(1));
     }
 
     /// The judgement the formatting methods make as the final answer is
