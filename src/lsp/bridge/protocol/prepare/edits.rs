@@ -195,30 +195,6 @@ impl PreparedMap {
         self.map_formatting_within(edits, budget, 0)
     }
 
-    /// Whether replacing P's `old` bytes with `new_text` breaks a line
-    /// inside its text whose own removed indent is not the content's: its
-    /// rest would be written as a line of its own with the content's
-    /// indent, moving it from where the line kept it (a line the peer
-    /// dedented unevenly, or left alone). Formatting answers only: an edit
-    /// keeping its extent says where it goes.
-    fn breaks_a_line_off_its_indent(&self, old: &Range<usize>, new_text: &str) -> bool {
-        let prepared = &self.prepared_lines.text;
-        if !new_text.contains(['\n', '\r'])
-            || prepared[old.clone()].contains(['\n', '\r'])
-            || is_line_start(prepared, old.start)
-            || is_line_end(prepared, old.end)
-        {
-            return false;
-        }
-        let line_start = prepared[..old.start]
-            .rfind(['\n', '\r'])
-            .map_or(0, |at| at + 1);
-        let own = empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
-            .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
-        let at = map_offset(&self.runs, line_start, Bias::Start, Side::Prepared);
-        self.uniform_indent_at(at) != Some(own)
-    }
-
     /// Whether a line of the content (not whitespace alone, nor starting in
     /// a gap's text) lost other indentation than its segment's uniform one:
     /// the peer left it alone, or removed another indent. A formatting
@@ -286,27 +262,12 @@ impl PreparedMap {
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
-        let indents = |line_start: usize| {
-            let own = empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
-                .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
-            let at = map_offset(&self.runs, line_start, Bias::Start, Side::Prepared);
-            (
-                own.to_string(),
-                self.uniform_indent_at(at).map(str::to_string),
-            )
-        };
-        let hunks = diff_hunks(prepared, &edited, &indents, &mut work)?;
+        let hunks = diff_hunks(prepared, &edited, &mut work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // at a line start where the later replaces some of that line's start
         // with text, or where the earlier ends with a line break of P and the
         // later replaces no line break (see `diff_hunks`), each then on its
         // own line.
-        if hunks
-            .iter()
-            .any(|hunk| self.breaks_a_line_off_its_indent(&hunk.old, &edited[hunk.new.clone()]))
-        {
-            return Err(FormattingRefusal::Shape);
-        }
         let mut mapped = hunks
             .into_iter()
             .map(|hunk| {
@@ -1093,12 +1054,7 @@ struct Hunk {
 /// over the unchanged character beside it. Stretches left touching merge,
 /// but at the start of a line one writes text over or the other's line
 /// break ends before.
-fn diff_hunks(
-    old: &str,
-    new: &str,
-    indents: &dyn Fn(usize) -> (String, Option<String>),
-    work: &mut Work,
-) -> Result<Vec<Hunk>, FormattingRefusal> {
+fn diff_hunks(old: &str, new: &str, work: &mut Work) -> Result<Vec<Hunk>, FormattingRefusal> {
     // Whole lines alike at either end are set aside, uncharged: a small
     // answer in a large region costs work for its own size.
     let (head, tail) = alike_line_ends(old, new);
@@ -1138,28 +1094,10 @@ fn diff_hunks(
         ]
     };
     let (old_keys, new_keys) = (line_keys(&old_lines), line_keys(&new_lines));
-    if lines_alike_tell_no_indent(old, &old_keys, &new_keys, indents) {
-        return Err(FormattingRefusal::Shape);
-    }
-    // The lines of text whose own removed indent is not the content's: one
-    // written anew would take the content's instead.
-    work.spend(old_lines.len())
-        .ok_or(FormattingRefusal::OutOfWork)?;
-    let own: Vec<bool> = old_lines
-        .iter()
-        .enumerate()
-        .map(|(line, &(start, _))| {
-            !old_keys[1][line].is_empty() && {
-                let (own, uniform) = indents(start);
-                uniform.as_deref() != Some(own.as_str())
-            }
-        })
-        .collect();
     let mut aligned = Vec::new();
     align_lines(
         &old_keys,
         &new_keys,
-        &own,
         0,
         0..old_lines.len(),
         0..new_lines.len(),
@@ -1167,9 +1105,6 @@ fn diff_hunks(
         &mut aligned,
     )
     .ok_or(FormattingRefusal::OutOfWork)?;
-    if moves_a_line_off_its_indent(&old_keys, &new_keys, &own, &aligned, work)? {
-        return Err(FormattingRefusal::Shape);
-    }
     let mut runs = Vec::new();
     for (old_range, new_range) in aligned {
         runs.extend(runs_to_diff(
@@ -1326,10 +1261,6 @@ enum Alignment {
     /// on each side are diffed further only when `true` (see
     /// [`patience_pairs`]).
     Diff(usize, fn(&str) -> bool, bool),
-    /// [`Alignment::Diff`] (no further diff) among the old lines of text
-    /// whose own removed indent is not the content's, and every new line of
-    /// text.
-    Own(usize),
     /// A line written as an old line's text with more after it: that line,
     /// lines joined onto it (see [`joined_lines`]).
     Joined,
@@ -1344,12 +1275,6 @@ enum Alignment {
 
 /// How [`align_lines`] pairs lines, from the surest to the loosest:
 ///
-/// - Lines of text whose own removed indent is not the content's (a line
-///   the peer left alone, or dedented otherwise), alike to the byte, then
-///   but for the whitespace around their text, each found once in each
-///   text: of two lines swapped, either reading moves as many, and the one
-///   moving the line of the content's indent loses nothing (a line written
-///   anew takes that indent), where moving the other would lose its own.
 /// - Lines of text alike to the byte, a line found once in each text
 ///   anchoring the rest (patience): of lines alike but for whitespace, the
 ///   one written as it was is that line. Not where as many on each side
@@ -1381,9 +1306,7 @@ enum Alignment {
 /// lines alike a line was written on, or which went, no answer tells; text
 /// the run's diff writes on a whitespace line the peer kept gains no
 /// indent, as typed text there does.
-const ALIGNMENTS: [Alignment; 10] = [
-    Alignment::Own(0),
-    Alignment::Own(1),
+const ALIGNMENTS: [Alignment; 8] = [
     Alignment::Diff(0, |key| !key.trim_matches([' ', '\t']).is_empty(), false),
     Alignment::Diff(1, |key| !key.is_empty(), false),
     Alignment::Diff(2, |key| !key.is_empty(), false),
@@ -1664,11 +1587,9 @@ fn runs_to_diff(
 /// [`LineKeys`]). A line joined onto
 /// another is left to a run, deleted whole: the text it gave is written on
 /// the line it joined.
-#[allow(clippy::too_many_arguments)]
 fn align_lines(
     old_keys: &LineKeys,
     new_keys: &LineKeys,
-    own: &[bool],
     level: usize,
     old_range: Range<usize>,
     new_range: Range<usize>,
@@ -1687,18 +1608,12 @@ fn align_lines(
         Alignment::Joined => joined_lines(old_keys, new_keys, &old_range, &new_range, work)?,
         Alignment::AlikeEnds => alike_ends(old_keys, new_keys, &old_range, &new_range, work)?,
         Alignment::Blanks => blank_lines(old_keys, new_keys, &old_range, &new_range, work)?,
-        Alignment::Own(_) if !old_range.clone().any(|line| own[line]) => Vec::new(),
-        Alignment::Diff(keys, _, _) | Alignment::Own(keys) => {
-            let (takes_part, fall_back, only_own): (fn(&str) -> bool, bool, bool) = match alignment
-            {
-                Alignment::Diff(_, takes_part, fall_back) => (takes_part, fall_back, false),
-                _ => (|key| !key.trim_matches([' ', '\t']).is_empty(), false, true),
-            };
+        Alignment::Diff(keys, takes_part, fall_back) => {
             // To the byte, a line alike but for whitespace to several, as
             // many on each side, is no surer than by its order: reindented,
-            // one copy may be written as another was (the copies' removed
-            // indents then decide which is which). Those are left to pair
-            // in order (see `ALIGNMENTS`).
+            // one copy may be written as another was, and pairing to the
+            // byte would cross them. Those are left to pair in order (see
+            // `ALIGNMENTS`).
             let mut copies: HashMap<&str, (usize, usize)> = HashMap::new();
             if keys == 0 && old_range.len() > 1 && new_range.len() > 1 {
                 for line in old_range.clone() {
@@ -1715,24 +1630,13 @@ fn align_lines(
                 .clone()
                 .filter(|&index| {
                     takes_part(&old_keys[keys][index])
-                        && (!only_own || own[index])
                         && !copies.contains_key(old_keys[1][index].as_str())
                 })
                 .collect();
-            // A line written as an old line was, to the byte, is that line
-            // rather than one alike but for whitespace.
-            let mut exact = std::collections::HashSet::new();
-            if only_own && keys > 0 {
-                for line in old_range.clone() {
-                    work.spend(1 + old_keys[0][line].len() / BYTES_PER_STEP)?;
-                    exact.insert(old_keys[0][line].as_str());
-                }
-            }
             let new_candidates: Vec<usize> = new_range
                 .clone()
                 .filter(|&index| {
                     takes_part(&new_keys[keys][index])
-                        && !exact.contains(new_keys[0][index].as_str())
                         && !copies.contains_key(new_keys[1][index].as_str())
                 })
                 .collect();
@@ -1764,7 +1668,6 @@ fn align_lines(
         align_lines(
             old_keys,
             new_keys,
-            own,
             level + 1,
             old_at..old_line,
             new_at..new_line,
@@ -1777,131 +1680,12 @@ fn align_lines(
     align_lines(
         old_keys,
         new_keys,
-        own,
         level + 1,
         old_at..old_range.end,
         new_at..new_range.end,
         work,
         aligned,
     )
-}
-
-/// Whether the alignment `aligned` moves a line of text whose own removed
-/// indent is not the content's (`own`): an old line of one entry (a pair,
-/// or a run left between pairs) whose text, but for whitespace, a new line
-/// of another entry writes, no old line of that entry holding it. Written anew, that line would take the
-/// content's indent rather than its own; and where reading the answer so
-/// moves no more lines than another reading, which line moved no answer
-/// tells. `Err` when `work` runs out.
-fn moves_a_line_off_its_indent(
-    old_keys: &LineKeys,
-    new_keys: &LineKeys,
-    own: &[bool],
-    aligned: &[(Range<usize>, Range<usize>)],
-    work: &mut Work,
-) -> Result<bool, FormattingRefusal> {
-    if !own.contains(&true) {
-        return Ok(false);
-    }
-    // The entry writing each text no old line of that entry holds (a line
-    // left there as it was, or reindented, is that line), or `usize::MAX`
-    // for more than one.
-    let mut written: HashMap<&str, usize> = HashMap::new();
-    for (entry, (old_range, new_range)) in aligned.iter().enumerate() {
-        let mut held = std::collections::HashSet::new();
-        for line in old_range.clone() {
-            let key = old_keys[2][line].as_str();
-            work.spend(1 + key.len() / BYTES_PER_STEP)
-                .ok_or(FormattingRefusal::OutOfWork)?;
-            held.insert(key);
-        }
-        for line in new_range.clone() {
-            let key = new_keys[2][line].as_str();
-            work.spend(1 + key.len() / BYTES_PER_STEP)
-                .ok_or(FormattingRefusal::OutOfWork)?;
-            if !key.is_empty() && !held.contains(key) {
-                written
-                    .entry(key)
-                    .and_modify(|at| {
-                        if *at != entry {
-                            *at = usize::MAX;
-                        }
-                    })
-                    .or_insert(entry);
-            }
-        }
-    }
-    for (entry, (old_range, _)) in aligned.iter().enumerate() {
-        for line in old_range.clone().filter(|&line| own[line]) {
-            let key = old_keys[2][line].as_str();
-            work.spend(1 + key.len() / BYTES_PER_STEP)
-                .ok_or(FormattingRefusal::OutOfWork)?;
-            if written.get(key).is_some_and(|&at| at != entry) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-/// Whether lines alike leave the answer's copies without an indent of
-/// their own: a line of P written in the answer more or fewer times, yet
-/// still written (not removed whole), whose copies in P have removed
-/// indents that differ (which copy was kept, or written anew, decides
-/// each one's indent), or one whose removed indent is not the content's
-/// (which copy is the line, keeping that indent, and which a line of the
-/// content, no answer tells). Lines compare as P holds them, whitespace
-/// and all. Only P's lines the answer changes their number of copies of
-/// matter, which `old_keys` and `new_keys` (what lies between the lines
-/// alike at the ends) tell; their copies are looked for through the whole
-/// of `old`. `indents` gives a line's own removed indent and the
-/// content's there, by the line's start in `old`.
-fn lines_alike_tell_no_indent(
-    old: &str,
-    old_keys: &LineKeys,
-    new_keys: &LineKeys,
-    indents: &dyn Fn(usize) -> (String, Option<String>),
-) -> bool {
-    // How many more copies of a line P holds than the answer, between the
-    // ends alike: the ends hold as many on each side.
-    let mut removed: HashMap<&str, isize> = HashMap::new();
-    for (line, text) in old_keys[0].iter().enumerate() {
-        if !old_keys[1][line].is_empty() {
-            *removed.entry(text.as_str()).or_default() += 1;
-        }
-    }
-    for (line, text) in new_keys[0].iter().enumerate() {
-        if !new_keys[1][line].is_empty() {
-            *removed.entry(text.as_str()).or_default() -= 1;
-        }
-    }
-    removed.retain(|_, count| *count != 0);
-    if removed.is_empty() {
-        return false;
-    }
-    // Per line of P: its copies' removed indent (none when they differ),
-    // whether it is the content's, and how many copies P holds.
-    let mut copies: HashMap<&str, (Option<String>, bool, isize)> = HashMap::new();
-    for (start, line) in lines_with_breaks(old) {
-        let text = line.trim_end_matches(['\r', '\n']);
-        let Some((&text, _)) = removed.get_key_value(text) else {
-            continue;
-        };
-        let (own, uniform) = indents(start);
-        let content = uniform.as_deref() == Some(own.as_str());
-        let entry = copies
-            .entry(text)
-            .or_insert_with(|| (Some(own.clone()), content, 0));
-        if entry.0.as_deref() != Some(own.as_str()) {
-            entry.0 = None;
-        }
-        entry.1 &= content;
-        entry.2 += 1;
-    }
-    copies.iter().any(|(text, (indent, content, held))| {
-        let written = held - removed[text];
-        written > 0 && (indent.is_none() || !content)
-    })
 }
 
 /// How many bytes of whole lines `old` and `new` hold alike at their start,
