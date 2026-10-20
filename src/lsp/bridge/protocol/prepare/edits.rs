@@ -175,19 +175,21 @@ impl PreparedMap {
         let Some((ranges, order)) = sorted_extents(&self.prepared_lines, edits, true) else {
             return false;
         };
-        // What ends the edited P: the last edit's text if it reaches P's end,
-        // else P's own end.
-        match order.last() {
-            Some(&last) if ranges[last].end == prepared.len() => {
-                let text = &edits[last].new_text;
-                if text.is_empty() {
-                    !prepared[..ranges[last].start].ends_with(['\n', '\r'])
-                } else {
-                    !text.ends_with(['\n', '\r'])
-                }
+        // What ends the edited P, judged on the whole set: walking back from
+        // P's end, each edit reaching where the text so far ends either ends
+        // it with its own text, or (writing nothing) leaves it to what comes
+        // before its start, another edit touching it included.
+        let mut end = prepared.len();
+        for &index in order.iter().rev() {
+            if ranges[index].end != end {
+                break;
             }
-            _ => false,
+            if let Some(last) = edits[index].new_text.chars().next_back() {
+                return !matches!(last, '\n' | '\r');
+            }
+            end = ranges[index].start;
         }
+        !prepared[..end].ends_with(['\n', '\r'])
     }
 
     /// [`Self::map_formatting_answer`], the diff doing at most `budget`
