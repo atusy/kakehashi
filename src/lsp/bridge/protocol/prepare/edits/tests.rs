@@ -3776,6 +3776,33 @@ mod formatting {
     }
 
     #[test]
+    fn the_final_break_is_judged_on_the_whole_answer() {
+        // `  a`, a blank line, then the closing indent the peer deleted:
+        // P is `a\n\n`.
+        let virtual_text = "  a\n\n  ";
+        let map = prepare(
+            virtual_text,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        assert_eq!(map.prepared_lines.text, "a\n\n");
+        // Both line breaks deleted by two edits: the last one alone, read
+        // against P, seems to leave `a\n`, but nothing breaks the line.
+        assert!(map.drops_the_break_before_the_closing(&[
+            edit((0, 1), (1, 0), ""),
+            edit((1, 0), (2, 0), ""),
+        ]));
+        // The line breaks deleted, an earlier edit writing one in their
+        // place: the answer still ends with a line break.
+        assert!(!map.drops_the_break_before_the_closing(&[
+            edit((0, 0), (0, 1), "b\n"),
+            edit((0, 1), (2, 0), ""),
+        ]));
+    }
+
+    #[test]
     fn text_after_p_s_final_break_or_its_loss_is_told_apart_from_answers_that_keep_it() {
         // `\t  x` dedented by three, then the closing indent `\t` the peer
         // deleted, shallower than the content: P is `x\r\n`.
