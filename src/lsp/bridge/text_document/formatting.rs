@@ -2,10 +2,12 @@
 //! `TextEdit` range from virtual coordinates back to the host document, applying
 //! the injection's [`RegionOffset`] (including per-line column for the first line).
 //!
-//! [`transform_formatting_response_to_host`] is `pub(super)` so
+//! [`formatting_answer_to_host`] (over
+//! [`transform_formatting_response_to_host`]) is `pub(super)` so
 //! [`super::range_formatting`], which shares the same virtual→host hazards,
 //! can reuse it; [`super::on_type_formatting`] uses
-//! [`transform_on_type_formatting_response_to_host`].
+//! [`on_type_formatting_answer_to_host`] (over
+//! [`transform_on_type_formatting_response_to_host`]).
 //!
 //! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!

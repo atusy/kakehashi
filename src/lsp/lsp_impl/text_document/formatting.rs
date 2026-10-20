@@ -2296,7 +2296,8 @@ pub(super) type RegionEdits = (Vec<TextEdit>, Option<Sourced<()>>);
 /// shape into the LSP-spec response (`None` when there are no edits).
 ///
 /// Both formatting handlers funnel their per-region futures into a single
-/// `JoinSet<Option<Vec<TextEdit>>>` and need to:
+/// `JoinSet<Option<RegionEdits>>` (each region's edits and the prepared
+/// region they were mapped through) and need to:
 ///
 /// 1. Cancel-aware collect every region's edits (regions whose dispatcher
 ///    cancelled or returned no result contribute nothing).

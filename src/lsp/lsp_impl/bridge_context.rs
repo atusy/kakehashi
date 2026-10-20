@@ -76,7 +76,9 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 
 /// Whether an edit method stays open to a contiguous prepared document: its
 /// edits are mapped back through the prepared map
-/// (`translate_virtual_text_edits_to_host`).
+/// (`translate_virtual_text_edits_to_host` and
+/// `translate_virtual_text_edit_to_host` for edits keeping their extents,
+/// `translate_virtual_formatting_edits_to_host` for a formatter's answer).
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
