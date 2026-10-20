@@ -425,6 +425,18 @@ edit states (one ending where the other starts is kept). A file
 operation on a virtual document refuses the whole edit, and other regions'
 virtual documents are dropped, as on any document.
 
+Snippet edits never reach a prepared document. LSP 3.18's
+`SnippetTextEdit` in `documentChanges` is not among the types kakehashi
+parses LSP with: the editor's `workspace.workspaceEdit.snippetEditSupport`
+is dropped as `initialize` is read, so no downstream server is invited to
+send one, and an entry holding one fails the parse of the whole edit (a
+rename answers null, the code action is skipped, `workspace/applyEdit` is
+answered `InvalidParams`), as on an unprepared document. A server sending
+snippet syntax in a plain `TextEdit` under an editor's `experimental`
+capability (rust-analyzer's `snippetTextEdit`, marking the edit with
+`insertTextFormat`) loses the mark in that parse: the editor inserts the
+text as is, which is the text the map checks.
+
 prepareRename's range, which the client shows as what a rename replaces,
 and linked editing ranges, which it types into together, are offered only
 where they cover in the host exactly the text they cover in P (no removed
@@ -612,9 +624,22 @@ Completion keeps to what the client inserts where it asked:
   insert/replace edit maps through both ranges, which must start at the
   same position as sent, map the shared text alike and keep their shared
   start.
-- A snippet is kept only when it is literal text: what a client expands
-  tabstops, placeholders, variables or escapes to is not the text checked.
-  Kept, it is sent as plain text, which no snippet engine re-indents.
+- A snippet is checked as the client expands it, every tabstop at its
+  default, and kept only when every client expands it alike: literal text,
+  tabstops, and at most one placeholder per tabstop, its default holding no
+  `$` and escaping nothing but `$`, `}` or `\`; the final tabstop at most
+  once; all on one line, with no tab. Choices are refused (VS Code inserts
+  the first option, Neovim's `vim.snippet.expand` nothing until the user
+  reaches it), as are variables, transforms, nested placeholders and a `$`
+  opening nothing (Neovim's grammar reads none of the latter). The
+  expansion is what the map and the region's checks read, with the
+  additional edits, through each range the client may apply the main edit
+  with; the snippet goes out with the indentation the expansion regained
+  written before it — spaces only — and is dropped otherwise. One
+  expanding to spaces alone is dropped: the user types at its tabstop,
+  which on a blank line among dedented ones regains no indent. A literal
+  snippet (no `$` or `\`) is sent as plain text, which no snippet engine
+  re-indents.
 - An item without a `textEdit` is inserted at the caret, outside the map:
   it is dropped when its text breaks a line; where the same text as an
   edit at the caret regains an indent (a blank line among dedented ones,
@@ -823,6 +848,17 @@ use, also revokes those maps (see Configuration and Discovery). Revocation
 is kept per input and is triggered only by that input's failure. It is not
 a hook per kind of change.
 
+### Snippets breaking lines for an editor declaring it inserts as is
+
+A multi-line snippet could regain the removed indentation on its lines
+(written into its literal text, or into a default its tabstop holds once)
+and go to an editor declaring `insertTextModeSupport` with `asIs`, marked
+so. The declaration does not reach the snippet engine: mini.completion
+declares it and expands through mini.snippets or `vim.snippet.expand`,
+which indent the lines after the first by the cursor line's anyway, so
+the regained indentation would be doubled. No declaration tells which
+editors keep a snippet as is.
+
 ## Consequences
 
 ### Positive
@@ -843,8 +879,18 @@ a hook per kind of change.
   does.
 - No edit-producing method (those listed in Coordinates) nor inbound
   `workspace/applyEdit` is available on a prepared document with gaps;
-  completion items are snippets only as literal text, and are not
-  resolved.
+  completion items are not resolved.
+- A snippet completion breaking a line or holding a tab is refused on a
+  prepared document, whatever the editor declares (a literal one goes out
+  as plain text): snippet engines rewrite both whatever `insertTextMode`
+  asks. Neovim's `vim.snippet.expand` (`runtime/lua/vim/snippet.lua`)
+  prefixes every line after the first with the cursor line's indentation
+  and, under `expandtab`, turns every tab into spaces; mini.snippets
+  indents the later lines too, behind mini.completion, which declares
+  `insertTextModeSupport` with `asIs`. The indentation a prepared map
+  regains would be doubled, or a tab shortened. One-line snippets with
+  tabstops and placeholders still map, and literal snippets go out as
+  plain text.
 - A rename's, code action's or server's own `workspace/applyEdit` edit
   adding, removing or rewriting lines on a
   region the peer dedented unevenly is refused whole (in-line edits, a
