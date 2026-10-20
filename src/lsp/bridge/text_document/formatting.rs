@@ -2269,6 +2269,121 @@ mod tests {
     }
 
     #[test]
+    fn whole_line_stretches_from_blank_lines_map_back_through_the_transform() {
+        // Formatting answers whose stretches start on, or run across,
+        // whitespace lines the peer emptied or kept.
+        {
+            // A line rewritten past a whitespace line the peer emptied (` `):
+            // `end` is a line of the content.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  x\\n \\n  c\\n  then\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 1, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 0}}, \"newText\": \"x\\nend\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "  x\n  end\n",
+                "m17"
+            );
+        }
+        {
+            // The same with the whitespace line kept (`   `).
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  x\\n   \\n  c\\n  then\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 0}}, \"newText\": \"x\\nend\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "  x\n  end\n",
+                "m8"
+            );
+        }
+        {
+            // A whole answer ending a line short of P's end, the closing kept.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\" \\tdef f(x):\\r\\n\\t\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"end\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                " \tend\r\n\t",
+                "n1"
+            );
+        }
+        {
+            // Lines reordered across CRLF and emptied whitespace lines; those
+            // blank lines read as rewritten empty (their whitespace, which
+            // the peer removed, is not told apart by the answer).
+            let virtual_content: &str = &serde_json::from_str::<String>("\"\\tcall(\\ud835\\udcb3, '\\u00e9')\\r\\n \\n\\t \\r\\n\\t\\n\\treturn x\\r\\n\\treturn x\\r\\n\\t \\n\\t    }\\r\\n\\t    let y = f x;\\r\\n\\t\\r\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 1, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 4, \"character\": 0}, \"end\": {\"line\": 4, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 5, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 6, \"character\": 0}, \"end\": {\"line\": 6, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 0}, \"end\": {\"line\": 7, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 0}, \"end\": {\"line\": 8, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 9, \"character\": 0}, \"end\": {\"line\": 9, \"character\": 1}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 8}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 0, \"character\": 9}, \"end\": {\"line\": 0, \"character\": 13}}, \"newText\": \" }\"}, {\"range\": {\"start\": {\"line\": 4, \"character\": 8}, \"end\": {\"line\": 4, \"character\": 8}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 5, \"character\": 8}, \"end\": {\"line\": 5, \"character\": 8}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 0}, \"end\": {\"line\": 7, \"character\": 3}}, \"newText\": \"call(\\ud835\\udcb3,\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 4}, \"end\": {\"line\": 7, \"character\": 5}}, \"newText\": \"'\\u00e9')\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 2}, \"end\": {\"line\": 8, \"character\": 4}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 15}, \"end\": {\"line\": 8, \"character\": 15}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 16}, \"end\": {\"line\": 9, \"character\": 0}}, \"newText\": \"\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "\t  }\r\n\n\r\n\n\treturn xss\r\n\treturn xss\r\n\n\tcall(\u{1D4B3}, '\u{e9}')\r\n\t  let y = f xss;\r\n",
+                "t1"
+            );
+        }
+        {
+            // A whole-line stretch from a kept whitespace line into a dedented
+            // line rewritten: the rewritten line keeps the content's indent.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  a = 1\\n \\n    foo(\\n    f('a')\\n\"")
+                    .unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 4, \"character\": 0}}, \"newText\": \"    a = 1\\na = 1,\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "      a = 1\n  a = 1,\n",
+                "r4t1"
+            );
+        }
+    }
+
+    #[test]
     fn a_line_after_a_removed_blank_line_keeps_the_contents_indent() {
         // A list item's Python fence: its blank lines carry the item's
         // indent, which the peer removes with the rest. Black removes one
