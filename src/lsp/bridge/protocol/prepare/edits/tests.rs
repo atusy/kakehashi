@@ -3666,6 +3666,50 @@ mod formatting {
     }
 
     #[test]
+    fn non_ascii_text_in_many_stretches_maps_back_exactly() {
+        // `["あ","é",...]` respaced after each comma: a stretch after every
+        // comma of one line, each mapped back to UTF-16 columns.
+        let virtual_text = "  [\"\u{3042}\",\"\u{e9}\",\"\u{1F600}\"]\n";
+        let map = dedent_by_two(virtual_text);
+        let answer = [edit(
+            (0, 0),
+            (1, 0),
+            "[\"\u{3042}\", \"\u{e9}\", \"\u{1F600}\"]\n",
+        )];
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert_eq!(
+            mapped,
+            vec![edit((0, 7), (0, 7), " "), edit((0, 11), (0, 11), " "),]
+        );
+        assert_eq!(
+            apply_to(virtual_text, &mapped),
+            "  [\"\u{3042}\", \"\u{e9}\", \"\u{1F600}\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_long_non_ascii_line_in_many_stretches_converts_in_linear_work() {
+        // One line of 20,000 `"あ"` elements respaced after each comma: some
+        // 20,000 stretches on one line. Their ends and the answer's convert
+        // in one pass each, never one by one rescanning the line.
+        let count = 20_000;
+        let elements = vec!["\"\u{3042}\""; count];
+        let virtual_text = format!("  [{}]\n", elements.join(","));
+        let formatted = format!("[{}]\n", elements.join(", "));
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (1, 0), &formatted)];
+        use super::super::super::{CONVERSIONS, SCANNED};
+        CONVERSIONS.with(|conversions| conversions.set(0));
+        SCANNED.with(|scanned| scanned.set(0));
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert_eq!(mapped.len(), count - 1);
+        assert!(CONVERSIONS.with(|conversions| conversions.get()) <= 16);
+        let scanned = SCANNED.with(|scanned| scanned.get());
+        assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
+        assert_eq!(apply_to(&virtual_text, &mapped), format!("  {formatted}"));
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.
