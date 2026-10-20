@@ -276,7 +276,7 @@ otherwise, as any answer still removing the line break that ends a
 region is: what follows the region, a closing fence say, would join its
 last line), and the result diffed against P. An answer
 changing a region whose peer dedented it unevenly — a line of text (not
-whitespace alone, nor starting with a gap's text) the peer left alone, or
+whitespace alone) the peer left alone, or
 dedented otherwise than the rest of its segment — is refused before any
 pairing: every line of a whole answer is rewritten text, and which old
 line each is, and so which indentation it regains, only a pairing reads;

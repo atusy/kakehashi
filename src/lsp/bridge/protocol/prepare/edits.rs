@@ -34,7 +34,10 @@ pub(crate) enum EditMode {
 /// [`PreparedMap::map_formatting_answer`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FormattingRefusal {
-    /// Its shape: the host cannot take what it changes, as mapped.
+    /// Its shape: the host cannot take what it changes, as mapped — or no
+    /// reading of a whole answer places it for sure: text where a
+    /// whitespace line the peer kept was, or any change to a region the
+    /// peer dedented unevenly.
     Shape,
     /// Its size: the diff ran out of work (see `FORMATTING_DIFF_BUDGET`)
     /// before telling what it changes.
@@ -77,8 +80,11 @@ impl std::fmt::Display for FormattingRefusal {
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 
 /// The most a formatting answer's diff may spend, the per-byte allowance
-/// included: the tables its searches keep take a cell per step (4 bytes),
-/// some 64 MiB at most however large the texts.
+/// included: the tables quadratic in what its searches compare (the line
+/// diff's trace, the blank-line table) take a cell per step (4 bytes),
+/// some 64 MiB at most however large the texts; what else the diff keeps
+/// (the line diff's frontier, the lines' keys and indexes) is linear in
+/// the texts.
 const FORMATTING_DIFF_BUDGET_CAP: usize = 1 << 24;
 
 /// How many bytes a step of work covers where the searches hash or compare
@@ -210,6 +216,9 @@ impl PreparedMap {
                 if line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
                     return false;
                 }
+                // Defensive: formatting is open only on prepared documents
+                // without gaps, so no line starts in a gap's text there; a
+                // map with gaps keeps such a line out of the count.
                 let run = self.runs.partition_point(|run| run.prepared.end <= start);
                 if self
                     .runs
@@ -1328,8 +1337,8 @@ enum Alignment {
 /// What is left between pairs (lines rewritten past telling, lines written
 /// or removed) is diffed by character as one run. Which of several blank
 /// lines alike a line was written on, or which went, no answer tells; text
-/// the run's diff writes on a whitespace line the peer kept gains no
-/// indent, as typed text there does.
+/// in the place of a whitespace line the peer kept is refused (see
+/// [`runs_to_diff`]).
 const ALIGNMENTS: [Alignment; 8] = [
     Alignment::Diff(0, |key| !key.trim_matches([' ', '\t']).is_empty(), false),
     Alignment::Diff(1, |key| !key.is_empty(), false),
@@ -1461,8 +1470,7 @@ fn joined_lines(
 /// same place from an end pair: a line no later than where the two texts
 /// part ways is the line it was there. A whitespace line the peer kept
 /// left between them, the answer's text in its place, is read line for
-/// line, and refused where the text is not typed on it (see
-/// [`runs_to_diff`]).
+/// line, and that text refused (see [`runs_to_diff`]).
 fn alike_ends(
     old_keys: &LineKeys,
     new_keys: &LineKeys,
@@ -1527,13 +1535,13 @@ type DiffRun = (Range<usize>, Range<usize>, bool);
 /// on one the answer removed, regaining that line's indent, not the
 /// content's. Where the old side holds blank lines only, as many as the new
 /// lines (the new not ending with a line break the old lacks), the new
-/// lines take their places line for line: a blank line, or text written on
-/// a whitespace line the peer kept after its whitespace, is that line (see
-/// [`ALIGNMENTS`]); other text is a line of the content in place of an
-/// empty line, and refused in place of a kept whitespace line. With more
-/// or fewer, each kept whitespace line keeps the first line written on it
-/// after its whitespace, in order; the others went, and the other lines
-/// are the content's.
+/// lines take their places line for line: a blank line is that line; text
+/// is a line of the content in place of an empty line, and refused in
+/// place of a kept whitespace line (written on it, or in its place, a
+/// whole-text answer does not tell). With more or fewer, the blank lines
+/// went and the other lines are the content's, before them; text starting
+/// with exactly a kept line's whitespace, which may have been typed on it,
+/// is refused.
 fn runs_to_diff(
     old_lines: &[(usize, &str)],
     new_lines: &[(usize, &str)],

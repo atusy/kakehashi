@@ -2441,9 +2441,12 @@ pub(super) async fn settled_verdict(
         if tokio::time::Instant::now() >= deadline {
             return Verdict::Unsettled;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::time::sleep(SETTLE_POLL).await;
     }
 }
+
+/// How often [`settled_verdict`] looks again while an answer is settling.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[cfg(test)]
 mod tests {
