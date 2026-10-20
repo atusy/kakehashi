@@ -507,24 +507,18 @@ fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
 
 #[test]
 fn a_snippet_completion_on_a_prepared_document_keeps_its_tabstops() {
-    // `do\n\t${1:body}\n$0end` expands to lines that regain the removed
-    // indent, written into the snippet: kept for an editor that inserts as
-    // is when told to, and told so. One that declares no such support may
-    // indent a snippet's lines itself: only the one-line snippet comes back.
-    for (capabilities, labels) in [
-        (
-            json!({ "textDocument": { "completion": { "completionItem": {
-                "snippetSupport": true,
-                "insertTextModeSupport": { "valueSet": [1, 2] }
-            }}}}),
-            vec!["call", "block"],
-        ),
-        (
-            json!({ "textDocument": { "completion": { "completionItem": {
-                "snippetSupport": true
-            }}}}),
-            vec!["call"],
-        ),
+    // A one-line snippet keeps its tabstops. `do\n\t${1:body}\n$0end` is
+    // refused whatever the editor declares: snippet engines indent a
+    // snippet's later lines by the caret line's, and turn its tabs into
+    // spaces, whatever the item asks.
+    for capabilities in [
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true,
+            "insertTextModeSupport": { "valueSet": [1, 2] }
+        }}}}),
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true
+        }}}}),
     ] {
         let (mut client, _dir) = Setup {
             capabilities,
@@ -539,29 +533,17 @@ fn a_snippet_completion_on_a_prepared_document_keeps_its_tabstops() {
             "textDocument/completion",
             json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 24 } }),
         );
-        let items = result_items(&response);
-        let got: Vec<&str> = items
-            .iter()
-            .map(|item| item["label"].as_str().unwrap())
-            .collect();
-        assert_eq!(got, labels, "{response}");
         let at = json!({
             "start": { "line": 3, "character": 24 },
             "end": { "line": 3, "character": 24 }
         });
         assert_eq!(
-            items[0]["textEdit"],
-            json!({ "range": at, "newText": "f(${1:x})$0" })
+            response["result"]["items"],
+            json!([{"label": "call", "insertTextFormat": 2, "textEdit": {
+                "range": at, "newText": "f(${1:x})$0"
+            }}]),
+            "{response}"
         );
-        assert_eq!(items[0]["insertTextFormat"], json!(2));
-        if let Some(block) = items.get(1) {
-            assert_eq!(
-                block["textEdit"],
-                json!({ "range": at, "newText": "do\n  \t${1:body}\n  $0end" })
-            );
-            assert_eq!(block["insertTextFormat"], json!(2));
-            assert_eq!(block["insertTextMode"], json!(1));
-        }
     }
 }
 
