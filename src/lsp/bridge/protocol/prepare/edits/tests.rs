@@ -6100,3 +6100,27 @@ mod replay_reference {
         assert!(replay[0].exact > 1000, "{:?}", replay[0]);
     }
 }
+
+#[test]
+fn a_long_line_broken_at_many_places_replays_as_one_group() {
+    let words: Vec<String> = (0..200).map(|at| format!("w{at}")).collect();
+    let virtual_text = format!("  {}\n  end\n", words.join(" "));
+    let map = dedent_by_two(&virtual_text);
+    // Every space of the long line broken.
+    let mut column = 0;
+    let mut edits = Vec::new();
+    for word in &words[..words.len() - 1] {
+        column += word.len() as u32;
+        edits.push(edit((0, column), (0, column + 1), "\n"));
+        column += 1;
+    }
+    let expected: String = words
+        .iter()
+        .map(|word| format!("  {word}\n"))
+        .chain(["  end\n".to_string()])
+        .collect();
+    assert_eq!(
+        replayed(&virtual_text, &map, &edits).as_deref(),
+        Some(expected.as_str())
+    );
+}
