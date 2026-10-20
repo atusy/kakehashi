@@ -33,10 +33,6 @@ pub(crate) enum EditMode {
     /// another, within one line maps keeping its extent; one creating,
     /// removing or rewriting lines is replayed on P and diffed on its own
     /// lines, as a formatting answer is (see [`PreparedMap::map_edits`]).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "workspace edits map through it next")
-    )]
     Replay,
 }
 
