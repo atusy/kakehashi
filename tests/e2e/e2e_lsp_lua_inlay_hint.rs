@@ -1395,18 +1395,31 @@ fn record_progress(message: &Value, kinds: &mut Vec<String>) {
     }
 }
 
-/// Collect messages until `id` is answered and the editor's progress ended,
-/// returning the answer.
-fn finish_held_progress_request(client: &mut LspClient, id: i64, kinds: &mut Vec<String>) -> Value {
+/// Collect messages until `id` and every id in `also` are answered and the
+/// editor's progress ended, returning `id`'s answer. The other answers are
+/// awaited here too, as they can interleave with it in either order.
+fn finish_held_progress_request(
+    client: &mut LspClient,
+    id: i64,
+    also: &[i64],
+    kinds: &mut Vec<String>,
+) -> Value {
     let mut response = None;
+    let mut pending: Vec<i64> = also.to_vec();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while response.is_none() || !kinds.iter().any(|kind| kind == "end") {
+    while response.is_none() || !pending.is_empty() || !kinds.iter().any(|kind| kind == "end") {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let message = client
-            .receive_any_message(remaining)
-            .unwrap_or_else(|| panic!("no answer or no End: {kinds:?} {response:?}"));
-        if message["id"] == json!(id) && message.get("method").is_none() {
-            response = Some(message);
+        let message = client.receive_any_message(remaining).unwrap_or_else(|| {
+            panic!("no answer or no End: {kinds:?} {response:?} pending {pending:?}")
+        });
+        if message.get("method").is_none()
+            && let Some(answered) = message["id"].as_i64()
+        {
+            if answered == id {
+                response = Some(message);
+            } else {
+                pending.retain(|other| *other != answered);
+            }
         } else {
             record_progress(&message, kinds);
         }
@@ -1435,7 +1448,7 @@ fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
             }
         }),
     );
-    let response = finish_held_progress_request(&mut client, id, &mut kinds);
+    let response = finish_held_progress_request(&mut client, id, &[release], &mut kinds);
     assert!(response.get("error").is_none(), "{response}");
     assert_eq!(
         response["result"].as_array().map(Vec::len),
@@ -1443,7 +1456,6 @@ fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
         "{response}"
     );
     assert_eq!(kinds, ["begin", "report", "end"]);
-    let _ = client.receive_response_for_id_public(release);
 
     shutdown_client(&mut client);
 }
@@ -1458,7 +1470,7 @@ fn e2e_inlay_hint_work_done_progress_ends_on_cancel() {
     let (id, mut kinds) = start_held_progress_request(&mut client, uri);
 
     client.send_notification("$/cancelRequest", json!({ "id": id }));
-    let response = finish_held_progress_request(&mut client, id, &mut kinds);
+    let response = finish_held_progress_request(&mut client, id, &[], &mut kinds);
     assert_eq!(response["error"]["code"], -32800, "{response}");
     assert_eq!(kinds, ["begin", "report", "end"]);
 
