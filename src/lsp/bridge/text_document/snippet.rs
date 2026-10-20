@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 /// A snippet and the text it expands to with every tabstop and placeholder
 /// left at its default: what the client inserts unless the user types over
-/// it. Every occurrence of a tabstop mirrors the default of its
-/// placeholder, wherever that stands — `$1x${1:y}` expands to `yxy`.
+/// it. Every later occurrence of a tabstop mirrors the default of its first
+/// — `${1:y}x$1` expands to `yxy`.
 #[derive(Debug)]
 pub(super) struct Expansion {
     snippet: String,
@@ -77,6 +77,13 @@ impl Expansion {
                             // transform.
                             _ => return None,
                         };
+                        // A default must stand on its tabstop's first
+                        // occurrence: mini.snippets takes the first as the
+                        // tabstop, inserting `x` for `$1x${1:y}` where
+                        // vim.snippet inserts `yxy`.
+                        if default.is_some() && occurrences.contains_key(&number) {
+                            return None;
+                        }
                         if let Some(default) = default
                             && defaults.insert(number.clone(), default).is_some()
                         {
@@ -226,12 +233,11 @@ mod tests {
         assert_eq!(expanded("${1}x$12y").as_deref(), Some("xy"));
         assert_eq!(expanded("${1:a\\}b\\$c}").as_deref(), Some("a}b$c"));
         assert_eq!(expanded("a}b\\").as_deref(), Some("a}b\\"));
-        // Every occurrence mirrors its tabstop's default, ahead of it too.
-        assert_eq!(expanded("$1x${1:y}").as_deref(), Some("yxy"));
-        assert_eq!(expanded("$01x${1:y}").as_deref(), Some("yxy"));
+        // Every later occurrence mirrors the default of its first.
+        assert_eq!(expanded("${1:y}x$1").as_deref(), Some("yxy"));
         assert_eq!(expanded("$00").as_deref(), Some(""));
         // Other tabstops mirror however often they occur.
-        assert_eq!(expanded("$1x$1${1:y}$0").as_deref(), Some("yxyy"));
+        assert_eq!(expanded("${1:y}x$1$1$0").as_deref(), Some("yxyy"));
     }
 
     #[test]
@@ -252,6 +258,10 @@ mod tests {
         assert_eq!(expanded("$0x$0"), None);
         assert_eq!(expanded("${0:a}x$0"), None);
         assert_eq!(expanded("$00x${0}"), None);
+        // A default after its tabstop's first occurrence, which
+        // mini.snippets does not mirror back.
+        assert_eq!(expanded("$1x${1:y}"), None);
+        assert_eq!(expanded("$1x$1${1:y}"), None);
         // Several defaults for one tabstop.
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:y}"), None);
