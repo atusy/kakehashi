@@ -35,7 +35,8 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
+//!   triple, the edit-producing formatting/on-type-formatting/rename/
+//!   color-presentation requests, and pull
 //!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
@@ -302,9 +303,11 @@ enum Role {
 /// Readers are the document-snapshotting request families: `semanticTokens`
 /// (including `range`, which never had the in-handler `edit_lock` settle),
 /// the `kakehashi/captures` triple, which mirrors it, the edit-producing
-/// requests (formatting, rename — their edits are applied by the client to
-/// its current text, so edits computed against a stale snapshot corrupt the
-/// document), and pull diagnostics.
+/// requests (formatting, on-type formatting, rename — their edits are applied
+/// by the client to its current text, so edits computed against a stale
+/// snapshot corrupt the document; an on-type request follows its trigger
+/// keystroke's didChange on the wire, so overtaking it would compute edits on
+/// text that lacks the typed character), and pull diagnostics.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568), and so is `textDocument/inlayHint`, whose
@@ -357,6 +360,7 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/semanticTokens/range"
         | "textDocument/formatting"
         | "textDocument/rangeFormatting"
+        | "textDocument/onTypeFormatting"
         | "textDocument/rename"
         | "textDocument/prepareRename"
         | "textDocument/codeAction"
@@ -815,6 +819,7 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/documentColor",
             "textDocument/colorPresentation",
+            "textDocument/onTypeFormatting",
             "textDocument/diagnostic",
             "kakehashi/captures/full",
             "kakehashi/captures/full/delta",
@@ -1138,6 +1143,51 @@ mod tests {
         assert!(writer.poll().is_ready());
         assert!(presentation.is_woken());
         assert!(presentation.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
+    /// The trigger keystroke's didChange and the on-type request arrive back to
+    /// back. If the request overtakes a didChange stalled behind the per-URI
+    /// edit lock, its edits are computed on text missing the trigger character
+    /// yet applied by the client at the post-keystroke caret.
+    #[tokio::test]
+    async fn gate_runs_on_type_formatting_only_after_preceding_change() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut gate = IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        });
+
+        let writer_fut = gate.call(notification("textDocument/didChange", URI));
+        let on_type_fut = gate.call(notification("textDocument/onTypeFormatting", URI));
+        let mut writer = tokio_test::task::spawn(writer_fut);
+        let mut on_type = tokio_test::task::spawn(on_type_fut);
+
+        assert!(
+            on_type.poll().is_pending(),
+            "onTypeFormatting must not run before the preceding didChange"
+        );
+        assert!(
+            writer.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        assert!(
+            on_type.poll().is_pending(),
+            "onTypeFormatting must remain behind the stalled didChange"
+        );
+
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(writer.poll().is_ready());
+        assert!(
+            on_type.is_woken(),
+            "didChange completion must wake the request"
+        );
+        assert!(on_type.poll().is_ready());
         assert_eq!(
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
