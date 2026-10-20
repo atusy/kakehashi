@@ -939,6 +939,13 @@ impl LspClient {
     /// hanging on a quiet pipe. A disconnect (reader thread ended at EOF) also
     /// returns None — no further messages can arrive. A framing/parse error
     /// panics with its diagnostic.
+    /// Receive the next message of any kind (response, notification or
+    /// server request) within `timeout`, for tests that must observe the
+    /// interleaving of a pending response with notifications.
+    pub(crate) fn receive_any_message(&mut self, timeout: Duration) -> Option<Value> {
+        self.try_receive_message(timeout)
+    }
+
     fn try_receive_message(&mut self, timeout: Duration) -> Option<Value> {
         match self.rx.recv_timeout(timeout) {
             Ok(ReaderEvent::Message(value)) => Some(value),

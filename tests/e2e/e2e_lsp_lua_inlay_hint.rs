@@ -1310,3 +1310,157 @@ fn e2e_inlay_hint_work_done_progress_spans_every_region() {
 
     shutdown_client(&mut client);
 }
+
+const PROGRESS_TOKEN: &str = "editor-inlay-progress";
+const HELD_REGION_TEXT: &str =
+    "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal slow = 2\n```\n";
+
+/// Open the two-fence document whose second fence the `inlay-hint-progress`
+/// mock holds, warm both regions, and send a whole-document request carrying
+/// the editor's work-done token. Returns the request id once the fast
+/// region's Begin and Report reached the editor and a quiet window showed no
+/// End and no answer while the held region is still in flight.
+fn start_held_progress_request(client: &mut LspClient, uri: &str) -> (i64, Vec<String>) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": HELD_REGION_TEXT
+        }}),
+    );
+    inlay_hints_with_retry(client, uri, 3, 4);
+    inlay_hints_with_retry(client, uri, 9, 10);
+
+    let id = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 11, "character": 0 }
+            },
+            "workDoneToken": PROGRESS_TOKEN
+        }),
+    );
+    let mut kinds = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !kinds.iter().any(|kind| kind == "report") {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = client
+            .receive_any_message(remaining)
+            .expect("the fast region's progress must reach the editor");
+        assert_ne!(
+            message["id"],
+            json!(id),
+            "answered while a region is held: {message}"
+        );
+        record_progress(&message, &mut kinds);
+    }
+    // The fast region has reported; its answer follows on the same pipe. A
+    // lifecycle tied to that region would end now, while the other is held.
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(700);
+    loop {
+        let remaining = quiet_until.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(message) = client.receive_any_message(remaining) else {
+            break;
+        };
+        assert_ne!(
+            message["id"],
+            json!(id),
+            "answered while a region is held: {message}"
+        );
+        record_progress(&message, &mut kinds);
+    }
+    assert_eq!(
+        kinds,
+        ["begin", "report"],
+        "progress must stay open while a region is still in flight"
+    );
+    (id, kinds)
+}
+
+fn record_progress(message: &Value, kinds: &mut Vec<String>) {
+    if message["method"] == "$/progress" && message["params"]["token"] == PROGRESS_TOKEN {
+        kinds.push(
+            message["params"]["value"]["kind"]
+                .as_str()
+                .expect("progress kind")
+                .to_string(),
+        );
+    }
+}
+
+/// Collect messages until `id` is answered and the editor's progress ended,
+/// returning the answer.
+fn finish_held_progress_request(client: &mut LspClient, id: i64, kinds: &mut Vec<String>) -> Value {
+    let mut response = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while response.is_none() || !kinds.iter().any(|kind| kind == "end") {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = client
+            .receive_any_message(remaining)
+            .unwrap_or_else(|| panic!("no answer or no End: {kinds:?} {response:?}"));
+        if message["id"] == json!(id) && message.get("method").is_none() {
+            response = Some(message);
+        } else {
+            record_progress(&message, kinds);
+        }
+    }
+    response.expect("answered")
+}
+
+/// The editor's work-done progress is one lifecycle for the whole request:
+/// the region that reports first owns it, and the bridge's terminal End
+/// comes only after the last region settles, not when the first one does.
+#[test]
+fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-progress", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress_held.md";
+    let (id, mut kinds) = start_held_progress_request(&mut client, uri);
+
+    // Any later inlay hint request releases the held region's answer.
+    let release = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 9, "character": 0 },
+                "end": { "line": 10, "character": 0 }
+            }
+        }),
+    );
+    let response = finish_held_progress_request(&mut client, id, &mut kinds);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"].as_array().map(Vec::len),
+        Some(2),
+        "{response}"
+    );
+    assert_eq!(kinds, ["begin", "report", "end"]);
+    let _ = client.receive_response_for_id_public(release);
+
+    shutdown_client(&mut client);
+}
+
+/// A cancel that lands while a region is held still ends the editor's
+/// progress, once, with the cancelled answer.
+#[test]
+fn e2e_inlay_hint_work_done_progress_ends_on_cancel() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-progress", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress_cancel.md";
+    let (id, mut kinds) = start_held_progress_request(&mut client, uri);
+
+    client.send_notification("$/cancelRequest", json!({ "id": id }));
+    let response = finish_held_progress_request(&mut client, id, &mut kinds);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    assert_eq!(kinds, ["begin", "report", "end"]);
+
+    shutdown_client(&mut client);
+}
