@@ -159,7 +159,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    narrowest per-line `RegionOffset` column). This is exact for the usual
    uniform-prefix injection (single-level indentation, or a uniform `> `) and is a
    documented limitation for the rare region whose per-line prefixes genuinely
-   differ across a line-count change. On **empty** output lines the prefix's
+   differ across a line-count change. A list item's fence leaves its blank rows
+   unindented, so they record no prefix; a row with none that comes before a
+   prefixed row, or before the closing fence's row, is such a blank row and
+   takes the region's common prefix instead, so output put there stays inside
+   the item. On **empty** output lines the prefix's
    trailing whitespace is trimmed (emit `>` not `> `, and leave a space-only prefix
    off entirely) so the pipeline does not introduce trailing-whitespace violations.
 
