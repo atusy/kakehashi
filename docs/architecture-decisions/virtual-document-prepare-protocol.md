@@ -325,9 +325,10 @@ Completion keeps to what the client inserts where it asked:
   Kept, it is sent as plain text, which no snippet engine re-indents.
 - An item without a `textEdit` is inserted at the caret, outside the map:
   it is dropped when its text breaks a line; where the same text as an
-  edit at the caret regains an indent (a blank line among dedented ones),
-  it goes out as that edit; its additional edits are dropped, having no
-  main edit to be checked with.
+  edit at the caret regains an indent (a blank line among dedented ones,
+  or one the peer emptied of other whitespace, which that edit replaces
+  on the caret's line), it goes out as that edit; its additional edits are
+  dropped, having no main edit to be checked with.
 - A mapped multi-line edit already regained the removed indentation: the
   item asks a client that supports it to insert as is, and is dropped for
   one that always adjusts indentation.
