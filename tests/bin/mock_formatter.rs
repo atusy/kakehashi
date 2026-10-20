@@ -1369,6 +1369,19 @@ fn main() {
                 }
             }
             "textDocument/codeAction" if mode == "echo-document" => {
+                // With `MOCK_CODE_ACTION_AFTER_RELEASE` set, answered only
+                // once the file `MOCK_RELEASE_FILE` names exists (or a
+                // minute later).
+                if std::env::var_os("MOCK_CODE_ACTION_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 // `echo-fix` replaces the first line; `echo-wrap` is lazy, its
                 // resolve wrapping the document in `do`/`end`, the header and
                 // the first line's indent as touching edits.

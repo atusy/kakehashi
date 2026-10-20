@@ -67,6 +67,9 @@ struct Setup {
     /// Have the echo mock answer renames only once the test creates
     /// `release` in its directory.
     rename_after_release: bool,
+    /// Have the echo mock answer code actions only once the test creates
+    /// `release` in its directory.
+    code_action_after_release: bool,
 }
 
 impl Default for Setup {
@@ -86,6 +89,7 @@ impl Default for Setup {
             second_on_type: false,
             color_after_release: false,
             rename_after_release: false,
+            code_action_after_release: false,
         }
     }
 }
@@ -153,6 +157,9 @@ impl Setup {
         }
         if self.rename_after_release {
             builder = builder.env("MOCK_RENAME_AFTER_RELEASE", "1");
+        }
+        if self.code_action_after_release {
+            builder = builder.env("MOCK_CODE_ACTION_AFTER_RELEASE", "1");
         }
         if self.wire_log {
             builder = builder.env(
@@ -1048,58 +1055,110 @@ fn linked_editing_ranges_map_back_through_the_prepared_document() {
     );
 }
 
+fn code_action_request(uri: &str) -> Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 8 }
+        },
+        "context": { "diagnostics": [] }
+    })
+}
+
 #[test]
 fn code_actions_map_back_through_the_prepared_document() {
-    // An editor resolving lazy actions itself: on a prepared document they
-    // are resolved within the request all the same, through its map.
-    let (mut client, _dir) = Setup {
-        capabilities: json!({ "textDocument": { "codeAction": {
-            "dataSupport": true,
-            "resolveSupport": { "properties": ["edit"] }
-        } } }),
+    // Lazy actions resolved by the editor, and for an editor that cannot,
+    // within the request: either way through the prepared document's map.
+    for resolves in [true, false] {
+        let (mut client, _dir) = Setup {
+            capabilities: if resolves {
+                json!({ "textDocument": { "codeAction": {
+                    "dataSupport": true,
+                    "resolveSupport": { "properties": ["edit"] }
+                } } })
+            } else {
+                json!({})
+            },
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/action.md";
+        let text = "# t\n\n```lua\n  local x = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+        let actions = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{response}"));
+        let action = |title: &str| {
+            actions
+                .iter()
+                .find(|action| {
+                    action["title"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with(title))
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("no {title}: {response}"))
+        };
+        let edited = |action: &Value| {
+            let edits = action["edit"]["changes"][uri]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("{action}"));
+            apply_edits(text, &edits)
+        };
+        assert_eq!(edited(&action("echo-fix")), "# t\n\n```lua\n  fixed\n```\n");
+        let wrap = action("echo-wrap");
+        let wrap = if resolves {
+            assert!(wrap.get("edit").is_none(), "{wrap}");
+            let resolved = client.send_request("codeAction/resolve", wrap);
+            resolved["result"].clone()
+        } else {
+            wrap
+        };
+        assert_eq!(
+            edited(&wrap),
+            "# t\n\n```lua\n  do\n    local x = 1\n  end\n```\n",
+            "resolves: {resolves}"
+        );
+    }
+}
+
+#[test]
+fn code_actions_the_host_moved_under_are_dropped() {
+    // The echo mock answers code actions only once released. The host is
+    // edited (outside the region) while the request is out: the actions,
+    // made for the text before the edit, are not offered.
+    let (mut client, dir) = Setup {
+        code_action_after_release: true,
+        wire_log: true,
         ..Setup::default()
     }
     .start();
-    let uri = "file:///prepare/action.md";
+    let uri = "file:///prepare/action-stale.md";
     let text = "# t\n\n```lua\n  local x = 1\n```\n";
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
-    let response = client.send_request(
-        "textDocument/codeAction",
-        json!({
-            "textDocument": { "uri": uri },
-            "range": {
-                "start": { "line": 3, "character": 8 },
-                "end": { "line": 3, "character": 8 }
-            },
-            "context": { "diagnostics": [] }
-        }),
-    );
-    let actions = response["result"]
-        .as_array()
-        .cloned()
-        .unwrap_or_else(|| panic!("{response}"));
-    let edited = |title: &str| {
-        let action = actions
-            .iter()
-            .find(|action| {
-                action["title"]
-                    .as_str()
-                    .is_some_and(|t| t.starts_with(title))
-            })
-            .unwrap_or_else(|| panic!("no {title}: {response}"));
-        assert!(action.get("data").is_none(), "{action}");
-        let edits = action["edit"]["changes"][uri]
-            .as_array()
-            .cloned()
-            .unwrap_or_else(|| panic!("{action}"));
-        apply_edits(text, &edits)
-    };
-    assert_eq!(edited("echo-fix"), "# t\n\n```lua\n  fixed\n```\n");
-    assert_eq!(
-        edited("echo-wrap"),
-        "# t\n\n```lua\n  do\n    local x = 1\n  end\n```\n"
-    );
+    let id = client.send_request_async("textDocument/codeAction", code_action_request(uri));
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/codeAction\t"))
+    {
+        assert!(Instant::now() < until, "code action request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
 }
 
 #[test]
