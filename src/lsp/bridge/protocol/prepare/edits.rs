@@ -281,7 +281,7 @@ impl PreparedMap {
             .into_iter()
             .map(|hunk| {
                 let following = prepared[hunk.old.end..].chars().next();
-                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following)
+                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following, true)
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(FormattingRefusal::Shape)?;
@@ -400,6 +400,7 @@ impl PreparedMap {
                 ranges[index].clone(),
                 &edits[index].new_text,
                 following,
+                false,
             )?);
         }
         let mapped: Vec<(Range<usize>, String)> = mapped
@@ -581,12 +582,15 @@ impl PreparedMap {
     }
 
     /// Map the replacement of P's `old` bytes by `new_text` onto V.
-    /// `following` is the character after the replacement in P.
+    /// `following` is the character after the replacement in P;
+    /// `whole_answer` tells a stretch of a formatting answer from an edit
+    /// keeping its extent.
     fn hunk_to_virtual(
         &self,
         old: Range<usize>,
         new_text: &str,
         following: Option<char>,
+        whole_answer: bool,
     ) -> Option<(Range<usize>, String)> {
         if self.hunk_reaches_into_gap(&old) {
             return None;
@@ -723,11 +727,13 @@ impl PreparedMap {
                 .take_while(|run| run.virtual_.end == virtual_start)
                 .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
         };
-        // Text written over a whole blank line, other than after the
-        // whitespace the peer kept on it, is a line of the content in its
-        // place: that line's whitespace was never an indent (a line the peer
-        // emptied, an empty line), or the text is not written after it.
-        let blank_line_text_in_place = whole_lines && {
+        // Text a formatting answer writes over a whole blank line, other
+        // than after the whitespace the peer kept on it, is a line of the
+        // content in its place: that line's whitespace was never an indent
+        // (a line the peer emptied, an empty line), or the text is not
+        // written after it. (Edits that keep their extents state where they
+        // go, and are placed as before.)
+        let blank_line_text_in_place = whole_answer && whole_lines && {
             let line_end = prepared[old.start..]
                 .find(['\n', '\r'])
                 .map_or(prepared.len(), |end| old.start + end);

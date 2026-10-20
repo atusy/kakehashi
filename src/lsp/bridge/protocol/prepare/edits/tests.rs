@@ -2947,6 +2947,33 @@ fn many_edits_on_one_long_line_look_at_it_in_linear_work() {
     }
 }
 
+#[test]
+fn an_edit_keeping_its_extent_over_whole_blank_lines_is_placed_as_it_says() {
+    // Text replacing whole lines from a blank line: an edit keeping its
+    // extent takes the indent its own rules give (formatting answers alone
+    // read such text as a line of the content in the blank line's place).
+    let changes = |removed: &[usize]| -> serde_json::Value {
+        removed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &width)| width > 0)
+            .map(|(line, &width)| {
+                json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": width}}, "newText": ""})
+            })
+            .collect()
+    };
+    let map = prepare("\t \n\n    \t\n", changes(&[1, 0, 4]));
+    assert_eq!(
+        map.map_one_with_extent(&edit((0, 0), (2, 1), "\u{1D11E}")),
+        Some(edit((0, 0), (2, 5), "\t\u{1D11E}"))
+    );
+    let map = prepare("    \r\na\n x\n      \n x\r\n", changes(&[3, 0, 0, 4, 1]));
+    assert_eq!(
+        map.map_one_with_extent(&edit((3, 0), (5, 1), "x")),
+        Some(edit((3, 0), (5, 0), "    x"))
+    );
+}
+
 mod formatting {
     use super::*;
 
