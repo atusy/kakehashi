@@ -74,54 +74,23 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
-/// Whether an edit method stays open to a contiguous prepared document: its
-/// edits are mapped back through the prepared map
+/// Whether `method` is closed to a region: one that is not contiguous
+/// cannot take the edits the method answers with. A contiguous prepared one
+/// can, every such method's edits mapping back through the prepared map
 /// (`translate_virtual_text_edits_to_host` and
 /// `translate_virtual_text_edit_to_host` for edits keeping their extents,
 /// `translate_virtual_formatting_edits_to_host` for a formatter's answer,
-/// `translate_virtual_replayed_edits_to_host` for a workspace edit), or the
-/// ranges standing for their text must read alike in the host
+/// `translate_virtual_replayed_edits_to_host` for a workspace edit), or its
+/// ranges standing for their text reading alike in the host
 /// (`translate_editable_virtual_range_to_host`: prepareRename's and
 /// linkedEditingRange's).
-fn method_maps_prepared_edits(method: &str) -> bool {
-    matches!(
-        method,
-        "textDocument/codeAction"
-            | "textDocument/colorPresentation"
-            | "textDocument/completion"
-            | "textDocument/formatting"
-            | "textDocument/inlayHint"
-            | "textDocument/linkedEditingRange"
-            | "textDocument/onTypeFormatting"
-            | "textDocument/prepareRename"
-            | "textDocument/rangeFormatting"
-            | "textDocument/rename"
-    )
-}
-
-/// Whether `method` is closed to a region: one that is not contiguous, or
-/// whose document is prepared (`prepared`), cannot take the edits the method
-/// answers with — but for the methods whose edits are mapped back through a
-/// prepared document ([`method_maps_prepared_edits`]).
-pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
-    method_closed_to_with(resolved, method, || prepared)
-}
-
-/// [`method_closed_to`], asking whether the document is prepared only for
-/// a method that depends on it.
-fn method_closed_to_with(
-    resolved: &ResolvedInjection,
-    method: &str,
-    prepared: impl FnOnce() -> bool,
-) -> bool {
-    method_requires_contiguous_injection(method)
-        && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
+pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str) -> bool {
+    method_requires_contiguous_injection(method) && !resolved.contiguous
 }
 
 /// [`prepare_request_context`] for a `method` request: `Err` when the
-/// document could not be prepared, `Ok(None)` when `method` is closed to it
-/// as prepared — checked again with the answer in, since the lifecycle pass
-/// may not have looked the region up yet.
+/// document could not be prepared, `Ok(None)` when `method` is closed to its
+/// region.
 pub(crate) async fn prepare_request_context_for(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     host_language: &str,
@@ -129,7 +98,7 @@ pub(crate) async fn prepare_request_context_for(
     method: &str,
 ) -> Result<Option<DocumentRequestContext>, crate::lsp::bridge::PrepareMiss> {
     let ctx = prepare_request_context(bridge, host_language, ctx).await?;
-    Ok((!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx))
+    Ok((!method_closed_to(&ctx.resolved, method)).then_some(ctx))
 }
 
 /// Start the prepare attempts of every region `regions` names (of a host in
@@ -1668,13 +1637,7 @@ impl Kakehashi {
             return None;
         };
 
-        // At once on what the lifecycle pass knows, a pending answer
-        // included (most likely prepared); checked again with the answer in
-        // (see `prepare_request_context_for`). Formatting waits instead (see
-        // its fan-out, which prepares every region's context).
-        if method_closed_to_with(&resolved, method_name, || {
-            self.lifecycle_prepares(&uri, &resolved)
-        }) {
+        if method_closed_to(&resolved, method_name) {
             return None;
         }
 
@@ -1917,9 +1880,10 @@ impl Kakehashi {
     }
 
     /// Whether the lifecycle pass prepares a region's current document (or
-    /// holds it back for its peer): what [`method_closed_to`] closes edit
-    /// methods by. Not whether a server still holds a prepared text of it
-    /// (see `BridgeCoordinator::region_coordinates_may_be_prepared`).
+    /// holds it back for its peer). Not whether a server still holds a
+    /// prepared text of it (see
+    /// `BridgeCoordinator::region_coordinates_may_be_prepared`).
+    #[cfg(test)]
     pub(crate) fn lifecycle_prepares(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
         self.bridge
             .prepare_region(
@@ -2525,9 +2489,7 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if method_closed_to_with(&resolved, method_name, || {
-                self.lifecycle_prepares(&uri, &resolved)
-            }) {
+            if method_closed_to(&resolved, method_name) {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
@@ -3358,11 +3320,11 @@ mod tests {
         ))
     }
 
-    /// An edit method on a region the lifecycle pass has not looked up yet
-    /// is closed once its answer is in, unless the document goes as is;
-    /// inlay hints and completion stay open (their edits are mapped back).
+    /// An edit method on a contiguous region the lifecycle pass has not
+    /// looked up yet stays open once its answer is in, its context prepared:
+    /// every one maps its edits back.
     #[tokio::test]
-    async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
+    async fn an_answer_in_before_the_lifecycle_pass_looks_prepares_edit_methods() {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
         let server = service.inner();
         answer(server, &uri, &resolved, dedented());
@@ -3542,7 +3504,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_document_is_closed_to_edit_methods_but_those_mapping_their_edits() {
+    fn a_contiguous_prepared_document_is_open_to_every_edit_method() {
         let mut resolved = crate::language::injection::ResolvedInjection {
             region: crate::language::injection::CacheableInjectionRegion {
                 language: "lua".to_string(),
@@ -3570,17 +3532,17 @@ mod tests {
             "textDocument/rename",
             "textDocument/linkedEditingRange",
         ] {
-            assert!(!method_closed_to(&resolved, method, true), "{method}");
+            assert!(!method_closed_to(&resolved, method), "{method}");
         }
-        assert!(!method_closed_to(&resolved, "textDocument/hover", true));
+        assert!(!method_closed_to(&resolved, "textDocument/hover"));
         resolved.contiguous = false;
-        assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
+        assert!(method_closed_to(&resolved, "textDocument/inlayHint"));
     }
 
     /// The carriers mapping edits back through a prepared map open on
     /// contiguous regions only: a noncontiguous one, whose map has gaps
-    /// (where `map_edits`' indentation is not yet exact), never reaches it,
-    /// prepared or not.
+    /// (where `map_edits`' indentation is not exact in every shape), never
+    /// reaches it, prepared or not.
     #[test]
     fn edit_carriers_mapping_prepared_edits_stay_closed_to_noncontiguous_regions() {
         let resolved = crate::language::injection::ResolvedInjection {
@@ -3599,17 +3561,18 @@ mod tests {
             gaps: Default::default(),
         };
         for method in [
+            "textDocument/codeAction",
             "textDocument/completion",
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/formatting",
-            "textDocument/rangeFormatting",
+            "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
+            "textDocument/prepareRename",
+            "textDocument/rangeFormatting",
+            "textDocument/rename",
         ] {
-            assert!(method_maps_prepared_edits(method), "{method}");
-            for prepared in [false, true] {
-                assert!(method_closed_to(&resolved, method, prepared), "{method}");
-            }
+            assert!(method_closed_to(&resolved, method), "{method}");
         }
     }
 
