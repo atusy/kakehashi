@@ -1727,21 +1727,25 @@ fn pipeline_region_text(
     } else {
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
+    let first_row_prefix = host_line_prefixes.first().cloned().unwrap_or_default();
     let (host_line_prefixes, first_row_blank) = fill_blank_row_prefixes(host_line_prefixes, offset);
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
     let text = reapply_host_line_prefixes(&final_text, &host_line_prefixes);
     // The replacement starts after the first row's host prefix, so a first
-    // row with none (a leading blank row) takes the block's prefix here when
-    // the output puts text on it.
+    // row that is a blank row (none, or a short part of the indentation)
+    // takes the rest of the block's prefix here when the output puts text on
+    // it. A short prefix the block's does not extend (a tab before a
+    // space-indented item) cannot be completed: the region is left as is.
     match first_row_blank {
         Some(prefix)
             if split_lsp_lines(&text)
                 .first()
                 .is_some_and(|(line, _)| !crate::text::is_markdown_blank(line)) =>
         {
-            Some(format!("{prefix}{text}"))
+            let rest = prefix.strip_prefix(first_row_prefix.as_str())?;
+            Some(format!("{rest}{text}"))
         }
         _ => Some(text),
     }
@@ -1749,9 +1753,10 @@ fn pipeline_region_text(
 
 /// A list item's fence leaves its blank rows unindented, so a per-line
 /// region records no prefix for them, and output lines mapped there would
-/// start at host column 0 and end the item. Such a blank row, as `offset`
-/// marks it from the region's text (`RegionOffset::with_content`), takes the
-/// longest common prefix of the region's recorded prefixes instead. Rows
+/// start at host column 0 and end the item; a blank row keeping part of the
+/// indentation records a short prefix, with the same effect. Such a blank
+/// row, as discovery marks it on `offset`, takes the longest common prefix
+/// of the other rows' recorded prefixes instead. Rows
 /// recording no prefix that hold text (a lazy continuation line) keep none,
 /// and a region with one column offset has unprefixed later rows by design.
 ///
@@ -1761,12 +1766,17 @@ fn fill_blank_row_prefixes<'a>(
     prefixes: std::borrow::Cow<'a, [String]>,
     offset: &RegionOffset,
 ) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
-    let blank_row = |i: usize| prefixes[i].is_empty() && offset.is_protected_blank_row(i);
+    let blank_row = |i: usize| offset.is_protected_blank_row(i);
     if !offset.has_protected_blank_rows() || !(0..prefixes.len()).any(blank_row) {
         return (prefixes, None);
     }
-    // The longest common prefix of the recorded (non-empty) prefixes.
-    let mut recorded = prefixes.iter().filter(|p| !p.is_empty());
+    // The longest common prefix of the recorded (non-empty) prefixes, past
+    // the blank rows: one keeping a short part of the indentation must not
+    // narrow it.
+    let mut recorded = (0..prefixes.len())
+        .filter(|&i| !blank_row(i))
+        .map(|i| &prefixes[i])
+        .filter(|p| !p.is_empty());
     let Some(first_recorded) = recorded.next() else {
         return (prefixes, None);
     };
@@ -3087,6 +3097,79 @@ mod tests {
             .expect("the region changed");
 
         assert_eq!(text, "a\nz\n    \\t    b");
+    }
+
+    const SHORT_ROW_HOST: &str = "- item\n\n  ```py\n  a\n \n  b\n  ```\n";
+
+    /// A blank row keeping one space of a two-space item records a 1-space
+    /// prefix. It is a blank row of the item: output there takes the item's
+    /// indentation, and its short prefix does not narrow the common prefix
+    /// that new lines take.
+    #[rstest::rstest]
+    // Line count changed: new lines take the common prefix.
+    #[case::line_added(
+        SHORT_ROW_HOST,
+        "a\n\nb\nc\n",
+        Some("- item\n\n  ```py\n  a\n\n  b\n  c\n  ```\n")
+    )]
+    // Line count kept: text put on the short row takes the item's prefix.
+    #[case::text_onto_the_short_row(
+        SHORT_ROW_HOST,
+        "a\nz\nb\n",
+        Some("- item\n\n  ```py\n  a\n  z\n  b\n  ```\n")
+    )]
+    // A leading short row the output now opens with text: the row's own
+    // space stays, and the rest of the item's indentation is added.
+    #[case::leading_short_row_dropped(
+        "- item\n\n  ```py\n \n  a\n  ```\n",
+        "a\n",
+        Some("- item\n\n  ```py\n  a\n  ```\n")
+    )]
+    // A leading tab row the item's spaces do not extend: left as is.
+    #[case::leading_tab_row_dropped("- item\n\n  ```py\n\t\n  a\n  ```\n", "a\n", None)]
+    fn pipeline_indents_a_short_whitespace_blank_row_of_a_list_item_fence(
+        #[case] host: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: Option<&str>,
+    ) {
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &language,
+            "((fenced_code_block (info_string (language) @injection.language) \
+              (code_fence_content) @injection.content))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        let original = resolved.virtual_content.clone();
+        let columns = resolved.line_column_offsets.clone();
+        let start_line = resolved.region.line_range.start;
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            start_line,
+            &columns,
+            lsp_line_count(&original),
+        );
+        let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
+        let range = region_replacement_range(&original, &offset).unwrap();
+        let edited =
+            pipeline_region_text(&original, formatted, &offset, &prefixes).map(|new_text| {
+                crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }])
+            });
+
+        assert_eq!(edited.as_deref(), expected_host);
     }
 
     /// Filling the blank rows of a long list-item fence takes time linear

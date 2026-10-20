@@ -412,6 +412,12 @@ mod tests {
     #[case::list_fence_leading_blank_rows("- item\n\n  ```py\n\n\n  a = 1\n  ```\n", FENCE_QUERY, vec![0, 1])]
     #[case::ordered_list_fence("1. item\n\n   ```py\n   a\n\n   b\n   ```\n", FENCE_QUERY, vec![1])]
     #[case::blockquote_fence("> ```py\n> a\n>\n> b\n> ```\n", FENCE_QUERY, vec![])]
+    // A blank row keeping less whitespace than the item's indentation.
+    #[case::list_fence_short_whitespace_row("- item\n\n  ```py\n  a\n \n  b\n  ```\n", FENCE_QUERY, vec![1])]
+    #[case::list_fence_short_whitespace_row_crlf("- item\r\n\r\n  ```py\r\n  a\r\n \r\n  b\r\n  ```\r\n", FENCE_QUERY, vec![1])]
+    #[case::list_fence_tab_row("- item\n\n  ```py\n  a\n\t\n  b\n  ```\n", FENCE_QUERY, vec![1])]
+    // A blank row keeping the item's whole indentation is a content row.
+    #[case::list_fence_full_whitespace_row("- item\n\n  ```py\n  a\n  \n  b\n  ```\n", FENCE_QUERY, vec![])]
     #[case::lazy_continuation("> a\nb\n> c\n", INLINE_QUERY, vec![])]
     fn discovery_marks_the_blank_rows_of_container_blocks(
         #[case] host: &str,
@@ -419,5 +425,17 @@ mod tests {
         #[case] expected: Vec<u32>,
     ) {
         assert_eq!(discover(host, query)[0].protected_blank_rows, expected);
+    }
+
+    /// A blank row keeping one space of a two-space item records offset 1:
+    /// text written there lands at host column 1, outside the item.
+    #[test]
+    fn a_short_whitespace_blank_row_of_a_list_item_fence_is_protected() {
+        let host = "- item\n\n  ```py\n  a\n \n  b\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![2, 1, 2, 0]);
+        assert!(!accepts(resolved(), &edit((4, 1), (4, 1), "x")));
+        // Deleting the row's content still applies.
+        assert!(accepts(resolved(), &edit((4, 1), (4, 1), "")));
     }
 }

@@ -181,9 +181,11 @@ pub(super) fn compute_line_prefixes(
 /// A list item's fence leaves its blank rows unindented (or indented less
 /// than its content), so virtual column 0 maps there to a host column short
 /// of the item's indentation. Such a row is blank in `virtual_content`
-/// (spaces and tabs only, as markdown counts it) and records no prefix, and
-/// its nearest row that holds text (before it, or after it when none is
-/// before) records a container prefix. A prefix of other text (a string opening mid-line) is no
+/// (spaces and tabs only, as markdown counts it), and its nearest row that
+/// holds text (before it, or after it when none is before) records a
+/// container prefix wider than the row's own: none, or whitespace only and
+/// shorter (a blank row keeping one space of a two-space item). A prefix of
+/// other text (a string opening mid-line) is no
 /// container, and a row recording no prefix that holds text (a lazy
 /// continuation line) anchors nothing. The row after the content's final
 /// line break is the closing fence's, which the edit checks treat apart.
@@ -247,7 +249,11 @@ pub(crate) fn protected_blank_rows(
     for row in 0..rows {
         if blank[row] {
             let width = previous.or(next_anchor[row]).unwrap_or(0);
-            if width > 0 && columns[row] == 0 {
+            // No prefix, or whitespace short of the container's: virtual
+            // column 0 lands short of the block's content there.
+            let short = columns[row] == 0
+                || (prefix(row) == LinePrefix::Whitespace && columns[row] < width);
+            if width > 0 && short {
                 protected.push(row as u32);
             }
         }
