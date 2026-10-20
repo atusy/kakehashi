@@ -58,6 +58,9 @@ struct Setup {
     /// `empty-on-release` to answer only once the test creates `release`
     /// in its directory.
     host_mode: &'static str,
+    /// Also bridge lua to an `on-type` mock, ranked below the echo mock for
+    /// on-type formatting.
+    second_on_type: bool,
 }
 
 impl Default for Setup {
@@ -74,6 +77,7 @@ impl Default for Setup {
             slow_host: None,
             concatenated: false,
             host_mode: "slow-empty",
+            second_on_type: false,
         }
     }
 }
@@ -92,6 +96,10 @@ impl Setup {
         } } } });
         if self.unprepared_python {
             markdown["bridge"]["python"] = json!({});
+        }
+        if self.second_on_type {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/onTypeFormatting"] =
+                json!({ "priorities": ["echo", "second"] });
         }
         if self.concatenated {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
@@ -156,6 +164,12 @@ impl Setup {
                 }
             }
         });
+        if self.second_on_type {
+            servers["second"] = json!({
+                "cmd": [mock_bin(), "on-type"],
+                "languages": ["lua"]
+            });
+        }
         if self.slow_host.is_some() {
             servers["slowhost"] = json!({
                 "cmd": [mock_bin(), self.host_mode],
@@ -529,6 +543,48 @@ fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
         apply_edits(text, &edits),
         "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
         "{response}"
+    );
+}
+
+#[test]
+fn an_on_type_answer_its_map_refuses_leaves_the_request_to_the_next_server() {
+    let (mut client, _dir) = Setup {
+        second_on_type: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/on-type-refused.md";
+    let text = "# t\n\n```lua\n  local x = 1; -- OVERLAP\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // The echo mock, ranked first, answers with overlapping edits: its map
+    // refuses them, which is no answer, so the `on-type` mock ranked below
+    // answers instead (uppercasing), its edits mapped back reindented.
+    let mut edits = Vec::new();
+    for _ in 0..100 {
+        let response = client.send_request(
+            "textDocument/onTypeFormatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 14 },
+                "ch": ";",
+                "options": { "tabSize": 2, "insertSpaces": true }
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        if let Some(result) = response["result"]
+            .as_array()
+            .filter(|edits| !edits.is_empty())
+        {
+            edits = result.clone();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1; -- OVERLAP\n```\n"
     );
 }
 

@@ -13,7 +13,8 @@
 //!   (In the modes answering `textDocument/formatting` and
 //!   `textDocument/rangeFormatting` with a whole-document edit, formatting a
 //!   text holding `OVERLAP` is answered with two overlapping edits: an
-//!   answer no document takes.)
+//!   answer no document takes; so is on-type formatting in `echo-document`
+//!   mode.)
 //! - `append` — advertises `documentFormattingProvider`; appends a
 //!   `-- mock-marker` line (lowercase, so a later `upper` step would be
 //!   detectable).
@@ -2767,7 +2768,19 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|uri| documents.get(uri))
-                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
+                    .map(|text| {
+                        // In `echo-document` mode, a text holding `OVERLAP`
+                        // is answered with two overlapping edits, as
+                        // formatting is: an answer no document takes.
+                        if mode == "echo-document" && text.contains("OVERLAP") {
+                            json!([
+                                { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }, "newText": "a" },
+                                { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "newText": "b" }
+                            ])
+                        } else {
+                            whole_document_edit(text, &mode, options.as_ref())
+                        }
+                    })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }

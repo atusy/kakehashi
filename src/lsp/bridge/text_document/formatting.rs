@@ -597,15 +597,17 @@ fn placed(error: io::Error, ctx: &BridgeResponseContext<'_>) -> io::Error {
 
 /// [`formatting_answer_to_host`] for an on-type formatting answer (see
 /// [`transform_on_type_formatting_response_to_host`]). One the prepared
-/// map refuses is no answer, logged at debug, as one the host moved under
-/// is: on-type answers come on trigger keystrokes, and a failure there
-/// would warn the user on every one.
+/// map refuses is no answer (`None`), logged at debug, as one the host
+/// moved under is: on-type answers come on trigger keystrokes, and a
+/// failure there would warn the user on every one. No answer, not an empty
+/// one: an empty answer says nothing needs formatting and wins the fan-in,
+/// while no answer leaves it to the servers ranked below.
 pub(super) fn on_type_formatting_answer_to_host(
     response: serde_json::Value,
     ctx: &BridgeResponseContext<'_>,
     virtual_content: &str,
     region_end: Position,
-) -> io::Result<Vec<TextEdit>> {
+) -> io::Result<Option<Vec<TextEdit>>> {
     match transform_on_type_formatting_response_to_host(
         response,
         ctx.offset,
@@ -614,9 +616,9 @@ pub(super) fn on_type_formatting_answer_to_host(
     ) {
         Err(error) if refusal(&error).is_some() => {
             log::debug!(target: "kakehashi::bridge", "{}", placed(error, ctx));
-            Ok(Vec::new())
+            Ok(None)
         }
-        result => result,
+        result => result.map(Some),
     }
 }
 
@@ -2502,16 +2504,28 @@ mod tests {
         assert!(message.contains("file:///refused.md"), "{message}");
         assert!(message.contains("file:///region.lua"), "{message}");
         assert!(message.contains("ran out of work"), "{message}");
-        // On type: no answer, not a failure warned on every keystroke.
+        // On type: no answer (not an empty one, which would win the
+        // fan-in), not a failure warned on every keystroke.
         assert_eq!(
             on_type_formatting_answer_to_host(response(), &ctx, &prepared, end).unwrap(),
-            vec![]
+            None
         );
+    }
+
+    /// [`on_type_formatting_answer_to_host`], no answer read as none.
+    fn on_type_answer(
+        response: serde_json::Value,
+        ctx: &BridgeResponseContext<'_>,
+        virtual_content: &str,
+        region_end: Position,
+    ) -> io::Result<Vec<TextEdit>> {
+        on_type_formatting_answer_to_host(response, ctx, virtual_content, region_end)
+            .map(Option::unwrap_or_default)
     }
 
     #[rstest]
     #[case::formatting(formatting_answer_to_host)]
-    #[case::on_type_formatting(on_type_formatting_answer_to_host)]
+    #[case::on_type_formatting(on_type_answer)]
     fn a_prepared_answer_maps_through_its_context(
         #[case] answer_to_host: fn(
             serde_json::Value,
