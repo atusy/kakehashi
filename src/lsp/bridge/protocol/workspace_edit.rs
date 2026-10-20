@@ -1307,25 +1307,25 @@ mod tests {
         }
     }
 
-    /// Judging every blank row of a long list-item fence costs work linear
-    /// in its rows, not quadratic: each row is decided without rescanning
-    /// the rows after it.
+    /// Judging every blank row of a long list-item fence takes time linear
+    /// in its rows. Rescanning the rows after each one would make the
+    /// 200k-row fence below take a minute or more (about 2e10 row checks);
+    /// the bound leaves a wide margin for a loaded machine.
     #[rstest::rstest]
     // Closed by a fence row: the boundary decides.
-    #[case::closed_fence(0, Position::new(3 + 10_001, 0))]
+    #[case::closed_fence(0, Position::new(3 + 200_001, 0))]
     // A prefixed last row, the region ending mid-row on it.
-    #[case::prefixed_last_row(2, Position::new(3 + 10_000, 3))]
-    fn blank_rows_of_a_long_list_item_fence_are_judged_in_linear_work(
+    #[case::prefixed_last_row(2, Position::new(3 + 200_000, 3))]
+    fn blank_rows_of_a_long_list_item_fence_are_judged_in_linear_time(
         #[case] last_column: u32,
         #[case] region_end: Position,
     ) {
-        use crate::text::ROWS_SCANNED;
         use tower_lsp_server::ls_types::Range;
-        const BLANK_ROWS: u32 = 9_999;
+        const BLANK_ROWS: u32 = 199_999;
         let mut columns = vec![2];
         columns.extend(std::iter::repeat_n(0, BLANK_ROWS as usize));
         columns.push(last_column);
-        ROWS_SCANNED.with(|rows| rows.set(0));
+        let started = std::time::Instant::now();
         let offset = RegionOffset::with_per_line_offsets(3, columns);
         for row in 1..=BLANK_ROWS {
             let at = |new_text: &str| TextEdit {
@@ -1335,8 +1335,11 @@ mod tests {
             assert!(text_edit_safe_in_region(&at(" "), &offset, region_end));
             assert!(!text_edit_safe_in_region(&at("x"), &offset, region_end));
         }
-        let scanned = ROWS_SCANNED.with(std::cell::Cell::get);
-        assert!(scanned <= 4 * 10_001, "{scanned} rows scanned");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
     }
 
     #[test]

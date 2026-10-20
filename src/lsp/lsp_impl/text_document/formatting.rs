@@ -1784,10 +1784,7 @@ fn fill_blank_row_prefixes<'a>(
         return (prefixes, None);
     }
     let fill = fill.to_string();
-    let last_recorded = prefixes.iter().rposition(|p| {
-        crate::text::count_row_scanned();
-        !p.is_empty()
-    });
+    let last_recorded = prefixes.iter().rposition(|p| !p.is_empty());
     let ends_with_line_break = original_virtual.ends_with(['\n', '\r']);
     let last = prefixes.len().saturating_sub(1);
     let blank_row = |i: usize| {
@@ -2993,19 +2990,20 @@ mod tests {
         assert_eq!(resolved[0].virtual_content, formatted);
     }
 
-    /// Filling the blank rows of a long list-item fence costs work linear in
-    /// its rows: each row is decided without rescanning the rows after it.
+    /// Filling the blank rows of a long list-item fence takes time linear
+    /// in its rows. Rescanning the rows after each one would make the
+    /// 200k-row fence below take a minute or more (about 2e10 row checks);
+    /// the bound leaves a wide margin for a loaded machine.
     #[rstest::rstest]
     // Closed by a fence row: the content ends with a line break.
     #[case::closed_fence(String::new(), "\n")]
     // A prefixed last row, the content ending mid-row on it.
     #[case::prefixed_last_row("  ".to_string(), "b")]
-    fn pipeline_fills_the_blank_rows_of_a_long_fence_in_linear_work(
+    fn pipeline_fills_the_blank_rows_of_a_long_fence_in_linear_time(
         #[case] last_prefix: String,
         #[case] last_text: &str,
     ) {
-        use crate::text::ROWS_SCANNED;
-        const BLANK_ROWS: usize = 9_999;
+        const BLANK_ROWS: usize = 199_999;
         let mut columns = vec![2];
         columns.extend(std::iter::repeat_n(0, BLANK_ROWS));
         columns.push(u32::from(!last_prefix.is_empty()) * 2);
@@ -3014,7 +3012,7 @@ mod tests {
         prefixes.push(last_prefix);
         let original = format!("a{}{}", "\n".repeat(BLANK_ROWS + 1), last_text.trim_end());
         let formatted = format!("a\nc{}{}", "\n".repeat(BLANK_ROWS), last_text.trim_end());
-        ROWS_SCANNED.with(|rows| rows.set(0));
+        let started = std::time::Instant::now();
 
         let text = pipeline_region_text(
             &original,
@@ -3025,8 +3023,11 @@ mod tests {
         .expect("the region changed");
 
         assert!(text.starts_with("a\n  c\n"), "{:?}", &text[..12]);
-        let scanned = ROWS_SCANNED.with(std::cell::Cell::get);
-        assert!(scanned <= 4 * (BLANK_ROWS + 2), "{scanned} rows scanned");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
     }
 
     #[test]

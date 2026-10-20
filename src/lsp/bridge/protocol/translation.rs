@@ -40,10 +40,7 @@ impl RegionOffset {
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        let last_prefixed_line = columns.iter().rposition(|&column| {
-            crate::text::count_row_scanned();
-            column > 0
-        });
+        let last_prefixed_line = columns.iter().rposition(|&column| column > 0);
         Self {
             line,
             columns,
@@ -197,6 +194,23 @@ pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &Region
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::one_offset_past_zero(RegionOffset::new(3, 4), Some(0))]
+    #[case::one_zero_offset(RegionOffset::new(3, 0), None)]
+    #[case::last_row_prefixed(RegionOffset::with_per_line_offsets(3, vec![0, 2, 0, 2]), Some(3))]
+    #[case::trailing_zero_rows(RegionOffset::with_per_line_offsets(3, vec![2, 0, 0, 0]), Some(0))]
+    #[case::all_zero(RegionOffset::with_per_line_offsets(3, vec![0, 0]), None)]
+    fn last_prefixed_line_is_the_last_line_offset_past_zero(
+        #[case] offset: RegionOffset,
+        #[case] expected: Option<usize>,
+    ) {
+        assert_eq!(offset.last_prefixed_line(), expected);
+        assert_eq!(
+            offset.last_prefixed_line(),
+            offset.columns().iter().rposition(|&column| column > 0)
+        );
+    }
 
     #[test]
     fn a_region_opens_mid_line_only_after_a_delimiter_on_its_line() {
