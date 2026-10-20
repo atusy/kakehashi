@@ -18,6 +18,8 @@ use std::collections::HashMap;
 pub(super) struct Expansion {
     snippet: String,
     text: String,
+    /// Whether the snippet holds a tabstop at all.
+    tabstops: bool,
 }
 
 /// A run of the snippet: literal text, or one occurrence of a tabstop.
@@ -116,12 +118,19 @@ impl Expansion {
         Some(Self {
             snippet: snippet.to_string(),
             text: out,
+            tabstops: !occurrences.is_empty(),
         })
     }
 
     /// The text the snippet expands to.
     pub(super) fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Whether the snippet holds a tabstop: without one, it is the text its
+    /// escapes stand for.
+    pub(super) fn has_tabstop(&self) -> bool {
+        self.tabstops
     }
 
     /// The snippet expanding to `mapped`: this expansion after spaces (the
@@ -270,6 +279,13 @@ mod tests {
         ] {
             assert_eq!(expanded(snippet), None, "{snippet:?}");
         }
+    }
+
+    #[test]
+    fn a_snippet_without_a_tabstop_is_known() {
+        assert!(!Expansion::of("x\\$").unwrap().has_tabstop());
+        assert!(Expansion::of("x$0").unwrap().has_tabstop());
+        assert!(Expansion::of("${1:x}").unwrap().has_tabstop());
     }
 
     #[test]

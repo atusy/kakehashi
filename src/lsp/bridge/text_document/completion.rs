@@ -609,19 +609,29 @@ fn transform_prepared_completion_item(
     // The snippet goes out where its expansion was checked, expanding to
     // the text checked: the indentation the map wrote before the expansion
     // written before the snippet, or the item refused.
+    // One without a tabstop is the text its escapes stand for: it goes out
+    // as that plain text, as checked. Sent as a snippet, a client may take
+    // it as plain text, backslashes and all (mini.completion expands only
+    // text holding a tabstop).
     if let Some(expansion) = expanded {
+        let plain = !expansion.has_tabstop();
         let mapped = match &mut item.text_edit {
             Some(CompletionTextEdit::Edit(edit)) => Some(&mut edit.new_text),
             Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(&mut edit.new_text),
             None => None,
         };
-        if let Some(mapped) = mapped {
+        if let Some(mapped) = mapped
+            && !plain
+        {
             let Some(snippet) = expansion.carry(mapped) else {
                 return false;
             };
             *mapped = snippet;
         }
-        if let Some(sent) = insert_text_sent {
+        if plain {
+            item.insert_text_format =
+                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
+        } else if let Some(sent) = insert_text_sent {
             item.insert_text = sent;
         }
     }
@@ -1429,22 +1439,24 @@ mod tests {
     }
 
     #[rstest]
-    #[case::tabstop("x$0", true)]
-    #[case::placeholder("${1:x}", true)]
-    #[case::choice("${1|x,y|}", false)]
-    #[case::mirror("${1:x}$1", true)]
-    #[case::escape("x\\$", true)]
-    #[case::escaped_brace("x\\}", true)]
-    #[case::literal("x", true)]
-    #[case::variable("$TM_SELECTED_TEXT", false)]
-    #[case::variable_with_default("${CLIPBOARD:x}", false)]
-    #[case::transform("${1/a/b/}", false)]
-    #[case::nested_placeholder("${1:${2:x}}", false)]
-    #[case::two_defaults("${1:a}${1:b}", false)]
-    #[case::choice_escaping_a_dollar("${1|a\\$|}", false)]
+    #[case::tabstop("x$0", true, None)]
+    #[case::placeholder("${1:x}", true, None)]
+    #[case::choice("${1|x,y|}", false, None)]
+    #[case::mirror("${1:x}$1", true, None)]
+    // Without a tabstop: the plain text its escapes stand for.
+    #[case::escape("x\\$", true, Some("x$"))]
+    #[case::escaped_brace("x\\}", true, Some("x}"))]
+    #[case::literal("x", true, Some("x"))]
+    #[case::variable("$TM_SELECTED_TEXT", false, None)]
+    #[case::variable_with_default("${CLIPBOARD:x}", false, None)]
+    #[case::transform("${1/a/b/}", false, None)]
+    #[case::nested_placeholder("${1:${2:x}}", false, None)]
+    #[case::two_defaults("${1:a}${1:b}", false, None)]
+    #[case::choice_escaping_a_dollar("${1|a\\$|}", false, None)]
     fn a_prepared_snippet_is_kept_as_every_client_expands_it(
         #[case] snippet: &str,
         #[case] kept: bool,
+        #[case] plain: Option<&str>,
     ) {
         use tower_lsp_server::ls_types::InsertTextFormat;
         let offset = dedented_offset("  a\n");
@@ -1472,20 +1484,26 @@ mod tests {
                 continue;
             }
             // Kept, it goes out as it came: on one line, the map writes
-            // nothing into it. Literal text goes out as the plain text it
-            // is, which no snippet engine re-indents.
-            assert_eq!(sent_text(&transformed), snippet, "{completed}");
+            // nothing into it. Text without a tabstop goes out as the plain
+            // text it stands for, which every client inserts as is.
             assert_eq!(
-                transformed.insert_text,
-                completed["insertText"].as_str().map(str::to_string),
+                sent_text(&transformed),
+                plain.unwrap_or(snippet),
                 "{completed}"
             );
+            if plain.is_none() {
+                assert_eq!(
+                    transformed.insert_text,
+                    completed["insertText"].as_str().map(str::to_string),
+                    "{completed}"
+                );
+            }
             assert_eq!(
                 transformed.insert_text_format,
-                Some(if snippet.contains(['$', '\\']) {
-                    InsertTextFormat::SNIPPET
-                } else {
+                Some(if plain.is_some() {
                     InsertTextFormat::PLAIN_TEXT
+                } else {
+                    InsertTextFormat::SNIPPET
                 }),
                 "{completed}"
             );
@@ -3915,9 +3933,11 @@ mod tests {
             ) {
                 return Ok(None);
             }
-            // Literal text goes out as the plain text it is, inserted as
-            // is; any other snippet must be one clients expand alike.
-            let literal = !snippet.contains(['$', '\\']);
+            // Text without a tabstop goes out as the plain text it stands
+            // for, inserted as is; any other snippet must be one clients
+            // expand alike.
+            let literal = !snippet.contains(['$', '\\'])
+                || (alike(nodes) && nodes.iter().all(|node| matches!(node, Node::Text(_))));
             prop_assert!(
                 literal || alike(nodes),
                 "kept though clients expand it apart: {:?}",
@@ -3936,7 +3956,11 @@ mod tests {
                     "kept without its edit: {completed:?}"
                 )));
             };
-            let parsed = parse(&sent.new_text);
+            let parsed = if literal {
+                Some(vec![Node::Text(sent.new_text.clone())])
+            } else {
+                parse(&sent.new_text)
+            };
             prop_assert!(parsed.is_some(), "no snippet: {:?}", sent.new_text);
             let parsed = parsed.unwrap();
             prop_assert_eq!(skeleton(&parsed), skeleton(nodes), "{:?}", sent.new_text);
