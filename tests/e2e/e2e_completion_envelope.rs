@@ -376,3 +376,100 @@ fn e2e_virtual_completion_resolve_reads_the_edited_fragment() {
     );
     shutdown_client(&mut client);
 }
+
+/// Completion follows its trigger keystroke's didChange on the wire, and the
+/// client applies the item's `textEdit` at the post-keystroke caret. The
+/// didChange handler is held (as it is when queued behind another pass's edit
+/// lock) longer than a completion round trip to the warm mock takes, so a
+/// request that is not ordered behind it answers from the text WITHOUT the
+/// typed character.
+#[test]
+fn e2e_virtual_completion_sees_its_trigger_keystroke() {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("completion_keystroke.toml");
+    std::fs::write(&config_path, "").expect("write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 path"))
+        .env("KAKEHASHI_E2E_STALL_DID_CHANGE_MS", "2000")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-completion": {
+                        "cmd": [mock_bin(), "completion-resolve-echo-edit"],
+                        "languages": ["lua"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MARKDOWN_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+    // Warm the downstream so the request below needs no retry: a retry would
+    // re-ask after the stall and hide an ungated first answer.
+    let completion_at = |client: &mut LspClient, character: u32| {
+        client.send_request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": MARKDOWN_URI },
+                "position": { "line": 3, "character": character }
+            }),
+        )
+    };
+    let warmed = (0..300).any(|_| {
+        let response = completion_at(&mut client, 11);
+        let ready = response["result"]["items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty());
+        if !ready {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        ready
+    });
+    assert!(warmed, "virt completion returns an item");
+
+    // Type `a` at the end of "local x = 1" (host line 3).
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MARKDOWN_URI, "version": 2 },
+            "contentChanges": [{
+                "range": {
+                    "start": { "line": 3, "character": 11 },
+                    "end": { "line": 3, "character": 11 }
+                },
+                "text": "a"
+            }]
+        }),
+    );
+    let response = completion_at(&mut client, 12);
+    assert!(response.get("error").is_none(), "{response}");
+    let item = &response["result"]["items"][0];
+    assert_eq!(
+        item["textEdit"]["range"],
+        json!({
+            "start": { "line": 3, "character": 12 },
+            "end": { "line": 3, "character": 12 }
+        }),
+        "the edit must be computed on the text that includes the keystroke: {response}"
+    );
+
+    shutdown_client(&mut client);
+}

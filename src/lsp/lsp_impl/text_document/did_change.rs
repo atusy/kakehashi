@@ -16,6 +16,14 @@ impl Kakehashi {
             return;
         };
 
+        // e2e-only fault injection: hold this handler before it takes the edit
+        // lock, the way a didChange queued behind another pass's edit lock is
+        // held, so the ordering e2e can force the window in which a following
+        // request could overtake it. Compiled only with the `e2e` feature, so
+        // the edit lock below stays the first `.await` in every other build.
+        #[cfg(feature = "e2e")]
+        e2e_stall_did_change().await;
+
         // Serialize edits to this document, acquired as the FIRST `.await` of
         // the handler. `didChange` handlers are dispatched concurrently and the
         // read-of-old-text → reparse → persist cycle below is not atomic, so
@@ -155,6 +163,22 @@ impl Kakehashi {
 
         self.notifier().log_info("file changed!").await;
     }
+}
+
+/// e2e-only fault injection (`KAKEHASHI_E2E_STALL_DID_CHANGE_MS`): delay every
+/// didChange handler before it applies its edit. Without it, the request that
+/// follows a didChange on the wire is almost never first-polled ahead of it,
+/// so an ordering e2e would pass whether or not the request is ingress-gated.
+/// Unset, this is a no-op. Release builds carry no `e2e` feature.
+#[cfg(feature = "e2e")]
+async fn e2e_stall_did_change() {
+    let Ok(ms) = std::env::var("KAKEHASHI_E2E_STALL_DID_CHANGE_MS") else {
+        return;
+    };
+    let Ok(ms) = ms.parse::<u64>() else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
 #[cfg(test)]
