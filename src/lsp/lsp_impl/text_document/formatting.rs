@@ -2409,7 +2409,9 @@ pub(super) async fn sources_verdict<'a, T: 'a>(
 /// its text: no settling brings that back); `Stale` as soon as nothing is
 /// `settling` (no edit left to settle, no hold to clear: what `current`
 /// says stays so). Otherwise wait, polling, until one holds, `Unsettled`
-/// past `within`.
+/// past `within`. Each poll reads `settling` before `current`: a settle
+/// landing between the two reads then shows in `current`, never as a
+/// `Stale` judged on what `current` said before it.
 pub(super) async fn settled_verdict(
     current: impl Fn() -> bool,
     moved: impl Fn() -> bool,
@@ -2418,13 +2420,14 @@ pub(super) async fn settled_verdict(
 ) -> Verdict {
     let deadline = tokio::time::Instant::now() + within;
     loop {
+        let settling = settling();
         if current() {
             return Verdict::Current;
         }
         if moved() {
             return Verdict::Moved;
         }
-        if !settling() {
+        if !settling {
             return Verdict::Stale;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -2576,6 +2579,23 @@ mod tests {
             assert_eq!(verdict, Verdict::Stale, "{case}");
             assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
         }
+    }
+
+    /// A settle landing between a poll's reads of `current` and `settling`
+    /// leaves the answer current, not stale: `current` read before the
+    /// settle, `settling` after it, would say neither.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_between_a_polls_reads_is_not_judged_stale() {
+        let settled = std::cell::Cell::new(false);
+        let verdict = settled_verdict(
+            // The settle lands right after this read.
+            || settled.replace(true),
+            || false,
+            || !settled.get(),
+            crate::lsp::bridge::PREPARE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(verdict, Verdict::Current);
     }
 
     /// The judgement the formatting methods make as the final answer is
