@@ -6,9 +6,10 @@
 //! escape it, break per-line `> ` prefixes, or merge content into the closing
 //! fence — if applied verbatim (see `transform_completion_item`).
 //! On a prepared document the items' edits map back through its map,
-//! re-indented; a literal snippet goes out as plain text, and an item without
-//! an edit is made an explicit one where its text at the caret regains an
-//! indent, or dropped where it would map off the caret.
+//! re-indented; a snippet maps as its expansion and goes out with the indent
+//! its expansion regained written in (a literal one as plain text), and an
+//! item without an edit is made an explicit one where its text at the caret
+//! regains an indent, or dropped where it would map off the caret.
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -29,6 +30,7 @@ use super::super::protocol::{
     translate_virtual_main_and_additional_edits_to_host, translate_virtual_range_to_host,
 };
 use super::keep_additional_edits_if_safe;
+use super::snippet::Expansion;
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
@@ -216,10 +218,11 @@ fn transform_completion_response_to_host(
 /// additionalTextEdits if present. On a prepared document the edits go
 /// through its map (`translate_virtual_main_and_additional_edits_to_host`),
 /// their text re-indented, and the item may be given `insertTextMode: asIs`
-/// (see `ClientInsertMode`). A literal snippet there is sent as plain text,
-/// and an item without an edit is probed as an edit at the caret: made that
-/// explicit edit when its text regains an indent, dropped when it maps off
-/// the caret.
+/// (see `ClientInsertMode`). A snippet there is checked as its expansion
+/// (see [`Expansion`]) and sent with the indentation its expansion regained
+/// written in, a literal one as plain text; an item without an edit is
+/// probed as an edit at the caret: made that explicit edit when its text
+/// regains an indent, dropped when it maps off the caret.
 ///
 /// Returns `false` when the item's primary insertion — its text edit, or the
 /// insertText/label fallback applied at the request position — is unsafe for the
@@ -228,9 +231,10 @@ fn transform_completion_response_to_host(
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
 /// On a prepared document also when its edit does not map back (or its
 /// insert and replace ranges map its text apart), a mapped range no longer
-/// contains the caret, its snippet is no literal text, its text without an
-/// edit breaks a line, or its multi-line edit would reach a client that
-/// always adjusts indentation.
+/// contains the caret, its snippet expands differently on some client (or
+/// breaks lines for one that may re-indent it) or cannot hold the indent its
+/// expansion regained, its text without an edit breaks a line, or its
+/// multi-line edit would reach a client that always adjusts indentation.
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
@@ -385,10 +389,16 @@ fn transform_prepared_completion_item(
 ) -> bool {
     use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextMode, TextEdit};
     // The text the map checks must be the text the client inserts: a
-    // snippet is kept only when it is literal text, with no tabstop,
-    // placeholder, variable or escape for the client to expand. (So no
-    // snippet variable is left to expand into lines at the insertion point,
-    // as the unprepared path has to check.)
+    // snippet's expansion, every tabstop at its default, kept only when
+    // every client expands it alike. The expansion stands in for the
+    // snippet through every check below, and the snippet goes out with the
+    // indentation its expansion regained written in (`expanded`). (An
+    // expansion holds no variable, so none is left to expand into lines at
+    // the insertion point, as the unprepared path has to check.)
+    let mut expanded: Option<Expansion> = None;
+    // An item without an edit is inserted as its insertText (or label): the
+    // expansion stands in for it, and it is put back as it came.
+    let mut insert_text_sent: Option<Option<String>> = None;
     if item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET) {
         let inserted = match &item.text_edit {
             Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
@@ -396,11 +406,31 @@ fn transform_prepared_completion_item(
             None => item.insert_text.as_ref().unwrap_or(&item.label),
         };
         if inserted.contains(['$', '\\']) {
-            return false;
+            let Some(expansion) = Expansion::of(inserted) else {
+                return false;
+            };
+            // A client's snippet engine may indent a snippet's lines once
+            // more whatever the item asks (Neovim's prefixes each with the
+            // caret line's indentation): kept only for one that declares
+            // it inserts as is when told to, and told so below.
+            if expansion.breaks_lines() && insert_mode != ClientInsertMode::AsIsSettable {
+                return false;
+            }
+            let text = expansion.text().to_string();
+            match &mut item.text_edit {
+                Some(CompletionTextEdit::Edit(edit)) => edit.new_text = text,
+                Some(CompletionTextEdit::InsertAndReplace(edit)) => edit.new_text = text,
+                None => {
+                    insert_text_sent = Some(item.insert_text.replace(text));
+                }
+            }
+            expanded = Some(expansion);
+        } else {
+            // Literal text means the same as plain text, which a client's
+            // snippet engine cannot re-indent once more on insertion.
+            item.insert_text_format =
+                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
         }
-        // Literal text means the same as plain text, which a client's
-        // snippet engine cannot re-indent once more on insertion.
-        item.insert_text_format = Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
     }
     // LSP requires an item's edit ranges to contain the requested position.
     // Out of a prepared document a range can map past it: the server saw the
@@ -571,6 +601,25 @@ fn transform_prepared_completion_item(
             target: "kakehashi::bridge",
             "completion: dropped an item's additionalTextEdits ({dropped}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
         );
+    }
+    // The snippet goes out where its expansion was checked, expanding to
+    // the text checked: the indentation the map wrote into the expansion
+    // written into the snippet, or the item refused.
+    if let Some(expansion) = expanded {
+        let mapped = match &mut item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => Some(&mut edit.new_text),
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(&mut edit.new_text),
+            None => None,
+        };
+        if let Some(mapped) = mapped {
+            let Some(snippet) = expansion.carry(mapped) else {
+                return false;
+            };
+            *mapped = snippet;
+        }
+        if let Some(sent) = insert_text_sent {
+            item.insert_text = sent;
+        }
     }
     true
 }
@@ -1364,24 +1413,49 @@ mod tests {
         );
     }
 
+    /// The text a client inserts for an item on a prepared document, from
+    /// its edit or (without one) its insertText or label.
+    fn sent_text(completed: &CompletionItem) -> &str {
+        use tower_lsp_server::ls_types::CompletionTextEdit;
+        match &completed.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
+            None => completed.insert_text.as_ref().unwrap_or(&completed.label),
+        }
+    }
+
     #[rstest]
-    #[case::tabstop("x$0", false)]
-    #[case::placeholder("${1:x}", false)]
-    #[case::escape("x\\$", false)]
-    #[case::escaped_brace("x\\}", false)]
+    #[case::tabstop("x$0", true)]
+    #[case::placeholder("${1:x}", true)]
+    #[case::choice("${1|x,y|}", true)]
+    #[case::mirror("${1:x}$1", true)]
+    #[case::escape("x\\$", true)]
+    #[case::escaped_brace("x\\}", true)]
     #[case::literal("x", true)]
-    fn a_prepared_snippet_is_kept_only_as_literal_text(#[case] snippet: &str, #[case] kept: bool) {
+    #[case::variable("$TM_SELECTED_TEXT", false)]
+    #[case::variable_with_default("${CLIPBOARD:x}", false)]
+    #[case::transform("${1/a/b/}", false)]
+    #[case::nested_placeholder("${1:${2:x}}", false)]
+    #[case::two_defaults("${1:a}${1:b}", false)]
+    #[case::choice_escaping_a_dollar("${1|a\\$|}", false)]
+    fn a_prepared_snippet_is_kept_as_every_client_expands_it(
+        #[case] snippet: &str,
+        #[case] kept: bool,
+    ) {
+        use tower_lsp_server::ls_types::InsertTextFormat;
         let offset = dedented_offset("  a\n");
         for completed in [
             json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+            json!({"label": snippet, "insertTextFormat": 2}),
             json!({"label": "x", "insertTextFormat": 2, "textEdit": {
                 "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
                 "newText": snippet
             }}),
         ] {
+            let mut transformed = item(completed.clone());
             assert_eq!(
                 transform_completion_item(
-                    &mut item(completed.clone()),
+                    &mut transformed,
                     &offset,
                     Position::new(11, 0),
                     Some(Position::new(10, 3)),
@@ -1390,23 +1464,26 @@ mod tests {
                 kept,
                 "{completed}"
             );
-        }
-        // Kept, it goes out as the plain text it is.
-        let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
-        assert_eq!(
-            transform_completion_item(
-                &mut literal,
-                &offset,
-                Position::new(11, 0),
-                Some(Position::new(10, 3)),
-                ClientInsertMode::default(),
-            ),
-            kept
-        );
-        if kept {
+            if !kept {
+                continue;
+            }
+            // Kept, it goes out as it came: on one line, the map writes
+            // nothing into it. Literal text goes out as the plain text it
+            // is, which no snippet engine re-indents.
+            assert_eq!(sent_text(&transformed), snippet, "{completed}");
             assert_eq!(
-                literal.insert_text_format,
-                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT)
+                transformed.insert_text,
+                completed["insertText"].as_str().map(str::to_string),
+                "{completed}"
+            );
+            assert_eq!(
+                transformed.insert_text_format,
+                Some(if snippet.contains(['$', '\\']) {
+                    InsertTextFormat::SNIPPET
+                } else {
+                    InsertTextFormat::PLAIN_TEXT
+                }),
+                "{completed}"
             );
         }
         // As is, a snippet is the client's to expand.
@@ -1418,9 +1495,110 @@ mod tests {
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
+        assert_eq!(as_is.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert_eq!(as_is.insert_text.as_deref(), Some(snippet));
+    }
+
+    /// A multi-line snippet's created lines regain the removed indent,
+    /// written into the snippet where it holds them as text: before a
+    /// tabstop opening a line, inside a placeholder default spanning lines.
+    /// A blank line of its expansion (one holding only a tabstop) regains
+    /// nothing, as any inserted blank line. Kept only for a client that
+    /// inserts as is when told to, and told so: a snippet engine
+    /// re-indenting lines whatever the item says (Neovim's) would indent
+    /// them twice, and one adjusting by default as well.
+    #[rstest]
+    #[case::tabstop_only_line("{\n$0\n}", "{\n$0\n  }")]
+    #[case::tabstop_opening_a_line("{\n\t$0\n}", "{\n  \t$0\n  }")]
+    #[case::placeholder_then_tabstop("if ${1:x}:\n\t$0", "if ${1:x}:\n  \t$0")]
+    #[case::placeholder_spanning_lines("${1:b\nc}\nd", "${1:b\n  c}\n  d")]
+    fn a_prepared_multi_line_snippet_regains_the_indent_for_a_client_inserting_as_is(
+        #[case] snippet: &str,
+        #[case] sent: &str,
+    ) {
+        use tower_lsp_server::ls_types::{InsertTextFormat, InsertTextMode};
+        let offset = dedented_offset("  a\n");
+        let completed = json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+            "newText": snippet
+        }});
+        let transform = |completed: &mut CompletionItem, insert_mode| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                insert_mode,
+            )
+        };
+        let mut settable = item(completed.clone());
+        assert!(transform(&mut settable, ClientInsertMode::AsIsSettable));
+        assert_eq!(sent_text(&settable), sent);
+        assert_eq!(settable.insert_text_mode, Some(InsertTextMode::AS_IS));
+        assert_eq!(settable.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        for insert_mode in [ClientInsertMode::AsIs, ClientInsertMode::AdjustsIndentation] {
+            assert!(
+                !transform(&mut item(completed.clone()), insert_mode),
+                "{insert_mode:?}"
+            );
+        }
+        // A literal multi-line snippet is plain text, which a client
+        // declaring nothing inserts as is.
+        let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+            "newText": "{\n}"
+        }}));
+        assert!(transform(&mut literal, ClientInsertMode::AsIs));
+        assert_eq!(sent_text(&literal), "{\n  }");
         assert_eq!(
-            as_is.insert_text_format,
-            Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+            literal.insert_text_format,
+            Some(InsertTextFormat::PLAIN_TEXT)
+        );
+    }
+
+    /// The indent a line regains goes into the snippet only where it holds
+    /// that line's start once: a default other occurrences mirror would
+    /// carry it to them too.
+    #[test]
+    fn a_prepared_snippet_mirroring_a_line_breaking_default_that_regains_an_indent_is_dropped() {
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+            "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+            "newText": "${1:b\nc}$1"
+        }}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::AsIsSettable,
+        ));
+    }
+
+    /// Without a textEdit, a snippet inserted at a caret regaining an
+    /// indent goes out as that edit, the snippet in it.
+    #[test]
+    fn an_implicit_snippet_made_an_edit_keeps_its_tabstops() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextFormat};
+        // A blank line among dedented ones: the caret there regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let mut completed =
+            item(json!({"label": "f", "insertTextFormat": 2, "insertText": "f(${1:x})$0"}));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        let Some(CompletionTextEdit::Edit(edit)) = &completed.text_edit else {
+            panic!("made an edit: {completed:?}");
+        };
+        assert_eq!(edit.new_text, "  f(${1:x})$0");
+        assert_eq!(completed.insert_text.as_deref(), Some("f(${1:x})$0"));
+        assert_eq!(
+            completed.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
         );
     }
 
@@ -1678,17 +1856,114 @@ mod tests {
         ));
     }
 
+    /// A snippet's tabstops vanish when the client expands it: the text the
+    /// map checks with the additional edits, and against the host text the
+    /// prepared document hides, is the expansion.
     #[test]
-    fn a_prepared_snippet_label_is_checked_when_it_is_the_text() {
-        let offset = dedented_offset("  a\n");
-        let mut completed = item(json!({"label": "x$1", "insertTextFormat": 2}));
-        assert!(!transform_completion_item(
+    fn a_prepared_snippet_and_its_additional_edits_are_checked_as_expanded() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        // `\rab\n`, its lone-CR leading line deleted: replacing `a` with
+        // `$0` and deleting `b` leaves `$0\n` after the hidden CR, which
+        // expands to an LF fusing with it.
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result("\rab\n", &VirtualLayout::single("\rab\n"), Some(answer))
+            .unwrap()
+            .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let mut completed = item(json!({
+            "label": "x",
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "$0"
+            },
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(12, 0),
+            Some(Position::new(11, 1)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(completed.additional_text_edits, None);
+    }
+
+    #[rstest]
+    // Reads as text ending with a line break, but expands to an LF right
+    // after the hidden CR.
+    #[case::tabstop_vanishing("$0\n")]
+    // Reads as starting with text, but `$1` mirrors the later default.
+    #[case::tabstop_mirroring_a_later_default("$1x${1:\n}")]
+    #[case::tabstop_numbered_with_a_leading_zero("$01x${1:\n}")]
+    fn a_prepared_snippet_whose_expansion_fuses_a_hidden_line_break_is_dropped(
+        #[case] snippet: &str,
+    ) {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        // `\ra`, its leading blank line (ended by a lone CR) deleted.
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result("\ra", &VirtualLayout::single("\ra"), Some(answer))
+            .unwrap()
+            .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        for insert_mode in [ClientInsertMode::AsIsSettable, ClientInsertMode::AsIs] {
+            let mut completed = item(json!({
+                "label": "x",
+                "insertTextFormat": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    "newText": snippet
+                }
+            }));
+            assert!(!transform_completion_item(
+                &mut completed,
+                &offset,
+                Position::new(11, 1),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            ));
+        }
+    }
+
+    /// An insert/replace snippet maps through both ranges as its expansion,
+    /// and goes out as the snippet over both.
+    #[test]
+    fn a_prepared_insert_replace_snippet_maps_both_ranges() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range};
+        let offset = dedented_offset("  foo\n");
+        let mut completed = item(json!({"label": "f", "insertTextFormat": 2, "textEdit": {
+            "insert": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "replace": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+            "newText": "f(${1:x})$0"
+        }}));
+        assert!(transform_completion_item(
             &mut completed,
             &offset,
             Position::new(11, 0),
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
+        let Some(CompletionTextEdit::InsertAndReplace(edit)) = &completed.text_edit else {
+            panic!("kept as insert/replace: {completed:?}");
+        };
+        assert_eq!(edit.new_text, "f(${1:x})$0");
+        assert_eq!(
+            edit.insert,
+            Range::new(Position::new(10, 2), Position::new(10, 3))
+        );
+        assert_eq!(
+            edit.replace,
+            Range::new(Position::new(10, 2), Position::new(10, 5))
+        );
     }
 
     #[test]

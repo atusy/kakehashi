@@ -40,7 +40,8 @@
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
 //!   answer as in the other modes, and color presentations add one over
 //!   (0, 6)-(0, 7); a document holding `SNIPPETS` gets an incomplete list
-//!   of snippets only instead. Proves what a prepared virtual
+//!   of snippets inserting a variable only instead, and one holding
+//!   `SNIPPET_EDIT` snippets inserted at the caret. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
@@ -1261,7 +1262,8 @@ fn main() {
                 respond(&mut writer, id, result);
             }
             // A document holding `SNIPPETS` gets an incomplete list of
-            // snippets only, which a prepared document drops whole.
+            // snippets only, each inserting a variable the client expands,
+            // which a prepared document drops whole.
             "textDocument/completion"
                 if mode == "echo-document"
                     && message
@@ -1274,7 +1276,32 @@ fn main() {
                     &mut writer,
                     id,
                     json!({"isIncomplete": true, "items": [
-                        {"label": "s", "insertTextFormat": 2, "insertText": "s$0"}
+                        {"label": "s", "insertTextFormat": 2, "insertText": "s$TM_SELECTED_TEXT"}
+                    ]}),
+                );
+            }
+            // A document holding `SNIPPET_EDIT` gets snippets inserted at
+            // the caret: one on one line, one breaking lines.
+            "textDocument/completion"
+                if mode == "echo-document"
+                    && message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .is_some_and(|text| text.contains("SNIPPET_EDIT")) =>
+            {
+                let position = message["params"]["position"].clone();
+                let at = json!({ "start": position, "end": position });
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"isIncomplete": false, "items": [
+                        {"label": "call", "insertTextFormat": 2, "textEdit": {
+                            "range": at, "newText": "f(${1:x})$0"
+                        }},
+                        {"label": "block", "insertTextFormat": 2, "textEdit": {
+                            "range": at, "newText": "do\n\t${1:body}\n$0end"
+                        }}
                     ]}),
                 );
             }
