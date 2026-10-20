@@ -6206,3 +6206,40 @@ fn a_line_written_as_one_of_several_copies_is_placed_among_what_pairs() {
         Some(expected)
     );
 }
+
+#[test]
+fn a_line_joined_onto_one_of_several_copies_is_placed_among_what_pairs() {
+    // `} 3a3` joins onto a `}`, P holding two with a kept whitespace line
+    // between: joined onto the first, that line would be read as rewritten.
+    let virtual_text = "\n\n  }\n \n  }\n  \t3a3\n    4𝄞x4\n\n";
+    let range = |start: (u32, u32), end: (u32, u32)| {
+        json!({"range": {"start": {"line": start.0, "character": start.1},
+            "end": {"line": end.0, "character": end.1}}, "newText": ""})
+    };
+    let map = prepare(
+        virtual_text,
+        json!([
+            range((0, 0), (1, 0)),
+            range((1, 0), (2, 0)),
+            range((2, 0), (2, 2)),
+            range((4, 0), (4, 2)),
+            range((5, 0), (5, 2)),
+            range((6, 0), (6, 2)),
+            range((7, 0), (8, 0)),
+        ]),
+    );
+    assert_eq!(map.prepared_text(), "}\n \n}\n\t3a3\n  4𝄞x4\n");
+    let answer = [edit((0, 0), (5, 0), "   }\n \n} 3a3\n")];
+    let expected = "\n\n     }\n \n  } 3a3\n\n";
+    assert_eq!(
+        map.map_formatting_answer(&answer)
+            .ok()
+            .map(|mapped| apply_to(virtual_text, &mapped))
+            .as_deref(),
+        Some(expected)
+    );
+    assert_eq!(
+        replayed(virtual_text, &map, &answer).as_deref(),
+        Some(expected)
+    );
+}
