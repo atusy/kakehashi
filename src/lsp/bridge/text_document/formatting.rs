@@ -764,9 +764,10 @@ fn transform_formatting_style_response(
     // whose edges the layout kept above. Its answer maps back through the
     // map, which restores the indentation the peer removed and keeps the
     // host text P does not show (the deleted edge lines). An answer the map
-    // refuses fails the request (the CLI reports it), unlike the malformed
-    // answers dropped below: the server did its job, and the region is left
-    // unformatted only because its result cannot be placed in the host. An
+    // refuses counts as its server failing (the fan-in falls through to the
+    // next server, and the CLI reports a region none formats), unlike the
+    // unsafe answers dropped below: the server did its job, and the region
+    // is left unformatted only because its result cannot be placed. An
     // unprepared document's edits translate as ranges, never refused.
     // Logged by the caller, which knows the document (see
     // `PreparedAnswerRefused`).
@@ -2437,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_answer_the_map_refuses_fails_the_request() {
+    fn a_prepared_answer_the_map_refuses_counts_as_its_server_failing() {
         // Lines dedented by two and by four: a new line has no one indent.
         let virtual_content = "  a\n    b\n";
         let offset = prepared_offset(

@@ -470,7 +470,7 @@ impl<T> Sourced<T> {
             .is_none_or(|source| source.live(pool, tracker))
     }
 
-    /// Whether whether this answer is current may still change while the
+    /// Whether what [`Self::still_current`] says of this answer may still change while the
     /// host's content version stays put (see
     /// `LanguageServerPool::host_settling`): never so without a map, nor
     /// once nothing can make it current again: its map revoked, or its
