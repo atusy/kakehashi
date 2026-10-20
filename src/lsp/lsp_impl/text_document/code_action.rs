@@ -64,6 +64,20 @@ fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionRespo
     (!merged.is_empty()).then_some(merged)
 }
 
+/// Whether `actions` answer a `preferred` walk, winning over a server or
+/// layer ranked below: any action at all — but on a prepared document
+/// only an enabled one, where an action whose edit the map refused comes
+/// back disabled, and a server ranked below may map.
+fn actions_answer(actions: &[CodeActionOrCommand], prepared: bool) -> bool {
+    if !prepared {
+        return !actions.is_empty();
+    }
+    actions.iter().any(|action| match action {
+        CodeActionOrCommand::Command(_) => true,
+        CodeActionOrCommand::CodeAction(action) => action.disabled.is_none(),
+    })
+}
+
 /// The actions of `parts` judged kept, in order: `Err` when judging emptied
 /// the answer (none left of a stale region's actions). An answer that came
 /// empty stays the empty answer it was (a concatenated walk's `[]`).
@@ -169,7 +183,11 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |parts: &ActionParts| parts.iter().any(|(actions, _)| !actions.is_empty()),
+                |parts: &ActionParts| {
+                    parts
+                        .iter()
+                        .any(|(actions, source)| actions_answer(actions, source.is_some()))
+                },
                 |mut parts: ActionParts, next| {
                     parts.extend(next);
                     parts
@@ -179,8 +197,11 @@ impl Kakehashi {
         // The final answer chosen: each prepared region's actions checked
         // once more against the host text, which may have moved while they
         // were held (see `judged_actions`). A stale region's actions are
-        // dropped; the others (the host layer's, an unprepared region's, a
-        // current one's) stay in the answer chosen.
+        // dropped; the others in the answer chosen stay (under
+        // `concatenated`, the host layer's and other regions'). Under a
+        // cross-layer `preferred` the host layer's answer is not in it once
+        // the virt layer won: a stale virt answer then leaves none, until
+        // the editor asks again.
         let result = match result {
             Ok(Some(parts)) => Ok(judged_actions(
                 self.bridge.pool(),
@@ -656,11 +677,12 @@ impl Kakehashi {
         // the whole multi-region walk and aborts it on cancel.
         match ctx.document.strategy {
             AggregationStrategy::Preferred => {
+                let prepared = ctx.document.prepared.is_some();
                 dispatch_preferred(
                     &ctx.document,
                     pool.clone(),
                     f,
-                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    |opt| matches!(opt, Some(v) if actions_answer(v, prepared)),
                     None,
                 )
                 .await
@@ -825,6 +847,28 @@ fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    /// Under `preferred`, a prepared document's disabled actions (edits the
+    /// map refused) do not win over a server ranked below; an unprepared
+    /// one's answer counts whatever it holds, as before.
+    #[test]
+    fn only_enabled_actions_answer_for_a_prepared_document() {
+        let disabled = CodeActionOrCommand::CodeAction(CodeAction {
+            title: "refused".into(),
+            disabled: Some(tower_lsp_server::ls_types::CodeActionDisabled {
+                reason: "cannot map".into(),
+            }),
+            ..Default::default()
+        });
+        let enabled = CodeActionOrCommand::CodeAction(CodeAction {
+            title: "fix".into(),
+            ..Default::default()
+        });
+        assert!(!actions_answer(std::slice::from_ref(&disabled), true));
+        assert!(actions_answer(std::slice::from_ref(&disabled), false));
+        assert!(actions_answer(&[disabled, enabled], true));
+        assert!(!actions_answer(&[], false));
+    }
 
     /// The final check drops only a stale prepared region's actions; an
     /// answer that came empty stays the empty answer it was.
