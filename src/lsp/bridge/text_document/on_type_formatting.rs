@@ -113,7 +113,6 @@ impl LanguageServerPool {
             // capability/trigger early returns above yield `Ok(None)`.
             |response, ctx| {
                 on_type_formatting_answer_to_host(response, ctx, virtual_content, region_end)
-                    .map(Some)
             },
         )
         .await?
