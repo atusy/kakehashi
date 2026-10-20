@@ -97,11 +97,18 @@ impl EditTranslation for Ranges<'_> {
 /// line, apart from the others: [`EditMode::InLine`]); one whose edits add,
 /// remove or rewrite lines is refused, since no edit of a replayed diff is
 /// any one of them.
-struct Replayed<'a>(&'a RegionOffset);
+struct Replayed<'a> {
+    offset: &'a RegionOffset,
+    /// The host ranges the `changes` form's mapped edits came out at.
+    mapped_changes: Vec<Range>,
+}
 
 impl EditTranslation for Replayed<'_> {
     fn edits(&mut self, edits: &mut Vec<TextEdit>) -> bool {
-        translate_virtual_replayed_edits_to_host(edits, self.0)
+        let mapped = translate_virtual_replayed_edits_to_host(edits, self.offset);
+        self.mapped_changes
+            .extend(edits.iter().map(|edit| edit.range));
+        mapped
     }
 
     fn entry(&mut self, edits: &mut Vec<OneOf<TextEdit, AnnotatedTextEdit>>) -> bool {
@@ -113,7 +120,7 @@ impl EditTranslation for Replayed<'_> {
                     OneOf::Right(_) => None,
                 })
                 .collect();
-            let mapped = translate_virtual_replayed_edits_to_host(&mut plain, self.0);
+            let mapped = translate_virtual_replayed_edits_to_host(&mut plain, self.offset);
             *edits = plain.into_iter().map(OneOf::Left).collect();
             return mapped;
         }
@@ -124,7 +131,7 @@ impl EditTranslation for Replayed<'_> {
                 OneOf::Right(annotated) => annotated.text_edit.clone(),
             })
             .collect();
-        if !translate_virtual_text_edits_to_host(&mut plain, self.0, EditMode::InLine) {
+        if !translate_virtual_text_edits_to_host(&mut plain, self.offset, EditMode::InLine) {
             return false;
         }
         for (one_of, text_edit) in edits.iter_mut().zip(plain) {
@@ -181,7 +188,9 @@ fn transform_edits(
 ///
 /// The region's mapped edits and the host URI's direct ones never overlap:
 /// those reaching into the region are refused, and mapped ones stay inside
-/// it, so the two can at most meet at its edges.
+/// it, so the two can at most meet at its edges; meeting there, in
+/// `changes` (one set, applied in no order the edits state), the edit is
+/// refused too.
 fn transform_prepared_workspace_edit(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
@@ -236,7 +245,31 @@ fn transform_prepared_workspace_edit(
         return false;
     }
 
-    transform_edits(edit, request_virtual_uri, host_uri, &mut Replayed(offset))
+    let direct_changes: Vec<Range> = edit
+        .changes
+        .as_ref()
+        .and_then(|changes| changes.get(host_uri))
+        .into_iter()
+        .flatten()
+        .map(|edit| edit.range)
+        .collect();
+    let mut replayed = Replayed {
+        offset,
+        mapped_changes: Vec::new(),
+    };
+    if !transform_edits(edit, request_virtual_uri, host_uri, &mut replayed) {
+        return false;
+    }
+    // In `changes` the host's own edits and the mapped ones are one set,
+    // the mapped ones after: a direct edit meeting a mapped one where the
+    // region starts or ends (an insertion there, one replaced up to there)
+    // would leave their order to the client, against what each meant.
+    !direct_changes.iter().any(|direct| {
+        replayed
+            .mapped_changes
+            .iter()
+            .any(|mapped| direct.end == mapped.start || mapped.end == direct.start)
+    })
 }
 
 /// An edit's range, annotated or not.
@@ -1942,5 +1975,23 @@ mod tests {
                 "{edits:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_direct_host_edit_meeting_a_mapped_one_at_the_regions_edge_refuses_the_edit() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // The region's last line deleted up to its end, and text inserted
+        // on the host right there: which goes first no edit states.
+        let mut edit = parse_workspace_edit(json!({"changes": {
+            virtual_uri.clone(): [{"range": range_json((1, 0), (2, 0)), "newText": ""}],
+            host_uri.as_str(): [{"range": range_json((12, 0), (12, 0)), "newText": "after\n"}]
+        }}));
+        assert!(!transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &prepared_offset()
+        ));
     }
 }
