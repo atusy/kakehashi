@@ -7,10 +7,10 @@
 //! fence — if applied verbatim (see `transform_completion_item`).
 //! On a prepared document the items' edits map back through its map,
 //! re-indented; a one-line snippet maps as its expansion and goes out with
-//! the indent its expansion regained before it (a literal one as plain
-//! text), and an
-//! item without an edit is made an explicit one where its text at the caret
-//! regains an indent, or dropped where it would map off the caret.
+//! the indent its expansion regained before it (one without a tabstop as
+//! the plain text it stands for), and an item without an edit is made an
+//! explicit one where its text at the caret regains an indent, or dropped
+//! where it would map off the caret.
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -221,9 +221,10 @@ fn transform_completion_response_to_host(
 /// their text re-indented, and the item may be given `insertTextMode: asIs`
 /// (see `ClientInsertMode`). A snippet there is checked as its expansion
 /// (see [`Expansion`]) and sent with the indentation its expansion regained
-/// before it, a literal one as plain text; an item without an edit is
-/// probed as an edit at the caret: made that explicit edit when its text
-/// regains an indent, dropped when it maps off the caret.
+/// before it, one without a tabstop as the plain text it stands for; an
+/// item without an edit is probed as an edit at the caret: made that
+/// explicit edit when its text regains an indent, dropped when it maps off
+/// the caret.
 ///
 /// Returns `false` when the item's primary insertion — its text edit, or the
 /// insertText/label fallback applied at the request position — is unsafe for the
