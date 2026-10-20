@@ -35,12 +35,13 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename/color-presentation/
-//!   willSaveWaitUntil/linkedEditingRange/completion requests, and pull
+//!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
 //!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
+//!   willSaveWaitUntil, linkedEditingRange and completion are edit-producing
+//!   readers too: the client applies their answers to its current text.
 //!
 //! Everything else passes through untouched.
 
@@ -306,12 +307,6 @@ enum Role {
 /// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
 /// document), and pull diagnostics.
-/// `textDocument/willSaveWaitUntil` and `textDocument/linkedEditingRange` are
-/// edit-producing too: save-time edits are applied to the buffer as saved,
-/// which includes every edit sent before the request, and linked ranges drive
-/// the client's mirrored edits. So is `textDocument/completion`: it follows
-/// its trigger keystroke's didChange on the wire, and its textEdit and
-/// additionalTextEdits are applied at the post-keystroke caret.
 /// `textDocument/codeAction` is in the same class: its
 /// `context.diagnostics` and returned edits are computed against the
 /// document snapshot (#568), and so is `textDocument/inlayHint`, whose
@@ -332,6 +327,13 @@ enum Role {
 /// incarnation checks catch staleness only after a lifecycle writer has run;
 /// without this barrier a following node request can overtake a wire-order
 /// `didChange`/`didClose` and observe the pre-writer document.
+///
+/// `textDocument/willSaveWaitUntil` and `textDocument/linkedEditingRange` are
+/// edit-producing too: save-time edits are applied to the buffer as saved,
+/// which includes every edit sent before the request, and linked ranges drive
+/// the client's mirrored edits. So is `textDocument/completion`: it follows
+/// its trigger keystroke's didChange on the wire, and its textEdit and
+/// additionalTextEdits are applied at the post-keystroke caret.
 fn classify(req: &Request) -> Option<Role> {
     let method = req.method();
     match method {
