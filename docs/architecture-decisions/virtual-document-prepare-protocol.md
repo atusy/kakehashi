@@ -296,7 +296,9 @@ order with the lines alike to several below), then one alike but for
 whitespace anywhere in it, the same way; then, between those, lines found as many
 times on each side (a `}` among several), by the fewest changes; then a
 line other lines were joined onto (found by looking up the old lines'
-texts, not comparing every pair); then blank lines with blank lines — as
+texts, not comparing every pair; a line whose text, or the text it joins
+onto, has more than one copy still to pair is left to the stages after,
+which place it among what they pair); then blank lines with blank lines — as
 many as can pair, and of the alignments pairing as many, the one keeping
 most whitespace lines with ones holding the same whitespace, so that text
 the formatter writes beside blank lines is a line of its own whenever a

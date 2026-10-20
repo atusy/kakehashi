@@ -1545,7 +1545,9 @@ enum Alignment {
 ///   once on each side paired too (by the fewest changes): only once every
 ///   line telling where it belongs is placed may a line alike to several
 ///   (`}`) take one of them, and only where each has one to take.
-/// - Lines of text other lines were joined onto.
+/// - Lines of text other lines were joined onto (but for a line whose
+///   text, or the text it joins onto, has several copies still to pair:
+///   left to the stages below, see [`joined_lines`]).
 /// - Blank lines among themselves: as many as can pair, so that text the
 ///   formatter writes beside blank lines is never read as written on one
 ///   while a blank line of the answer could be that line; of the
@@ -1644,9 +1646,10 @@ fn blank_lines<'a>(
     Some(pairs)
 }
 
-/// Pairs of an old line and the new line written as its text with more
-/// after it, in order: the first such old line for each new line, past the
-/// one paired before.
+/// Pairs of an old line and the new line written as its text (or as its
+/// text with more after it), in order: the one such old line past the one
+/// paired before, for each new line — none where several copies of that
+/// text are still to pair, which of them no order tells.
 ///
 /// The old lines' texts are indexed: each new line looks up its own
 /// prefixes of the lengths old texts have, each lookup spent from `work`,
