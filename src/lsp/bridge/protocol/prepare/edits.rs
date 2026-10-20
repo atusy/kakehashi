@@ -34,6 +34,11 @@ pub(crate) enum EditMode {
     /// removing or rewriting lines is replayed on P and diffed on its own
     /// lines, as a formatting answer is (see [`PreparedMap::map_edits`]).
     Replay,
+    /// Edits that must map one for each (annotated edits, keeping their
+    /// identity): taken only when each stays within one line, apart from
+    /// the others, where replaying them maps each as it keeps its extent;
+    /// any other set refused.
+    InLine,
 }
 
 /// Why a formatting answer was refused (see
@@ -147,6 +152,7 @@ impl PreparedMap {
         match mode {
             EditMode::Extent => self.map_extents(edits),
             EditMode::Replay => self.map_replayed(edits),
+            EditMode::InLine => self.map_in_line(edits),
         }
     }
 
@@ -458,6 +464,26 @@ impl PreparedMap {
             return None;
         }
         self.to_text_edits(mapped)
+    }
+
+    /// [`EditMode::InLine`]: each edit within one line (neither what it
+    /// replaces nor its text holds a line break) and touching no other, as
+    /// replaying them would take each, mapped keeping its extent.
+    fn map_in_line(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        let prepared = &self.prepared_lines.text;
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, false)?;
+        let breaks = |text: &str| text.contains(['\n', '\r']);
+        if order
+            .windows(2)
+            .any(|pair| ranges[pair[0]].end == ranges[pair[1]].start)
+            || edits
+                .iter()
+                .zip(&ranges)
+                .any(|(edit, range)| breaks(&prepared[range.clone()]) || breaks(&edit.new_text))
+        {
+            return None;
+        }
+        self.map_extents(edits)
     }
 
     /// [`EditMode::Replay`]. The edits are taken in P's order and grouped
