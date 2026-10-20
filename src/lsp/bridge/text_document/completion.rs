@@ -1427,7 +1427,7 @@ mod tests {
     #[rstest]
     #[case::tabstop("x$0", true)]
     #[case::placeholder("${1:x}", true)]
-    #[case::choice("${1|x,y|}", true)]
+    #[case::choice("${1|x,y|}", false)]
     #[case::mirror("${1:x}$1", true)]
     #[case::escape("x\\$", true)]
     #[case::escaped_brace("x\\}", true)]

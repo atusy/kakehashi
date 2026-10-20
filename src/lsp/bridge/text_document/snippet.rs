@@ -11,11 +11,10 @@
 
 use std::collections::HashMap;
 
-/// A snippet and the text it expands to with every tabstop, placeholder and
-/// choice left at its default: what the client inserts unless the user types
-/// over it. Every occurrence of a tabstop mirrors the default of its
-/// placeholder (or choice), wherever that stands — `$1x${1:y}` expands to
-/// `yxy`.
+/// A snippet and the text it expands to with every tabstop and placeholder
+/// left at its default: what the client inserts unless the user types over
+/// it. Every occurrence of a tabstop mirrors the default of its
+/// placeholder, wherever that stands — `$1x${1:y}` expands to `yxy`.
 #[derive(Debug)]
 pub(super) struct Expansion {
     snippet: String,
@@ -35,8 +34,8 @@ enum Piece {
     Tabstop(String),
 }
 
-/// A tabstop's default (a placeholder's text, a choice's first option),
-/// with each line break's end in it and in the snippet.
+/// A tabstop's default (a placeholder's text), with each line break's end
+/// in it and in the snippet.
 struct Default {
     text: String,
     breaks: Vec<(usize, usize)>,
@@ -44,16 +43,16 @@ struct Default {
 
 impl Expansion {
     /// The expansion of `snippet`, when every client agrees on it: literal
-    /// text, tabstops, and at most one placeholder (or choice) per tabstop
-    /// whose default holds no `$` — no nesting, no mirror inside a default
-    /// — and no choice breaking a line (its options other than the first
-    /// would go out unchecked). `None` for anything else: text the client
-    /// decides at insert time (a variable), that this expansion does not
-    /// compute (a transform), or that clients resolve differently (several
-    /// defaults for one tabstop, defaults holding defaults, a choice
-    /// escaping anything but `,`, `|` or `\`, a default escaping anything
-    /// but `$`, `}` or `\`, a `$` opening nothing); and for an expansion
-    /// far longer than the snippet (one default mirrored many times).
+    /// text, tabstops, and at most one placeholder per tabstop whose
+    /// default holds no `$` — no nesting, no mirror inside a default.
+    /// `None` for anything else: text the client decides at insert time (a
+    /// variable), that this expansion does not compute (a transform), or
+    /// that clients resolve differently (several defaults for one tabstop,
+    /// defaults holding defaults, a choice — VS Code inserts its first
+    /// option, Neovim nothing until the user reaches it —, a default
+    /// escaping anything but `$`, `}` or `\`, a `$` opening nothing); and
+    /// for an expansion far longer than the snippet (one default mirrored
+    /// many times).
     pub(super) fn of(snippet: &str) -> Option<Self> {
         let mut chars = snippet.char_indices().peekable();
         let mut pieces = Vec::new();
@@ -83,8 +82,8 @@ impl Expansion {
                         let default = match chars.next()?.1 {
                             '}' => None,
                             ':' => Some(placeholder(&mut chars)?),
-                            '|' => Some(choice(&mut chars)?),
-                            // A transform.
+                            // A choice, which clients insert apart, or a
+                            // transform.
                             _ => return None,
                         };
                         if let Some(default) = default
@@ -285,38 +284,6 @@ fn placeholder(chars: &mut Chars<'_>) -> Option<Default> {
     Some(Default { text, breaks })
 }
 
-/// A choice's first option, after its opening `|`, through its `|}`.
-fn choice(chars: &mut Chars<'_>) -> Option<Default> {
-    let mut text = String::new();
-    let mut first = true;
-    loop {
-        match chars.next()?.1 {
-            // Clients agree only on these escapes in a choice: VS Code
-            // keeps the backslash of `\$` and `\}`, which the grammar drops.
-            '\\' => match chars.next()?.1 {
-                escaped @ (',' | '|' | '\\') => {
-                    if first {
-                        text.push(escaped);
-                    }
-                }
-                _ => return None,
-            },
-            ',' => first = false,
-            '|' => break,
-            // An option breaking a line: picked instead of the first, it
-            // would go out unchecked.
-            c if is_break(c) => return None,
-            c if first => text.push(c),
-            _ => {}
-        }
-    }
-    chars.next_if(|&(_, c)| c == '}')?;
-    Some(Default {
-        text,
-        breaks: Vec::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,11 +297,6 @@ mod tests {
         assert_eq!(expanded("$0\n").as_deref(), Some("\n"));
         assert_eq!(expanded("f(${1})$0").as_deref(), Some("f()"));
         assert_eq!(expanded("f(${1:x}, ${2:y})").as_deref(), Some("f(x, y)"));
-        assert_eq!(expanded("${1|a,b|}c").as_deref(), Some("ac"));
-        assert_eq!(
-            expanded("${1|a\\,b\\|\\\\c,d|}").as_deref(),
-            Some("a,b|\\c")
-        );
         assert_eq!(expanded("\\$1 \\} \\x").as_deref(), Some("$1 } \\x"));
         assert_eq!(expanded("$0name\n").as_deref(), Some("name\n"));
         assert_eq!(expanded("${1}x$12y").as_deref(), Some("xy"));
@@ -348,10 +310,11 @@ mod tests {
 
     #[test]
     fn a_snippet_clients_expand_differently_has_no_expansion() {
-        // Escapes clients read differently in a choice.
-        assert_eq!(expanded("${1|a\\$b|}"), None);
-        assert_eq!(expanded("${1|a\\}b|}"), None);
-        assert_eq!(expanded("${1|a\\qb|}"), None);
+        // A choice: VS Code inserts its first option, Neovim nothing until
+        // the user reaches it.
+        assert_eq!(expanded("${1|a,b|}c"), None);
+        assert_eq!(expanded("${1:x}-${2|a,b|}"), None);
+        assert_eq!(expanded("${1|a\\,b\\|\\\\c,d|}"), None);
         // A `$` opening nothing, an escape a default holds of anything but
         // `$`, `}` or `\`: Neovim's grammar reads neither (VS Code reads
         // them as text).
@@ -359,13 +322,9 @@ mod tests {
         assert_eq!(expanded("a $ b"), None);
         assert_eq!(expanded("$$1"), None);
         assert_eq!(expanded("${1:a\\qb}"), None);
-        // A choice whose options break a line, the first or another.
-        assert_eq!(expanded("${1|a,b\nc|}"), None);
-        assert_eq!(expanded("${1|a\n,b|}"), None);
         // Several defaults for one tabstop.
         assert_eq!(expanded("${1:a} ${1:b}"), None);
         assert_eq!(expanded("$1x${1:}${1:\n}"), None);
-        assert_eq!(expanded("${1:a}${1|b|}"), None);
         // Defaults holding placeholders or mirrors, which clients resolve
         // differently (and could chain or cycle without end).
         assert_eq!(expanded("f(${1:x, ${2:y}})"), None);
@@ -388,7 +347,6 @@ mod tests {
         assert_eq!(expanded("${_x}"), None);
         assert_eq!(expanded("${1/a/b/}"), None);
         assert_eq!(expanded("${1:x"), None);
-        assert_eq!(expanded("${1|a,b|"), None);
         let deep = format!("{}x{}", "${1:".repeat(10_000), "}".repeat(10_000));
         assert_eq!(expanded(&deep), None);
     }
