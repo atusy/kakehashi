@@ -264,17 +264,18 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
 }
 
 /// Classify each line prefix of a region by the host parse: a prefix is a
-/// container continuation only in a markdown host, where it is exactly the
-/// `block_continuation` tree-sitter-md parses at the start of that line (for
-/// the region's first line, the one right before the content node; for
-/// later lines, the content node's excluded children). Every other prefix,
-/// in any other host or span, is other text. The children are walked once,
-/// in the order the gaps arrive.
+/// container continuation only when it is exactly the `block_continuation`
+/// that tree-sitter-md parses at the start of that line. For the region's
+/// first line, that is the node right before the content node; for later
+/// lines, it is the content node's excluded children. Only tree-sitter-md
+/// emits that node kind, so no other host has one, and the check needs no
+/// language name (an older parser reports none). Every other non-empty
+/// prefix is other text. The children are walked once, in the order the
+/// gaps arrive.
 fn markdown_container_prefixes<'a>(
     content_node: &Node<'a>,
     text: &'a str,
 ) -> impl FnMut(Option<usize>, usize) -> LinePrefix + 'a {
-    let markdown = content_node.language().name() == Some("markdown");
     let bytes = text.as_bytes();
     let starts_line = move |at: usize| at == 0 || matches!(bytes.get(at - 1), Some(b'\n' | b'\r'));
     let first_line = content_node
@@ -282,20 +283,13 @@ fn markdown_container_prefixes<'a>(
         .filter(|node| node.kind() == "block_continuation" && starts_line(node.start_byte()))
         .map(|node| node.byte_range());
     let mut cursor = content_node.walk();
-    let children: Vec<std::ops::Range<usize>> = if markdown {
-        content_node
-            .named_children(&mut cursor)
-            .filter(|node| node.kind() == "block_continuation")
-            .map(|node| node.byte_range())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let children: Vec<std::ops::Range<usize>> = content_node
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "block_continuation")
+        .map(|node| node.byte_range())
+        .collect();
     let mut next = 0;
     move |line_start, gap| {
-        if !markdown {
-            return LinePrefix::Other;
-        }
         let span = match line_start {
             None => {
                 if starts_line(gap) {
