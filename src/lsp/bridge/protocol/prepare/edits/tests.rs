@@ -3710,6 +3710,28 @@ mod formatting {
     }
 
     #[test]
+    fn a_line_inserted_above_an_emptied_whitespace_line_maps_with_its_breaks_switched() {
+        // The whitespace line `  ` emptied by the peer, the answer switching
+        // CRLF to LF (prettier's default) and inserting `y = 2` above it:
+        // the switched break before it and the insertion both meet the
+        // indent the emptied line had, and each leaves it to the next.
+        let virtual_text = "  x = 1\r\n  \r\n  foo(a,b)\r\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2]);
+        assert_eq!(map.prepared_lines.text, "x = 1\r\n\r\nfoo(a,b)\r\n");
+        let answer = [edit((0, 0), (4, 0), "x = 1\ny = 2\n\nfoo(a, b)\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  x = 1\n  y = 2\n\n  foo(a, b)\n")
+        );
+        // Without the insertion, as before.
+        let answer = [edit((0, 0), (4, 0), "x = 1\n\nfoo(a, b)\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  x = 1\n\n  foo(a, b)\n")
+        );
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.

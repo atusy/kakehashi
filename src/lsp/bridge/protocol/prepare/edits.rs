@@ -290,10 +290,9 @@ impl PreparedMap {
         // writing it for its own first line rather than giving it back (the
         // same text), and the two touch.
         let indent = |text: &str| text.chars().all(|c| c == ' ' || c == '\t');
-        for at in 1..mapped.len() {
-            let (next_start, next_end) = (mapped[at].0.start, mapped[at].0.end);
-            let (earlier, _) = mapped.split_at_mut(at);
-            let (range, new_text) = &mut earlier[at - 1];
+        // A stretch taking along the indent at `next_start`, which the next
+        // stretch claims, ends before it instead.
+        let leave_indent = |(range, new_text): &mut (Range<usize>, String), next_start: usize| {
             if range.start <= next_start && next_start < range.end {
                 let taken = &virtual_text[next_start..range.end];
                 // Only a removed indent is ever taken along and given back:
@@ -302,6 +301,14 @@ impl PreparedMap {
                     new_text.truncate(new_text.len() - taken.len());
                     range.end = next_start;
                 }
+            }
+        };
+        for at in 1..mapped.len() {
+            let (next_start, next_end) = (mapped[at].0.start, mapped[at].0.end);
+            let (earlier, _) = mapped.split_at_mut(at);
+            let (range, new_text) = &mut earlier[at - 1];
+            if range.start <= next_start && next_start < range.end {
+                leave_indent(&mut earlier[at - 1], next_start);
             } else if range.start == range.end
                 && next_start < range.start
                 && range.start <= next_end
@@ -311,6 +318,13 @@ impl PreparedMap {
                     new_text.truncate(new_text.len() - taken.len());
                     new_text.insert_str(0, taken);
                     *range = next_start..next_start;
+                    // Moved before the indent, the insertion now meets the
+                    // stretch before it there, which may have taken the same
+                    // indent along (a line break switched above a cleared
+                    // whitespace line): that one leaves it too.
+                    if at >= 2 {
+                        leave_indent(&mut earlier[at - 2], next_start);
+                    }
                 }
             }
         }
