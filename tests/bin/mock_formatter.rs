@@ -44,7 +44,8 @@
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
 //!   there (pinned to the version it holds when the text holds `VERSIONED`;
-//!   with `MOCK_APPLY_EDIT_AFTER_RELEASE`, once the release file exists) and
+//!   with `MOCK_APPLY_EDIT_AFTER_CHANGE`, once it has read the document's
+//!   next change) and
 //!   logs `echo-document applied: <bool>` with the answer.
 //! - `echo-document-push` — advertises only `hoverProvider` and full sync
 //!   with save: hover and the save hooks as `echo-document`, and instead of
@@ -283,6 +284,9 @@ fn main() {
     let mut documents: HashMap<String, String> = HashMap::new();
     // The version of each document as last opened or changed.
     let mut versions: HashMap<String, i64> = HashMap::new();
+    // An applyEdit held for its document's next didChange (see
+    // `MOCK_APPLY_EDIT_AFTER_CHANGE`).
+    let mut pending_apply_edit: Option<(String, Value)> = None;
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
@@ -867,6 +871,18 @@ fn main() {
                     {
                         versions.insert(uri.to_string(), version);
                     }
+                    if pending_apply_edit
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == uri)
+                        && let Some((_, params)) = pending_apply_edit.take()
+                    {
+                        request_with_params(
+                            &mut writer,
+                            json!(7001),
+                            "workspace/applyEdit",
+                            params,
+                        );
+                    }
                     if mode == "echo-document-push" {
                         notify(
                             &mut writer,
@@ -1020,21 +1036,6 @@ fn main() {
                         );
                     }
                     if held.contains("EDIT") {
-                        // With `MOCK_APPLY_EDIT_AFTER_RELEASE` set, asked only
-                        // once the file `MOCK_RELEASE_FILE` names exists (or a
-                        // minute later): a barrier a test lifts after editing
-                        // the host, the edit still for the text saved.
-                        if std::env::var_os("MOCK_APPLY_EDIT_AFTER_RELEASE").is_some()
-                            && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                        {
-                            let until =
-                                std::time::Instant::now() + std::time::Duration::from_secs(60);
-                            while !std::path::Path::new(&release).exists()
-                                && std::time::Instant::now() < until
-                            {
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                        }
                         let edit = json!([{ "range": first_line, "newText": "edited" }]);
                         // Holding `VERSIONED`: pinned to the version this
                         // server holds.
@@ -1047,14 +1048,22 @@ fn main() {
                                 "edits": edit
                             }] })
                         } else {
-                            json!({ "changes": { saved_uri: edit } })
+                            json!({ "changes": { saved_uri.clone(): edit } })
                         };
-                        request_with_params(
-                            &mut writer,
-                            json!(7001),
-                            "workspace/applyEdit",
-                            json!({ "edit": edit }),
-                        );
+                        // With `MOCK_APPLY_EDIT_AFTER_CHANGE` set, asked only
+                        // once the document's next didChange is read: the
+                        // edit is for the text saved, the server holding a
+                        // newer one by then.
+                        if std::env::var_os("MOCK_APPLY_EDIT_AFTER_CHANGE").is_some() {
+                            pending_apply_edit = Some((saved_uri.clone(), json!({ "edit": edit })));
+                        } else {
+                            request_with_params(
+                                &mut writer,
+                                json!(7001),
+                                "workspace/applyEdit",
+                                json!({ "edit": edit }),
+                            );
+                        }
                     }
                 }
             }

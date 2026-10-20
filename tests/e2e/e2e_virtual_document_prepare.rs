@@ -70,9 +70,9 @@ struct Setup {
     /// Have the echo mock answer code actions only once the test creates
     /// `release` in its directory.
     code_action_after_release: bool,
-    /// Have the echo mock ask to apply its save edit only once the test
-    /// creates `release` in its directory.
-    apply_edit_after_release: bool,
+    /// Have the echo mock ask to apply its save edit only once it has read
+    /// the document's next change.
+    apply_edit_after_change: bool,
 }
 
 impl Default for Setup {
@@ -93,7 +93,7 @@ impl Default for Setup {
             color_after_release: false,
             rename_after_release: false,
             code_action_after_release: false,
-            apply_edit_after_release: false,
+            apply_edit_after_change: false,
         }
     }
 }
@@ -165,8 +165,8 @@ impl Setup {
         if self.code_action_after_release {
             builder = builder.env("MOCK_CODE_ACTION_AFTER_RELEASE", "1");
         }
-        if self.apply_edit_after_release {
-            builder = builder.env("MOCK_APPLY_EDIT_AFTER_RELEASE", "1");
+        if self.apply_edit_after_change {
+            builder = builder.env("MOCK_APPLY_EDIT_AFTER_CHANGE", "1");
         }
         if self.wire_log {
             builder = builder.env(
@@ -1834,15 +1834,14 @@ fn an_edit_a_server_computed_for_a_prepared_text_maps_back_through_it() {
 
 #[test]
 fn an_edit_for_a_text_the_host_moved_from_is_refused() {
-    // The echo mock asks to apply its edit, pinned to the version it
-    // holds, only once released. Unmoved, it applies; the host's region
-    // edited meanwhile, the server sent its new text, the edit is refused:
-    // the editor never asked, the server told it was not applied.
+    // The echo mock's edit on save is pinned to the version it holds.
+    // Unmoved, it applies. Moved: the mock asks only once it has read the
+    // region's next change, its edit still for the text saved; the edit is
+    // refused, the editor never asked, the server told it was not applied.
     for moved in [false, true] {
-        let (mut client, dir) = Setup {
+        let (mut client, _dir) = Setup {
             capabilities: json!({ "workspace": { "applyEdit": true } }),
-            apply_edit_after_release: true,
-            wire_log: true,
+            apply_edit_after_change: moved,
             ..Setup::default()
         }
         .start();
@@ -1851,23 +1850,9 @@ fn an_edit_for_a_text_the_host_moved_from_is_refused() {
         open(&mut client, uri, text);
         hover_with_retry(&mut client, uri, 3, 4);
         save(&mut client, uri);
-        let wire = dir.path().join("wire.log");
-        let until = Instant::now() + Duration::from_secs(10);
-        while !std::fs::read_to_string(&wire)
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line.starts_with("textDocument/didSave\t"))
-        {
-            assert!(Instant::now() < until, "save not forwarded");
-            std::thread::sleep(Duration::from_millis(20));
-        }
         if moved {
             change(&mut client, uri, 2, &text.replace("local x", "local y"));
-            // The new prepared text sent before the mock is released (the
-            // mock, held, reads it only after).
-            std::thread::sleep(Duration::from_secs(1));
         }
-        std::fs::write(dir.path().join("release"), "").expect("release");
         let (asked, told) = answer_apply_edit(&mut client, true);
         assert_eq!(asked.is_some(), !moved, "moved: {moved}: {asked:?}");
         assert_eq!(told, (!moved).to_string(), "moved: {moved}");
