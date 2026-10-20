@@ -15,7 +15,7 @@ use tower_lsp_server::ls_types::{Position, PrepareRenameResponse, TextDocumentPo
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::translate_editable_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
     host_position_within_region_bounds, response_has_jsonrpc_error,
@@ -140,20 +140,21 @@ fn transform_prepare_rename_response_to_host(
         }
     };
 
-    // Transform range coordinates for variants that contain a Range
-    match &mut prepare_rename {
-        PrepareRenameResponse::Range(range) => {
-            translate_virtual_range_to_host(range, offset);
-        }
-        PrepareRenameResponse::RangeWithPlaceholder { range, .. } => {
-            translate_virtual_range_to_host(range, offset);
+    // Transform range coordinates for variants that contain a Range: the
+    // range the client renames in place, so on a prepared document it must
+    // cover the host text the server saw there; otherwise no answer.
+    let mapped = match &mut prepare_rename {
+        PrepareRenameResponse::Range(range)
+        | PrepareRenameResponse::RangeWithPlaceholder { range, .. } => {
+            translate_editable_virtual_range_to_host(range, offset)
         }
         PrepareRenameResponse::DefaultBehavior { .. } => {
             // No coordinates to transform
+            true
         }
-    }
+    };
 
-    Ok(Some(prepare_rename))
+    Ok(mapped.then_some(prepare_rename))
 }
 
 #[cfg(test)]
@@ -348,5 +349,59 @@ mod tests {
             }
             _ => panic!("Expected Range variant"),
         }
+    }
+
+    /// `  a = 1\n  b\n`, dedented by two, at host line 3.
+    fn prepared_offset() -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a = 1\n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        RegionOffset::new(3, 0).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn a_prepared_documents_rename_range_maps_where_it_reads_alike() {
+        let response = |start: (u32, u32), end: (u32, u32)| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "range": {"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}},
+                "placeholder": "a"
+            }})
+        };
+        // `a` at the start of its dedented line: after the host's indent.
+        let Some(PrepareRenameResponse::RangeWithPlaceholder { range, .. }) =
+            transform_prepare_rename_response_to_host(response((0, 0), (0, 1)), &prepared_offset())
+                .unwrap()
+        else {
+            panic!("mapped");
+        };
+        assert_eq!(
+            (range.start, range.end),
+            (Position::new(3, 2), Position::new(3, 3))
+        );
+        // Across the line break: the host has the next line's indent there.
+        assert!(
+            transform_prepare_rename_response_to_host(response((0, 6), (1, 1)), &prepared_offset())
+                .unwrap()
+                .is_none()
+        );
+        // As is, an unprepared document's range maps as before.
+        assert!(
+            transform_prepare_rename_response_to_host(
+                response((0, 6), (1, 1)),
+                &RegionOffset::new(3, 0)
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 }

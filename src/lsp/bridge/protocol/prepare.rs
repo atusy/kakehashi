@@ -1057,6 +1057,29 @@ impl PreparedMap {
         )
     }
 
+    /// Whether a P range, mapped as ranges are (its start as positions, its
+    /// end after any run it ends inside), covers in V exactly the text it
+    /// covers in P: no indentation the peer removed, no hidden line nor gap
+    /// text inside it. A range a client edits through in place (a symbol
+    /// renamed where it stands, linked ranges typed into together) is safe
+    /// only so: what it replaces in the host is what the server saw.
+    pub(crate) fn range_reads_alike(&self, range: tower_lsp_server::ls_types::Range) -> bool {
+        if range.start > range.end {
+            return false;
+        }
+        let start = self.prepared_lines.offset_clamped(range.start);
+        let end = self.prepared_lines.offset_clamped(range.end);
+        let virtual_start = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
+        let virtual_end = if start == end {
+            virtual_start
+        } else {
+            map_offset(&self.runs, end, Bias::End, Side::Prepared)
+        };
+        virtual_start <= virtual_end
+            && self.prepared_lines.text[start..end]
+                == self.virtual_lines.text[virtual_start..virtual_end]
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {

@@ -950,29 +950,33 @@ fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
 }
 
 #[test]
-fn a_rename_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+fn a_rename_maps_back_through_the_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/rename.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
     open(&mut client, uri, text);
 
-    // At once: the answer is not in yet. The request waits for it, finds
-    // the document prepared, and is refused — the echo mock would rename.
-    for _ in 0..20 {
-        let response = client.send_request(
-            "textDocument/rename",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": 3, "character": 8 },
-                "newName": "y"
-            }),
-        );
-        assert!(response.get("error").is_none(), "{response}");
-        assert!(response["result"].is_null(), "{response}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // The document was bridged meanwhile.
-    hover_with_retry(&mut client, uri, 3, 4);
+    // At once, the answer not in yet: the request waits for it, and the
+    // rename (the echo mock replaces its first line) is placed after the
+    // host's indentation, which the server never saw.
+    let response = client.send_request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 8 },
+            "newName": "y"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let edits = response["result"]["changes"][uri]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  renamed\n  return x\n```\n",
+        "{response}"
+    );
 }
 
 #[test]

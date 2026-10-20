@@ -14,7 +14,7 @@ use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
 use crate::lsp::bridge::strip_bridge_local_versions;
 use crate::lsp::bridge::workspace_edit_has_effect;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/rename";
 
@@ -27,27 +27,53 @@ impl Kakehashi {
         let new_name = params.new_name;
 
         let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token);
-        let native = self.native_bindings_answer(&lsp_uri, position, |ctx| {
-            super::native_bindings::native_rename(ctx, &lsp_uri, &new_name)
-        });
-        self.walk_layers_with_native(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            raw_params,
-            virt,
-            native,
-            // Host-layer edits are verbatim except versions: a downstream's
-            // document versions are bridge-local and would read as stale to
-            // version-checking editors.
-            |value| {
-                let mut edit = parse_host_verbatim::<WorkspaceEdit>(value)?;
-                strip_bridge_local_versions(&mut edit);
-                Some(edit)
-            },
-            rename_workspace_edit_has_result,
-        )
-        .await
+        let native = async {
+            let edit = self
+                .native_bindings_answer(&lsp_uri, position, |ctx| {
+                    super::native_bindings::native_rename(ctx, &lsp_uri, &new_name)
+                })
+                .await?;
+            Ok(edit.map(Sourced::unprepared))
+        };
+        let answer = self
+            .walk_layers_with_native(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                native,
+                // Host-layer edits are verbatim except versions: a downstream's
+                // document versions are bridge-local and would read as stale to
+                // version-checking editors.
+                |value| {
+                    let mut edit = parse_host_verbatim::<WorkspaceEdit>(value)?;
+                    strip_bridge_local_versions(&mut edit);
+                    Some(Sourced::unprepared(edit))
+                },
+                |sourced: &Sourced<WorkspaceEdit>| rename_workspace_edit_has_result(&sourced.value),
+            )
+            .await?;
+        // The final answer chosen: its edits checked once more against the
+        // host text, which may have moved while it was held. A rename comes
+        // once per action, like formatting, so the check waits for the
+        // host's last edit to settle and its regions' holds to clear (see
+        // `formatting_sources_current`); a stale answer is no answer.
+        let Some(sourced) = answer else {
+            return Ok(None);
+        };
+        let verdict = self
+            .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
+            .await;
+        if !verdict.keeps() {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "rename result for {} dropped: {verdict}",
+                lsp_uri.as_str()
+            );
+            return Ok(None);
+        }
+        Ok(Some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -57,7 +83,9 @@ impl Kakehashi {
         position: Position,
         new_name: &str,
         client_progress_token: Option<NumberOrString>,
-    ) -> Result<Option<WorkspaceEdit>> {
+    ) -> Result<Option<Sourced<WorkspaceEdit>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let revision = self.prepared_request_revision(lsp_uri);
         let Some(mut ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -100,7 +128,10 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result.handle(&self.notifier(), "rename", None, Ok).await
+        let edit = result.handle(&self.notifier(), "rename", None, Ok).await?;
+        Ok(edit.map(|edit| {
+            Sourced::from_region(&ctx.document, edit, self.bridge.node_tracker(), revision)
+        }))
     }
 }
 
