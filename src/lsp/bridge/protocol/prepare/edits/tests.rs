@@ -3734,6 +3734,23 @@ mod formatting {
         let scanned = SCANNED.with(|scanned| scanned.get());
         assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
         assert_eq!(apply_to(&virtual_text, &mapped), format!("  {formatted}"));
+        // The same answer as an edit after each comma: the answer's own
+        // ends convert in one pass over the line too, each position from
+        // the one before.
+        let mut column = 1;
+        let answer: Vec<TextEdit> = (1..count)
+            .map(|_| {
+                column += 4;
+                edit((0, column), (0, column), " ")
+            })
+            .collect();
+        CONVERSIONS.with(|conversions| conversions.set(0));
+        SCANNED.with(|scanned| scanned.set(0));
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert!(CONVERSIONS.with(|conversions| conversions.get()) <= 16);
+        let scanned = SCANNED.with(|scanned| scanned.get());
+        assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
+        assert_eq!(apply_to(&virtual_text, &mapped), format!("  {formatted}"));
     }
 
     #[test]
@@ -5058,7 +5075,7 @@ mod formatting_reference {
                                 .is_none_or(|old| old.trim() != text.trim()))
                 })
         });
-        [(true, false), (false, false), (true, true)]
+        [(true, false), (false, false), (true, true), (false, true)]
             .into_iter()
             .filter(|&(_, on_last_line)| !on_last_line || on_empty_line_last)
             .filter_map(|(written_on, on_last_line)| {
@@ -5377,16 +5394,13 @@ mod formatting_reference {
                 },
             )
             .unwrap();
-        // Cases the host could take, refused: none from the fixed seed;
-        // from another, availability only, and rare.
+        // Cases the host could take, refused: availability only, and rare
+        // (one in 10,000 at most, the fixed seed's 3,000 cases none; one
+        // allowed more from another seed).
         let fixed_seed = std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_none()
             && std::env::var_os("PROPTEST_RNG_SEED").is_none();
         assert!(
-            if fixed_seed {
-                over_refused.get() == 0
-            } else {
-                over_refused.get() * 200 <= cases as usize
-            },
+            over_refused.get() <= usize::from(!fixed_seed) + cases as usize / 10_000,
             "refused {} answers the host could take",
             over_refused.get()
         );
