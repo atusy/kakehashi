@@ -64,19 +64,16 @@ fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionRespo
     (!merged.is_empty()).then_some(merged)
 }
 
-/// The actions of `parts` whose prepared region is `current` (all others'
-/// as they are), in order: `Err` when the check emptied the answer (none
-/// left of a stale region's actions), `Ok(None)` for none at all. An answer
-/// that came empty stays the empty answer it was (a concatenated walk's
-/// `[]`).
+/// The actions of `parts` judged kept, in order: `Err` when judging emptied
+/// the answer (none left of a stale region's actions). An answer that came
+/// empty stays the empty answer it was (a concatenated walk's `[]`).
 fn current_actions(
-    parts: ActionParts,
-    current: impl Fn(&Sourced<()>) -> bool,
-) -> std::result::Result<Option<CodeActionResponse>, ()> {
+    parts: Vec<(CodeActionResponse, bool)>,
+) -> std::result::Result<CodeActionResponse, ()> {
     let mut kept: CodeActionResponse = Vec::new();
     let mut dropped = false;
-    for (actions, source) in parts {
-        if source.as_ref().is_none_or(&current) {
+    for (actions, keep) in parts {
+        if keep {
             kept.extend(actions);
         } else {
             dropped = true;
@@ -85,7 +82,38 @@ fn current_actions(
     if dropped && kept.is_empty() {
         return Err(());
     }
-    Ok(Some(kept))
+    Ok(kept)
+}
+
+/// [`current_actions`], each prepared part judged by the same final check
+/// as the other answers mapped through prepared regions
+/// ([`sources_verdict`](super::super::bridge_context::sources_verdict)): kept when
+/// current, which it reads at once in the common case; waited on only
+/// while the host's last edit is settling or its region held for its
+/// answer (an edit to another fence just before the request, say), dropped
+/// at once when moved or stale. The others are kept as they are.
+async fn judged_actions(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    parts: ActionParts,
+) -> std::result::Result<CodeActionResponse, ()> {
+    let mut judged = Vec::with_capacity(parts.len());
+    for (actions, source) in parts {
+        let keep = match &source {
+            None => true,
+            Some(source) => super::super::bridge_context::sources_verdict(
+                pool,
+                tracker,
+                &current_version,
+                std::iter::once(source),
+            )
+            .await
+            .keeps(),
+        };
+        judged.push((actions, keep));
+    }
+    current_actions(judged)
 }
 
 /// Collapse the cross-server `isPreferred` collision on a concatenated menu:
@@ -150,27 +178,27 @@ impl Kakehashi {
             .await;
         // The final answer chosen: each prepared region's actions checked
         // once more against the host text, which may have moved while they
-        // were held. Asked again as the caret moves, like completion: a
-        // stale region's actions are dropped, not waited on; the others (the
-        // host layer's, an unprepared region's, a current one's) stay.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        let result = result.map(|answer| {
-            answer.and_then(|parts| {
-                current_actions(parts, |source| {
-                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-                })
-                .inspect_err(|()| {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
-                        lsp_uri.as_str()
-                    );
-                })
-                .ok()
-                .flatten()
+        // were held (see `judged_actions`). A stale region's actions are
+        // dropped; the others (the host layer's, an unprepared region's, a
+        // current one's) stay in the answer chosen.
+        let result = match result {
+            Ok(Some(parts)) => Ok(judged_actions(
+                self.bridge.pool(),
+                self.bridge.node_tracker(),
+                || self.host_content_version(&lsp_uri),
+                parts,
+            )
+            .await
+            .inspect_err(|()| {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
+                    lsp_uri.as_str()
+                );
             })
-        });
+            .ok()),
+            other => other.map(|_| None),
+        };
         // Collapse the cross-source isPreferred collision on the FINAL menu,
         // regardless of the cross-layer strategy: WITHIN-layer concatenation can
         // merge several servers' actions into one layer even when the cross-layer
@@ -802,58 +830,110 @@ mod tests {
     /// answer that came empty stays the empty answer it was.
     #[test]
     fn the_final_check_drops_only_stale_regions_actions() {
-        use crate::lsp::lsp_impl::bridge_context::Sourced;
         let action = |title: &str| {
             CodeActionOrCommand::CodeAction(CodeAction {
                 title: title.into(),
                 ..Default::default()
             })
         };
-        let titles = |answer: std::result::Result<Option<CodeActionResponse>, ()>| {
+        let titles = |answer: std::result::Result<CodeActionResponse, ()>| {
             answer.map(|actions| {
-                actions.map(|actions| {
-                    actions
-                        .into_iter()
-                        .map(|action| match action {
-                            CodeActionOrCommand::CodeAction(action) => action.title,
-                            CodeActionOrCommand::Command(command) => command.title,
-                        })
-                        .collect::<Vec<_>>()
-                })
+                actions
+                    .into_iter()
+                    .map(|action| match action {
+                        CodeActionOrCommand::CodeAction(action) => action.title,
+                        CodeActionOrCommand::Command(command) => command.title,
+                    })
+                    .collect::<Vec<_>>()
             })
         };
         // A host layer answering `[]`, nothing else: `[]`.
-        assert_eq!(
-            titles(current_actions(vec![(vec![], None)], |_| false)),
-            Ok(Some(vec![]))
-        );
+        assert_eq!(titles(current_actions(vec![(vec![], true)])), Ok(vec![]));
         // A stale region beside the host layer's actions: those stay.
-        let stale = || Some(Sourced::unprepared(()));
         assert_eq!(
-            titles(current_actions(
-                vec![
-                    (vec![action("virt")], stale()),
-                    (vec![action("host")], None)
-                ],
-                |_| false
-            )),
-            Ok(Some(vec!["host".to_string()]))
+            titles(current_actions(vec![
+                (vec![action("virt")], false),
+                (vec![action("host")], true)
+            ])),
+            Ok(vec!["host".to_string()])
         );
         // Only stale actions: none.
         assert_eq!(
-            titles(current_actions(
-                vec![(vec![action("virt")], stale())],
-                |_| false
-            )),
+            titles(current_actions(vec![(vec![action("virt")], false)])),
             Err(())
         );
-        assert_eq!(
-            titles(current_actions(
-                vec![(vec![action("virt")], stale())],
-                |_| { true }
-            )),
-            Ok(Some(vec!["virt".to_string()]))
-        );
+    }
+
+    /// A region's actions answered before the host's last edit (to another
+    /// fence, the region's text unchanged) settled are kept once it
+    /// settles, not dropped; those the host moved under are dropped.
+    #[tokio::test(start_paused = true)]
+    async fn actions_answered_before_the_hosts_last_edit_settles_are_judged_once_it_does() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                .unwrap();
+        for moves in [false, true] {
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            let host = url::Url::parse("file:///test/settle.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            pool.note_host_edited(&host, 1, 1);
+            let source = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                1,
+            );
+            let version = Arc::new(AtomicU64::new(1));
+            let settle = {
+                let (pool, host, version) = (Arc::clone(&pool), host.clone(), Arc::clone(&version));
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if moves {
+                        version.store(2, Ordering::SeqCst);
+                    } else {
+                        pool.note_host_settled(&host, 1, 1);
+                    }
+                })
+            };
+            let answer = judged_actions(
+                &pool,
+                &tracker,
+                || Some(version.load(Ordering::SeqCst)),
+                vec![(
+                    vec![CodeActionOrCommand::CodeAction(CodeAction {
+                        title: "fix".into(),
+                        ..Default::default()
+                    })],
+                    Some(source),
+                )],
+            )
+            .await;
+            settle.await.unwrap();
+            assert_eq!(
+                answer.map(|actions| actions.len()),
+                if moves { Err(()) } else { Ok(1) }
+            );
+        }
     }
 
     /// An action resolved while its region went from as is to prepared (an

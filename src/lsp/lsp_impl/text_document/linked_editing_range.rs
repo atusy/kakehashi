@@ -38,15 +38,16 @@ impl Kakehashi {
             .await?;
         // The final answer chosen: ranges the client types into, checked
         // once more against the host text, which may have moved while it was
-        // held. Asked again as the caret moves, like completion: a stale
-        // answer is none, not waited on.
-        Ok(answer
-            .filter(|sourced| {
-                sourced.still_current(self.bridge.pool(), self.bridge.node_tracker(), || {
-                    self.host_content_version(&lsp_uri)
-                })
-            })
-            .map(|sourced| sourced.value))
+        // held, by the same check as other prepared answers (see
+        // `sources_verdict`): waited on only while the host's last edit is
+        // settling, a moved or stale answer none at once.
+        let Some(sourced) = answer else {
+            return Ok(None);
+        };
+        let verdict = self
+            .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
+            .await;
+        Ok(verdict.keeps().then_some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
