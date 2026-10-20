@@ -79,6 +79,32 @@ mod tests {
     use tower_lsp_server::ls_types::Range;
 
     #[test]
+    fn many_edits_on_one_long_line_apply_in_one_pass() {
+        // 20,000 insertions after each comma of one line of `"あ"`: the
+        // positions convert in one pass over the text, none one at a time.
+        use crate::text::position::{ONE_AT_A_TIME, STEPPED};
+        let count = 20_000;
+        let text = format!("[{}]", vec!["\"\u{3042}\""; count].join(","));
+        let mut column = 1;
+        let edits: Vec<TextEdit> = (1..count)
+            .map(|_| {
+                column += 4;
+                edit(0, column, 0, column, " ")
+            })
+            .collect();
+        ONE_AT_A_TIME.with(|count| count.set(0));
+        STEPPED.with(|stepped| stepped.set(0));
+        let applied = apply_text_edits(&text, &edits);
+        assert_eq!(
+            applied,
+            format!("[{}]", vec!["\"\u{3042}\""; count].join(", "))
+        );
+        assert_eq!(ONE_AT_A_TIME.with(|count| count.get()), 0);
+        let stepped = STEPPED.with(|stepped| stepped.get());
+        assert!(stepped <= text.chars().count(), "{stepped}");
+    }
+
+    #[test]
     fn positions_converted_in_one_pass_apply_as_one_at_a_time() {
         // Each position clamped through the line index on its own, as the
         // one-pass conversion must reproduce, for every caller.
