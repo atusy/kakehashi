@@ -64,6 +64,30 @@ fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionRespo
     (!merged.is_empty()).then_some(merged)
 }
 
+/// The actions of `parts` whose prepared region is `current` (all others'
+/// as they are), in order: `Err` when the check emptied the answer (none
+/// left of a stale region's actions), `Ok(None)` for none at all. An answer
+/// that came empty stays the empty answer it was (a concatenated walk's
+/// `[]`).
+fn current_actions(
+    parts: ActionParts,
+    current: impl Fn(&Sourced<()>) -> bool,
+) -> std::result::Result<Option<CodeActionResponse>, ()> {
+    let mut kept: CodeActionResponse = Vec::new();
+    let mut dropped = false;
+    for (actions, source) in parts {
+        if source.as_ref().is_none_or(&current) {
+            kept.extend(actions);
+        } else {
+            dropped = true;
+        }
+    }
+    if dropped && kept.is_empty() {
+        return Err(());
+    }
+    Ok(Some(kept))
+}
+
 /// Collapse the cross-server `isPreferred` collision on a concatenated menu:
 /// the client's auto-fix keybinding picks the FIRST `isPreferred: true`, so once
 /// several servers each mark their action preferred, keep only the first (the
@@ -133,21 +157,18 @@ impl Kakehashi {
         let tracker = self.bridge.node_tracker();
         let result = result.map(|answer| {
             answer.and_then(|parts| {
-                let mut kept: CodeActionResponse = Vec::new();
-                for (actions, source) in parts {
-                    if source.is_none_or(|source| {
-                        source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-                    }) {
-                        kept.extend(actions);
-                    } else {
-                        log::debug!(
-                            target: "kakehashi::bridge",
-                            "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
-                            lsp_uri.as_str()
-                        );
-                    }
-                }
-                (!kept.is_empty()).then_some(kept)
+                current_actions(parts, |source| {
+                    source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+                })
+                .inspect_err(|()| {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
+                        lsp_uri.as_str()
+                    );
+                })
+                .ok()
+                .flatten()
             })
         });
         // Collapse the cross-source isPreferred collision on the FINAL menu,
@@ -776,6 +797,64 @@ fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    /// The final check drops only a stale prepared region's actions; an
+    /// answer that came empty stays the empty answer it was.
+    #[test]
+    fn the_final_check_drops_only_stale_regions_actions() {
+        use crate::lsp::lsp_impl::bridge_context::Sourced;
+        let action = |title: &str| {
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                ..Default::default()
+            })
+        };
+        let titles = |answer: std::result::Result<Option<CodeActionResponse>, ()>| {
+            answer.map(|actions| {
+                actions.map(|actions| {
+                    actions
+                        .into_iter()
+                        .map(|action| match action {
+                            CodeActionOrCommand::CodeAction(action) => action.title,
+                            CodeActionOrCommand::Command(command) => command.title,
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+        // A host layer answering `[]`, nothing else: `[]`.
+        assert_eq!(
+            titles(current_actions(vec![(vec![], None)], |_| false)),
+            Ok(Some(vec![]))
+        );
+        // A stale region beside the host layer's actions: those stay.
+        let stale = || Some(Sourced::unprepared(()));
+        assert_eq!(
+            titles(current_actions(
+                vec![
+                    (vec![action("virt")], stale()),
+                    (vec![action("host")], None)
+                ],
+                |_| false
+            )),
+            Ok(Some(vec!["host".to_string()]))
+        );
+        // Only stale actions: none.
+        assert_eq!(
+            titles(current_actions(
+                vec![(vec![action("virt")], stale())],
+                |_| false
+            )),
+            Err(())
+        );
+        assert_eq!(
+            titles(current_actions(
+                vec![(vec![action("virt")], stale())],
+                |_| { true }
+            )),
+            Ok(Some(vec!["virt".to_string()]))
+        );
+    }
 
     /// An action resolved while its region went from as is to prepared (an
     /// epoch move gaining its pair a peer) is refused: its edit was computed
