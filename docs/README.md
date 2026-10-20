@@ -956,9 +956,9 @@ not) and a server's own `workspace/applyEdit` are mapped back too: lines they ad
 regain the indentation the prepare server removed, and edits that would reach
 into host text the prepared document does not show are dropped (completion
 snippets are offered only on one line, without a tab, and in the forms
-every editor expands alike — tabstops and placeholders, no choices or
-variables — since editors re-indent and retab snippets whatever the item
-asks; a formatting result
+every editor expands alike — tabstops and placeholders written plainly,
+no choices or variables — since editors re-indent, retab and parse
+snippets differently whatever the item asks; a formatting result
 that cannot be placed, or that rewrites a large region too heavily to
 compare within the work its size allows, counts as its server failing, and
 `kakehashi format` exits 2 when no other server formats the region; an

@@ -625,25 +625,38 @@ Completion keeps to what the client inserts where it asked:
   same position as sent, map the shared text alike and keep their shared
   start.
 - A snippet is checked as the client expands it, every tabstop at its
-  default, and kept only when every client expands it alike: literal text,
-  tabstops, and at most one placeholder per tabstop, its default holding no
-  `$` and escaping nothing but `$`, `}` or `\`; the final tabstop at most
-  once; all on one line, with no tab. Choices are refused (VS Code inserts
-  the first option, Neovim's `vim.snippet.expand` nothing until the user
-  reaches it), as are variables (the editor resolves them at insert
-  time), transforms (not computed here), nested placeholders (which
-  clients resolve differently) and a `$` opening nothing (which Neovim's
-  grammar does not read). The
-  expansion is what the map and the region's checks read, with the
-  additional edits, through each range the client may apply the main edit
-  with; the snippet goes out with the indentation the expansion regained
-  written before it — spaces only — and is dropped otherwise. One
+  default, and kept only in the forms every client expands alike: literal
+  text escaping nothing but `$`, `}` or `\`; tabstops `$n` or `${n}`, the
+  number written without a leading zero and at most 9999, the final
+  tabstop at most once; at most one placeholder `${n:…}` per tabstop, on
+  its first occurrence (later ones mirror it), its default literal text
+  escaping only the same three; all on one line, with no tab, and read as
+  a snippet by its text (a `$` opening a word after anything but a
+  backslash: mini.completion inserts other text as is). Anything else is
+  refused: choices (VS Code inserts the first option, Neovim's
+  `vim.snippet.expand` nothing until the user reaches it), variables (the
+  editor resolves them at insert time), transforms (not computed here),
+  nested placeholders (which clients resolve differently), a default after
+  its tabstop's first occurrence (mini.snippets mirrors the first), other
+  escapes (Neovim reads them into a pattern), a `$` opening nothing (which
+  Neovim's grammar does not read), and tabstop numbers with a leading zero
+  (mini.snippets reads `01` as another tabstop than `1`) or past 9999 (Lua
+  numbers lose integers). The expansion is what the map and the region's
+  checks read, with the additional edits, through each range the client
+  may apply the main edit with; the snippet goes out with the indentation
+  the expansion regained written before it — spaces only — and is dropped
+  otherwise. One
   expanding to spaces alone is dropped: the user types at its tabstop,
   which on a blank line among dedented ones regains no indent. A snippet
   without a tabstop (literal text, or only escapes) is sent as the plain
-  text it stands for, which every client inserts as is: mini.completion
-  expands an item as a snippet only when it holds a tabstop, a tab or a
-  line break, and would insert `x\$` with its backslash.
+  text it stands for, which clients insert as is (for an item of the
+  snippet kind, see below): mini.completion expands an item as a snippet
+  only when it holds a tabstop, a tab or a line break, and would insert
+  `x\$` with its backslash.
+- An item of the snippet kind going out as plain text is dropped where
+  its text holds a line break, a tab or a `$` opening a word:
+  mini.completion inserts such an item as a snippet whatever its format
+  says.
 - An item without a `textEdit` is inserted at the caret, outside the map:
   it is dropped when its text breaks a line; where the same text as an
   edit at the caret regains an indent (a blank line among dedented ones,
