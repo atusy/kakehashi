@@ -5455,3 +5455,156 @@ mod formatting_reference {
         assert!(mapped > 0);
     }
 }
+
+/// `virtual_text` once `edits` to its prepared text are replayed onto it;
+/// `None` when the set is refused.
+fn replayed(virtual_text: &str, map: &PreparedMap, edits: &[TextEdit]) -> Option<String> {
+    map.map_edits(edits, EditMode::Replay)
+        .map(|mapped| apply_to(virtual_text, &mapped))
+}
+
+#[test]
+fn a_rename_replayed_at_several_sites_keeps_every_indent() {
+    let virtual_text = "  a = 1\n  b = a\n    a(b)\n";
+    let map = dedent_by_two(virtual_text);
+    assert_eq!(map.prepared_text(), "a = 1\nb = a\n  a(b)\n");
+    let edits = [
+        edit((0, 0), (0, 1), "x"),
+        edit((1, 4), (1, 5), "x"),
+        edit((2, 2), (2, 3), "x"),
+    ];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  x = 1\n  b = x\n    x(b)\n")
+    );
+}
+
+#[test]
+fn touching_line_deletions_replayed_take_each_lines_indent_once() {
+    let virtual_text = "  a\n  b\n  c\n";
+    let map = dedent_by_two(virtual_text);
+    // Mapped one by one, both would claim `b`'s removed indent.
+    let edits = [edit((0, 0), (1, 0), ""), edit((1, 0), (2, 0), "")];
+    assert_eq!(map.map_edits(&edits, EditMode::Extent), None);
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  c\n")
+    );
+}
+
+#[test]
+fn a_block_wrapped_by_touching_insertions_regains_the_content_indent() {
+    let virtual_text = "  a\n  b\n";
+    let map = dedent_by_two(virtual_text);
+    // A wrap code action: a header inserted at the first line's start, and
+    // every wrapped line indented there.
+    let edits = [
+        edit((0, 0), (0, 0), "if x:\n"),
+        edit((0, 0), (0, 0), "  "),
+        edit((1, 0), (1, 0), "  "),
+    ];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  if x:\n    a\n    b\n")
+    );
+    // Unwrapping it back.
+    let virtual_text = "  if x:\n    a\n    b\n";
+    let map = dedent_by_two(virtual_text);
+    let edits = [edit((0, 0), (1, 2), ""), edit((2, 0), (2, 2), "")];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  a\n  b\n")
+    );
+}
+
+#[test]
+fn an_import_inserted_above_edits_elsewhere_regains_the_indent() {
+    let virtual_text = "  def f():\n    return g()\n";
+    let map = dedent_by_two(virtual_text);
+    let edits = [
+        edit((0, 0), (0, 0), "from m import g\n"),
+        edit((1, 11), (1, 11), "1"),
+    ];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  from m import g\n  def f():\n    return g(1)\n")
+    );
+}
+
+#[test]
+fn a_replayed_whole_document_keeps_the_lines_it_leaves_alike() {
+    // The whitespace-only line keeps its whitespace in the host, which a
+    // whole replacement keeping its extent would rewrite as an empty line.
+    let virtual_text = "  a\n  \n  b\n";
+    let map = dedent_by_two(virtual_text);
+    assert_eq!(map.prepared_text(), "a\n\nb\n");
+    let edits = [edit((0, 0), (3, 0), "A\n\nb\n")];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  A\n  \n  b\n")
+    );
+    assert_eq!(
+        map.map_edits(&edits, EditMode::Extent)
+            .map(|mapped| apply_to(virtual_text, &mapped))
+            .as_deref(),
+        Some("  A\n\n  b\n")
+    );
+}
+
+#[test]
+fn deleting_one_of_two_alike_lines_deletes_the_one_named() {
+    // The second `a` is followed by a whitespace line the first is not:
+    // which went shows in the host text.
+    let virtual_text = "  a\n  b\n  a\n  \n";
+    let map = dedent_by_two(virtual_text);
+    let edits = [edit((2, 0), (3, 0), "")];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  a\n  b\n  \n")
+    );
+    let edits = [edit((0, 0), (1, 0), "")];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  b\n  a\n  \n")
+    );
+}
+
+#[test]
+fn replayed_lines_on_an_unevenly_dedented_region_are_refused_and_in_line_edits_map() {
+    // `c` is left alone by the peer.
+    let virtual_text = "  a\nc\n  b\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_text(), "a\nc\nb\n");
+    assert_eq!(
+        replayed(
+            virtual_text,
+            &map,
+            &[edit((0, 0), (0, 1), "x"), edit((2, 0), (2, 1), "y")]
+        )
+        .as_deref(),
+        Some("  x\nc\n  y\n")
+    );
+    assert_eq!(
+        replayed(virtual_text, &map, &[edit((0, 1), (0, 1), "\nq")]),
+        None
+    );
+}
+
+#[test]
+fn replayed_lines_in_a_crlf_document_past_its_first_line_map() {
+    let virtual_text = "  a\r\n  b\r\n  c\r\n";
+    let map = dedent_by_two(virtual_text);
+    assert_eq!(map.prepared_text(), "a\r\nb\r\nc\r\n");
+    // A line inserted after `b`, and `c` renamed in place beside it.
+    let edits = [edit((1, 1), (1, 1), "\r\nq"), edit((2, 0), (2, 1), "C")];
+    assert_eq!(
+        replayed(virtual_text, &map, &edits).as_deref(),
+        Some("  a\r\n  b\r\n  q\r\n  C\r\n")
+    );
+}
