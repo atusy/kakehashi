@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::{LinkedEditingRangeParams, LinkedEditingRanges, 
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/linkedEditingRange";
 
@@ -25,16 +25,28 @@ impl Kakehashi {
         let position = params.text_document_position_params.position;
 
         let virt = self.linked_editing_range_virt_layer(&lsp_uri, position);
-        self.walk_layers(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            raw_params,
-            virt,
-            parse_host_verbatim::<LinkedEditingRanges>,
-            |r: &LinkedEditingRanges| !r.ranges.is_empty(),
-        )
-        .await
+        let answer = self
+            .walk_layers(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                |value| parse_host_verbatim::<LinkedEditingRanges>(value).map(Sourced::unprepared),
+                |r: &Sourced<LinkedEditingRanges>| !r.value.ranges.is_empty(),
+            )
+            .await?;
+        // The final answer chosen: ranges the client types into, checked
+        // once more against the host text, which may have moved while it was
+        // held. Asked again as the caret moves, like completion: a stale
+        // answer is none, not waited on.
+        Ok(answer
+            .filter(|sourced| {
+                sourced.still_current(self.bridge.pool(), self.bridge.node_tracker(), || {
+                    self.host_content_version(&lsp_uri)
+                })
+            })
+            .map(|sourced| sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -42,7 +54,9 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
-    ) -> Result<Option<LinkedEditingRanges>> {
+    ) -> Result<Option<Sourced<LinkedEditingRanges>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -79,8 +93,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result
+        let ranges = result
             .handle(&self.notifier(), "linkedEditingRange", None, Ok)
-            .await
+            .await?;
+        Ok(ranges.map(|ranges| {
+            Sourced::from_region(&ctx.document, ranges, self.bridge.node_tracker(), revision)
+        }))
     }
 }
