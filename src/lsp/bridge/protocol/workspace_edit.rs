@@ -362,12 +362,13 @@ pub(crate) fn text_edit_safe_in_region(
 ///   blockquote region has no line after, so the start line's own offset is
 ///   the only signal there).
 ///
-/// A blank row of the prefixed block that records no prefix (a list item's
-/// fence leaves blank rows unindented) maps virtual column 0 to host column
-/// 0, unlike the block's other rows. An edit starting there, with or without
-/// a newline, is unsafe iff it writes anything but spaces, tabs and line
-/// breaks (what markdown counts as blank): that text reads back dedented by
-/// the block's prefix width, or ends the block.
+/// A protected blank row of a list item's fence (one recording no prefix,
+/// or whitespace markdown reads as short of the item's indentation; the
+/// offset carries the rows discovery marked) maps virtual column 0 short of
+/// the item's content, unlike the block's other rows. An edit starting
+/// there, with or without a newline, is unsafe iff it writes anything but
+/// spaces, tabs and line breaks (what markdown counts as blank): that text
+/// reads back dedented by the missing width, or ends the block.
 ///
 /// Plain fenced blocks (all-zero column offsets) are exempt from the prefix
 /// rules — every edit is prefix-safe there, which keeps the common case
@@ -492,12 +493,14 @@ pub(crate) fn text_edit_preserves_line_prefixes(
         // the host line continues past the region and a newline would split
         // it, so line 0's offset still rejects there.
         let newline_splits_nothing = columns.len() == 1 && region_end.line > offset.line();
-        // A blank row of a prefixed block (a list item's fence leaves its
-        // blank rows unindented; `RegionOffset::with_content` marks them from
-        // the region's text) maps virtual column 0 to host column 0, but the
+        // A protected blank row of a list item's fence (one recording no
+        // prefix, or whitespace short of the item's indentation; discovery
+        // marks them from tree-sitter-md's container continuations, see
+        // `language::injection::content::container_blank_rows`, and the offset
+        // carries them through `RegionOffset::with_protected_blank_rows`)
+        // maps virtual column 0 short of the item's content, while the
         // block's other rows map it past the prefix, so text written there
-        // reads back dedented by that width, or ends the block when it is
-        // indented less. Only the prefix's width is recorded, not its text
+        // reads back dedented, or ends the block. Only the prefix's width is recorded, not its text
         // (`  ` vs `> `), so such an edit is refused rather than re-prefixed;
         // text of only spaces, tabs and line breaks, and deletions, still
         // apply. Rows recording no prefix that hold text (lazy continuation

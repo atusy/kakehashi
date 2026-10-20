@@ -487,9 +487,12 @@ pub(crate) struct EnvelopeOffset {
     /// `None` for non-blockquote injections (backwards-compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_column_offsets: Option<Vec<u32>>,
-    /// The virtual lines that are blank rows of a prefixed block (see
-    /// `RegionOffset::with_content`), carried so a resolve judges edits as
-    /// the original response was. Empty for most regions.
+    /// The virtual lines that discovery marked as protected blank rows of a
+    /// list item's fence (recording no prefix, or whitespace short of the
+    /// item's indentation; see
+    /// `language::injection::content::container_blank_rows`), carried so a
+    /// resolve judges edits as the original response was. Empty for most
+    /// regions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protected_blank_rows: Vec<u32>,
 }
