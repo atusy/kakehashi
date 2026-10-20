@@ -61,6 +61,9 @@ struct Setup {
     /// Also bridge lua to an `on-type` mock, ranked below the echo mock for
     /// on-type formatting.
     second_on_type: bool,
+    /// Have the echo mock answer color presentations only once the test
+    /// creates `release` in its directory.
+    color_after_release: bool,
 }
 
 impl Default for Setup {
@@ -78,6 +81,7 @@ impl Default for Setup {
             concatenated: false,
             host_mode: "slow-empty",
             second_on_type: false,
+            color_after_release: false,
         }
     }
 }
@@ -140,6 +144,9 @@ impl Setup {
                     .to_str()
                     .expect("UTF-8 release path"),
             );
+        if self.color_after_release {
+            builder = builder.env("MOCK_COLOR_AFTER_RELEASE", "1");
+        }
         if self.wire_log {
             builder = builder.env(
                 "MOCK_LSP_WIRE_LOG",
@@ -756,6 +763,57 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
             "{strategy} {method}, edited: {response}"
         );
     }
+}
+
+#[test]
+fn a_color_presentation_the_host_moved_under_is_dropped() {
+    // The echo mock answers the picker only once released. The host is
+    // edited (outside the region) while the request is out: its
+    // presentation, made for the text before the edit, is dropped.
+    let (mut client, dir) = Setup {
+        color_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/color-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+        "range": {
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 9 }
+        }
+    });
+    // Unedited, the presentations map back.
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.send_request("textDocument/colorPresentation", request.clone());
+    assert!(!result_items(&response).is_empty(), "{response}");
+    std::fs::remove_file(dir.path().join("release")).expect("hold again");
+
+    let id = client.send_request_async("textDocument/colorPresentation", request);
+    let wire = dir.path().join("wire.log");
+    let sent = || {
+        std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("textDocument/colorPresentation\t"))
+            .count()
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while sent() < 2 {
+        assert!(Instant::now() < until, "color request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(result_items(&response).is_empty(), "{response}");
 }
 
 #[test]

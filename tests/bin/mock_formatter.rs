@@ -2214,6 +2214,19 @@ fn main() {
                     record_mock_event(&mode, "request", &message);
                     std::thread::sleep(std::time::Duration::from_secs(3));
                 }
+                // With `MOCK_COLOR_AFTER_RELEASE` set, answered only once
+                // the file `MOCK_RELEASE_FILE` names exists (or a minute
+                // later): a barrier a test lifts after editing the host.
+                if std::env::var_os("MOCK_COLOR_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 let range = message.pointer("/params/range").cloned();
                 let result = if mode == "document-color-empty-presentation" {
                     json!([])
