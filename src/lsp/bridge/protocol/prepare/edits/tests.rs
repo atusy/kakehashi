@@ -1788,6 +1788,10 @@ mod exact_reference {
         Content { body: usize, gap: Option<bool> },
         /// An empty line inside the content.
         Empty,
+        /// A whitespace-only line inside the content, which the peer
+        /// empties: holding the indent (removed with the content's), or
+        /// when `short`, a single space (removed whole).
+        Blank { short: bool },
         /// Host lines between two fences: a gap starting a line.
         Fence,
     }
@@ -1820,6 +1824,7 @@ mod exact_reference {
             4 => (0..BODIES.len(), prop::option::of(any::<bool>()))
                 .prop_map(|(body, gap)| Line::Content { body, gap }),
             1 => Just(Line::Empty),
+            1 => any::<bool>().prop_map(|short| Line::Blank { short }),
             1 => Just(Line::Fence),
         ]
     }
@@ -1848,7 +1853,7 @@ mod exact_reference {
                 Line::Content { .. } => has_content = true,
                 Line::Fence if !has_content => return None,
                 Line::Fence => has_content = false,
-                Line::Empty => {}
+                Line::Empty | Line::Blank { .. } => {}
             }
         }
         if !has_content {
@@ -1872,6 +1877,11 @@ mod exact_reference {
         for line in lines {
             match line {
                 Line::Empty => push_content(&mut text, &mut pieces, "\n"),
+                Line::Blank { short } => push_content(
+                    &mut text,
+                    &mut pieces,
+                    &format!("{}\n", if *short { " " } else { indent }),
+                ),
                 Line::Fence => {
                     let start = text.len();
                     text.push('\n');
@@ -1927,8 +1937,15 @@ mod exact_reference {
                     // Edge blank lines go whole, one change each.
                     let edge_line = (index == 0 && at < leading)
                         || (index == last && at >= content_end && at < content_end + trailing);
+                    let line_text = text[at..range.end].split('\n').next().unwrap_or_default();
                     if edge_line {
                         segment_changes.push(change(at, at + 1));
+                    } else if !line_text.is_empty()
+                        && !line_text.starts_with(indent)
+                        && line_text.chars().all(|c| c == ' ')
+                    {
+                        // A short blank line, emptied whole.
+                        segment_changes.push(change(at, at + line_text.len()));
                     } else if text[at..range.end].starts_with(indent) {
                         segment_changes.push(change(at, at + indent.len()));
                     }
@@ -2013,10 +2030,41 @@ mod exact_reference {
                 return None;
             }
         }
+        // A blank line whose indent the peer removed keeps it while no edit
+        // reaches into it (on a document without gaps, where `text` is the
+        // edited P itself).
+        let kept_blank_lines: Vec<(usize, &str)> = if gaps.is_empty() {
+            map.runs
+                .iter()
+                .filter(|run| {
+                    run.kind == RunKind::Deleted
+                        && run.prepared.is_empty()
+                        && super::super::super::is_line_start(prepared, run.prepared.start)
+                        && prepared[run.prepared.start..].starts_with('\n')
+                })
+                .filter(|run| {
+                    !ranges.iter().any(|(range, _)| {
+                        range.start <= run.prepared.start && run.prepared.start < range.end
+                    })
+                })
+                .map(|run| {
+                    (
+                        shifted(run.prepared.start),
+                        &document.virtual_text[run.virtual_.clone()],
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut indented = String::new();
         let mut at_line_start = true;
         for (offset, character) in text.char_indices() {
-            if at_line_start && character != '\n' && !fence_starts.contains(&offset) {
+            if at_line_start && character == '\n' {
+                if let Some((_, removed)) = kept_blank_lines.iter().find(|(at, _)| *at == offset) {
+                    indented.push_str(removed);
+                }
+            } else if at_line_start && !fence_starts.contains(&offset) {
                 indented.push_str(indent);
             }
             indented.push(character);
@@ -2542,6 +2590,91 @@ fn a_blank_lines_removed_indent_does_not_set_the_contents() {
     );
     let typed = map.map_one_with_extent(&edit((0, 0), (0, 0), "z")).unwrap();
     assert_eq!(apply_to(virtual_text, &[typed]), "  z\n  \n");
+}
+
+#[test]
+fn text_replacing_lines_from_a_blank_one_takes_the_indent_of_where_it_lands() {
+    // `  x`, a one-space line the peer emptied, `  c`, `  then`: replacing
+    // from the blank line through `then` leaves one line, `then`'s place.
+    let virtual_text = "  x\n \n  c\n  then\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "x\n\nc\nthen\n");
+    let replaced = map
+        .map_one_with_extent(&edit((1, 0), (3, 4), "end"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  end\n");
+    // Partway into the line: the rest of it stays after the text.
+    let replaced = map.map_one_with_extent(&edit((1, 0), (3, 2), "e")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  een\n");
+    // Lines created from the blank line regain the content's indent, not
+    // the blank line's.
+    let replaced = map
+        .map_one_with_extent(&edit((1, 0), (3, 0), "end\n"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  end\n  then\n");
+    // Content left at column 0, the blank line's space removed: none.
+    let virtual_text = "x\n \nc\nthen\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""}
+        ]),
+    );
+    let replaced = map
+        .map_one_with_extent(&edit((1, 0), (3, 4), "end"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "x\nend\n");
+    // A whitespace line the peer kept: the text lands where `then` was.
+    let virtual_text = "  x\n   \n  c\n  then\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 2}}, "newText": ""}
+        ]),
+    );
+    assert_eq!(map.prepared_lines.text, "x\n   \nc\nthen\n");
+    let replaced = map
+        .map_one_with_extent(&edit((1, 0), (3, 4), "end"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[replaced]), "  x\n  end\n");
+}
+
+#[test]
+fn text_typed_on_an_emptied_blank_line_is_content() {
+    // A one-space line under a two-space indent, emptied by the peer: text
+    // typed there is a line of the content, which its space says nothing
+    // of; text joining it after a line break too.
+    let virtual_text = "  a\n \n  b\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]),
+    );
+    let typed = map.map_one_with_extent(&edit((1, 0), (1, 0), "z")).unwrap();
+    assert_eq!(apply_to(virtual_text, &[typed]), "  a\n  z\n  b\n");
+    let joined = map
+        .map_one_with_extent(&edit((0, 1), (1, 0), "\nw"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[joined]), "  a\n  w\n  b\n");
+    // Its space kept when nothing is typed on it: a line break inserted
+    // before it leaves it as it was.
+    let broken = map
+        .map_one_with_extent(&edit((1, 0), (1, 0), "\n"))
+        .unwrap();
+    assert_eq!(apply_to(virtual_text, &[broken]), "  a\n\n \n  b\n");
 }
 
 #[test]

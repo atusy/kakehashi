@@ -342,9 +342,38 @@ impl PreparedMap {
                 Some(&self.virtual_lines.text[run.virtual_.clone()])
                     != self.uniform_indent_at(plain_start)
             });
-        let start_indent = (whole_lines || lines_before_own_indent)
-            .then_some(removed_at_start)
-            .flatten();
+        // A blank line inside the content the peer emptied of its whitespace
+        // (not the indentation-only last line, which keeps its own): text
+        // placed on it
+        // is content (or joins the line the change ends in), so the change
+        // covers that whitespace, which says nothing of the indent the text
+        // regains.
+        // (Only where that whitespace is not the content's indent: there,
+        // text placed after it, as positions place it, reads the same.)
+        let blank_at_start = removed_at_start.filter(|run| {
+            let removed = &self.virtual_lines.text[run.virtual_.clone()];
+            self.virtual_lines.text[run.virtual_.end..].starts_with(['\n', '\r'])
+                && self.uniform_indent_at(plain_start) != Some(removed)
+        });
+        let start_indent = (whole_lines
+            || lines_before_own_indent
+            || blank_at_start.is_some() && !(old.is_empty() && new_text.is_empty()))
+        .then_some(removed_at_start)
+        .flatten();
+        // Text without a line break replacing whole lines up to partway into
+        // a later one is the start of that later line: the text left there
+        // is its own, and takes its removed indent (none, for a line the
+        // peer did not dedent), not the one of the line the change starts in.
+        let ends_in_later_line = prepared[old.clone()].contains(['\n', '\r'])
+            && !is_line_start(prepared, old.end)
+            && !new_text.contains(['\n', '\r']);
+        let end_line_indent = ends_in_later_line.then(|| {
+            let line_start = prepared[..old.end]
+                .rfind(['\n', '\r'])
+                .map_or(0, |at| at + 1);
+            empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
+                .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()])
+        });
         let virtual_start = start_indent.map_or(plain_start, |run| run.virtual_.start);
         // The end maps after a removed indent at a line start, unlike a range
         // end: the change takes that indent along, and `reindent` restores
@@ -411,6 +440,9 @@ impl PreparedMap {
             {
                 FirstIndent::Existing(tail.unwrap_or_default())
             }
+            _ if whole_lines && let Some(indent) = end_line_indent => FirstIndent::Exact(indent),
+            // Text on a blank line is a line of the content.
+            Some(_) if blank_at_start.is_some() => FirstIndent::Uniform,
             // The replaced line's own removed indent comes back.
             Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
             // Text landing at a V line start that kept no indent before it
@@ -435,8 +467,14 @@ impl PreparedMap {
         };
         // Text joining that line takes its indent only from a line of text
         // or one holding the indent the peer removed: joining a blank line,
-        // it starts a new line of the content.
-        let joined = tail.filter(|_| removed_at_end.is_some() || begins_line(following));
+        // it starts a new line of the content — a blank line the peer
+        // emptied of its whitespace included, which says nothing of it.
+        let emptied_at_end = removed_at_end.is_some_and(|run| {
+            let rest = &virtual_text[run.virtual_.end..];
+            rest.starts_with(['\n', '\r'])
+        });
+        let joined =
+            tail.filter(|_| removed_at_end.is_some() && !emptied_at_end || begins_line(following));
         let inserted = self.reindent(virtual_start, first, new_text, following, tail, joined)?;
         // A CR and an LF meeting at either edge of the change make one line
         // break in P, or two in V where host text the change stops beside (an
