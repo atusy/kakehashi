@@ -567,8 +567,10 @@ fn an_on_type_answer_its_map_refuses_leaves_the_request_to_the_next_server() {
 
     // The echo mock, ranked first, answers with overlapping edits: its map
     // refuses them, which is no answer, so the `on-type` mock ranked below
-    // answers instead (uppercasing), its edits mapped back reindented.
-    let mut edits = Vec::new();
+    // answers instead (uppercasing), its edits mapped back reindented. No
+    // answer (null) only while that server starts; the first answer given
+    // is checked as it comes (an empty list would be the refusal winning).
+    let mut edits = None;
     for _ in 0..100 {
         let response = client.send_request(
             "textDocument/onTypeFormatting",
@@ -580,15 +582,13 @@ fn an_on_type_answer_its_map_refuses_leaves_the_request_to_the_next_server() {
             }),
         );
         assert!(response.get("error").is_none(), "{response}");
-        if let Some(result) = response["result"]
-            .as_array()
-            .filter(|edits| !edits.is_empty())
-        {
-            edits = result.clone();
+        if !response["result"].is_null() {
+            edits = response["result"].as_array().cloned();
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let edits = edits.expect("an on-type answer");
     assert_eq!(
         apply_edits(text, &edits),
         "# t\n\n```lua\n  LOCAL X = 1; -- OVERLAP\n```\n"
