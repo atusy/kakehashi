@@ -6243,3 +6243,21 @@ fn a_line_joined_onto_one_of_several_copies_is_placed_among_what_pairs() {
         Some(expected)
     );
 }
+
+#[test]
+fn touching_in_line_edits_replay_as_the_one_edit_they_make() {
+    // Together they clear `cd`, its removed indent with it, as the one edit
+    // clearing the line does; each alone would not.
+    let virtual_text = "  ab\n  cd\n";
+    let map = dedent_by_two(virtual_text);
+    let apart = [edit((1, 0), (1, 1), ""), edit((1, 1), (1, 2), "")];
+    let merged = [edit((1, 0), (1, 2), "")];
+    assert_eq!(
+        replayed(virtual_text, &map, &apart).as_deref(),
+        Some("  ab\n\n")
+    );
+    assert_eq!(
+        replayed(virtual_text, &map, &apart),
+        replayed(virtual_text, &map, &merged)
+    );
+}
