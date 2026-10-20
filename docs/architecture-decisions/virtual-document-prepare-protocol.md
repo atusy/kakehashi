@@ -270,7 +270,11 @@ edit: its edits are applied to P (an end at the start of the line just
 past P's last naming P's end, as whole-document answers do), the region's
 edge layout of P restored as for any document (but for an on-type answer,
 which keeps the edges as it writes them, typing being an edit, not a
-reformatting of the region), and the result diffed against P. An answer
+reformatting of the region: one dropping P's final line break is refused
+where the peer deleted closing lines after it, and dropped whole
+otherwise, as any answer still removing the line break that ends a
+region is: what follows the region, a closing fence say, would join its
+last line), and the result diffed against P. An answer
 changing a region whose peer dedented it unevenly — a line of text (not
 whitespace alone, nor starting with a gap's text) the peer left alone, or
 dedented otherwise than the rest of its segment — is refused before any
