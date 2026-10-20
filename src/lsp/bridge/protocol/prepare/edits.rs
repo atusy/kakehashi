@@ -1685,7 +1685,15 @@ fn joined_lines(
             }
             // A lookup hashes the prefix: charged by its length too.
             work.spend(1 + length / BYTES_PER_STEP)?;
-            if let Some(lines) = index.get(&written[..length]) {
+            if let Some(lines) = index.get(&written[..length])
+                // A line written as it was, not joined onto, of which the
+                // old text holds several copies: which copy it is the
+                // order does not tell (the first one left here could pair
+                // it across blank lines and copies another reading keeps):
+                // left to the alignments below, which place it among
+                // what they pair.
+                && !(length == written.len() && lines.len() > 1)
+            {
                 let at = lines.partition_point(|&line| line < old_from);
                 if let Some(&line) = lines.get(at) {
                     first = Some(first.map_or(line, |first| first.min(line)));

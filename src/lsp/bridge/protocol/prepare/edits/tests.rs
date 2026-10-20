@@ -14,16 +14,22 @@ impl PreparedMap {
     }
 }
 
+/// How many cases a property defaulting to `cases` runs: as many, or
+/// `KAKEHASHI_PROPTEST_CASES`.
+fn property_cases(cases: u32) -> u32 {
+    std::env::var("KAKEHASHI_PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(cases)
+}
+
 /// A property's runner over `cases` cases, from a fixed seed: a run is
 /// repeatable, and a failure it finds found again. `PROPTEST_RNG_SEED` picks
 /// another seed, `KAKEHASHI_PROPTEST_RANDOM` set a random one, and
 /// `KAKEHASHI_PROPTEST_CASES` another number of cases.
 fn property_runner(cases: u32) -> proptest::test_runner::TestRunner {
     use proptest::test_runner::{Config, RngSeed, TestRunner};
-    let cases = std::env::var("KAKEHASHI_PROPTEST_CASES")
-        .ok()
-        .and_then(|cases| cases.parse().ok())
-        .unwrap_or(cases);
+    let cases = property_cases(cases);
     let rng_seed = if std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_some() {
         RngSeed::Random
     } else if std::env::var_os("PROPTEST_RNG_SEED").is_some() {
@@ -5437,8 +5443,16 @@ mod formatting_reference {
         let fixed_seed = std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_none()
             && std::env::var_os("PROPTEST_RNG_SEED").is_none();
         assert!(
-            over_refused.get() <= usize::from(!fixed_seed) + cases as usize / 10_000,
+            over_refused.get()
+                <= usize::from(!fixed_seed) + property_cases(cases) as usize / 10_000,
             "refused {} answers the host could take",
+            over_refused.get()
+        );
+        eprintln!(
+            "formatting reference over {} cases: {} mapped, {} changing P, {} refused the host could take",
+            property_cases(cases),
+            mapped_sets.get(),
+            changing.get(),
             over_refused.get()
         );
         (mapped_sets.get(), changing.get())
@@ -6167,5 +6181,28 @@ fn a_replayed_cr_meeting_an_lf_of_p_is_diffed_with_that_lines_break() {
     assert_eq!(
         replayed(virtual_text, &map, &[edit((1, 0), (1, 0), "x\r")]).as_deref(),
         Some("  a\n  x\r\n  b\n")
+    );
+}
+
+#[test]
+fn a_line_written_as_one_of_several_copies_is_placed_among_what_pairs() {
+    // `}` written as it was, P holding two: paired with the first, the blank
+    // line between would be rewritten (and lose the host's whitespace); the
+    // blank line and the second `}` pair as they stand.
+    let virtual_text = "  }\n    a\n  \n  }\n  a = 1\n";
+    let map = dedent_by_two(virtual_text);
+    assert_eq!(map.prepared_text(), "}\n  a\n\n}\na = 1\n");
+    let answer = [edit((0, 0), (5, 0), "xy\n\n}\nxy = 1\n")];
+    let expected = "  xy\n  \n  }\n  xy = 1\n";
+    assert_eq!(
+        map.map_formatting_answer(&answer)
+            .ok()
+            .map(|mapped| apply_to(virtual_text, &mapped))
+            .as_deref(),
+        Some(expected)
+    );
+    assert_eq!(
+        replayed(virtual_text, &map, &answer).as_deref(),
+        Some(expected)
     );
 }
