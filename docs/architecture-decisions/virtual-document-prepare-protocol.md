@@ -342,7 +342,8 @@ but stops at 2^24 steps: some 64 MiB of tables at most. Whole lines alike
 at either end of P and the edited P are set aside first, uncharged, so the
 work follows what the answer changes, not the region's size: a one-line
 answer costs its line in any region, and a 20,000-line region of half a
-megabyte rewritten whole maps in some 30 to 100 ms (release build), so the
+megabyte rewritten whole maps in some 30 to 100 ms (release build, on a
+loaded machine), so the
 diff runs where the answer arrives. The budget decides only which answers
 are refused, never what an accepted one writes; a large region heavily
 rewritten may be refused.
@@ -701,7 +702,7 @@ a hook per kind of change.
   compared as numbers), so the budget bounds time with long lines too:
   1 MB of 1 KB lines, each rewritten at its end, maps in some 60 ms; 4 MB
   of them is refused in some 200 ms, and a 4 MB answer to a 500 KB region
-  in some 140 ms (release build).
+  in some 140 ms (release build, measured on a loaded machine).
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
