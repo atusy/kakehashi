@@ -1464,3 +1464,56 @@ fn e2e_inlay_hint_work_done_progress_ends_on_cancel() {
 
     shutdown_client(&mut client);
 }
+
+/// A range wholly inside the stripped `> ` prefix of a blockquoted fence
+/// line covers no embedded text, so no region is asked (as for a range that
+/// starts there on a single-region request). A range from the prefix into
+/// the line's text is asked from where the text starts.
+#[test]
+fn e2e_inlay_hint_range_inside_a_stripped_prefix_asks_no_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_blockquote_prefix.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "> ```lua\n> local x = 1\n> local y = 2\n> ```\n"
+        }}),
+    );
+    inlay_hints_with_retry(&mut client, uri, 1, 2);
+
+    let request = |client: &mut LspClient, start: u64, end: u64| {
+        client.send_request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 2, "character": start },
+                    "end": { "line": 2, "character": end }
+                }
+            }),
+        )
+    };
+    let prefix_only = request(&mut client, 0, 1);
+    assert!(prefix_only.get("error").is_none(), "{prefix_only}");
+    assert!(prefix_only["result"].is_null(), "{prefix_only}");
+    let caret_in_prefix = request(&mut client, 1, 1);
+    assert!(caret_in_prefix["result"].is_null(), "{caret_in_prefix}");
+
+    let into_text = request(&mut client, 1, 5);
+    let hints = into_text["result"]
+        .as_array()
+        .expect("hints for the line's text");
+    assert_eq!(
+        hints[0]["data"]["kakehashi"]["inner"]["receivedRange"],
+        json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 1, "character": 3 }
+        })
+    );
+
+    shutdown_client(&mut client);
+}
