@@ -272,7 +272,7 @@ fn prepared_may_keep(
 ) -> bool {
     // Read before `current`: a settle landing between the two reads then
     // shows as current, never as stale.
-    let settling = source.settling(pool);
+    let settling = source.settling(pool, tracker);
     if source.still_current(pool, tracker, &current_version) {
         return true;
     }
