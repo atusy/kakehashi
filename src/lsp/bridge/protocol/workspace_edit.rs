@@ -449,7 +449,9 @@ pub(crate) fn text_edit_preserves_line_prefixes(
     }
 
     let columns = offset.columns();
-    if columns.iter().all(|&column| column == 0) {
+    // A list item's fence holding only blank rows records no prefix on any
+    // row, but its rows are protected all the same.
+    if columns.iter().all(|&column| column == 0) && !offset.has_protected_blank_rows() {
         return true;
     }
     let content_prefixed = columns.len() > 1;

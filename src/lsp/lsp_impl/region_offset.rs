@@ -413,6 +413,11 @@ mod tests {
     #[case::list_fence_leading_blank_rows("- item\n\n  ```py\n\n\n  a = 1\n  ```\n", FENCE_QUERY, vec![0, 1])]
     #[case::ordered_list_fence("1. item\n\n   ```py\n   a\n\n   b\n   ```\n", FENCE_QUERY, vec![1])]
     #[case::blockquote_fence("> ```py\n> a\n>\n> b\n> ```\n", FENCE_QUERY, vec![])]
+    // A list fence holding only blank rows: the opener's indentation anchors.
+    #[case::blank_only_list_fence("- item\n\n  ```py\n\n  ```\n", FENCE_QUERY, vec![0])]
+    #[case::two_blank_rows_only_list_fence("- item\n\n  ```py\n\n\n  ```\n", FENCE_QUERY, vec![0, 1])]
+    #[case::blank_only_blockquote_fence("> ```py\n>\n> ```\n", FENCE_QUERY, vec![])]
+    #[case::blank_only_plain_fence("```py\n\n```\n", FENCE_QUERY, vec![])]
     // A blank row keeping less whitespace than the item's indentation.
     #[case::list_fence_short_whitespace_row("- item\n\n  ```py\n  a\n \n  b\n  ```\n", FENCE_QUERY, vec![1])]
     #[case::list_fence_short_whitespace_row_crlf("- item\r\n\r\n  ```py\r\n  a\r\n \r\n  b\r\n  ```\r\n", FENCE_QUERY, vec![1])]
@@ -505,5 +510,20 @@ mod tests {
                 .map(|r| r.virtual_content.as_str()),
             Some("a\nx\nb\n")
         );
+    }
+
+    /// A list fence holding only blank rows has no row with the item's
+    /// indentation; the opener's anchors its rows. Text written there is
+    /// refused, and a blank line added still applies and reads back.
+    #[test]
+    fn a_list_fence_holding_only_blank_rows_keeps_them_protected() {
+        let host = "- item\n\n  ```py\n\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![0, 0, 0]);
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+        let change = edit((3, 0), (3, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n\n");
     }
 }

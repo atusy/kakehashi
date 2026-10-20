@@ -199,7 +199,7 @@ pub(crate) fn protected_blank_rows(
     prefixes: &[LinePrefix],
     virtual_content: &str,
 ) -> Vec<u32> {
-    container_blank_rows(columns, prefixes, virtual_content).0
+    container_blank_rows(columns, prefixes, virtual_content, 0).0
 }
 
 /// [`protected_blank_rows`], and every blank row of a container block whose
@@ -207,12 +207,17 @@ pub(crate) fn protected_blank_rows(
 /// item its full indentation). The concatenated pipeline's common prefix
 /// skips the latter: such a row keeps none or part of the item's
 /// indentation, which must not narrow the prefix the item's content takes.
+///
+/// `opener_width` is the width of the list-item indentation before the
+/// block's opening line (0 when there is none): it anchors blank rows that
+/// no row holding text anchors, as in a fence holding only blank rows.
 pub(crate) fn container_blank_rows(
     columns: &[u32],
     prefixes: &[LinePrefix],
     virtual_content: &str,
+    opener_width: u32,
 ) -> (Vec<u32>, Vec<u32>) {
-    if columns.len() <= 1 || !columns.iter().any(|&column| column > 0) {
+    if columns.len() <= 1 || (opener_width == 0 && !columns.iter().any(|&column| column > 0)) {
         return (Vec::new(), Vec::new());
     }
     // Whether each LSP line (a lone CR ends one too, as the offsets count
@@ -272,7 +277,7 @@ pub(crate) fn container_blank_rows(
     let mut container = Vec::new();
     for row in 0..rows {
         if blank[row] {
-            let width = previous.or(next_anchor[row]).unwrap_or(0);
+            let width = previous.or(next_anchor[row]).unwrap_or(opener_width);
             // No prefix, or whitespace markdown reads short of the
             // container's: virtual column 0 lands short of the block's
             // content there. A tab reaching the content's column is enough.

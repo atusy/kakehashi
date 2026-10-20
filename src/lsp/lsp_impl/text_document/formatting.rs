@@ -3238,6 +3238,9 @@ mod tests {
         "a\n",
         Some("- item\n\n  ```py\n  a\n  ```\n")
     )]
+    // A fence holding only blank rows is all layout to the pipeline (see
+    // `restore_edge_layout`): it is left as it is, as main leaves it.
+    #[case::blank_only_fence("- item\n\n  ```py\n\n  ```\n", "pass\n", None)]
     // A leading tab row already gives the item its indentation: the
     // output's first line keeps the tab.
     #[case::leading_tab_row_dropped(

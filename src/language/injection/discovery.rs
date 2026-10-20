@@ -362,14 +362,39 @@ fn extract_virtual_content_and_offsets(
         included_ranges.as_deref(),
         markdown_container_prefixes(&region.content_node, text),
     );
-    let (protected_blank_rows, container_blank_rows) =
-        container_blank_rows(&line_column_offsets, &line_prefixes, &virtual_content);
+    let opener_prefix = list_fence_opener_prefix(&region.content_node, text);
+    let opener_width = match opener_prefix.map(LinePrefix::continuation) {
+        Some(LinePrefix::Whitespace(width)) => width,
+        _ => 0,
+    };
+    let (protected_blank_rows, container_blank_rows) = container_blank_rows(
+        &line_column_offsets,
+        &line_prefixes,
+        &virtual_content,
+        opener_width,
+    );
     Some((
         virtual_content,
         line_column_offsets,
         protected_blank_rows,
         container_blank_rows,
     ))
+}
+
+/// The container continuation before a fenced code block's opening line,
+/// as tree-sitter-md parses it (the `block_continuation` right before the
+/// block): a list item's indentation, which a fence holding only blank rows
+/// has on no row of its own. O(1): one parent and one sibling.
+fn list_fence_opener_prefix<'a>(content_node: &Node<'_>, text: &'a str) -> Option<&'a str> {
+    let block = content_node
+        .parent()
+        .filter(|node| node.kind() == "fenced_code_block")?;
+    let continuation = block.prev_sibling().filter(|node| {
+        node.kind() == "block_continuation" && node.end_byte() == block.start_byte()
+    })?;
+    let start = continuation.start_byte();
+    let starts_line = start == 0 || matches!(text.as_bytes().get(start - 1), Some(b'\n' | b'\r'));
+    starts_line.then(|| clamped_slice(text, continuation.byte_range()))
 }
 
 impl CacheableInjectionRegion {
