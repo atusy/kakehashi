@@ -175,25 +175,19 @@ pub(super) fn reads_as_snippet(text: &str) -> bool {
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
-/// Read a tabstop number (digits only: `$0name` is tabstop 0, then text),
-/// without leading zeros (`$01` is tabstop 1); `None`, consuming nothing,
-/// before anything else.
+/// Read a tabstop number (digits only: `$0name` is tabstop 0, then text);
+/// `None` before anything else, and for a number written with a leading
+/// zero (`$01`): vim.snippet reads it as `1`, mini.snippets as the text
+/// `01`, another tabstop.
 fn tabstop(chars: &mut Chars<'_>) -> Option<String> {
     let mut number = String::new();
-    let mut read = false;
     while let Some(digit) = chars.next_if(char::is_ascii_digit) {
-        read = true;
-        if !(number.is_empty() && digit == '0') {
-            number.push(digit);
-        }
+        number.push(digit);
     }
-    read.then(|| {
-        if number.is_empty() {
-            "0".to_string()
-        } else {
-            number
-        }
-    })
+    if number.is_empty() || (number.len() > 1 && number.starts_with('0')) {
+        return None;
+    }
+    Some(number)
 }
 
 /// A placeholder's default, after its `:`, through its `}`.
@@ -235,7 +229,6 @@ mod tests {
         assert_eq!(expanded("a}b\\").as_deref(), Some("a}b\\"));
         // Every later occurrence mirrors the default of its first.
         assert_eq!(expanded("${1:y}x$1").as_deref(), Some("yxy"));
-        assert_eq!(expanded("$00").as_deref(), Some(""));
         // Other tabstops mirror however often they occur.
         assert_eq!(expanded("${1:y}x$1$1$0").as_deref(), Some("yxyy"));
     }
@@ -254,10 +247,16 @@ mod tests {
         assert_eq!(expanded("a $ b"), None);
         assert_eq!(expanded("$$1"), None);
         assert_eq!(expanded("${1:a\\qb}"), None);
-        // The final tabstop more than once, however it is numbered.
+        // The final tabstop more than once.
         assert_eq!(expanded("$0x$0"), None);
         assert_eq!(expanded("${0:a}x$0"), None);
-        assert_eq!(expanded("$00x${0}"), None);
+        assert_eq!(expanded("$0x${0}"), None);
+        // A tabstop number with a leading zero, which clients read apart.
+        assert_eq!(expanded("$00"), None);
+        assert_eq!(expanded("$01"), None);
+        assert_eq!(expanded("${01}"), None);
+        assert_eq!(expanded("${01:a}"), None);
+        assert_eq!(expanded("${1:y}x$01"), None);
         // A default after its tabstop's first occurrence, which
         // mini.snippets does not mirror back.
         assert_eq!(expanded("$1x${1:y}"), None);
