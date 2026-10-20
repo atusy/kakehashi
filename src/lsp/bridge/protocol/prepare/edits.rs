@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
+use tower_lsp_server::ls_types::{Position, Range as LspRange, TextEdit};
 
 use super::{
     Bias, LineMap, PreparedMap, Run, RunKind, Side, empty_run, is_line_start, map_offset,
@@ -396,13 +396,16 @@ impl PreparedMap {
     /// [`Self::mapped_edits_keep_host_text`]).
     fn to_text_edits(&self, mapped: Vec<(Range<usize>, String)>) -> Option<Vec<TextEdit>> {
         self.mapped_edits_keep_host_text(&mapped).then(|| {
+            let ends: Vec<usize> = mapped
+                .iter()
+                .flat_map(|(range, _)| [range.start, range.end])
+                .collect();
+            let positions = self.virtual_lines.positions(&ends);
             mapped
                 .into_iter()
-                .map(|(range, new_text)| TextEdit {
-                    range: LspRange::new(
-                        self.virtual_lines.position(range.start),
-                        self.virtual_lines.position(range.end),
-                    ),
+                .zip(positions.as_chunks::<2>().0)
+                .map(|((_, new_text), &[start, end])| TextEdit {
+                    range: LspRange::new(start, end),
                     new_text,
                 })
                 .collect()
@@ -991,9 +994,17 @@ fn sorted_extents(
     edits: &[TextEdit],
     end_past_last_line: bool,
 ) -> Option<(Vec<Range<usize>>, Vec<usize>)> {
+    // Every end on a line of the text, converted in one pass.
+    let on_a_line = |position: Position| lines.index.0.line(position.line).is_some();
+    let ends: Vec<Position> = edits
+        .iter()
+        .flat_map(|edit| [edit.range.start, edit.range.end])
+        .collect();
+    let offsets = lines.offsets_clamped(&ends);
     let ranges = edits
         .iter()
-        .map(|edit| {
+        .zip(offsets.as_chunks::<2>().0)
+        .map(|(edit, &[start, end_offset])| {
             // A reversed range is refused as sent: clamped past the end, both
             // its ends would read as one insertion there.
             if edit.range.start > edit.range.end {
@@ -1003,8 +1014,8 @@ fn sorted_extents(
             // column past its line as the line's end, but not a line past the
             // document as its end (an import "at line 7" of a 3-line P would
             // land after its content).
-            let end = if lines.index.0.line(edit.range.end.line).is_some() {
-                lines.offset_clamped(edit.range.end)
+            let end = if on_a_line(edit.range.end) {
+                end_offset
             } else if end_past_last_line
                 && edit.range.end.character == 0
                 && edit
@@ -1018,7 +1029,6 @@ fn sorted_extents(
             } else {
                 return None;
             };
-            let start = lines.offset_clamped(edit.range.start);
             (start <= end).then_some(start..end)
         })
         .collect::<Option<Vec<_>>>()?;
