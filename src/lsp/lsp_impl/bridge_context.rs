@@ -86,7 +86,8 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/colorPresentation"
+        "textDocument/codeAction"
+            | "textDocument/colorPresentation"
             | "textDocument/completion"
             | "textDocument/formatting"
             | "textDocument/inlayHint"
@@ -3384,10 +3385,8 @@ mod tests {
                 .ok()
                 .flatten()
         };
-        for method in ["textDocument/codeAction"] {
-            assert!(for_method(method).await.is_none(), "{method} closes");
-        }
         for method in [
+            "textDocument/codeAction",
             "textDocument/rename",
             "textDocument/inlayHint",
             "textDocument/completion",
@@ -3559,13 +3558,8 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         };
-        // Every edit method whose edits are not mapped back stays closed
-        // (inbound applyEdit is refused on its own path: the region's offset
-        // carries a map).
-        let method = "textDocument/codeAction";
-        assert!(!method_closed_to(&resolved, method, false), "{method}");
-        assert!(method_closed_to(&resolved, method, true), "{method}");
         for method in [
+            "textDocument/codeAction",
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/completion",

@@ -25,12 +25,15 @@
 //! - `echo-document` — advertises `hoverProvider`, `completionProvider`,
 //!   `inlayHintProvider`, `colorProvider`, `documentFormattingProvider`,
 //!   `documentRangeFormattingProvider`, `renameProvider`, `linkedEditingRangeProvider`,
+//!   `codeActionProvider` (with resolve),
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting, range and on-type
 //!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
 //!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists); linked
-//!   editing ranges are every occurrence of the word at the position; a pull diagnostic
+//!   editing ranges are every occurrence of the word at the position; code
+//!   actions are `echo-fix` (the first line replaced) and the lazy
+//!   `echo-wrap` (resolved: the document wrapped in `do`/`end`); a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -391,6 +394,7 @@ fn main() {
                         "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
                         "renameProvider": true,
                         "linkedEditingRangeProvider": true,
+                        "codeActionProvider": { "resolveProvider": true },
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
                             "interFileDependencies": false,
@@ -1363,6 +1367,63 @@ fn main() {
                 } else {
                     respond(&mut writer, id, item);
                 }
+            }
+            "textDocument/codeAction" if mode == "echo-document" => {
+                // `echo-fix` replaces the first line; `echo-wrap` is lazy, its
+                // resolve wrapping the document in `do`/`end`, the header and
+                // the first line's indent as touching edits.
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let width = documents
+                    .get(&uri)
+                    .and_then(|text| text.lines().next())
+                    .map_or(0, |line| line.encode_utf16().count());
+                respond(
+                    &mut writer,
+                    id,
+                    json!([
+                        {
+                            "title": "echo-fix",
+                            "kind": "quickfix",
+                            "edit": { "changes": { uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": width }
+                                },
+                                "newText": "fixed"
+                            }] } }
+                        },
+                        { "title": "echo-wrap", "kind": "refactor", "data": { "uri": uri } }
+                    ]),
+                );
+            }
+            "codeAction/resolve" if mode == "echo-document" => {
+                let mut action = message.get("params").cloned().unwrap_or(Value::Null);
+                let uri = action
+                    .pointer("/data/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let lines = documents.get(&uri).map_or(0, |text| text.lines().count());
+                let at = |line: usize, text: &str| {
+                    json!({
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": 0 }
+                        },
+                        "newText": text
+                    })
+                };
+                let mut edits = vec![at(0, "do\n")];
+                for line in 0..lines {
+                    edits.push(at(line, "  "));
+                }
+                edits.push(at(lines, "end\n"));
+                action["edit"] = json!({ "changes": { uri: edits } });
+                respond(&mut writer, id, action);
             }
             "textDocument/codeAction" => {
                 let result = message

@@ -3255,10 +3255,23 @@ impl LanguageServerPool {
     /// and that one, is told afterwards by [`Self::held_unchanged`]. Nothing
     /// is noted without the prepare layer, where every text is held as is.
     pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
+        self.note_held_under(virtual_uri, connection_key, None)
+    }
+
+    /// [`Self::note_held`] for a resolve whose item was minted through
+    /// `expected` (`None`: as is), within the same request: its reply must
+    /// be computed on the text that map describes, held at the note and
+    /// still at the reply ([`Self::held_unchanged`]).
+    pub(crate) fn note_held_under(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        expected: Option<&super::protocol::PreparedMap>,
+    ) -> HeldNote {
         HeldNote(self.prepares().then(|| {
-            let (generation, as_is) = self
-                .document_tracker
-                .held_as_is(virtual_uri, connection_key);
+            let (generation, as_is) =
+                self.document_tracker
+                    .held_under(virtual_uri, connection_key, expected);
             (
                 virtual_uri.to_owned(),
                 connection_key.clone(),
@@ -3290,11 +3303,13 @@ impl LanguageServerPool {
         self.note_held(&virtual_uri.to_uri_string(), connection_key)
     }
 
-    /// Whether the reply to a resolve noted as `note` was computed on a text
-    /// held as is: the connection held one as the resolve was queued (not a
-    /// prepared text sent before it, after a peer was gained), and no text
-    /// was recorded for the document since (one sent ahead of it after the
-    /// note), so the reply is in the coordinates of the item's text.
+    /// Whether the reply to a resolve noted as `note` was computed on the
+    /// text its item was minted from (held as is, or through the map
+    /// [`Self::note_held_under`] names): the connection held it as the
+    /// resolve was queued (not a prepared text sent before it, after a peer
+    /// was gained), and no text was recorded for the document since (one
+    /// sent ahead of it after the note), so the reply is in the coordinates
+    /// of the item's text.
     pub(crate) fn held_unchanged(&self, note: &HeldNote) -> bool {
         note.0
             .as_ref()

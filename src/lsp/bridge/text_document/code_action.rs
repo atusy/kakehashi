@@ -36,7 +36,7 @@ use super::super::pool::{
     ConnectionHandle, ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
+    JsonRpcRequest, PreparedMap, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
     transform_workspace_edit_to_host, translate_host_range_to_virtual,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
@@ -497,6 +497,19 @@ impl LanguageServerPool {
             return Ok(None);
         };
 
+        // An action minted from a prepared document carries no envelope a
+        // resolve could map back through (the map is not carried): its lazy
+        // actions are resolved here, within the request whose map they were
+        // minted through, as for a client that cannot resolve them itself.
+        let upstream_caps = if offset.prepared().is_some() {
+            UpstreamCodeActionCaps {
+                data_support: false,
+                ..upstream_caps
+            }
+        } else {
+            upstream_caps
+        };
+
         // Phase 2: eager-resolve fallback. A client without resolve+data
         // support can never complete a lazy action and may strip our routing
         // envelope, so resolve those actions downstream now (bounded: only the
@@ -514,7 +527,7 @@ impl LanguageServerPool {
                 &handle,
                 &mut actions,
                 upstream_request_id,
-                virtual_uri.as_deref(),
+                virtual_uri.as_deref().map(|uri| (uri, offset.prepared())),
             )
             .await;
         }
@@ -570,7 +583,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         actions: &mut [CodeActionOrCommand],
         upstream_id: Option<UpstreamId>,
-        virtual_uri: Option<&str>,
+        held_as: Option<(&str, Option<&PreparedMap>)>,
     ) {
         if !handle.has_capability("codeAction/resolve") {
             return;
@@ -616,7 +629,7 @@ impl LanguageServerPool {
                             action,
                             upstream_id,
                             None,
-                            virtual_uri,
+                            held_as,
                         )
                         .await,
                     )
@@ -934,7 +947,9 @@ impl LanguageServerPool {
                 outgoing,
                 upstream_id,
                 None,
-                virtual_uri.as_deref(),
+                // An enveloped action was minted as is (a prepared one never
+                // resolves through its envelope).
+                virtual_uri.as_deref().map(|uri| (uri, None)),
             )
             .await
         else {
@@ -1107,7 +1122,7 @@ impl LanguageServerPool {
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
         host_context: Option<HostResolveContext<'_>>,
-        virtual_uri: Option<&str>,
+        held_as: Option<(&str, Option<&PreparedMap>)>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1168,9 +1183,11 @@ impl LanguageServerPool {
                 return None;
             }
             // What the producer holds for the virtual document as the
-            // resolve is queued: the reply must be computed on that text.
-            if let Some(uri) = virtual_uri {
-                held = self.note_held(uri, connection_key);
+            // resolve is queued: the reply must be computed on that text,
+            // the one its item was minted from (as is, or through the map
+            // `held_as` names).
+            if let Some((uri, expected)) = held_as {
+                held = self.note_held_under(uri, connection_key, expected);
             }
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
@@ -1818,7 +1835,7 @@ mod tests {
                         },
                         Some(upstream_id),
                         None,
-                        Some(&uri),
+                        Some((&uri, None)),
                     )
                     .await
                 })
@@ -1857,6 +1874,117 @@ mod tests {
                 request.await.unwrap().is_some(),
                 sent.is_none(),
                 "prepared text sent: {sent:?}"
+            );
+        }
+    }
+
+    /// An action minted through a prepared map, resolved within its
+    /// request: its reply is kept only when computed on the text that map
+    /// describes, held as the resolve is queued and still as it answers.
+    #[tokio::test]
+    async fn a_resolve_within_its_request_is_kept_only_on_the_text_its_map_describes() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let minted = dedented("  a");
+        // What the connection holds as the resolve is queued, and what it
+        // is sent after.
+        for (held, after, kept) in [
+            ("prepared", None, true),
+            ("prepared", Some("  b"), false),
+            ("as is", None, false),
+        ] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("ruff");
+            let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host = Url::parse("file:///test.md").unwrap();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+                "lua",
+                "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+            );
+            if held == "prepared" {
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &minted.text,
+                        map: Some(&minted.map),
+                    },
+                );
+            } else {
+                pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            }
+            let upstream_id = UpstreamId::Number(79);
+            let request = {
+                let pool = Arc::clone(&pool);
+                let handle = Arc::clone(&handle);
+                let upstream_id = upstream_id.clone();
+                let uri = virtual_uri.to_uri_string();
+                let map = Arc::clone(&minted.map);
+                tokio::spawn(async move {
+                    pool.send_code_action_resolve_on_handle(
+                        &handle,
+                        CodeAction {
+                            title: "lazy".into(),
+                            ..Default::default()
+                        },
+                        Some(upstream_id),
+                        None,
+                        Some((&uri, Some(&map))),
+                    )
+                    .await
+                })
+            };
+            let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(id) = handle
+                        .router()
+                        .lookup_downstream_ids(&upstream_id)
+                        .into_iter()
+                        .next()
+                    {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be admitted");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !handle.router().is_sent(downstream_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be sent");
+            if let Some(text) = after {
+                let other = dedented(text);
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &other.text,
+                        map: Some(&other.map),
+                    },
+                );
+            }
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": { "title": "resolved" }
+            }));
+            assert_eq!(
+                request.await.unwrap().is_some(),
+                kept,
+                "held {held}, sent after: {after:?}"
             );
         }
     }

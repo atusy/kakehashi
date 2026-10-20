@@ -1049,6 +1049,60 @@ fn linked_editing_ranges_map_back_through_the_prepared_document() {
 }
 
 #[test]
+fn code_actions_map_back_through_the_prepared_document() {
+    // An editor resolving lazy actions itself: on a prepared document they
+    // are resolved within the request all the same, through its map.
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "codeAction": {
+            "dataSupport": true,
+            "resolveSupport": { "properties": ["edit"] }
+        } } }),
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 8 },
+                "end": { "line": 3, "character": 8 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+    );
+    let actions = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    let edited = |title: &str| {
+        let action = actions
+            .iter()
+            .find(|action| {
+                action["title"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(title))
+            })
+            .unwrap_or_else(|| panic!("no {title}: {response}"));
+        assert!(action.get("data").is_none(), "{action}");
+        let edits = action["edit"]["changes"][uri]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{action}"));
+        apply_edits(text, &edits)
+    };
+    assert_eq!(edited("echo-fix"), "# t\n\n```lua\n  fixed\n```\n");
+    assert_eq!(
+        edited("echo-wrap"),
+        "# t\n\n```lua\n  do\n    local x = 1\n  end\n```\n"
+    );
+}
+
+#[test]
 fn downstream_sees_edge_blank_lines_deleted_and_the_host_keeps_them() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/edges.md";
