@@ -450,10 +450,18 @@ pub(crate) fn text_edit_preserves_line_prefixes(
     }
 
     let columns = offset.columns();
-    // A list item's fence holding only blank rows records no prefix on any
-    // row, but its rows are protected all the same.
-    if columns.iter().all(|&column| column == 0) && !offset.has_protected_blank_rows() {
-        return true;
+    if columns.iter().all(|&column| column == 0) {
+        // A list item's fence holding only blank rows records no prefix on
+        // any row, yet its rows are protected: text written on one is
+        // refused. Every other edit is judged as in a plain fence.
+        let writes_on_protected_row = e
+            .range
+            .start
+            .line
+            .checked_sub(offset.line())
+            .is_some_and(|row| offset.is_protected_blank_row(row as usize))
+            && !crate::text::is_markdown_blank(&e.new_text);
+        return !writes_on_protected_row;
     }
     let content_prefixed = columns.len() > 1;
     let boundary_at = |host_line: u32| {

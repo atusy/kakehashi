@@ -526,4 +526,33 @@ mod tests {
         let edited = crate::text::edit::apply_text_edits(host, &[change]);
         assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n\n");
     }
+
+    /// A fence holding only blank rows records no prefix anywhere: apart from
+    /// refusing text on its protected rows, its edits are judged as main
+    /// judges a plain fence. Blank lines, whitespace and deletions apply and
+    /// read back as the server meant them.
+    #[rstest::rstest]
+    #[case::blank_line_added((3, 0), (3, 0), "\n", "\n\n")]
+    #[case::row_deleted((3, 0), (4, 0), "", "")]
+    #[case::whitespace_written((3, 0), (3, 0), "  ", "\n")]
+    fn a_list_fence_holding_one_blank_row_takes_blank_edits(
+        #[case] start: (u32, u32),
+        #[case] end: (u32, u32),
+        #[case] new_text: &str,
+        #[case] expected_virtual: &str,
+    ) {
+        let host = "- item\n\n  ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().protected_blank_rows, vec![0]);
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+
+        let change = edit(start, end, new_text);
+        assert!(accepts(resolved(), &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        let read_back = discover(&edited, FENCE_QUERY);
+        assert_eq!(
+            read_back.first().map_or("", |r| r.virtual_content.as_str()),
+            expected_virtual
+        );
+    }
 }
