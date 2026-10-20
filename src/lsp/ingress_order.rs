@@ -27,13 +27,11 @@
 //!   server→client request (its editor-facing awaits are one-way log/show
 //!   notifications, and the one awaited bridge call, `process_injections`,
 //!   only forwards a didChange on the edit path, not on open), so the handler
-//!   can never block on a client response. A slow auto-install still runs
-//!   inside the handler and so holds the writer ticket — its network/git
-//!   stages are timeout-bounded, but parser *compilation* is not, so a
-//!   pathologically hung compiler can hold the ticket indefinitely and wedge
-//!   later same-URI readers/writers. Moving auto-install to a spawned task
-//!   (#480) is therefore a liveness fix, not just a latency one; until then
-//!   the exposure is one-time, first open of an uninstalled parser.
+//!   can never block on a client response. Auto-install runs in a task the
+//!   handler spawns (#480), so a slow download or a hung parser *compile*
+//!   does not hold the writer ticket or wedge later same-URI readers and
+//!   writers; the handler's remaining wait is loading an installed parser
+//!   from disk (`ensure_language_loaded_async`).
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
 //!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
 //!   diagnostics) snapshot the current
