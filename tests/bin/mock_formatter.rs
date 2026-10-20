@@ -28,7 +28,8 @@
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting, range and on-type
-//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
+//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
+//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists); a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -2844,6 +2845,19 @@ fn main() {
                 }),
             ),
             "textDocument/rename" if mode == "echo-document" => {
+                // With `MOCK_RENAME_AFTER_RELEASE` set, answered only once
+                // the file `MOCK_RELEASE_FILE` names exists (or a minute
+                // later): a barrier a test lifts after editing the host.
+                if std::env::var_os("MOCK_RENAME_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 // Renames the document's first line.
                 let uri = message
                     .pointer("/params/textDocument/uri")

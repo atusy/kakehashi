@@ -160,6 +160,14 @@ fn transform_workspace_edit_response_to_host_bounded(
     let mut edit: WorkspaceEdit = serde_json::from_value(result).ok()?;
 
     if !transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset) {
+        // Through a prepared document, an edit set the host cannot take:
+        // said once per rename, its server then counting as not answering.
+        if offset.prepared().is_some() {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "rename edit for {request_virtual_uri} refused: it cannot be mapped back through the prepared virtual document"
+            );
+        }
         return None;
     }
     // A multi-file rename's OTHER real files can carry versioned entries;

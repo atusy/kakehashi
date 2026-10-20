@@ -64,6 +64,9 @@ struct Setup {
     /// Have the echo mock answer color presentations only once the test
     /// creates `release` in its directory.
     color_after_release: bool,
+    /// Have the echo mock answer renames only once the test creates
+    /// `release` in its directory.
+    rename_after_release: bool,
 }
 
 impl Default for Setup {
@@ -82,6 +85,7 @@ impl Default for Setup {
             host_mode: "slow-empty",
             second_on_type: false,
             color_after_release: false,
+            rename_after_release: false,
         }
     }
 }
@@ -146,6 +150,9 @@ impl Setup {
             );
         if self.color_after_release {
             builder = builder.env("MOCK_COLOR_AFTER_RELEASE", "1");
+        }
+        if self.rename_after_release {
+            builder = builder.env("MOCK_RENAME_AFTER_RELEASE", "1");
         }
         if self.wire_log {
             builder = builder.env(
@@ -977,6 +984,45 @@ fn a_rename_maps_back_through_the_prepared_document() {
         "# t\n\n```lua\n  renamed\n  return x\n```\n",
         "{response}"
     );
+}
+
+#[test]
+fn a_rename_the_host_moved_under_is_answered_as_content_modified() {
+    // The echo mock answers renames only once released. The host is
+    // edited (outside the region) while the request is out: the rename,
+    // made for the text before the edit, is not applied, and the editor is
+    // told the content was modified, not that there is nothing to rename.
+    let (mut client, dir) = Setup {
+        rename_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/rename-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 3, "character": 8 },
+        "newName": "y"
+    });
+    let id = client.send_request_async("textDocument/rename", request);
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/rename\t"))
+    {
+        assert!(Instant::now() < until, "rename request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(response["error"]["code"], -32801, "{response}");
 }
 
 #[test]
