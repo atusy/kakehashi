@@ -1727,8 +1727,7 @@ fn pipeline_region_text(
     } else {
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
-    let (host_line_prefixes, first_row_blank) =
-        fill_blank_row_prefixes(host_line_prefixes, offset, original_virtual);
+    let (host_line_prefixes, first_row_blank) = fill_blank_row_prefixes(host_line_prefixes, offset);
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
@@ -1750,24 +1749,23 @@ fn pipeline_region_text(
 
 /// A list item's fence leaves its blank rows unindented, so a per-line
 /// region records no prefix for them, and output lines mapped there would
-/// start at host column 0 and end the item. A row with no prefix that comes
-/// before a prefixed row, or before the row after the content's final line
-/// break (the closing fence), is such a blank row: it takes the longest
-/// common prefix of the region's recorded prefixes instead. A region with
-/// one column offset has unprefixed later rows by design and is left as is.
+/// start at host column 0 and end the item. Such a blank row, as `offset`
+/// marks it from the region's text (`RegionOffset::with_content`), takes the
+/// longest common prefix of the region's recorded prefixes instead. Rows
+/// recording no prefix that hold text (a lazy continuation line) keep none,
+/// and a region with one column offset has unprefixed later rows by design.
 ///
 /// Also returns the prefix the first row takes when it is a blank row, as
 /// the replacement range starts after that row's (empty) host prefix.
 fn fill_blank_row_prefixes<'a>(
     prefixes: std::borrow::Cow<'a, [String]>,
     offset: &RegionOffset,
-    original_virtual: &str,
 ) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
-    if offset.columns().len() <= 1 {
+    let blank_row = |i: usize| prefixes[i].is_empty() && offset.is_protected_blank_row(i);
+    if !offset.has_protected_blank_rows() || !(0..prefixes.len()).any(blank_row) {
         return (prefixes, None);
     }
-    // The longest common prefix of the recorded (non-empty) prefixes, and
-    // the last row recording one, each found in one pass over the rows.
+    // The longest common prefix of the recorded (non-empty) prefixes.
     let mut recorded = prefixes.iter().filter(|p| !p.is_empty());
     let Some(first_recorded) = recorded.next() else {
         return (prefixes, None);
@@ -1784,22 +1782,11 @@ fn fill_blank_row_prefixes<'a>(
     if fill.is_empty() {
         return (prefixes, None);
     }
-    let fill = fill.to_string();
-    let last_recorded = prefixes.iter().rposition(|p| !p.is_empty());
-    let ends_with_line_break = original_virtual.ends_with(['\n', '\r']);
-    let last = prefixes.len().saturating_sub(1);
-    let blank_row = |i: usize| {
-        prefixes[i].is_empty()
-            && ((ends_with_line_break && i < last) || last_recorded.is_some_and(|at| i < at))
-    };
-    if !(0..prefixes.len()).any(blank_row) {
-        return (prefixes, None);
-    }
-    let first_row_blank = blank_row(0).then(|| fill.clone());
+    let first_row_blank = blank_row(0).then(|| fill.to_string());
     let filled = (0..prefixes.len())
         .map(|i| {
             if blank_row(i) {
-                fill.clone()
+                fill.to_string()
             } else {
                 prefixes[i].clone()
             }
@@ -2959,7 +2946,7 @@ mod tests {
         #[case] formatted: &str,
         #[case] expected_host: &str,
     ) {
-        let offset = RegionOffset::with_per_line_offsets(3, columns.clone());
+        let offset = RegionOffset::with_content(3, columns.clone(), original_virtual);
         let mapper = crate::text::PositionMapper::new(host);
         let prefixes = extract_host_line_prefixes(
             &mapper,
@@ -2999,6 +2986,60 @@ mod tests {
         assert_eq!(resolved[0].virtual_content, formatted);
     }
 
+    /// A paragraph's lazy continuation line records no prefix but holds
+    /// text: the pipeline leaves it as it was when it changes another line,
+    /// adding no prefix the host did not have.
+    #[rstest::rstest]
+    #[case::blockquote("> a\nb\n> c\n", "a\nb\nC", "> a\nb\n> C\n")]
+    #[case::list_item("- a\nb\n  c\n", "a\nb\nC", "- a\nb\n  C\n")]
+    fn pipeline_leaves_a_lazy_continuation_line_unprefixed(
+        #[case] host: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: &str,
+    ) {
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &md,
+            "((inline) @injection.content (#set! injection.language \"markdown_inline\"))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![2, 0, 2]);
+        let offset = RegionOffset::with_content(
+            0,
+            resolved.line_column_offsets.clone(),
+            &resolved.virtual_content,
+        );
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            0,
+            &resolved.line_column_offsets,
+            lsp_line_count(&resolved.virtual_content),
+        );
+        let new_text =
+            pipeline_region_text(&resolved.virtual_content, formatted, &offset, &prefixes)
+                .expect("the region changed");
+        let range = region_replacement_range(&resolved.virtual_content, &offset).unwrap();
+
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]),
+            expected_host
+        );
+    }
+
     /// Filling the blank rows of a long list-item fence takes time linear
     /// in its rows. Rescanning the rows after each one would make the
     /// 200k-row fence below take a minute or more (about 2e10 row checks);
@@ -3026,7 +3067,7 @@ mod tests {
         let text = pipeline_region_text(
             &original,
             &formatted,
-            &RegionOffset::with_per_line_offsets(3, columns),
+            &RegionOffset::with_content(3, columns, &original),
             &prefixes,
         )
         .expect("the region changed");

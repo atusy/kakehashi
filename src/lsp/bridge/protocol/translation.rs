@@ -99,6 +99,11 @@ impl RegionOffset {
             .unwrap_or(false)
     }
 
+    /// Whether any row is a protected blank row.
+    pub(crate) fn has_protected_blank_rows(&self) -> bool {
+        !self.protected_blank_rows.is_empty()
+    }
+
     /// The protected blank rows, as virtual line numbers.
     pub(crate) fn protected_blank_row_list(&self) -> Vec<u32> {
         (0u32..)
