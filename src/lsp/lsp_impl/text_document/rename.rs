@@ -58,7 +58,9 @@ impl Kakehashi {
         // host text, which may have moved while it was held. A rename comes
         // once per action, like formatting, so the check waits for the
         // host's last edit to settle and its regions' holds to clear (see
-        // `formatting_sources_current`); a stale answer is no answer.
+        // `formatting_sources_current`). A stale answer is answered as
+        // `ContentModified`, not `null` (which reads as nothing to rename):
+        // the user can rename again.
         let Some(sourced) = answer else {
             return Ok(None);
         };
@@ -71,7 +73,9 @@ impl Kakehashi {
                 "rename result for {} dropped: {verdict}",
                 lsp_uri.as_str()
             );
-            return Ok(None);
+            let mut error = crate::error::content_modified_error();
+            error.message = format!("kakehashi: rename result dropped: {verdict}").into();
+            return Err(error);
         }
         Ok(Some(sourced.value))
     }
