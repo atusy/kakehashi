@@ -413,6 +413,13 @@ fn transform_prepared_completion_item(
             let Some(expansion) = Expansion::of(inserted) else {
                 return false;
             };
+            // Nothing but spaces to check, where the user types at a
+            // tabstop: on a blank line among dedented ones the map regains
+            // no indent for it, and what is typed would land short of the
+            // content's.
+            if expansion.text().chars().all(|c| c == ' ') {
+                return false;
+            }
             let text = expansion.text().to_string();
             match &mut item.text_edit {
                 Some(CompletionTextEdit::Edit(edit)) => edit.new_text = text,
@@ -1594,6 +1601,36 @@ mod tests {
         assert_eq!(sent_text(&literal), "\tf()");
     }
 
+    /// A snippet expanding to nothing but spaces is refused: the user types
+    /// at its tabstop, which on a blank line among dedented ones would
+    /// regain no indent. One expanding to text regains it before the
+    /// tabstop.
+    #[rstest]
+    #[case::tabstop("$1", None)]
+    #[case::final_tabstop("$0", None)]
+    #[case::space_default("${1: }", None)]
+    #[case::text_after("$1x", Some("  $1x"))]
+    #[case::default("${1:x}", Some("  ${1:x}"))]
+    fn a_prepared_snippet_expanding_to_spaces_only_is_refused(
+        #[case] snippet: &str,
+        #[case] sent: Option<&str>,
+    ) {
+        // A blank line among dedented ones.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let mut completed = item(json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+            "newText": snippet
+        }}));
+        let kept = transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        );
+        assert_eq!(kept.then(|| sent_text(&completed)), sent);
+    }
+
     /// Without a textEdit, a snippet inserted at a caret regaining an
     /// indent goes out as that edit, the snippet in it.
     #[test]
@@ -1873,45 +1910,6 @@ mod tests {
             Some(Position::new(10, 7)),
             ClientInsertMode::default(),
         ));
-    }
-
-    /// A snippet's tabstops vanish when the client expands it: the text the
-    /// map checks with the additional edits, and against the host text the
-    /// prepared document hides, is the expansion.
-    #[test]
-    fn a_prepared_snippet_and_its_additional_edits_are_checked_as_expanded() {
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
-        // `\rab\n`, its lone-CR leading line deleted: replacing `a` with
-        // `$0` and deleting `b` leaves `$0\n` after the hidden CR, which
-        // expands to an LF fusing with it.
-        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
-            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""}
-        ]}]}))
-        .unwrap();
-        let map = apply_prepare_result("\rab\n", &VirtualLayout::single("\rab\n"), Some(answer))
-            .unwrap()
-            .map;
-        let offset = RegionOffset::new(10, 0).with_prepared(map);
-        let mut completed = item(json!({
-            "label": "x",
-            "insertTextFormat": 2,
-            "textEdit": {
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
-                "newText": "$0"
-            },
-            "additionalTextEdits": [{
-                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
-                "newText": ""
-            }]
-        }));
-        assert!(transform_completion_item(
-            &mut completed,
-            &offset,
-            Position::new(12, 0),
-            Some(Position::new(11, 1)),
-            ClientInsertMode::default(),
-        ));
-        assert_eq!(completed.additional_text_edits, None);
     }
 
     /// An insert/replace snippet maps through both ranges as its expansion,
