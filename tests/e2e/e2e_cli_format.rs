@@ -1023,6 +1023,7 @@ languages = ["lua"]
         .current_dir(ws.path())
         .env("KAKEHASHI_DATA_DIR", data_dir())
         .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env("RUST_LOG", "kakehashi=warn")
         .output()
         .expect("spawn kakehashi format");
     assert_eq!(
@@ -1030,6 +1031,17 @@ languages = ["lua"]
         Some(2),
         "a refused prepared answer must exit 2; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    // At warn, the refusal is logged once, naming the region it came from.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("refused").count(),
+        1,
+        "the refusal must be reported once; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("formatting response for") && stderr.contains("doc.md"),
+        "the refusal must name the region; stderr: {stderr}"
     );
     assert_eq!(read(ws.path(), "doc.md"), markdown);
 }

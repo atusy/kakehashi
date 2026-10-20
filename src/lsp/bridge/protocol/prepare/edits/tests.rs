@@ -3606,6 +3606,40 @@ mod formatting {
     }
 
     #[test]
+    fn the_allowance_per_byte_counts_both_texts() {
+        // Every line rewritten, a whitespace line after each: the blank
+        // line table is quadratic in them, so 1,100 such lines need more
+        // than the base budget and fifteen steps a byte, and no more than
+        // sixteen, counted over P and the edited P alike.
+        let count = 1_100;
+        let virtual_text: String = (0..count).map(|line| format!("  a{line}\n  \n")).collect();
+        let formatted: String = (0..count).map(|line| format!("b{line}\n\n")).collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (2 * count as u32, 0), &formatted)];
+        assert!(map.map_formatting_answer(&answer).is_ok());
+        assert_eq!(
+            map.map_formatting_within(&answer, FORMATTING_DIFF_BUDGET, 15),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn pairing_lines_alike_in_letters_and_digits_costs_work() {
+        // Every line's punctuation rewritten: only their letters and digits
+        // pair them, and that pairing is charged, a step a line and one for
+        // every 64 bytes compared. 474 steps take the answer, 473 do not.
+        let virtual_text: String = (0..10).map(|line| format!("  f{line}('a')\n")).collect();
+        let formatted: String = (0..10).map(|line| format!("f{line}(\"a\");\n")).collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (10, 0), &formatted)];
+        assert!(map.map_formatting(&answer, 474).is_ok());
+        assert_eq!(
+            map.map_formatting(&answer, 473),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
     fn lines_reordered_keep_their_places_and_indents() {
         // Patience keeps the longest run of unique lines in order: `b`
         // and `c` swapped cannot both anchor.
