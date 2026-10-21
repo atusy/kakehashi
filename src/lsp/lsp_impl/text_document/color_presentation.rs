@@ -35,26 +35,24 @@ impl Kakehashi {
         let tracker = self.bridge.node_tracker();
         let current_version = || self.host_content_version(&lsp_uri);
         let passed_over = PassedOver::default();
-        let answer = self
-            .walk_layers_by_strategy(
-                &lsp_uri,
-                METHOD,
-                METHOD,
-                virt,
-                host,
-                std::future::ready(Ok(None)),
-                // Under `preferred`, read as the race decides (see
-                // `PassedOver::answers`).
-                |answer: &ColorAnswer| passed_over.answers(answer, pool, tracker, current_version),
-                ColorAnswer::combine,
-            )
-            .await;
+        let race = self.walk_layers_by_strategy(
+            &lsp_uri,
+            METHOD,
+            METHOD,
+            virt,
+            host,
+            std::future::ready(Ok(None)),
+            // Under `preferred`, read as the race decides (see
+            // `PassedOver::answers`).
+            |answer: &ColorAnswer| passed_over.answers(answer, pool, tracker, current_version),
+            ColorAnswer::combine,
+        );
         // The final answer chosen: a prepared part's edits checked once
         // more against the host text, which may have moved while it was
         // held, once the host's last edit settles (a picker asks once per
         // interaction, not on every keystroke).
         passed_over
-            .or_chosen(answer, pool, tracker, current_version)
+            .resolve(race, pool, tracker, current_version)
             .await
     }
 
@@ -257,7 +255,12 @@ impl ColorAnswer {
 /// the race goes on to the next layer's answer, which stands in for it
 /// when it is dropped, instead of none. A current one wins at once.
 #[derive(Default)]
-struct PassedOver(std::sync::Mutex<Option<ColorAnswer>>);
+struct PassedOver {
+    kept: std::sync::Mutex<Option<ColorAnswer>>,
+    /// Signalled as an answer is kept aside, so its settle is waited on
+    /// while the race goes on.
+    kept_aside: tokio::sync::Notify,
+}
 
 impl PassedOver {
     /// Whether `answer` wins the race: it has presentations and its
@@ -279,49 +282,89 @@ impl PassedOver {
         }
         if answer.has_result(|source| prepared_may_keep(source, pool, tracker, &current_version)) {
             let mut kept = self
-                .0
+                .kept
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if kept.is_none() {
                 *kept = Some(answer.clone());
+                // A permit stored: the wait never misses it.
+                self.kept_aside.notify_one();
             }
         }
         false
     }
 
-    /// The presentations of the answer kept aside, judged once the host's
-    /// last edit settles, when it keeps any; else those of the race's
-    /// `chosen` answer (none, or a layer's error, which the answer kept
-    /// aside outranked). A cancel stays a cancel.
-    async fn or_chosen(
-        self,
-        chosen: Result<Option<ColorAnswer>>,
+    /// The presentations of the answer kept aside, judged as the host's
+    /// last edit settles, while `race` goes on: kept any, they answer at
+    /// once, the race's answers dropped unawaited; else those of the
+    /// race's chosen answer (none, or a layer's error, which the answer
+    /// kept aside outranked). A cancel the race returns first stays a
+    /// cancel.
+    async fn resolve(
+        &self,
+        race: impl Future<Output = Result<Option<ColorAnswer>>>,
         pool: &crate::lsp::bridge::LanguageServerPool,
         tracker: &crate::language::NodeTracker,
         current_version: impl Fn() -> Option<u64>,
     ) -> Result<Vec<ColorPresentation>> {
-        let kept = self
-            .0
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(kept) = kept
-            && !matches!(
-                &chosen,
-                Err(error) if error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
-            )
-        {
-            let presentations = kept
-                .settled_presentations(pool, tracker, &current_version)
-                .await;
-            if !presentations.is_empty() {
-                return Ok(presentations);
+        let mut race = std::pin::pin!(race);
+        let mut settled = std::pin::pin!(self.settled(pool, tracker, &current_version));
+        let chosen = tokio::select! {
+            chosen = &mut race => {
+                let cancelled = matches!(
+                    &chosen,
+                    Err(error) if error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+                );
+                if !cancelled && self.has_kept() {
+                    let presentations = settled.await;
+                    if !presentations.is_empty() {
+                        return Ok(presentations);
+                    }
+                }
+                chosen
             }
-        }
+            presentations = &mut settled => {
+                if !presentations.is_empty() {
+                    return Ok(presentations);
+                }
+                race.await
+            }
+        };
         match chosen? {
             Some(answer) => Ok(answer
-                .settled_presentations(pool, tracker, current_version)
+                .settled_presentations(pool, tracker, &current_version)
                 .await),
             None => Ok(Vec::new()),
+        }
+    }
+
+    fn has_kept(&self) -> bool {
+        self.kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// The presentations of the answer kept aside, judged once the host's
+    /// last edit settles: pending until one is kept aside.
+    async fn settled(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+        current_version: impl Fn() -> Option<u64>,
+    ) -> Vec<ColorPresentation> {
+        self.kept_aside.notified().await;
+        let kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match kept {
+            Some(kept) => {
+                kept.settled_presentations(pool, tracker, current_version)
+                    .await
+            }
+            None => Vec::new(),
         }
     }
 }
@@ -462,7 +505,8 @@ mod tests {
     /// settling as the race decides outranks the host layer's, and is the
     /// answer when the settle keeps it; dropped then (re-prepared to other
     /// coordinates as it settled), the host layer's presentations answer,
-    /// not none. A current one wins without waiting on the host layer.
+    /// not none. A current one, or one kept as it settles, answers without
+    /// waiting on the host layer.
     #[tokio::test(start_paused = true)]
     async fn a_settling_presentation_dropped_at_settle_falls_back_to_the_host_layers() {
         use crate::config::settings::LayerSource::{Host, Virt};
@@ -484,7 +528,12 @@ mod tests {
             text_edit: None,
             additional_text_edits: None,
         };
-        for case in ["current", "settling, kept", "settling, dropped"] {
+        for case in [
+            "current",
+            "settling, kept",
+            "settling, kept, host hung",
+            "settling, dropped",
+        ] {
             let prepared = prepare("  red\n");
             let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
             let host = url::Url::parse("file:///test/color-fallback.md").unwrap();
@@ -499,7 +548,7 @@ mod tests {
             if case != "current" {
                 pool.note_host_edited(&host, 1, 1);
                 let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
-                let dropped = case.ends_with("dropped");
+                let dropped = case.contains("dropped");
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     if dropped {
@@ -519,38 +568,46 @@ mod tests {
                 1,
             ));
             let host_answer = async {
-                if case == "current" {
-                    // A hung host layer: a current answer never waits on it.
-                    std::future::pending::<()>().await;
+                if case == "current" || case.ends_with("host hung") {
+                    // A host layer hung until the request would time out:
+                    // a current answer, or one kept once it settles, never
+                    // waits on it.
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 Ok(Some(ColorAnswer::unprepared(vec![presentation("host")])))
             };
             let passed_over = PassedOver::default();
             let started = tokio::time::Instant::now();
-            let chosen = race_layers_preferred(
+            let race = race_layers_preferred(
                 &[Virt, Host],
                 std::future::ready(Ok(Some(virt))),
                 host_answer,
                 std::future::ready(Ok(None)),
                 |answer: &ColorAnswer| passed_over.answers(answer, &pool, &tracker, || Some(1)),
-            )
-            .await;
+            );
             let labels = passed_over
-                .or_chosen(chosen, &pool, &tracker, || Some(1))
+                .resolve(race, &pool, &tracker, || Some(1))
                 .await
                 .unwrap()
                 .into_iter()
                 .map(|presentation| presentation.label)
                 .collect::<Vec<_>>();
-            let expected = if case.ends_with("dropped") {
+            let expected = if case.contains("dropped") {
                 "host"
             } else {
                 "virt"
             };
             assert_eq!(labels, [expected], "{case}");
-            if case == "current" {
-                assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}");
+            match case {
+                "current" => assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}"),
+                // Settled at 500ms, judged as the settle is seen.
+                "settling, kept, host hung" => assert!(
+                    started.elapsed() < std::time::Duration::from_secs(1),
+                    "{case}: answered as it settled, not after {:?}",
+                    started.elapsed()
+                ),
+                _ => {}
             }
         }
     }
