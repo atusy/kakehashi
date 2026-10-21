@@ -31,6 +31,11 @@ impl Kakehashi {
                 .await?;
             Ok(presentations.map(ColorAnswer::unprepared))
         };
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        let current = |source: &Sourced<()>| {
+            source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+        };
         let answer = self
             .walk_layers_by_strategy(
                 &lsp_uri,
@@ -39,19 +44,17 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |answer: &ColorAnswer| !answer.items.is_empty(),
+                // Under `preferred`, read as the race decides: a stale
+                // prepared answer is no answer of its layer, and the race
+                // falls through to the next layer's.
+                |answer: &ColorAnswer| answer.has_result(current),
                 ColorAnswer::combine,
             )
             .await?;
         // The final answer chosen: a prepared part's edits checked once
-        // more against the host text, which may have moved while it was held.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        Ok(answer.map_or_else(Vec::new, |answer| {
-            answer.still_current(|source| {
-                source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-            })
-        }))
+        // more against the host text, which may have moved while it was held
+        // (under `concatenated`, the race waits for every layer).
+        Ok(answer.map_or_else(Vec::new, |answer| answer.still_current(current)))
     }
 
     async fn color_presentation_virt_layer(
@@ -196,6 +199,17 @@ impl ColorAnswer {
         }
     }
 
+    /// Whether the answer is one a `preferred` race may choose: it has
+    /// presentations, and a prepared part's edits still land where they
+    /// were mapped (`current`).
+    fn has_result(&self, current: impl Fn(&Sourced<()>) -> bool) -> bool {
+        !self.items.is_empty()
+            && self
+                .prepared
+                .as_ref()
+                .is_none_or(|(source, _)| current(source))
+    }
+
     fn combine(mut self, mut next: Self) -> Self {
         let shift = self.items.len();
         self.items.append(&mut next.items);
@@ -261,6 +275,22 @@ mod tests {
             ["host", "virt", "virt2"]
         );
         assert_eq!(labels(answer().still_current(|_| false)), ["host"]);
+        // Under `preferred` a layer's answer is its own part: a stale
+        // prepared one is no answer, which the race falls through.
+        let virt_only = || {
+            ColorAnswer::from_layer(Sourced::prepared_for_test(
+                vec![presentation("virt")],
+                &host,
+                "css",
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                &map,
+                1,
+                0,
+            ))
+        };
+        assert!(virt_only().has_result(|_| true));
+        assert!(!virt_only().has_result(|_| false));
+        assert!(ColorAnswer::unprepared(vec![presentation("host")]).has_result(|_| unreachable!()));
         // Without a prepared part nothing is read.
         assert_eq!(
             labels(

@@ -42,6 +42,15 @@ impl Kakehashi {
             let response = self.completion_host_layer(&lsp_uri, raw_params).await?;
             Ok(response.map(Sourced::unprepared))
         };
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        // Whether the host moved under a prepared answer is read as the race
+        // decides on it: a stale one is no answer of its layer, and the race
+        // falls through to the next layer's (the host's, waited for if need
+        // be), its ask to re-query kept.
+        let current = |sourced: &Sourced<CompletionResponse>| {
+            sourced.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
+        };
         let (response, layers) = self
             .walk_layer_futures_in_order(
                 &lsp_uri,
@@ -51,14 +60,13 @@ impl Kakehashi {
                 host,
                 std::future::ready(Ok(None)),
                 |sourced: &Sourced<CompletionResponse>| {
-                    completion_response_has_result(&sourced.value)
+                    completion_layer_has_result(sourced, current, &requery)
                 },
             )
             .await;
         // The final answer chosen: its edits checked once more against the
-        // host text, which may have moved while it was held.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
+        // host text (with no await since the race decided, it reads as it
+        // did there).
         let response = response.map(|response| {
             response.and_then(|sourced| {
                 let current =
@@ -270,6 +278,28 @@ impl Kakehashi {
             )
         }))
     }
+}
+
+/// Whether a layer's completion answer is one the race may choose: it has
+/// a result, and, mapped through a prepared map, its edits still land where
+/// they were mapped (`current`). A stale one is no answer, so the race falls
+/// through to the next layer's; an incomplete one still asks to re-query
+/// (`requery`), as a virt layer without items does.
+fn completion_layer_has_result(
+    sourced: &Sourced<CompletionResponse>,
+    current: impl Fn(&Sourced<CompletionResponse>) -> bool,
+    requery: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if !completion_response_has_result(&sourced.value) {
+        return false;
+    }
+    if !sourced.is_prepared() || current(sourced) {
+        return true;
+    }
+    if matches!(&sourced.value, CompletionResponse::List(list) if list.is_incomplete) {
+        requery.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    false
 }
 
 /// The chosen completion answer once its edits were checked against the
@@ -605,6 +635,83 @@ mod tests {
     /// The re-query truth table, a row per case: what the virt layer's
     /// servers answered (an ask ranked above the winner, or not), what the
     /// layers gave, and what the client gets.
+    /// A stale prepared answer is no answer of its layer: the race falls
+    /// through to the host layer's, waited for when it is still running,
+    /// and a stale incomplete list still asks to re-query. A current one
+    /// wins as ever.
+    #[tokio::test]
+    async fn a_stale_prepared_answer_falls_through_to_the_host_layers() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        use tower_lsp_server::ls_types::CompletionItem;
+        let list = |label: &str, is_incomplete| {
+            CompletionResponse::List(CompletionList {
+                is_incomplete,
+                items: vec![CompletionItem {
+                    label: label.to_string(),
+                    ..Default::default()
+                }],
+            })
+        };
+        let host_uri = url::Url::parse("file:///test/race.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let virt = |is_incomplete| {
+            Sourced::prepared_for_test(
+                list("virt", is_incomplete),
+                &host_uri,
+                "lua",
+                "r",
+                &map,
+                1,
+                0,
+            )
+        };
+        let race = |virt_answer: Sourced<CompletionResponse>, fresh: bool, host_delay_ms: u64| {
+            let requery = std::sync::atomic::AtomicBool::new(false);
+            let host = async move {
+                tokio::time::sleep(std::time::Duration::from_millis(host_delay_ms)).await;
+                Ok(Some(Sourced::unprepared(list("host", false))))
+            };
+            async move {
+                let won = race_layers_preferred(
+                    &[Virt, Host, Native],
+                    std::future::ready(Ok(Some(virt_answer))),
+                    host,
+                    std::future::ready(Ok(None)),
+                    |sourced: &Sourced<CompletionResponse>| {
+                        completion_layer_has_result(sourced, |_| fresh, &requery)
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let CompletionResponse::List(list) = won.value else {
+                    panic!("a list");
+                };
+                (list.items[0].label.clone(), requery.into_inner())
+            }
+        };
+        assert_eq!(
+            race(virt(false), true, 0).await,
+            ("virt".to_string(), false)
+        );
+        assert_eq!(
+            race(virt(false), false, 0).await,
+            ("host".to_string(), false)
+        );
+        assert_eq!(
+            race(virt(false), false, 20).await,
+            ("host".to_string(), false)
+        );
+        assert_eq!(race(virt(true), false, 0).await, ("host".to_string(), true));
+    }
+
     #[test]
     fn a_stale_completion_answers_no_items() {
         use tower_lsp_server::ls_types::CompletionItem;
