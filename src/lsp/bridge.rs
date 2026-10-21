@@ -40,7 +40,7 @@ mod prepare_layer;
 mod prepare_registry;
 pub(crate) use prepare_registry::{
     Answer as PrepareAnswer, PrepareInput, PrepareLookup, PrepareMiss, PrepareTarget, Resync,
-    retry_delay as prepare_retry_delay,
+    ResyncCause, retry_delay as prepare_retry_delay,
 };
 mod progress_registry;
 mod protocol;

@@ -121,19 +121,72 @@ pub(crate) enum PrepareMiss {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resync {
     pub(crate) host_uri: Url,
-    /// A document held back became ready to send (rather than a retry
-    /// coming due, or an answer coming back unusable), so the host's
-    /// diagnostics are collected again too.
-    pub(crate) ready: bool,
+    pub(crate) cause: ResyncCause,
+}
+
+/// Why a host is synced again, which decides whether its diagnostics are
+/// collected again too. Several of a host's resyncs merge into one (see
+/// [`ResyncCause::merge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResyncCause {
+    /// Only synced: a retry came due, a pass is repeated, or the epoch moved
+    /// before anything was looked up.
+    Retry,
+    /// A document held back became ready to send: the host's diagnostics
+    /// are collected again too.
+    Ready {
+        /// See [`ResyncCause::edited`].
+        edited: bool,
+    },
     /// The host's diagnostics are collected again too, dropping those
     /// placed from a document's earlier text: one held back got an unusable
-    /// answer, so it is no longer bridged.
-    pub(crate) recollect: bool,
-    /// The document's answer, ready or unusable, follows one for its earlier
-    /// text under the same epoch: an edit's, whose diagnostics the edit's
-    /// debounced collection gathers, rather than a collection of its own at
-    /// once.
-    pub(crate) edited: bool,
+    /// answer, so it is no longer bridged, or the epoch moved.
+    Recollect {
+        /// See [`ResyncCause::edited`].
+        edited: bool,
+    },
+}
+
+impl ResyncCause {
+    /// Whether a document held back became ready to send.
+    pub(crate) fn ready(self) -> bool {
+        matches!(self, Self::Ready { .. })
+    }
+
+    /// Whether the host's diagnostics are collected again.
+    pub(crate) fn collects(self) -> bool {
+        !matches!(self, Self::Retry)
+    }
+
+    /// Whether the answer, ready or unusable, follows one for its
+    /// document's earlier text under the same epoch: an edit's, whose
+    /// diagnostics the edit's debounced collection gathers, rather than a
+    /// collection of its own at once. Never for a retry, which collects
+    /// nothing.
+    pub(crate) fn edited(self) -> bool {
+        match self {
+            Self::Retry => false,
+            Self::Ready { edited } | Self::Recollect { edited } => edited,
+        }
+    }
+
+    /// One cause for two of a host's resyncs: ready when either is,
+    /// collecting when either does, and edited only when every collecting
+    /// one is (any other collects at once).
+    pub(crate) fn merge(self, other: Self) -> Self {
+        let edited = match (self.collects(), other.collects()) {
+            (true, true) => self.edited() && other.edited(),
+            (true, false) => self.edited(),
+            (false, _) => other.edited(),
+        };
+        if self.ready() || other.ready() {
+            Self::Ready { edited }
+        } else if self.collects() || other.collects() {
+            Self::Recollect { edited }
+        } else {
+            Self::Retry
+        }
+    }
 }
 
 /// The answer for one input under one epoch, and the attempts to get it.
@@ -712,9 +765,7 @@ impl PrepareRegistry {
             // closed host is synced to nothing: its document is gone.)
             let _ = self.resync_tx.send(Resync {
                 host_uri: input.host_uri.clone(),
-                ready: false,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Retry,
             });
             return PrepareLookup::Pending;
         };
@@ -1192,11 +1243,14 @@ impl PrepareRegistry {
                     if held() && pool.prepare_epoch() == cell.epoch {
                         *host_answers.entry(job.host_uri.to_string()).or_default() += 1;
                         // The receiver is gone only at shutdown.
+                        let edited = cell.after_edit.load(Ordering::Acquire);
                         let _ = resync_tx.send(Resync {
                             host_uri: job.host_uri.clone(),
-                            ready,
-                            recollect: !ready,
-                            edited: cell.after_edit.load(Ordering::Acquire),
+                            cause: if ready {
+                                ResyncCause::Ready { edited }
+                            } else {
+                                ResyncCause::Recollect { edited }
+                            },
                         });
                     }
                 }
@@ -1222,9 +1276,7 @@ impl PrepareRegistry {
                         if still_held {
                             let _ = resync_tx.send(Resync {
                                 host_uri,
-                                ready: false,
-                                recollect: false,
-                                edited: false,
+                                cause: ResyncCause::Retry,
                             });
                         }
                     });
@@ -1803,9 +1855,7 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host,
-                ready: true,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Ready { edited: false },
             })
         );
     }
@@ -1822,9 +1872,7 @@ mod tests {
         let target = unstartable_target(&pool);
         let ready = |edited| Resync {
             host_uri: host.clone(),
-            ready: true,
-            recollect: false,
-            edited,
+            cause: ResyncCause::Ready { edited },
         };
         registry.lookup_or_start(&pool, &target, input(&host, "a"));
         assert!(
@@ -1898,9 +1946,7 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host.clone(),
-                ready: true,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Ready { edited: false },
             })
         );
         // An answer for text the lifecycle pass no longer holds on re-syncs
@@ -1943,9 +1989,7 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host,
-                ready: false,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Retry,
             })
         );
     }
@@ -2240,9 +2284,7 @@ mod tests {
             resynced,
             Some(Resync {
                 host_uri: host.clone(),
-                ready: false,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Retry,
             })
         );
     }
@@ -2286,9 +2328,7 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host.clone(),
-                ready: false,
-                recollect: true,
-                edited: false,
+                cause: ResyncCause::Recollect { edited: false },
             })
         );
     }
@@ -2324,9 +2364,7 @@ mod tests {
             resync.try_recv().ok(),
             Some(Resync {
                 host_uri: host,
-                ready: false,
-                recollect: true,
-                edited: true,
+                cause: ResyncCause::Recollect { edited: true },
             })
         );
     }

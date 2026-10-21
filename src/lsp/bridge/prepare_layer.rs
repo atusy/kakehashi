@@ -12,7 +12,9 @@ use url::Url;
 
 use super::ResolvedServerConfig;
 use super::pool::{LanguageServerPool, RegionPrepare};
-use super::prepare_registry::{PrepareInput, PrepareLookup, PrepareMiss, PrepareRegistry, Resync};
+use super::prepare_registry::{
+    PrepareInput, PrepareLookup, PrepareMiss, PrepareRegistry, Resync, ResyncCause,
+};
 use crate::config::WorkspaceSettings;
 use crate::text::terminal::escape_terminal_controls;
 
@@ -321,9 +323,11 @@ impl super::BridgeCoordinator {
             layer.registry.requeue_resync(
                 Resync {
                     host_uri: host.clone(),
-                    ready: answered,
-                    recollect: false,
-                    edited: answered,
+                    cause: if answered {
+                        ResyncCause::Ready { edited: true }
+                    } else {
+                        ResyncCause::Retry
+                    },
                 },
                 std::time::Duration::ZERO,
             );
@@ -628,6 +632,8 @@ impl super::BridgeCoordinator {
 mod tests {
     use std::sync::Arc;
 
+    use super::ResyncCause;
+
     use url::Url;
 
     use super::super::pool::test_helpers::TEST_ULID_LUA_0;
@@ -845,10 +851,10 @@ mod tests {
             .expect("synced again")
             .unwrap();
         assert_eq!(resync.host_uri, host);
-        assert!(resync.ready, "settles the debt");
-        assert!(
-            resync.edited,
-            "and collects through the debounce, not at once"
+        assert_eq!(
+            resync.cause,
+            ResyncCause::Ready { edited: true },
+            "settles the debt, and collects through the debounce, not at once"
         );
         // A pull that saw that answer already waits for the other.
         coordinator.owe_pull_after_prepare(&host, coordinator.prepare_host_answers(&host));
