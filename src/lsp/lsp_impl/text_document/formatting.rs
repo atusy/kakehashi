@@ -55,7 +55,7 @@ use crate::lsp::bridge::{
     UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::{
-    DocumentRequestContext, Sourced, Verdict, poll_verdict, sources_verdict,
+    DocumentRequestContext, Sourced, Verdict, sources_verdict,
 };
 use crate::lsp::lsp_impl::text_document::{
     RequestErrorSink, count_no_winner_errors, count_request_errors,
@@ -677,21 +677,6 @@ impl Kakehashi {
         );
         count_request_errors(failure_sink, 1);
         false
-    }
-
-    /// [`source_may_keep`] for a layer's answer to a request on `lsp_uri`:
-    /// read as a layers' race decides on it.
-    pub(super) fn answer_may_keep<T>(
-        &self,
-        lsp_uri: &tower_lsp_server::ls_types::Uri,
-        sourced: &Sourced<T>,
-    ) -> bool {
-        source_may_keep(
-            sourced,
-            self.bridge.pool(),
-            self.bridge.node_tracker(),
-            || self.host_content_version(lsp_uri),
-        )
     }
 
     /// Format the host document itself (the **host** layer,
@@ -2493,148 +2478,6 @@ pub(super) async fn finalize_formatting_edits(
     Ok((!all_edits.is_empty()).then_some((all_edits, sources)))
 }
 
-/// One poll of
-/// [`settled_verdict`](crate::lsp::lsp_impl::bridge_context::settled_verdict)
-/// for an answer mapped through `source`, read at once, never waited on:
-/// whether it may still be judged current — current now, or not yet (the
-/// host's last edit settling, or its region held, while it can still
-/// become current) and the host unedited since the request read its text.
-/// `false` once moved or stale, which no wait brings back. For a race
-/// choosing among answers, where one that may not be kept is no answer;
-/// the final check still judges the one chosen.
-pub(super) fn source_may_keep<T>(
-    source: &Sourced<T>,
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    tracker: &crate::language::NodeTracker,
-    current_version: impl Fn() -> Option<u64>,
-) -> bool {
-    if !source.is_prepared() {
-        return true;
-    }
-    matches!(
-        poll_verdict(
-            || source.still_current(pool, tracker, &current_version),
-            || source.moved(current_version()),
-            || source.live(pool, tracker) && source.settling(pool, tracker),
-        ),
-        None | Some(Verdict::Current)
-    )
-}
-
-/// Whether a layer's answer is one a layers' race may choose: it has a
-/// result (`has_result`), and, mapped through a prepared map, may still be
-/// kept (`may_keep`, see [`source_may_keep`]). One moved or stale is no
-/// answer of its layer, and the race falls through to the next layer's
-/// rather than choosing what the final check drops. Unprepared answers read
-/// nothing.
-pub(super) fn layer_answers<T>(
-    sourced: &Sourced<T>,
-    has_result: impl FnOnce(&T) -> bool,
-    may_keep: impl FnOnce(&Sourced<T>) -> bool,
-) -> bool {
-    has_result(&sourced.value) && (!sourced.is_prepared() || may_keep(sourced))
-}
-
-/// A prepared answer a layers' race passed over as one it cannot keep
-/// ([`layer_answers`]), kept for when no other layer answers: a method
-/// that answers a dropped answer otherwise than with nothing (a rename's
-/// `ContentModified`) then still does, through its final check.
-pub(super) struct PassedOverAnswer<T>(std::sync::Mutex<Option<Sourced<T>>>);
-
-impl<T> Default for PassedOverAnswer<T> {
-    fn default() -> Self {
-        Self(std::sync::Mutex::new(None))
-    }
-}
-
-impl<T: Clone> PassedOverAnswer<T> {
-    /// [`layer_answers`], keeping aside, once (the race asks in priority
-    /// order: the highest-ranked), an answer with a result it passes over.
-    pub(super) fn answers(
-        &self,
-        sourced: &Sourced<T>,
-        has_result: impl Fn(&T) -> bool,
-        may_keep: impl FnOnce(&Sourced<T>) -> bool,
-    ) -> bool {
-        if !has_result(&sourced.value) {
-            return false;
-        }
-        if layer_answers(sourced, &has_result, may_keep) {
-            return true;
-        }
-        let mut kept = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if kept.is_none() {
-            *kept = Some(sourced.clone());
-        }
-        false
-    }
-
-    /// The race's `result`, or, when it found no answer (nothing, or only
-    /// a layer's error, which the answer passed over would have
-    /// outranked), the answer kept aside. A cancel stays a cancel.
-    pub(super) fn or_passed_over(
-        self,
-        result: Result<Option<Sourced<T>>>,
-    ) -> Result<Option<Sourced<T>>> {
-        let kept = self
-            .0
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (result, kept) {
-            (Ok(None), Some(kept)) => Ok(Some(kept)),
-            (Err(error), Some(kept))
-                if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
-            {
-                Ok(Some(kept))
-            }
-            (result, _) => result,
-        }
-    }
-}
-
-/// A `preferred` race over [virt, host] whose virt layer answers `virt`,
-/// prepared, at once, and whose host layer answers `host` after
-/// `host_delay_ms`, the virt answer read as `may_keep` says: which value
-/// won, for a method's race test.
-#[cfg(test)]
-pub(super) async fn race_prepared_virt_against_host<T>(
-    virt: T,
-    host: T,
-    host_delay_ms: u64,
-    may_keep: bool,
-    has_result: impl Fn(&T) -> bool,
-) -> T {
-    use crate::config::settings::LayerSource::{Host, Native, Virt};
-    use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
-    let host_uri = url::Url::parse("file:///test/race.md").unwrap();
-    let map = crate::lsp::bridge::apply_prepare_result(
-        "a",
-        &crate::lsp::bridge::VirtualLayout::single("a"),
-        None,
-    )
-    .unwrap()
-    .map;
-    let virt = Sourced::prepared_for_test(virt, &host_uri, "lua", "r", &map, 1, 0);
-    let host = async move {
-        tokio::time::sleep(std::time::Duration::from_millis(host_delay_ms)).await;
-        Ok(Some(Sourced::unprepared(host)))
-    };
-    race_layers_preferred(
-        &[Virt, Host, Native],
-        std::future::ready(Ok(Some(virt))),
-        host,
-        std::future::ready(Ok(None)),
-        |sourced: &Sourced<T>| layer_answers(sourced, &has_result, |_| may_keep),
-    )
-    .await
-    .unwrap()
-    .expect("a layer answers")
-    .value
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2774,60 +2617,6 @@ mod tests {
             assert_eq!(edits, expected, "{case}");
             assert_eq!(refused, verdict, "{case}");
         }
-    }
-
-    /// Read at once, an answer may still be kept while current or settling
-    /// (it would be waited on), and may not once moved or stale.
-    #[tokio::test]
-    async fn an_answer_may_be_kept_while_current_or_settling_only() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        let prepare = |text: &str| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{
-                "type": "content", "changes": [{
-                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                    "newText": ""
-                }]
-            }]}))
-            .unwrap();
-            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
-        };
-        let prepared = prepare("  red\n");
-        for case in ["current", "settling", "settling, moved", "moved", "stale"] {
-            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
-            let host = url::Url::parse("file:///test/keep.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let region = tracker
-                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-                .unwrap()
-                .to_string();
-            pool.open_host_incarnation(&host, 1).await;
-            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
-            if case.starts_with("settling") {
-                pool.note_host_edited(&host, 1, 1);
-            }
-            if case == "stale" {
-                // Re-prepared to other coordinates, the host unedited.
-                let other = prepare("  blue\n");
-                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &other);
-            }
-            let version = if case.ends_with("moved") { 2 } else { 1 };
-            let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
-            assert_eq!(
-                source_may_keep(&source, &pool, &tracker, || Some(version)),
-                matches!(case, "current" | "settling"),
-                "{case}"
-            );
-        }
-        // Unprepared: nothing read.
-        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
-        let tracker = crate::language::NodeTracker::new();
-        assert!(source_may_keep(
-            &Sourced::unprepared(()),
-            &pool,
-            &tracker,
-            || unreachable!()
-        ));
     }
 
     /// A prepared region whose formatter answered nothing is not judged

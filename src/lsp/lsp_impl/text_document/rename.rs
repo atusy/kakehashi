@@ -35,7 +35,7 @@ impl Kakehashi {
                 .await?;
             Ok(edit.map(Sourced::unprepared))
         };
-        let passed_over = super::formatting::PassedOverAnswer::default();
+        let passed_over = super::super::bridge_context::PassedOverAnswer::default();
         let answer = self
             .walk_layers_with_native(
                 &lsp_uri,
@@ -221,7 +221,7 @@ mod tests {
         let walk = |host: Result<Option<Sourced<WorkspaceEdit>>>| {
             let virt = Sourced::prepared_for_test(edit.clone(), &host_uri, "lua", "r", &map, 1, 0);
             async move {
-                let passed_over = super::super::formatting::PassedOverAnswer::default();
+                let passed_over = super::super::super::bridge_context::PassedOverAnswer::default();
                 let result = race_layers_preferred(
                     &[Virt, Host, Native],
                     std::future::ready(Ok(Some(virt))),
@@ -273,7 +273,7 @@ mod tests {
             }
         };
         for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
-            let won = super::super::formatting::race_prepared_virt_against_host(
+            let won = super::super::super::bridge_context::race_prepared_virt_against_host(
                 edit("virt"),
                 edit("host"),
                 host_delay_ms,

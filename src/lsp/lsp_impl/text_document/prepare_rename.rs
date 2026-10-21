@@ -50,7 +50,7 @@ impl Kakehashi {
                 // is no answer of its layer, and the race falls through to
                 // the next layer's.
                 |sourced: &Sourced<PrepareRenameResponse>| {
-                    super::formatting::layer_answers(
+                    super::super::bridge_context::layer_answers(
                         sourced,
                         |_| true,
                         |sourced| self.answer_may_keep(&lsp_uri, sourced),
@@ -149,7 +149,7 @@ mod tests {
             ))
         };
         for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
-            let won = super::super::formatting::race_prepared_virt_against_host(
+            let won = super::super::super::bridge_context::race_prepared_virt_against_host(
                 range(1),
                 range(2),
                 host_delay_ms,

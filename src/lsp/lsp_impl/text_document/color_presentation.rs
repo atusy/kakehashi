@@ -293,7 +293,7 @@ impl PassedOver {
             return true;
         }
         if answer.has_result(|source| {
-            super::formatting::source_may_keep(source, pool, tracker, &current_version)
+            super::super::bridge_context::source_may_keep(source, pool, tracker, &current_version)
         }) {
             let mut kept = self
                 .kept

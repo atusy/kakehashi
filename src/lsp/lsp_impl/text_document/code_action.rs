@@ -286,7 +286,7 @@ impl Kakehashi {
         let tracker = self.bridge.node_tracker();
         let passed_over = PassedOver::default();
         let may_keep = |source: &Sourced<()>| {
-            super::formatting::source_may_keep(source, pool, tracker, || {
+            super::super::bridge_context::source_may_keep(source, pool, tracker, || {
                 self.host_content_version(&lsp_uri)
             })
         };
