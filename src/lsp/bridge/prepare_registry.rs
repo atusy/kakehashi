@@ -530,7 +530,8 @@ impl PrepareFailures {
             .entry(region_hash(host_uri, injection_language, region_id))
             .or_insert_with(|| Region::bare(host_uri, injection_language, region_id));
         if !region.is(host_uri, injection_language, region_id) {
-            // A hash collision with another region: start over.
+            // A hash collision with another region: start over, its answers
+            // gone with it (as `slot`'s reset takes a withheld mark).
             *region = Region::bare(host_uri, injection_language, region_id);
         }
         region.withheld = Some(incarnation);
@@ -546,17 +547,24 @@ impl PrepareFailures {
         incarnation: u64,
     ) {
         let host_uri = host_uri.as_str();
-        self.regions.remove_if_mut(
-            &region_hash(host_uri, injection_language, region_id),
-            |_, region| {
-                if region.is(host_uri, injection_language, region_id)
-                    && region.withheld == Some(incarnation)
-                {
-                    region.withheld = None;
-                }
-                region.is_empty()
-            },
-        );
+        let hash = region_hash(host_uri, injection_language, region_id);
+        // Read first, under the shard's read lock: every recorded text
+        // comes here, and most regions are withheld by nothing.
+        if !self
+            .regions
+            .get(&hash)
+            .is_some_and(|region| region.withheld == Some(incarnation))
+        {
+            return;
+        }
+        self.regions.remove_if_mut(&hash, |_, region| {
+            if region.is(host_uri, injection_language, region_id)
+                && region.withheld == Some(incarnation)
+            {
+                region.withheld = None;
+            }
+            region.is_empty()
+        });
     }
 
     /// An answer for `input`, taken at `taken` in the presentation order, as
@@ -1021,7 +1029,9 @@ impl PrepareRegistry {
             .entry(hash)
             .or_insert_with(|| Region::bare(host_uri, input.injection_language, input.region_id));
         if !region.is(host_uri, input.injection_language, input.region_id) {
-            // A hash collision with another region: start over.
+            // A hash collision with another region: start over, its
+            // withheld mark gone with it (as `PrepareFailures::withhold`'s
+            // reset takes its answers).
             *region = Region::bare(host_uri, input.injection_language, input.region_id);
         }
         // Moved off an input of the same epoch, answered or not: an edit.
