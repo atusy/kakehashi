@@ -402,12 +402,13 @@ dropped, not kept stale. How an edit maps back depends on the whole text
 — which lines are blank, what an inserted line joins, which indentation
 a created line regains — so no text but the request's is known to place
 it as the server meant, and a stale edit could land in indentation the
-host has and P never showed. For completion, color presentations and
-inlay hints clients ask again on every keystroke, so the answer for the
-latest text still arrives and is kept: the cost is availability (an answer
-within a keystroke's parse and prepare round-trip), never a misplaced
-edit. The formatting methods, asked once per action, wait for the host to
-settle instead (see above).
+host has and P never showed. Completion answers dropped this way come back
+as an empty incomplete list, which the client asks again for, and inlay
+hints stay shown with only their edits stripped: the answer for the latest
+text still arrives, the cost availability (an answer within a keystroke's
+parse and prepare round-trip), never a misplaced edit. Color presentations
+are asked once per picker interaction, and the formatting methods once per
+action: they wait for the host to settle instead (see above).
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
