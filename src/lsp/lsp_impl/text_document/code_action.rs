@@ -79,11 +79,14 @@ fn actions_answer(actions: &[CodeActionOrCommand], prepared: bool) -> bool {
 }
 
 /// Whether a layer's `parts` answer a cross-layer `preferred` walk (see
-/// [`actions_answer`]): a prepared part only by an enabled action.
-fn parts_answer(parts: &ActionParts) -> bool {
-    parts
-        .iter()
-        .any(|(actions, source)| actions_answer(actions, source.is_some()))
+/// [`actions_answer`]): a prepared part only by an enabled action, and
+/// only while it may still be kept (`may_keep`, read as the race decides):
+/// one moved or stale is no answer, and the race falls through to the next
+/// layer's rather than choosing actions the final check drops.
+fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) -> bool {
+    parts.iter().any(|(actions, source)| {
+        actions_answer(actions, source.is_some()) && source.as_ref().is_none_or(&may_keep)
+    })
 }
 
 /// The actions of `parts` judged kept, in order: `Err` when judging emptied
@@ -200,6 +203,13 @@ impl Kakehashi {
                 .await?;
             Ok(actions.map(|actions| vec![(actions, None)]))
         };
+        let pool = self.bridge.pool();
+        let tracker = self.bridge.node_tracker();
+        let may_keep = |source: &Sourced<()>| {
+            super::formatting::source_may_keep(source, pool, tracker, || {
+                self.host_content_version(&lsp_uri)
+            })
+        };
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
         // non-empty layer; `concatenated` merges every layer's actions in priority
@@ -212,7 +222,7 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                parts_answer,
+                |parts: &ActionParts| parts_answer(parts, may_keep),
                 |mut parts: ActionParts, next| {
                     parts.extend(next);
                     parts
@@ -224,9 +234,11 @@ impl Kakehashi {
         // were held (see `judged_actions`). A stale region's actions are
         // dropped; the others in the answer chosen stay (under
         // `concatenated`, the host layer's and other regions'). Under a
-        // cross-layer `preferred` the host layer's answer is not in it once
-        // the virt layer won: a stale virt answer then leaves none, until
-        // the editor asks again.
+        // cross-layer `preferred` a virt answer already moved or stale as
+        // the race decided lost it to the host layer's (`parts_answer`);
+        // the host layer's answer is not in the one chosen, so a virt
+        // answer that was settling then and is dropped here, or that the
+        // host moved under since, leaves none, until the editor asks again.
         let result = match result {
             Ok(Some(parts)) => Ok(judged_actions(
                 self.bridge.pool(),
@@ -1031,16 +1043,97 @@ mod tests {
         assert!(!actions_answer(&[], false));
         // Across layers, by each part's source.
         let source = || Some(crate::lsp::lsp_impl::bridge_context::Sourced::unprepared(()));
-        assert!(!parts_answer(&vec![(vec![disabled_action()], source())]));
-        assert!(parts_answer(&vec![(vec![disabled_action()], None)]));
-        assert!(parts_answer(&vec![
-            (vec![disabled_action()], source()),
-            (vec![], None),
-            (
-                vec![CodeActionOrCommand::CodeAction(CodeAction::default())],
-                source()
-            ),
-        ]));
+        assert!(!parts_answer(
+            &vec![(vec![disabled_action()], source())],
+            |_| true
+        ));
+        assert!(parts_answer(&vec![(vec![disabled_action()], None)], |_| {
+            true
+        }));
+        assert!(parts_answer(
+            &vec![
+                (vec![disabled_action()], source()),
+                (vec![], None),
+                (
+                    vec![CodeActionOrCommand::CodeAction(CodeAction::default())],
+                    source()
+                ),
+            ],
+            |_| true
+        ));
+    }
+
+    /// Under a cross-layer `preferred`, a prepared region's actions that may
+    /// no longer be kept (moved, stale) are no answer of the virt layer: the
+    /// race falls through to the host layer's, waited for when it is still
+    /// running. Ones that may be (current, or settling and waited on after)
+    /// win as ever.
+    #[tokio::test]
+    async fn actions_that_may_not_be_kept_fall_through_to_the_host_layers() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        let action = |title: &str| {
+            vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                ..Default::default()
+            })]
+        };
+        let prepared_source = || {
+            let host = url::Url::parse("file:///test/race.md").unwrap();
+            let map = crate::lsp::bridge::apply_prepare_result(
+                "a",
+                &crate::lsp::bridge::VirtualLayout::single("a"),
+                None,
+            )
+            .unwrap()
+            .map;
+            Some(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host,
+                    "lua",
+                    "r",
+                    &map,
+                    1,
+                    0,
+                ),
+            )
+        };
+        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+            let virt: ActionParts = vec![(action("virt"), prepared_source())];
+            let host = async move {
+                tokio::time::sleep(std::time::Duration::from_millis(host_delay_ms)).await;
+                Ok(Some(vec![(action("host"), None)]))
+            };
+            let won = race_layers_preferred(
+                &[Virt, Host, Native],
+                std::future::ready(Ok(Some(virt))),
+                host,
+                std::future::ready(Ok(None)),
+                |parts: &ActionParts| parts_answer(parts, |_| may_keep),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let titles: Vec<_> = won
+                .iter()
+                .flat_map(|(actions, _)| actions)
+                .map(|action| match action {
+                    CodeActionOrCommand::CodeAction(action) => action.title.clone(),
+                    CodeActionOrCommand::Command(command) => command.title.clone(),
+                })
+                .collect();
+            assert_eq!(
+                titles,
+                [if may_keep { "virt" } else { "host" }],
+                "{may_keep} {host_delay_ms}"
+            );
+        }
+        // An unprepared part is not read.
+        assert!(parts_answer(
+            &vec![(action("as is"), None)],
+            |_| unreachable!()
+        ));
     }
 
     /// The final check drops only a stale prepared region's actions; an
