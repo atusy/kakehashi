@@ -1778,6 +1778,8 @@ fn reapply_host_line_prefixes(
         .iter()
         .map(|&(line, _)| is_blank_line(line))
         .collect();
+    // The caller sizes the prefixes by the same text's LSP lines.
+    debug_assert_eq!(blank_rows.len(), host_line_prefixes.len());
     let lcp = region_common_prefix(host_line_prefixes, &blank_rows);
 
     // Reserve for the prefixes being prepended too (slight over-reserve when
@@ -1873,8 +1875,7 @@ fn is_blank_line(line: &str) -> bool {
 ///
 /// Taken over the rows of the original virtual text that hold text, since a
 /// blank row's prefix is not the region's (see
-/// [`reapply_host_line_prefixes`]). A row past `blank_rows` counts as holding
-/// text. When no row holds text, the blank rows' prefixes are all there is;
+/// [`reapply_host_line_prefixes`]). When no row holds text, the blank rows' prefixes are all there is;
 /// the LCP is then taken over every row but the trailing empty-prefix ones:
 /// a region whose content ends with '\n' carries one for the synthetic line
 /// bucket after the final newline, whose host prefix sits OUTSIDE the
@@ -2979,7 +2980,12 @@ mod tests {
 
     #[test]
     fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
-        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+        let text = pipeline_region_text(
+            "\nx\n",
+            "x\n",
+            &RegionOffset::new(1, 0),
+            &[String::new(), String::new(), String::new()],
+        );
 
         assert_eq!(text.as_deref(), Some("x\n"));
     }
