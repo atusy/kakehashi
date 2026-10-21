@@ -214,8 +214,9 @@ fn transform_edits(
 /// [`transform_workspace_edit_to_host`] for a prepared document: the
 /// request's virtual document's edits go back through the prepared map as
 /// one set the client applies together ([`Replayed`]), re-keyed to the
-/// host URI as on any document. `false` — the whole edit refused — when a set is
-/// refused, or when the edit cannot be read as one set of host edits:
+/// host URI as on any document. `Err`, with why — the whole edit refused —
+/// when a set is refused, or when the edit cannot be read as one set of
+/// host edits:
 ///
 /// - an edit made to the host URI directly reaches into the region's host
 ///   text (meeting it at an edge is not reaching in): it never went through

@@ -69,7 +69,7 @@ impl Kakehashi {
         // host text, which may have moved while it was held. A rename comes
         // once per action, like formatting, so the check waits for the
         // host's last edit to settle and its regions' holds to clear (see
-        // `formatting_sources_current`). A stale answer is answered as
+        // `Self::settled_answer`). A dropped answer is answered as
         // `ContentModified`, not `null` (which reads as nothing to rename):
         // an editor showing the error lets the user rename again (how it
         // is shown is the client's).
