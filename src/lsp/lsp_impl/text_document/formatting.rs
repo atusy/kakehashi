@@ -1744,21 +1744,22 @@ fn pipeline_region_text(
 /// without this step a blockquoted/indented injection loses its `> ` markers
 /// or indentation on every continuation line.
 ///
-/// - **Line count preserved** (output lines == region lines): each output
-///   line `i` re-gains its own original prefix `host_line_prefixes[i]` — a
-///   1:1 mapping, exact even when prefixes differ per line (nested
-///   blockquotes).
+/// A *row* is a line of `original_virtual`; output line `i` lands on row `i`.
+///
+/// - **Line count preserved** (output lines == rows): each output line `i`
+///   re-gains its own original prefix `host_line_prefixes[i]` — a 1:1
+///   mapping, exact even when prefixes differ per line (nested blockquotes)
+///   — except text landing on a blank row (below).
 /// - **Line count changed**: the pipeline computes no diff/alignment, so
 ///   every continuation line takes the region's longest common prefix — exact
 ///   for the usual uniform-prefix region, a documented limitation otherwise.
-///   Symmetrically, a trailing **empty** output line stays unprefixed — it
-///   abuts the host's own prefix at the region end.
-/// - **Blank rows** of `original_virtual` say nothing about the region's
-///   prefix: a list item's fence leaves them unindented (no prefix) and a
-///   blockquote leaves its marker without the space (`>`). So the LCP is
-///   taken over the rows holding text ([`region_common_prefix`]), and output
-///   text that lands on a blank row takes the LCP when the row's own prefix
-///   falls short of it.
+///   A trailing **empty** output line stays unprefixed — it abuts the host's
+///   own prefix at the region end.
+/// - **Blank rows** say nothing about the region's prefix: a list item's
+///   fence may leave them unindented (no prefix) and a blockquote leaves its
+///   marker without the space (`>`). So the LCP is taken over the rows
+///   holding text ([`region_common_prefix`]), and output text that lands on a
+///   blank row takes the LCP when the row's own prefix falls short of it.
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
@@ -1872,17 +1873,19 @@ fn is_blank_line(line: &str) -> bool {
     line.chars().all(|c| c == ' ' || c == '\t')
 }
 
-/// The host prefix shared by the region's lines, for output lines with no
-/// original counterpart (Decision point 4).
+/// The host prefix shared by the region's rows, for output lines with no
+/// original counterpart and for text written on a blank row (Decision
+/// point 4).
 ///
 /// Taken over the rows of the original virtual text that hold text, since a
 /// blank row's prefix is not the region's (see
-/// [`reapply_host_line_prefixes`]). When no row holds text, the blank rows' prefixes are all there is;
-/// the LCP is then taken over every row but the trailing empty-prefix ones:
-/// a region whose content ends with '\n' carries one for the synthetic line
-/// bucket after the final newline, whose host prefix sits OUTSIDE the
-/// replacement range (the range ends at its column 0), and including it
-/// would collapse the LCP to "" for a blockquoted fence of blank rows.
+/// [`reapply_host_line_prefixes`]). That leaves out the synthetic row after
+/// a final '\n' too: it is blank, and its host prefix sits OUTSIDE the
+/// replacement range (the range ends at its column 0). When no row holds
+/// text, the blank rows' prefixes are all there is; the LCP is then taken
+/// over every row but the trailing empty-prefix ones, since including the
+/// synthetic row's would collapse it to "" for a blockquoted fence of blank
+/// rows.
 fn region_common_prefix<'a>(host_line_prefixes: &'a [String], blank_rows: &[bool]) -> &'a str {
     let holds_text = |i: usize| blank_rows.get(i) != Some(&true);
     if (0..host_line_prefixes.len()).any(holds_text) {
@@ -3100,7 +3103,7 @@ mod tests {
 
     #[test]
     fn reapply_lcp_keeps_trailing_empty_output_line_unprefixed() {
-        // Even with a uniformly non-empty prefix list, a trailing empty
+        // Even with `> ` on every content line, a trailing empty
         // output line abuts the host's own prefix on the region's end line —
         // prefixing it would double the marker (">> ```").
         let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
