@@ -1265,7 +1265,10 @@ impl PrepareRegistry {
                     // Nothing else would look the document up again before
                     // the next edit: sync the host once the backoff ends,
                     // unless newer text (or a newer epoch) has taken over by
-                    // then.
+                    // then. Holding the cell until then also keeps it from
+                    // eviction for its whole backoff (only a cell nothing
+                    // else references is evicted), so a lookup of its input
+                    // meanwhile keeps its misses rather than asking afresh.
                     let host_uri = job.host_uri.clone();
                     let cell = Arc::clone(&cell);
                     tokio::spawn(async move {
@@ -2287,6 +2290,50 @@ mod tests {
                 cause: ResyncCause::Retry,
             })
         );
+    }
+
+    /// An input backing off after a miss is not evicted while it backs off,
+    /// even once the lifecycle pass moved off it through a burst past the
+    /// bound: its retry timer holds the cell for the whole backoff, so a
+    /// lookup of it (an undo) finds its misses, not a fresh cell asking at
+    /// once. Bounded so: one timer per miss, each ending with its backoff.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_backing_off_input_is_not_evicted_while_it_backs_off() {
+        let registry = PrepareRegistry::default();
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        // Cancelled with a code LSP lets a client retry: a miss at once.
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.0, -32800).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        registry.slot(
+            &target,
+            input(&host, "a"),
+            Holder::LifecyclePass,
+            target.epoch,
+        );
+        assert_eq!(
+            registry
+                .prepare(&pool, &target, input(&host, "a"))
+                .await
+                .err(),
+            Some(PrepareMiss::Unanswered)
+        );
+        // Typed on: held on other inputs, past the bound.
+        for text in ["b", "c", "d", "e", "f"] {
+            registry.slot(
+                &target,
+                input(&host, text),
+                Holder::LifecyclePass,
+                target.epoch,
+            );
+        }
+        let again = registry
+            .slot(&target, input(&host, "a"), Holder::Request, target.epoch)
+            .unwrap();
+        assert!(again.cell.backing_off());
+        assert_eq!(again.cell.misses.load(Ordering::Acquire), 1);
     }
 
     #[cfg(unix)]
