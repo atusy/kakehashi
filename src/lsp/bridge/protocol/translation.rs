@@ -520,6 +520,16 @@ pub(crate) fn translate_host_range_to_virtual(range: &mut Range, offset: &Region
     }
 }
 
+/// Whether non-empty host `range` holds nothing of the document `offset`
+/// translates it into: through a prepared map, a selection of only what the
+/// peer removed (a line's indentation, a blank line at the document's edge)
+/// is empty there, as no position of the prepared text lies inside it.
+pub(crate) fn host_range_selects_nothing(range: Range, offset: &RegionOffset) -> bool {
+    let mut virtual_range = range;
+    translate_host_range_to_virtual(&mut virtual_range, offset);
+    virtual_range.start >= virtual_range.end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +585,31 @@ mod tests {
         let mut pos = Position::new(11, 1);
         translate_host_position_to_virtual(&mut pos, &offset);
         assert_eq!(pos, Position::new(1, 0));
+    }
+
+    #[test]
+    fn a_host_range_of_only_a_removed_indent_selects_nothing() {
+        let offset = prepared_offset();
+        // Host line 11 is V line 1, `    y`, which lost two spaces.
+        let range = |start: (u32, u32), end: (u32, u32)| {
+            Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1))
+        };
+        assert!(host_range_selects_nothing(range((11, 0), (11, 2)), &offset));
+        assert!(host_range_selects_nothing(range((11, 1), (11, 2)), &offset));
+        // One kept space, or the line break before the indent, is something.
+        assert!(!host_range_selects_nothing(
+            range((11, 0), (11, 3)),
+            &offset
+        ));
+        assert!(!host_range_selects_nothing(
+            range((10, 10), (11, 2)),
+            &offset
+        ));
+        // Unprepared, every character is kept.
+        assert!(!host_range_selects_nothing(
+            range((11, 0), (11, 2)),
+            &RegionOffset::new(10, 4)
+        ));
     }
 
     #[test]
