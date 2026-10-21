@@ -363,7 +363,9 @@ rewritten may be refused.
 
 A rename's or a code action's workspace edit, and a server's
 `workspace/applyEdit`, are one set of edits per document the client
-applies together. The request's virtual document's edits are **replayed**:
+applies together. The request's virtual document's edits are **replayed**
+(an end at the start of the line just past P's last naming P's end, as in
+a formatting answer: a whole-document replacement's):
 taken in P's order and grouped where they touch (one ending where the next
 starts, two inserting at one place). A group within one line (neither what
 it replaces nor its text holds a line break) creates no line and regains no
