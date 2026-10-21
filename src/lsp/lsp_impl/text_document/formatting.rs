@@ -349,10 +349,23 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
+            // Same-range query alternatives are tried in discovery priority
+            // order, but an unconfigured or explicitly disabled language is
+            // not a winner. Reserve the span only after planning so the first
+            // executable alternative formats it; later executable layers are
+            // suppressed to keep emitted edits non-overlapping.
+            let span = (
+                resolved.region.byte_range.start,
+                resolved.region.byte_range.end,
+            );
+            if seen_edit_ranges.contains(&span) {
+                continue;
+            }
             // A prepared document's edits are not mapped back through its map:
             // closed as a non-contiguous one is. Asked only of a region that
-            // formats: one that would not sends no request, so its peer is
-            // not waited for and no failure of it is counted.
+            // formats: one that would not, being unplanned or its span taken,
+            // sends no request, so its peer is not waited for and no failure
+            // of it is counted. One closed or unprepared takes no span.
             match self
                 .method_gate(uri, language_name, resolved, "textDocument/formatting")
                 .await
@@ -366,17 +379,7 @@ impl Kakehashi {
                     continue;
                 }
             }
-            // Same-range query alternatives are tried in discovery priority
-            // order, but an unconfigured or explicitly disabled language is
-            // not a winner. Reserve the span only after planning so the first
-            // executable alternative formats it; later executable layers are
-            // suppressed to keep emitted edits non-overlapping.
-            if !seen_edit_ranges.insert((
-                resolved.region.byte_range.start,
-                resolved.region.byte_range.end,
-            )) {
-                continue;
-            }
+            seen_edit_ranges.insert(span);
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
