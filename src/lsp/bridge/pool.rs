@@ -363,27 +363,34 @@ pub(crate) struct HostVirtualContents {
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
     contents: DashMap<String, DashMap<String, LatestText>>,
-    /// (language, region id) of the regions the lifecycle pass holds for a
-    /// prepare peer known to prepare them (see
-    /// [`LanguageServerPool::hold_latest_virtual_content`]): no request opens
-    /// one with text as is. Whether a peer failed one is the registry's to
-    /// say (see [`LanguageServerPool::prepare_failed`]). `None` for a pool
-    /// that prepares nothing, which holds nothing: no map is allocated for
-    /// each host it opens.
-    held: Option<dashmap::DashSet<(String, String)>>,
-    /// How many entries `held` has: read in place of `held`'s emptiness,
-    /// which locks every shard, on every lazy open and every recorded text.
-    held_count: std::sync::atomic::AtomicUsize,
 }
 
-impl HostVirtualContents {
-    /// Whether the lifecycle pass holds `(language, region_id)` (see `held`).
-    fn holds(&self, language: &str, region_id: &str) -> bool {
-        self.held_count.load(Ordering::Acquire) > 0
-            && self
-                .held
-                .as_ref()
-                .is_some_and(|held| held.contains(&(language.to_string(), region_id.to_string())))
+/// What a text meets for one region of one host, read at once from the
+/// prepare registry's table (see [`LanguageServerPool::region_admission`]).
+/// Everything is admitted without the prepare layer.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RegionAdmission {
+    /// The failure the lifecycle pass holds the region on stands at the
+    /// current epoch: no text as is goes through it.
+    failed: bool,
+    /// The lifecycle pass withholds the region for a prepare peer known to
+    /// prepare it, under the host's current incarnation (see
+    /// [`LanguageServerPool::hold_latest_virtual_content`]): no request
+    /// opens it with text as is.
+    held: bool,
+}
+
+impl RegionAdmission {
+    /// Whether a text from `map` (`None`: a text as is) is refused for its
+    /// failure: a map its peer revoked since (see `PreparedMap::revoked`),
+    /// or a text as is while the region's failure stands.
+    fn refuses_answer(&self, map: Option<&super::protocol::PreparedMap>) -> bool {
+        map.map_or(self.failed, super::protocol::PreparedMap::revoked)
+    }
+
+    /// [`Self::refuses_answer`], or a text as is of a withheld region.
+    fn refuses(&self, map: Option<&super::protocol::PreparedMap>) -> bool {
+        self.refuses_answer(map) || map.is_none() && self.held
     }
 }
 
@@ -453,6 +460,15 @@ impl LatestText {
             && (super::protocol::PreparedMap::same_answer(held.map, content.map)
                 || super::protocol::PreparedMap::taken_before(content.map, held.map))
     }
+}
+
+/// The error an open refused by its region's admission fails with (see
+/// [`RegionAdmission`]).
+fn held_for_prepare_peer() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "bridge: the region is held for its prepare peer",
+    )
 }
 
 /// The error a send of a text from a revoked answer fails with: nothing was
@@ -2803,11 +2819,8 @@ impl LanguageServerPool {
                 .held_text(&virtual_uri.to_uri_string(), connection_key)
                 .is_some_and(|held| held.map.is_some())
                 || self
-                    .latest_virtual_contents
-                    .get(host_uri)
-                    .is_some_and(|host| {
-                        host.holds(virtual_uri.language(), virtual_uri.region_id())
-                    }))
+                    .region_admission(host_uri, virtual_uri.language(), virtual_uri.region_id())
+                    .held)
     }
 
     async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
@@ -2829,34 +2842,19 @@ impl LanguageServerPool {
         // A region its peer failed opens with no text from an answer taken
         // before it failed (the peer no longer gives that answer), as the
         // registry says the moment it is recorded.
-        let region_held = || {
-            self.prepares()
-                && self
-                    .latest_virtual_contents
-                    .get(host_uri)
-                    .is_some_and(|host| host.holds(virtual_uri.language(), virtual_uri.region_id()))
-        };
+        let admission =
+            || self.region_admission(host_uri, virtual_uri.language(), virtual_uri.region_id());
         // Whatever the text comes from: a snapshot checked against the
         // host's revision too, as the hold can come after it was taken
         // without moving that revision (an epoch move gaining the pair its
         // peer).
-        let refused = |content: &VirtualOpenContent<'_>, held: bool| {
-            let (VirtualOpenContent::LatestKnown(provided)
-            | VirtualOpenContent::Snapshot(provided)) = content;
-            self.prepare_failed(
-                host_uri,
-                virtual_uri.language(),
-                virtual_uri.region_id(),
-                provided.map.map(|map| &**map),
-            ) || provided.map.is_none() && held
-        };
-        if refused(&content, region_held()) {
+        let (VirtualOpenContent::LatestKnown(provided) | VirtualOpenContent::Snapshot(provided)) =
+            content;
+        let provided_map = provided.map.map(|map| &**map);
+        if admission().refuses(provided_map) {
             drop(transition_guard);
             self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "bridge: the region is held for its prepare peer",
-            ));
+            return Err(held_for_prepare_peer());
         }
         if !self
             .document_tracker
@@ -2950,23 +2948,23 @@ impl LanguageServerPool {
             .await;
         // Asked again now that the document is registered: the lifecycle
         // pass publishes a hold before its close sweep, which finds only
-        // registered documents. A hold published while this open awaited
-        // its claim, and swept past it, is seen here; one published after
-        // this read is followed by a sweep that finds the document and
-        // closes it.
-        let region_held = region_held();
-        if refused(&content, region_held) {
-            self.document_tracker
-                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
-                .await;
-            claim_guard.disarm();
-            drop(claim_guard);
-            drop(transition_guard);
-            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "bridge: the region is held for its prepare peer",
-            ));
+        // registered documents (an ordering kept on purpose: publishing at
+        // the lookup instead would refuse opens the sweep closes today). A
+        // hold published while this open awaited its claim, and swept past
+        // it, is seen here; one published after this read is followed by a
+        // sweep that finds the document and closes it.
+        let registered = admission();
+        if registered.refuses(provided_map) {
+            self.abandon_claimed_open(
+                host_uri,
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
+            )
+            .await;
+            return Err(held_for_prepare_peer());
         }
         // A deferred open refreshes from the forwarded-content cache as close
         // to enqueue as possible. A revision-guarded repair already owns newer
@@ -3004,30 +3002,23 @@ impl LanguageServerPool {
                 provided
                     .map
                     .is_none_or(|request| cached.recorded() > request.built())
-                    && (cached.map().is_some() || !region_held)
+                    && (cached.map().is_some() || !registered.held)
             })
             .map_or(provided, LatestText::as_sent);
         // Checked again on the text it sends when that is the cached one:
         // an answer its peer failed since is not opened, whichever it is.
-        if latest_known
-            && self.prepare_failed(
+        // (Its failure alone: a hold was read on it above.)
+        if latest_known && admission().refuses_answer(virtual_content.map.map(|map| &**map)) {
+            self.abandon_claimed_open(
                 host_uri,
-                virtual_uri.language(),
-                virtual_uri.region_id(),
-                virtual_content.map.map(|map| &**map),
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
             )
-        {
-            self.document_tracker
-                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
-                .await;
-            claim_guard.disarm();
-            drop(claim_guard);
-            drop(transition_guard);
-            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "bridge: the region is held for its prepare peer",
-            ));
+            .await;
+            return Err(held_for_prepare_peer());
         }
         // What the connection holds is recorded as the didOpen is queued,
         // taken back unless it is (see `DocumentTracker::record_and_queue`):
@@ -3054,13 +3045,15 @@ impl LanguageServerPool {
                 .unwrap_or_else(|| Err(revoked_text(virtual_uri)))
         });
         if let Err(e) = queued {
-            self.document_tracker
-                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
-                .await;
-            claim_guard.disarm();
-            drop(claim_guard);
-            drop(transition_guard);
-            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            self.abandon_claimed_open(
+                host_uri,
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
+            )
+            .await;
             return Err(e);
         }
         // Once didOpen has entered the FIFO, promotion must outlive cancellation
@@ -3113,6 +3106,26 @@ impl LanguageServerPool {
             ));
         }
         Ok(())
+    }
+
+    /// Give up an open whose didOpen was not queued: its claim rolled back,
+    /// then its transition released.
+    async fn abandon_claimed_open(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        mut claim_guard: OpenClaimGuard,
+        transition_guard: tokio::sync::OwnedMutexGuard<()>,
+        transition: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.document_tracker
+            .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim_guard.claim)
+            .await;
+        claim_guard.disarm();
+        drop(claim_guard);
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, transition);
     }
 
     pub(crate) fn record_latest_virtual_content<'a>(
@@ -3171,14 +3184,10 @@ impl LanguageServerPool {
             }
         }
         // Only once the text to open with is in: a request checking the hold
-        // in between would open the text it replaces.
-        if host.held_count.load(Ordering::Acquire) > 0
-            && host.held.as_ref().is_some_and(|held| {
-                held.remove(&(language.to_string(), region_id.to_string()))
-                    .is_some()
-            })
-        {
-            host.held_count.fetch_sub(1, Ordering::AcqRel);
+        // in between would open the text it replaces. Under the host's
+        // guard, as the hold is set: a close waits for both.
+        if stamped && let Some(failures) = self.prepare_failures.get() {
+            failures.release(host_uri, language, region_id, incarnation);
         }
     }
 
@@ -3194,17 +3203,17 @@ impl LanguageServerPool {
         language: &str,
         region_id: &str,
     ) {
-        if let Some(host) = self.latest_virtual_contents.get(host_uri)
+        // Nothing is held without the prepare layer. Kept in the prepare
+        // registry's table by the incarnation it is for: read under another
+        // (a reopen's), it holds nothing.
+        if self.prepares()
+            && let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
-            && let Some(held) = &host.held
         {
-            // Counted before it is held, undone if it was held already: the
-            // count never reads below what `held` holds (removals take the
-            // entry out first), so no open sees a held region as free.
-            host.held_count.fetch_add(1, Ordering::AcqRel);
-            if !held.insert((language.to_string(), region_id.to_string())) {
-                host.held_count.fetch_sub(1, Ordering::AcqRel);
-            }
+            self.prepare_failures
+                .get_or_init(Default::default)
+                .withhold(host_uri, language, region_id, incarnation);
+            drop(host);
         }
     }
 
@@ -3269,7 +3278,7 @@ impl LanguageServerPool {
     /// for `region_id` (under `language`) of `host_uri`: a map its peer
     /// revoked since (see `PreparedMap::revoked`), or a text as is while the
     /// failure the lifecycle pass holds the region on stands (see
-    /// `PrepareFailures::region_failed`). Such a request reads no
+    /// `PrepareFailures::admission`). Such a request reads no
     /// coordinates through it, as no push is placed through it. Read as the
     /// failure is recorded; never without the prepare layer.
     pub(crate) fn prepare_failed(
@@ -3281,9 +3290,30 @@ impl LanguageServerPool {
     ) -> bool {
         match answer {
             Some(map) => map.revoked(),
-            None => self.prepare_failures.get().is_some_and(|failures| {
-                failures.region_failed(host_uri, language, region_id, self.prepare_epoch())
-            }),
+            None => self.region_admission(host_uri, language, region_id).failed,
+        }
+    }
+
+    /// What a text meets for `region_id` (under `language`) of `host_uri`
+    /// (see [`RegionAdmission`]): the one read of the prepare registry's
+    /// table every open and request goes through, at the current epoch and
+    /// host incarnation. Nothing is read without the prepare layer.
+    pub(crate) fn region_admission(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+    ) -> RegionAdmission {
+        let Some(failures) = self.prepare_failures.get() else {
+            return RegionAdmission::default();
+        };
+        let standing = failures.admission(host_uri, language, region_id, self.prepare_epoch());
+        RegionAdmission {
+            failed: standing.failed,
+            held: self.prepares()
+                && standing.withheld.is_some_and(|incarnation| {
+                    self.current_host_incarnation(host_uri) == Some(incarnation)
+                }),
         }
     }
 
@@ -3382,8 +3412,6 @@ impl LanguageServerPool {
                 incarnation,
                 promoted_language: None,
                 contents: DashMap::new(),
-                held: self.prepares().then(dashmap::DashSet::new),
-                held_count: std::sync::atomic::AtomicUsize::new(0),
             },
         );
     }
@@ -10314,34 +10342,71 @@ mod tests {
             },
         );
         assert!(
-            pool.latest_virtual_contents
-                .get(&host_uri)
-                .unwrap()
+            !pool
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
                 .held
-                .as_ref()
-                .unwrap()
-                .is_empty()
+        );
+        // Nothing is left of the region in the registry's table.
+        assert_eq!(
+            pool.prepare_failures_for_test().admission(
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                pool.prepare_epoch()
+            ),
+            Default::default()
         );
     }
 
-    /// A pool that prepares nothing holds nothing, and allocates no set of
-    /// held regions for each host it opens.
+    /// A pool that prepares nothing holds nothing, and builds no table to
+    /// hold regions in.
     #[tokio::test]
-    async fn a_pool_that_prepares_nothing_allocates_no_held_set() {
+    async fn a_pool_that_prepares_nothing_holds_nothing() {
         let host_uri = Url::parse("file:///test/no-held-set.md").unwrap();
-        let held_set = |pool: &LanguageServerPool| {
-            pool.latest_virtual_contents
-                .get(&host_uri)
-                .unwrap()
-                .held
-                .is_some()
-        };
         let plain = LanguageServerPool::new();
         plain.open_host_incarnation(&host_uri, 1).await;
-        assert!(!held_set(&plain));
+        plain.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(plain.prepare_failures.get().is_none());
+        assert!(
+            !plain
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        );
         let preparing = LanguageServerPool::preparing();
         preparing.open_host_incarnation(&host_uri, 1).await;
-        assert!(held_set(&preparing));
+        preparing.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(
+            preparing
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        );
+    }
+
+    /// A hold is the host incarnation's it was published under: a reopen
+    /// holds nothing, and a stale pass neither holds nor releases the
+    /// reopen's regions.
+    #[tokio::test]
+    async fn a_hold_stands_only_under_its_incarnation() {
+        let host_uri = Url::parse("file:///test/hold-incarnation.md").unwrap();
+        let pool = LanguageServerPool::preparing();
+        let held = || {
+            pool.region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        };
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(held());
+        pool.close_host_incarnation(&host_uri, 1).await;
+        assert!(!held(), "a closed host holds nothing");
+        pool.open_host_incarnation(&host_uri, 2).await;
+        assert!(!held(), "the reopen holds nothing of the closed lifetime");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(!held(), "a stale pass holds nothing");
+        pool.hold_latest_virtual_content(&host_uri, 2, "lua", TEST_ULID_LUA_0);
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "x");
+        assert!(held(), "a stale pass releases nothing");
+        pool.record_latest_virtual_content(&host_uri, 2, "lua", TEST_ULID_LUA_0, "x");
+        assert!(!held());
     }
 
     #[tokio::test]

@@ -239,6 +239,14 @@ struct Region {
     /// The input the lifecycle pass holds the document on: only its answer
     /// re-syncs the host, whoever started the attempt.
     held: Option<u64>,
+    /// The host incarnation under which the lifecycle pass withheld the
+    /// region for a prepare peer known to prepare it, until text is
+    /// recorded for it again (see [`PrepareFailures::withhold`]): no request
+    /// opens it with text as is meanwhile. Apart from `held`, which outlives
+    /// the answer and is set for any lookup: it is kept past a forget of the
+    /// region's answers (only a host's close takes it), and read only under
+    /// the incarnation it was set in.
+    withheld: Option<u64>,
 }
 
 impl Region {
@@ -254,6 +262,30 @@ impl Region {
 
     fn has(&self, cell: &Arc<Cell>) -> bool {
         self.slots.iter().any(|slot| Arc::ptr_eq(&slot.cell, cell))
+    }
+
+    fn bare(host_uri: &str, injection_language: &str, region_id: &str) -> Self {
+        Self {
+            host_uri: host_uri.to_string(),
+            injection_language: injection_language.to_string(),
+            region_id: region_id.to_string(),
+            slots: Vec::new(),
+            held: None,
+            withheld: None,
+        }
+    }
+
+    /// Whether nothing is kept for it: no answer, nothing held or withheld.
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty() && self.held.is_none() && self.withheld.is_none()
+    }
+
+    /// Forget its answers and what the lifecycle pass holds it on, keeping
+    /// only its withheld mark; `true` when nothing is left to keep.
+    fn forget_answers(&mut self) -> bool {
+        self.slots.clear();
+        self.held = None;
+        self.withheld.is_none()
     }
 
     fn held_cell(&self) -> Option<&Arc<Cell>> {
@@ -396,10 +428,11 @@ impl Revocations {
     }
 }
 
-/// The failures the lifecycle pass holds regions on, read from the
-/// registry's own table: what a request or a lazy open asks before it reads
-/// coordinates through a region, at the moment an answer is recorded, with
-/// no copy to wait for.
+/// The failures the lifecycle pass holds regions on, and the regions it
+/// withholds for their prepare peers, read from the registry's own table:
+/// what a request or a lazy open asks before it reads coordinates through a
+/// region, or opens it with text as is, at the moment an answer is recorded,
+/// with no copy to wait for.
 #[derive(Clone, Default)]
 pub(crate) struct PrepareFailures {
     regions: Arc<Regions>,
@@ -408,29 +441,86 @@ pub(crate) struct PrepareFailures {
     revocations: Arc<Revocations>,
 }
 
+/// What the registry's table says of a text as is for one region, read
+/// under one guard (see [`PrepareFailures::admission`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RegionStanding {
+    /// The failure the lifecycle pass holds the region on stands at the
+    /// epoch asked about, so the region is not bridged.
+    pub(crate) failed: bool,
+    /// The host incarnation the region is withheld under, if any (see
+    /// `Region::withheld`).
+    pub(crate) withheld: Option<u64>,
+}
+
 impl PrepareFailures {
-    /// Whether a text as is is refused for `region_id` (under
-    /// `injection_language`) of `host_uri`: the failure the lifecycle pass
-    /// holds the region on stands at `epoch`, so the region is not bridged.
-    /// (Whether a prepared text is refused is the map's own to say: see
+    /// What a text as is meets for `region_id` (under `injection_language`)
+    /// of `host_uri` at `epoch` (see [`RegionStanding`]). (Whether a
+    /// prepared text is refused is the map's own to say: see
     /// `PreparedMap::revoked`.)
-    pub(crate) fn region_failed(
+    pub(crate) fn admission(
         &self,
         host_uri: &Url,
         injection_language: &str,
         region_id: &str,
         epoch: u64,
-    ) -> bool {
+    ) -> RegionStanding {
         let host_uri = host_uri.as_str();
         self.regions
             .get(&region_hash(host_uri, injection_language, region_id))
             .filter(|region| region.is(host_uri, injection_language, region_id))
-            .and_then(|region| {
-                region.held_cell().map(|cell| {
+            .map(|region| RegionStanding {
+                failed: region.held_cell().is_some_and(|cell| {
                     matches!(cell.outcome.get(), Some(Answer::Unusable)) && cell.epoch == epoch
-                })
+                }),
+                withheld: region.withheld,
             })
-            .unwrap_or(false)
+            .unwrap_or_default()
+    }
+
+    /// Withhold `region_id` (under `injection_language`) of `host_uri` for
+    /// its prepare peer under the host's `incarnation` (see
+    /// `Region::withheld`), keeping whatever else its region holds.
+    pub(crate) fn withhold(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        incarnation: u64,
+    ) {
+        let host_uri = host_uri.as_str();
+        let mut region = self
+            .regions
+            .entry(region_hash(host_uri, injection_language, region_id))
+            .or_insert_with(|| Region::bare(host_uri, injection_language, region_id));
+        if !region.is(host_uri, injection_language, region_id) {
+            // A hash collision with another region: start over.
+            *region = Region::bare(host_uri, injection_language, region_id);
+        }
+        region.withheld = Some(incarnation);
+    }
+
+    /// Text was recorded for `region_id` (under `injection_language`) of
+    /// `host_uri` under the host's `incarnation`: it is withheld no more.
+    pub(crate) fn release(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        incarnation: u64,
+    ) {
+        let host_uri = host_uri.as_str();
+        self.regions.remove_if_mut(
+            &region_hash(host_uri, injection_language, region_id),
+            |_, region| {
+                if region.is(host_uri, injection_language, region_id)
+                    && region.withheld == Some(incarnation)
+                {
+                    region.withheld = None;
+                }
+                region.is_empty()
+            },
+        );
     }
 
     /// An answer for `input`, taken at `taken` in the presentation order, as
@@ -499,8 +589,15 @@ impl PrepareFailures {
             );
             let _ = cell.outcome.set(Answer::Unusable);
         }
+        let hash = region_hash(host_uri.as_str(), injection_language, region_id);
+        // A withheld mark stays, as through any forget of its answers.
+        let withheld = self
+            .regions
+            .get(&hash)
+            .filter(|region| region.is(host_uri.as_str(), injection_language, region_id))
+            .and_then(|region| region.withheld);
         self.regions.insert(
-            region_hash(host_uri.as_str(), injection_language, region_id),
+            hash,
             Region {
                 host_uri: host_uri.to_string(),
                 injection_language: injection_language.to_string(),
@@ -510,6 +607,7 @@ impl PrepareFailures {
                     cell: Arc::new(cell),
                 }],
                 held: Some(0),
+                withheld,
             },
         );
     }
@@ -703,8 +801,9 @@ impl PrepareRegistry {
         })
     }
 
-    /// Forget one region: it was replaced or invalidated, or its pair lost
-    /// its peer. `injection_language` `None` forgets it under every language.
+    /// Forget one region's answers: it was replaced or invalidated, or its
+    /// pair lost its peer. `injection_language` `None` forgets it under
+    /// every language. Its withheld mark stays (see `Region::withheld`).
     pub(crate) fn forget_region(
         &self,
         host_uri: &Url,
@@ -714,13 +813,15 @@ impl PrepareRegistry {
         let host_uri = host_uri.as_str();
         match injection_language {
             Some(language) => {
-                if self
-                    .regions
-                    .remove_if(&region_hash(host_uri, language, region_id), |_, region| {
-                        region.is(host_uri, language, region_id)
-                    })
-                    .is_some()
-                {
+                let mut forgot = false;
+                self.regions.remove_if_mut(
+                    &region_hash(host_uri, language, region_id),
+                    |_, region| {
+                        forgot = region.is(host_uri, language, region_id);
+                        forgot && region.forget_answers()
+                    },
+                );
+                if forgot {
                     self.held_changes.fetch_add(1, Ordering::AcqRel);
                 }
             }
@@ -730,14 +831,15 @@ impl PrepareRegistry {
         }
     }
 
-    /// Forget the regions `goes` accepts, noting a change of what is held
-    /// only when one went (an unchanged registry keeps its cached scan).
+    /// Forget the answers of the regions `goes` accepts, keeping their
+    /// withheld marks (see `Region::withheld`), noting a change of what is
+    /// held only when one went (an unchanged registry keeps its cached scan).
     fn forget_where(&self, goes: impl Fn(&Region) -> bool) {
         let mut removed = false;
         self.regions.retain(|_, region| {
             let gone = goes(region);
             removed |= gone;
-            !gone
+            !gone || !region.forget_answers()
         });
         if removed {
             self.held_changes.fetch_add(1, Ordering::AcqRel);
@@ -803,7 +905,17 @@ impl PrepareRegistry {
         {
             self.closed_hosts.remove(&oldest);
         }
-        self.forget_where(|region| region.host_uri == host_uri.as_str());
+        // Withheld marks too: they were set under the incarnation that
+        // closed, which no open reads them under.
+        let mut removed = false;
+        self.regions.retain(|_, region| {
+            let gone = region.host_uri == host_uri.as_str();
+            removed |= gone;
+            !gone
+        });
+        if removed {
+            self.held_changes.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Settle `input`'s answer as an attempt would, the lifecycle pass
@@ -878,22 +990,13 @@ impl PrepareRegistry {
         self.used.store(true, Ordering::Release);
         let key = input_key(target, input);
         let hash = region_hash(host_uri, input.injection_language, input.region_id);
-        let mut region = self.regions.entry(hash).or_insert_with(|| Region {
-            host_uri: host_uri.to_string(),
-            injection_language: input.injection_language.to_string(),
-            region_id: input.region_id.to_string(),
-            slots: Vec::new(),
-            held: None,
-        });
+        let mut region = self
+            .regions
+            .entry(hash)
+            .or_insert_with(|| Region::bare(host_uri, input.injection_language, input.region_id));
         if !region.is(host_uri, input.injection_language, input.region_id) {
             // A hash collision with another region: start over.
-            *region = Region {
-                host_uri: host_uri.to_string(),
-                injection_language: input.injection_language.to_string(),
-                region_id: input.region_id.to_string(),
-                slots: Vec::new(),
-                held: None,
-            };
+            *region = Region::bare(host_uri, input.injection_language, input.region_id);
         }
         // Moved off an input of the same epoch, answered or not: an edit.
         // Typing ahead of a slow peer moves off pending inputs, and those
@@ -2489,6 +2592,63 @@ mod tests {
         assert_eq!(retry_delay(6), Duration::from_secs(32));
         assert_eq!(retry_delay(7), Duration::from_secs(60));
         assert_eq!(retry_delay(100), Duration::from_secs(60));
+    }
+
+    /// A withheld mark outlives every forget of its region's answers, as
+    /// the lifecycle pass's hold does until text is recorded, and reads as
+    /// no answer: only a host's close, or a release, takes it.
+    #[test]
+    fn a_withheld_mark_outlives_forgetting_its_answers() {
+        let registry = PrepareRegistry::default();
+        let failures = registry.failures();
+        let pool = LanguageServerPool::preparing();
+        let target = unstartable_target(&pool);
+        let host = Url::parse("file:///host.md").unwrap();
+        let withheld = || {
+            failures
+                .admission(&host, "lua", REGION, target.epoch)
+                .withheld
+        };
+        let forgets: [&dyn Fn(); 4] = [
+            &|| registry.forget_region(&host, Some("lua"), REGION),
+            &|| registry.forget_region(&host, None, REGION),
+            &|| registry.forget_regions(&host, &[REGION.to_string()]),
+            &|| registry.forget_region_except(&host, REGION, None),
+        ];
+        for forget in forgets {
+            registry.slot(
+                &target,
+                input(&host, "a"),
+                Holder::LifecyclePass,
+                target.epoch,
+            );
+            failures.withhold(&host, "lua", REGION, 7);
+            forget();
+            assert_eq!(withheld(), Some(7));
+            assert_eq!(
+                registry.region(&host, "lua", REGION, target.epoch),
+                RegionPrepare::default(),
+                "its answers are gone"
+            );
+            assert!(!registry.any_region_prepared(target.epoch));
+            assert!(!registry.host_has_pending(&host, target.epoch));
+        }
+        // A release under another incarnation keeps it; its own takes it,
+        // and the region with it.
+        failures.release(&host, "lua", REGION, 6);
+        assert_eq!(withheld(), Some(7));
+        failures.release(&host, "lua", REGION, 7);
+        assert_eq!(withheld(), None);
+        assert!(registry.regions.is_empty());
+        // A close takes it.
+        failures.withhold(&host, "lua", REGION, 7);
+        registry.forget_host(&host);
+        assert_eq!(withheld(), None);
+        assert!(registry.regions.is_empty());
+        // Withholding looks nothing up.
+        let fresh = PrepareRegistry::default();
+        fresh.failures().withhold(&host, "lua", REGION, 7);
+        assert!(fresh.unused());
     }
 
     #[test]
