@@ -1480,7 +1480,7 @@ async fn try_run(
         {
             continue;
         }
-        let failures_cleared = pool.prepare_start_failures_cleared();
+        let failures_cleared = pool.prepare_start_failures_cleared(name, &job.host_uri);
         let handle = match pool
             .get_or_create_connection_wait_ready_admitted(
                 name,
