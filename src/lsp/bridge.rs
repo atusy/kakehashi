@@ -92,6 +92,7 @@ pub(crate) use protocol::Revocation;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::host_position_within_region_bounds;
+pub(crate) use protocol::host_range_selects_nothing;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;

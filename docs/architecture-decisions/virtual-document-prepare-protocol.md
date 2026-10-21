@@ -190,7 +190,9 @@ position in P, such as one strictly inside a gap or on a deleted edge line,
 since the server would answer it for another place. A position inside
 indentation the peer removed names the start of its line in P (completion
 alone refuses it, see Edits): on-type formatting typed there answers for
-that line.
+that line. A range-formatting selection of only what the peer removed
+(indentation, deleted edge blank lines) is empty in P: it is not sent,
+as a selection lying only in a host prefix is not.
 
 The methods closed to a non-contiguous combined document — codeAction,
 colorPresentation, completion, formatting, inlayHint, linkedEditingRange,

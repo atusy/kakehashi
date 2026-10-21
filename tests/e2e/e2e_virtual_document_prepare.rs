@@ -627,6 +627,64 @@ fn on_type_formatting_with_the_caret_in_a_removed_indent_is_answered() {
 }
 
 #[test]
+fn a_selection_of_only_what_the_peer_removed_is_not_range_formatted() {
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let wire = dir.path().join("wire.log");
+    let sent = || {
+        std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("textDocument/rangeFormatting\t"))
+            .count()
+    };
+    // Each selection on its own document: (text, selection, reaches the
+    // server). One holding nothing the prepared text has (the removed
+    // indent, or a removed blank line) is empty there: no request, as for a
+    // selection only in a host prefix. One holding a character of the code
+    // is sent.
+    let one_line = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    let blank_first = "# t\n\n```lua\n\n  local x = 1; local y = 2\n```\n";
+    for (index, (text, (start, end), reaches)) in [
+        (one_line, ((3, 0), (3, 2)), false),
+        (one_line, ((3, 1), (3, 2)), false),
+        (blank_first, ((3, 0), (4, 0)), false),
+        (one_line, ((3, 0), (3, 3)), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = format!("file:///prepare/range-removed-{index}.md");
+        let code_line = if text == blank_first { 4 } else { 3 };
+        open(&mut client, &uri, text);
+        hover_with_retry(&mut client, &uri, code_line, 4);
+        let before = sent();
+        let response = client.send_request(
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": start.0, "character": start.1 },
+                    "end": { "line": end.0, "character": end.1 }
+                },
+                "options": { "tabSize": 2, "insertSpaces": true }
+            }),
+        );
+        assert!(response.get("error").is_none(), "{index}: {response}");
+        assert_eq!(sent() - before, usize::from(reaches), "{index}: {response}");
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            apply_edits(text, &edits) != text,
+            reaches,
+            "{index}: {response}"
+        );
+    }
+}
+
+#[test]
 fn the_concatenated_pipeline_formats_a_prepared_document() {
     let (mut client, _dir) = Setup {
         concatenated: true,

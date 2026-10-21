@@ -315,6 +315,22 @@ impl Kakehashi {
                 let Some(region_ctx) = spans.admit(span, region_ctx) else {
                     continue;
                 };
+                // A selection of only what the peer removed (indentation, a
+                // blank edge line) is empty in the prepared text: skipped as
+                // one in a host prefix is, its span kept, for this
+                // alternative found nothing selected there.
+                if let Some(map) = &region_ctx.prepared
+                    && crate::lsp::bridge::host_range_selects_nothing(
+                        clipped_host_range,
+                        &crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+                            region_ctx.resolved.region.line_range.start,
+                            region_ctx.resolved.line_column_offsets.clone(),
+                        )
+                        .with_prepared(Arc::clone(map)),
+                    )
+                {
+                    continue;
+                }
                 // Counted toward the final check only once its task returns edits
                 // (see `finalize_formatting_edits`).
                 let source = region_ctx.prepared.is_some().then(|| {
