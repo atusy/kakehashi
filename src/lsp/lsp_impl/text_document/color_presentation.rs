@@ -8,7 +8,9 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
-use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
+use crate::lsp::lsp_impl::bridge_context::{
+    Sourced, Verdict, parse_host_verbatim, poll_verdict, sources_verdict,
+};
 
 const METHOD: &str = "textDocument/colorPresentation";
 
@@ -216,7 +218,7 @@ impl ColorAnswer {
     }
 
     /// [`Self::still_current`], the prepared part judged once the host's
-    /// last edit settles (see `formatting::sources_verdict`).
+    /// last edit settles (see `bridge_context::sources_verdict`).
     async fn settled_presentations(
         self,
         pool: &crate::lsp::bridge::LanguageServerPool,
@@ -224,14 +226,11 @@ impl ColorAnswer {
         current_version: impl Fn() -> Option<u64>,
     ) -> Vec<ColorPresentation> {
         let keeps = match &self.prepared {
-            Some((source, _)) => super::formatting::sources_verdict(
-                pool,
-                tracker,
-                current_version,
-                std::iter::once(source),
-            )
-            .await
-            .keeps(),
+            Some((source, _)) => {
+                sources_verdict(pool, tracker, current_version, std::iter::once(source))
+                    .await
+                    .keeps()
+            }
             None => true,
         };
         self.still_current(|_| keeps)
@@ -381,12 +380,12 @@ fn prepared_may_keep(
     current_version: impl Fn() -> Option<u64>,
 ) -> bool {
     matches!(
-        super::formatting::poll_verdict(
+        poll_verdict(
             || source.still_current(pool, tracker, &current_version),
             || source.moved(current_version()),
             || source.settling(pool, tracker),
         ),
-        None | Some(super::formatting::Verdict::Current)
+        None | Some(Verdict::Current)
     )
 }
 
