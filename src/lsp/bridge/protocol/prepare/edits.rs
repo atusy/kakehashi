@@ -604,8 +604,9 @@ struct EdgeShape<'a> {
     text_breaks_line: bool,
     /// The removed indent of the existing line the change ends before.
     tail: Option<&'a str>,
-    /// The edit's text is empty, or what follows the change in V begins a
-    /// line of text (not a line break or the end).
+    /// The edit's text is empty, or the character after the change (P's, or
+    /// the first of a gap's V text when one starts right there) is neither a
+    /// line break nor the end.
     text_joins_line: bool,
     /// An empty insertion.
     inserts_nothing: bool,
