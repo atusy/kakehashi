@@ -2409,13 +2409,8 @@ pub(super) async fn sources_verdict<'a, T: 'a>(
         // Moved only by an edit: a host gone (no version) is no move, and
         // its answer, nothing left to settle, is stale.
         || {
-            current_version().is_some_and(|now| {
-                sources.clone().any(|source| {
-                    source
-                        .request_content_version()
-                        .is_some_and(|version| version != now)
-                })
-            })
+            let now = current_version();
+            sources.clone().any(|source| source.moved(now))
         },
         // Settling while every region can still become current: one that
         // never can makes the whole answer stale, whatever else settles.
@@ -2433,9 +2428,7 @@ pub(super) async fn sources_verdict<'a, T: 'a>(
 /// its text: no settling brings that back); `Stale` as soon as nothing is
 /// `settling` (no edit left to settle, no hold to clear: what `current`
 /// says stays so). Otherwise wait, polling, until one holds, `Unsettled`
-/// past `within`. Each poll reads `settling` before `current`: a settle
-/// landing between the two reads then shows in `current`, never as a
-/// `Stale` judged on what `current` said before it.
+/// past `within` (each look is one [`poll_verdict`]).
 pub(super) async fn settled_verdict(
     current: impl Fn() -> bool,
     moved: impl Fn() -> bool,
@@ -2444,20 +2437,35 @@ pub(super) async fn settled_verdict(
 ) -> Verdict {
     let deadline = tokio::time::Instant::now() + within;
     loop {
-        let settling = settling();
-        if current() {
-            return Verdict::Current;
-        }
-        if moved() {
-            return Verdict::Moved;
-        }
-        if !settling {
-            return Verdict::Stale;
+        if let Some(verdict) = poll_verdict(&current, &moved, &settling) {
+            return verdict;
         }
         if tokio::time::Instant::now() >= deadline {
             return Verdict::Unsettled;
         }
         tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// One look of [`settled_verdict`] at an answer, without waiting: the
+/// verdict once it can be judged, `None` while it is still settling.
+/// Reads `settling` before `current`: a settle landing between the two
+/// reads then shows in `current`, never as a `Stale` judged on what
+/// `current` said before it.
+pub(super) fn poll_verdict(
+    current: impl Fn() -> bool,
+    moved: impl Fn() -> bool,
+    settling: impl Fn() -> bool,
+) -> Option<Verdict> {
+    let settling = settling();
+    if current() {
+        Some(Verdict::Current)
+    } else if moved() {
+        Some(Verdict::Moved)
+    } else if !settling {
+        Some(Verdict::Stale)
+    } else {
+        None
     }
 }
 

@@ -492,12 +492,17 @@ impl<T> Sourced<T> {
         })
     }
 
-    /// The host's content version the request's text was read at, for an
-    /// answer mapped through a prepared map.
-    pub(crate) fn request_content_version(&self) -> Option<u64> {
-        self.prepared
-            .as_ref()
-            .and_then(|source| source.content_version)
+    /// Whether the host was edited since the request read its text: its
+    /// content version `now` is not the one read before the request's
+    /// text, for an answer mapped through a prepared map. A host gone
+    /// (`now` is `None`) is no move.
+    pub(crate) fn moved(&self, now: Option<u64>) -> bool {
+        now.is_some_and(|now| {
+            self.prepared
+                .as_ref()
+                .and_then(|source| source.content_version)
+                .is_some_and(|version| version != now)
+        })
     }
 
     /// Whether the edits mapped into the answer still land where they were
