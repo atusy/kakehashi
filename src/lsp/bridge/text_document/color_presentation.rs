@@ -22,6 +22,7 @@ use super::super::protocol::{
     translate_host_range_to_virtual, translate_virtual_main_and_additional_edits_to_host,
     translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
 };
+use super::keep_additional_edits_if_safe;
 
 impl LanguageServerPool {
     /// Send a color presentation request and wait for the response.
@@ -227,23 +228,16 @@ fn transform_color_presentation_response_to_host(
                 translate_virtual_text_edits_to_host(additional_edits, offset, EditMode::Extent);
         }
 
-        // ALL-OR-NOTHING (same reasoning as completion): the array can carry
-        // paired halves of one operation, so any unsafe member drops the
-        // whole array rather than half-applying it. The presentation is kept:
-        // its textEdit still applies, though possibly semantically incomplete
-        // — availability over fidelity, never corruption.
-        if let Some(additional_edits) = &presentation.additional_text_edits
-            && (!additional_kept
-            || !additional_edits
-                .iter()
-                .all(|edit| text_edit_safe_in_region(edit, offset, region_end)))
-        {
+        if let Some(dropped) = keep_additional_edits_if_safe(
+            &mut presentation.additional_text_edits,
+            additional_kept,
+            offset,
+            region_end,
+        ) {
             log::warn!(
                 target: "kakehashi::bridge",
-                "colorPresentation: dropped a presentation's additionalTextEdits ({}): a member is unsafe for the injection region",
-                additional_edits.len()
+                "colorPresentation: dropped a presentation's additionalTextEdits ({dropped}): a member is unsafe for the injection region",
             );
-            presentation.additional_text_edits = None;
         }
         true
     });
