@@ -504,11 +504,13 @@ elsewhere (Neovim asks code actions once per keypress), and an answer
 dropped only for that would be asked again only on the next keypress.
 Completion and inlay hints, asked again as the caret moves, do not wait.
 A rename comes once per action, like formatting: it waits as formatting
-does, and dropped, it is answered as `ContentModified`, so that the user
-can rename again rather than read it as nothing to rename (clients retry
-it on their own only where they list it to).
-prepareRename's range is display only, and its server's own rename is
-what is checked. Formatting reads whether the host moved
+does, and dropped, it is answered as `ContentModified` rather than as
+nothing to rename: an editor that shows the error lets the user rename
+again; how it is shown is the client's (VS Code's language client reads
+it as no result, as it would `null`), and none retries it on its own
+unless it lists the method to.
+A prepareRename range is judged as code actions are (waiting while the
+host's last edit settles, none once moved or stale). Formatting reads whether the host moved
 under its answer only when the final answer is chosen, not as each reply
 arrives: refused there, a reply would count as its server failing, and the
 fan-in would fall through to a server ranked below it whose reply came

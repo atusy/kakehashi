@@ -60,7 +60,8 @@ impl Kakehashi {
         // host's last edit to settle and its regions' holds to clear (see
         // `formatting_sources_current`). A stale answer is answered as
         // `ContentModified`, not `null` (which reads as nothing to rename):
-        // the user can rename again.
+        // an editor showing the error lets the user rename again (how it
+        // is shown is the client's).
         let Some(sourced) = answer else {
             return Ok(None);
         };
