@@ -374,10 +374,11 @@ meet are one) and diffed there against P exactly as a formatting answer is,
 with its budget and refusals: what it leaves alike stays as the host has it
 (a whitespace line's whitespace, a line the peer left alone), and its new
 lines regain the content's indentation — alike as the diff reads it: a new
-line written to the byte as a line already in the group (a header repeating
-one below) can be read as that line, the lines between it and its copy as
-rewritten, a whitespace line among them then taking the content's
-indentation. Such a group is refused, with the
+line reading as a line already in the group apart from its whitespace (a
+moved line re-indented under a new header, a header repeating one below)
+can be read as that line where repeated lines lie between them, those
+lines then read as rewritten, a whitespace line among them taking the
+content's indentation. Such a group is refused, with the
 whole edit, on a region the peer dedented unevenly, as a formatting answer
 is. Groups are diffed apart, never as one text: a whole-text diff could move
 a change onto another line reading the same in P (the first of two alike
