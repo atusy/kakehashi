@@ -65,16 +65,19 @@ fn concat_merge(vecs: Vec<Option<CodeActionResponse>>) -> Option<CodeActionRespo
 }
 
 /// Whether `actions` answer a `preferred` walk, winning over a server or
-/// layer ranked below: any action at all — but on a prepared document
-/// only an enabled one, where an action whose edit the map refused comes
-/// back disabled, and a server ranked below may map.
+/// layer ranked below: any action at all — but on a prepared document not
+/// one whose edit the map refused (it comes back disabled), where a server
+/// ranked below may map. An action its server disabled answers as on any
+/// document.
 fn actions_answer(actions: &[CodeActionOrCommand], prepared: bool) -> bool {
     if !prepared {
         return !actions.is_empty();
     }
     actions.iter().any(|action| match action {
         CodeActionOrCommand::Command(_) => true,
-        CodeActionOrCommand::CodeAction(action) => action.disabled.is_none(),
+        CodeActionOrCommand::CodeAction(action) => {
+            !crate::lsp::bridge::refused_by_prepared_map(action)
+        }
     })
 }
 
@@ -1145,17 +1148,24 @@ mod tests {
         }
     }
 
-    /// Under `preferred`, a prepared document's disabled actions (edits the
-    /// map refused) do not win over a server ranked below; an unprepared
-    /// one's answer counts whatever it holds, as before.
+    /// Under `preferred`, a prepared document's actions whose edits the map
+    /// refused do not win over a server ranked below; one its server
+    /// disabled does, as an unprepared one's answer counts whatever it
+    /// holds, as on main.
     #[test]
-    fn only_enabled_actions_answer_for_a_prepared_document() {
+    fn only_actions_the_map_refused_give_way_on_a_prepared_document() {
+        let server_disabled = CodeActionOrCommand::CodeAction(CodeAction {
+            title: "not here".into(),
+            disabled: Some(tower_lsp_server::ls_types::CodeActionDisabled {
+                reason: "the server says no".into(),
+            }),
+            ..Default::default()
+        });
+        assert!(actions_answer(std::slice::from_ref(&server_disabled), true));
         let disabled_action = || {
             CodeActionOrCommand::CodeAction(CodeAction {
                 title: "refused".into(),
-                disabled: Some(tower_lsp_server::ls_types::CodeActionDisabled {
-                    reason: "cannot map".into(),
-                }),
+                disabled: Some(crate::lsp::bridge::prepared_map_refusal_for_test()),
                 ..Default::default()
             })
         };
@@ -1276,9 +1286,7 @@ mod tests {
         let action = |title: &str, disabled: bool| {
             vec![CodeActionOrCommand::CodeAction(CodeAction {
                 title: title.into(),
-                disabled: disabled.then(|| tower_lsp_server::ls_types::CodeActionDisabled {
-                    reason: "cannot map".into(),
-                }),
+                disabled: disabled.then(crate::lsp::bridge::prepared_map_refusal_for_test),
                 ..Default::default()
             })]
         };

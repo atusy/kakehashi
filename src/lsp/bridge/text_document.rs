@@ -14,9 +14,11 @@ pub(crate) use call_hierarchy::{
 };
 mod color_presentation;
 
+#[cfg(test)]
+pub(crate) use code_action::prepared_map_refusal_for_test;
 pub(crate) use code_action::{
     CodeActionEnvelope, UpstreamCodeActionCaps, bridge_code_actions, extract_code_action_envelope,
-    parse_code_actions_leniently,
+    parse_code_actions_leniently, refused_by_prepared_map,
 };
 pub(crate) use code_lens::{envelope_host_code_lenses, extract_code_lens_envelope};
 mod completion;
