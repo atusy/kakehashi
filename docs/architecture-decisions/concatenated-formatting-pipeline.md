@@ -156,17 +156,18 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    region's common prefix when the line's own prefix falls short of it. When the
    formatter changes the line count, new lines have no original counterpart
    and — since the pipeline computes no diff/alignment — the **region's common
-   prefix** is applied to them: the longest leading host prefix shared by the
-   region's lines that hold text (their LCP), or, when no line holds text, by
-   all of its lines. A blank line's prefix is not the region's: a list item's
-   fence may leave its blank lines unindented and a blockquote leaves a blank
-   line's `>` without its space, so blank lines are left out of the LCP. This
-   is exact for the usual uniform-prefix injection (single-level indentation,
-   or a uniform `> `) and is a documented limitation for the rare region whose
+   prefix** is applied to every continuation line: the longest leading host
+   prefix shared by the region's lines that hold text (their LCP), or, when no
+   line holds text, by all of its lines but the synthetic one after the final
+   line break. A blank line's prefix is not the region's: a list item's fence
+   may leave its blank lines unindented and a blockquote leaves a blank line's
+   `>` without its space, so blank lines are left out of the LCP. This is exact
+   for the usual uniform-prefix injection (single-level indentation, or a
+   uniform `> `) and is a documented limitation for the rare region whose
    per-line prefixes genuinely differ across a line-count change. On **empty**
-   output lines the prefix's
-   trailing whitespace is trimmed (emit `>` not `> `, and leave a space-only prefix
-   off entirely) so the pipeline does not introduce trailing-whitespace violations.
+   output lines the prefix's trailing whitespace is trimmed (emit `>` not `> `,
+   and leave a space-only prefix off entirely) so the pipeline does not
+   introduce trailing-whitespace violations.
 
 5. **Range formatting stays on `preferred`.** Although `textDocument/rangeFormatting`
    shares this aggregation config (it resolves `strategy`/`priorities` under the
