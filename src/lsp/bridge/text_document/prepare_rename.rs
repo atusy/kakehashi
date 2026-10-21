@@ -377,6 +377,47 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_rename_range_across_a_quoted_line_break_maps_to_none() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // Blockquoted: each host line opens with `> `, left out of V.
+        let virtual_text = "a\nb\n";
+        let answer =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": []}]}))
+                .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let offset =
+            RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_prepared(prepared.map);
+        let response = |end: (u32, u32)| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": end.0, "character": end.1}},
+                "placeholder": "a"
+            }})
+        };
+        // In the host it would cover `a\n> b`: the new name would replace
+        // the next line's `> ` too.
+        assert!(
+            transform_prepare_rename_response_to_host(response((1, 1)), &offset)
+                .unwrap()
+                .is_none()
+        );
+        // Within its line it maps, after the `> `.
+        let Some(PrepareRenameResponse::RangeWithPlaceholder { range, .. }) =
+            transform_prepare_rename_response_to_host(response((0, 1)), &offset).unwrap()
+        else {
+            panic!("mapped");
+        };
+        assert_eq!(
+            (range.start, range.end),
+            (Position::new(3, 2), Position::new(3, 3))
+        );
+    }
+
+    #[test]
     fn a_prepared_documents_rename_range_maps_where_it_reads_alike() {
         let response = |start: (u32, u32), end: (u32, u32)| {
             json!({"jsonrpc": "2.0", "id": 1, "result": {

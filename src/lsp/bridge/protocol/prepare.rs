@@ -1063,13 +1063,9 @@ impl PreparedMap {
         )
     }
 
-    /// Whether a P range, mapped as ranges are (its start as positions, its
-    /// end after any run it ends inside), covers in V exactly the text it
-    /// covers in P: no indentation the peer removed, no hidden line nor gap
-    /// text inside it. A range a client shows as the text an action works
-    /// on (the symbol a rename will replace) or edits through in place
-    /// (linked ranges typed into together) is right only so: what it
-    /// stands for in the host is what the server saw.
+    /// [`Self::map_ranges_alike`] for one range, converted on its own: the
+    /// reference the batch is checked against.
+    #[cfg(test)]
     pub(crate) fn range_reads_alike(&self, range: tower_lsp_server::ls_types::Range) -> bool {
         if range.start > range.end {
             return false;
@@ -1087,11 +1083,17 @@ impl PreparedMap {
                 == self.virtual_lines.text[virtual_start..virtual_end]
     }
 
-    /// [`Self::range_reads_alike`] for every one of `ranges`, each mapped to
-    /// V as ranges are when all read alike (`None` otherwise): their ends
-    /// converted all at once, a pass over each line they fall on, not one
-    /// conversion each (many ranges on a long line, linked ones say, would
-    /// cost the line's length each).
+    /// Whether every one of `ranges`, P ranges mapped as ranges are (each
+    /// start as positions, each end after any run it ends inside), covers
+    /// in V exactly the text it covers in P: no indentation the peer
+    /// removed, no hidden line nor gap text inside it. A range a client
+    /// shows as the text an action works on (the symbol a rename will
+    /// replace) or edits through in place (linked ranges typed into
+    /// together) is right only so. Each is mapped to V as ranges are when
+    /// all read alike (`None` otherwise): their ends converted all at once,
+    /// a pass over each line they fall on, not one conversion each (many
+    /// ranges on a long line, linked ones say, would cost the line's length
+    /// each).
     pub(crate) fn map_ranges_alike(
         &self,
         ranges: &[tower_lsp_server::ls_types::Range],
