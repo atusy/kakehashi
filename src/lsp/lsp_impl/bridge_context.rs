@@ -453,11 +453,13 @@ impl<T> Sourced<T> {
     /// Read where an answer is chosen, and nowhere per reply: a reply refused
     /// as it arrived would count as no answer, and a server ranked below it
     /// replying once the host settled (the region's content unchanged) would
-    /// win. Completion and color presentations read it as the layer race
-    /// decides on the injected layer's answer, so a stale one falls through
-    /// to the host layer's; inlay hints only once the answer is chosen, a
-    /// stale answer's hints staying shown without their edits. Every carrier
-    /// reads it again as it returns the answer, after the last await.
+    /// win. Completion, and color presentations under `preferred`, read it
+    /// as the layer race decides on the injected layer's answer, so a stale
+    /// one falls through to the host layer's, and again as they return the
+    /// answer, after the last await. Color presentations under
+    /// `concatenated` read it once, after every layer answered, dropping only
+    /// a stale prepared part; inlay hints once the answer is chosen, a stale
+    /// answer's hints staying shown without their edits.
     pub(crate) fn still_current(
         &self,
         pool: &crate::lsp::bridge::LanguageServerPool,
