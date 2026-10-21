@@ -515,21 +515,15 @@ impl LanguageServerPool {
         // Already another (a newer text sent meanwhile), the lazy actions
         // cannot be enveloped, and are resolved here or dropped as for an
         // editor that cannot resolve them.
-        let held_generation = offset.prepared().and_then(|prepared| {
-            let host = crate::lsp::lsp_impl::url_to_uri(host_uri).ok()?;
-            let uri = VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string();
-            self.held_text(&uri, handle.key())
-                .filter(|held| PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared)))
-                .map(|held| held.generation)
+        let listing = offset.prepared().map(|prepared| {
+            let uri = crate::lsp::lsp_impl::url_to_uri(host_uri).ok().map(|host| {
+                VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string()
+            });
+            self.listing_on_prepared(uri.as_deref(), handle.key(), prepared, upstream_caps)
         });
-        let listed_on_held = offset.prepared().is_none() || held_generation.is_some();
-        let upstream_caps = if listed_on_held {
-            upstream_caps
-        } else {
-            UpstreamCodeActionCaps {
-                data_support: false,
-                ..upstream_caps
-            }
+        let (held_generation, upstream_caps, listed_on_held) = match listing {
+            Some(listing) => listing,
+            None => (None, upstream_caps, true),
         };
 
         // Phase 2: eager-resolve fallback. A client without resolve+data
@@ -1179,6 +1173,39 @@ fn finalize_virt_resolved_action(
 }
 
 impl LanguageServerPool {
+    /// How a prepared list's lazy actions are handed out, read as its reply
+    /// is: the generation of the text its server holds when that is still
+    /// the one `prepared` describes (for its envelopes to record), the
+    /// editor's capabilities as the policy reads them, and whether the
+    /// list was computed on the text its server holds. Once another text
+    /// was sent (other coordinates, or a newer generation), no envelope can
+    /// record it: the actions go as for an editor that cannot resolve them,
+    /// and are not resolved within the request either, whose every reply
+    /// would be discarded.
+    fn listing_on_prepared(
+        &self,
+        virtual_uri: Option<&str>,
+        connection_key: &ConnectionKey,
+        prepared: &PreparedMap,
+        upstream_caps: UpstreamCodeActionCaps,
+    ) -> (Option<u64>, UpstreamCodeActionCaps, bool) {
+        let held_generation = virtual_uri
+            .and_then(|uri| self.held_text(uri, connection_key))
+            .filter(|held| PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared)))
+            .map(|held| held.generation);
+        match held_generation {
+            Some(_) => (held_generation, upstream_caps, true),
+            None => (
+                None,
+                UpstreamCodeActionCaps {
+                    data_support: false,
+                    ..upstream_caps
+                },
+                false,
+            ),
+        }
+    }
+
     /// The map an action minted from a prepared document resolves through:
     /// the one its server holds for `virtual_uri` now, while that is the
     /// very text the action was listed on (the generation its envelope
@@ -2149,6 +2176,68 @@ mod tests {
             pool.prepared_action_held_map(&uri, &key, &envelope)
                 .is_none()
         );
+    }
+
+    /// A prepared list's lazy actions are enveloped with the generation of
+    /// the text its server holds while that is the list's; once another text
+    /// was sent, none is enveloped nor resolved within the request.
+    #[test]
+    fn a_prepared_list_envelopes_its_lazy_actions_only_while_its_text_is_held() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let listed = dedented("  a");
+        for sent_after in [None, Some("  b"), Some("  a")] {
+            let pool = LanguageServerPool::preparing();
+            let key = ConnectionKey::for_server("ruff");
+            let virtual_uri =
+                VirtualDocumentUri::new(&make_host_uri(), "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            let uri = virtual_uri.to_uri_string();
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &listed.text,
+                    map: Some(&listed.map),
+                },
+            );
+            let generation = pool.held_text(&uri, &key).unwrap().generation;
+            // A newer text, or the same one under other coordinates.
+            if let Some(text) = sent_after {
+                let mut other = dedented(text);
+                if text == "  a" {
+                    other =
+                        apply_prepare_result("  a", &VirtualLayout::single("  a"), None).unwrap();
+                }
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &other.text,
+                        map: Some(&other.map),
+                    },
+                );
+            }
+            let (held, caps, listed_on_held) =
+                pool.listing_on_prepared(Some(&uri), &key, &listed.map, caps_resolve());
+            if sent_after.is_none() {
+                assert_eq!(held, Some(generation));
+                assert!(caps.can_envelope() && listed_on_held);
+            } else {
+                assert_eq!(held, None, "{sent_after:?}");
+                assert!(!caps.can_envelope(), "{sent_after:?}");
+                assert!(
+                    !resolves_within_request(caps, listed_on_held),
+                    "{sent_after:?}"
+                );
+            }
+        }
     }
 
     /// Lazy actions are resolved within their request for an editor that
