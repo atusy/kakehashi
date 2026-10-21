@@ -2077,21 +2077,6 @@ impl Kakehashi {
             .flatten()
     }
 
-    /// Whether the lifecycle pass prepares a region's current document (or
-    /// holds it back for its peer). Not whether a server still holds a
-    /// prepared text of it (see
-    /// `BridgeCoordinator::region_coordinates_may_be_prepared`).
-    #[cfg(test)]
-    pub(crate) fn lifecycle_prepares(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
-        self.bridge
-            .prepare_region(
-                uri,
-                &resolved.injection_language,
-                &resolved.region.region_id,
-            )
-            .prepared
-    }
-
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
     /// given host language, injection language, and LSP method in a single call.
     ///
@@ -3529,7 +3514,18 @@ mod tests {
         answer: crate::lsp::bridge::PrepareAnswer,
     ) {
         answer_held(server, uri, resolved, answer, false);
-        assert!(!server.lifecycle_prepares(uri, resolved));
+        // The lifecycle pass neither prepares the region's document nor
+        // holds it back for its peer.
+        assert!(
+            !server
+                .bridge
+                .prepare_region(
+                    uri,
+                    &resolved.injection_language,
+                    &resolved.region.region_id,
+                )
+                .prepared
+        );
     }
 
     /// [`answer`], the lifecycle pass holding the document on it when
