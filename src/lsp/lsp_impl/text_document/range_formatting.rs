@@ -181,6 +181,27 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+            // Every overlapped region's prepare attempt started before any
+            // is waited for (see `formatting`).
+            crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+                &self.bridge,
+                &language_name,
+                all_regions
+                    .iter()
+                    .filter(|resolved| {
+                        !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                            resolved,
+                            "textDocument/rangeFormatting",
+                            false,
+                        ) && clip_request_to_region(
+                            &request_bytes,
+                            &resolved.region.byte_range,
+                            &mapper,
+                        )
+                        .is_some()
+                    })
+                    .map(|resolved| (&uri, resolved)),
+            );
             let mut spans = super::formatting::SpanReservations::default();
             for resolved in all_regions.iter() {
                 // Non-contiguous combined injections contain masked host-only

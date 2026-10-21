@@ -348,6 +348,23 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+        // Every region's prepare attempt started before any is waited for:
+        // the waits in the loop below then share attempts already running,
+        // the request waiting about the slowest, not one after another.
+        crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+            &self.bridge,
+            language_name,
+            all_regions
+                .iter()
+                .filter(|resolved| {
+                    !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                        resolved,
+                        "textDocument/formatting",
+                        false,
+                    )
+                })
+                .map(|resolved| (uri, resolved)),
+        );
         let mut spans = SpanReservations::default();
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
@@ -417,13 +434,11 @@ impl Kakehashi {
                 client_progress_token: None,
             };
             // The document as its servers see it: prepared when its peer
-            // prepares it, waiting for the answer (once the lifecycle pass
-            // has looked the document up it has started every region's
-            // attempt, so waiting for each in turn costs about the slowest
-            // one; a request before that waits for the lookup as well), and
-            // the method closed to it as
-            // the answer's shape says (a prepared one stays open, its edits
-            // mapped back through its map).
+            // prepares it, waiting for the answer (every region's attempt
+            // started above, so waiting for each in turn costs about the
+            // slowest one), and the method closed to it as the answer's
+            // shape says (a prepared one stays open, its edits mapped back
+            // through its map).
             let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
                 &self.bridge,
                 language_name,
