@@ -1169,6 +1169,59 @@ fn code_actions_the_host_moved_under_are_dropped() {
 }
 
 #[test]
+fn a_rename_range_the_host_moved_under_is_no_answer() {
+    // The echo mock answers prepareRename (the word at the position) only
+    // once released. Unedited, the word maps where the host has it; the
+    // host edited above the region while the request is out, its range,
+    // for the text before the edit, is no answer.
+    for moved in [false, true] {
+        let (mut client, dir) = Setup {
+            rename_after_release: true,
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/prepare-rename.md";
+        let text = "# t\n\n```lua\n  local x = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let id = client.send_request_async(
+            "textDocument/prepareRename",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+        );
+        let wire = dir.path().join("wire.log");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("textDocument/prepareRename\t"))
+        {
+            assert!(Instant::now() < until, "prepareRename not sent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if moved {
+            change(&mut client, uri, 2, &format!("# u\n{text}"));
+            hover(&mut client, uri, 0, 0);
+        }
+        std::fs::write(dir.path().join("release"), "").expect("release");
+        let response = client.receive_response_for_id_public(id);
+        assert!(response.get("error").is_none(), "{response}");
+        if moved {
+            assert!(response["result"].is_null(), "{response}");
+        } else {
+            assert_eq!(
+                response["result"],
+                json!({
+                    "start": { "line": 3, "character": 8 },
+                    "end": { "line": 3, "character": 9 }
+                }),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[test]
 fn downstream_sees_edge_blank_lines_deleted_and_the_host_keeps_them() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/edges.md";

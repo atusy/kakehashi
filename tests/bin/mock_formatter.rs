@@ -30,7 +30,8 @@
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting, range and on-type
 //!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
-//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists); linked
+//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists, as
+//!   prepareRename answers the word at the position); linked
 //!   editing ranges are every occurrence of the word at the position; code
 //!   actions are `echo-fix` (the first line replaced) and the lazy
 //!   `echo-wrap` (resolved: the document wrapped in `do`/`end`); a pull diagnostic
@@ -400,7 +401,7 @@ fn main() {
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
                         "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
-                        "renameProvider": true,
+                        "renameProvider": { "prepareProvider": true },
                         "linkedEditingRangeProvider": true,
                         "codeActionProvider": { "resolveProvider": true },
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
@@ -3021,6 +3022,54 @@ fn main() {
                     }
                     json!({ "ranges": ranges })
                 });
+                respond(&mut writer, id, result);
+            }
+            "textDocument/prepareRename" if mode == "echo-document" => {
+                // The word at the position, in this server's own text and
+                // coordinates; with `MOCK_RENAME_AFTER_RELEASE` set, once the
+                // file `MOCK_RELEASE_FILE` names exists (or a minute later).
+                if std::env::var_os("MOCK_RENAME_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let line = message
+                    .pointer("/params/position/line")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let character = message
+                    .pointer("/params/position/character")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let text = documents.get(uri).cloned().unwrap_or_default();
+                let chars: Vec<char> = text.lines().nth(line).unwrap_or_default().chars().collect();
+                let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                let start = (0..character.min(chars.len()))
+                    .rev()
+                    .take_while(|&at| is_word(chars[at]))
+                    .last()
+                    .unwrap_or(character);
+                let end = (character..chars.len())
+                    .take_while(|&at| is_word(chars[at]))
+                    .last()
+                    .map_or(character, |at| at + 1);
+                let result = if start < end {
+                    json!({
+                        "start": { "line": line, "character": start },
+                        "end": { "line": line, "character": end }
+                    })
+                } else {
+                    Value::Null
+                };
                 respond(&mut writer, id, result);
             }
             "textDocument/rename" if mode == "echo-document" => {

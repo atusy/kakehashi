@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/prepareRename";
 
@@ -27,20 +27,40 @@ impl Kakehashi {
         let position = params.position;
 
         let virt = self.prepare_rename_virt_layer(&lsp_uri, position);
-        let native = self.native_bindings_answer(&lsp_uri, position, |ctx| {
-            super::native_bindings::native_prepare_rename(ctx)
-        });
-        self.walk_layers_with_native(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            raw_params,
-            virt,
-            native,
-            parse_host_verbatim::<PrepareRenameResponse>,
-            |_| true,
-        )
-        .await
+        let native = async {
+            let answer = self
+                .native_bindings_answer(&lsp_uri, position, |ctx| {
+                    super::native_bindings::native_prepare_rename(ctx)
+                })
+                .await?;
+            Ok(answer.map(Sourced::unprepared))
+        };
+        let answer = self
+            .walk_layers_with_native(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                raw_params,
+                virt,
+                native,
+                |value| {
+                    parse_host_verbatim::<PrepareRenameResponse>(value).map(Sourced::unprepared)
+                },
+                |_| true,
+            )
+            .await?;
+        // The final answer chosen: a range in host coordinates, checked once
+        // more against the host text, which may have moved while it was held
+        // (text above the region edited, say), by the same check as other
+        // prepared answers (see `sources_verdict`): waited on only while the
+        // host's last edit is settling, a moved or stale answer none at once.
+        let Some(sourced) = answer else {
+            return Ok(None);
+        };
+        let verdict = self
+            .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
+            .await;
+        Ok(verdict.keeps().then_some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -48,7 +68,9 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
-    ) -> Result<Option<PrepareRenameResponse>> {
+    ) -> Result<Option<Sourced<PrepareRenameResponse>>> {
+        // Before the text is read: see `Sourced::from_region`.
+        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -85,8 +107,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result
+        let answer = result
             .handle(&self.notifier(), "prepareRename", None, Ok)
-            .await
+            .await?;
+        Ok(answer.map(|answer| {
+            Sourced::from_region(&ctx.document, answer, self.bridge.node_tracker(), revision)
+        }))
     }
 }
