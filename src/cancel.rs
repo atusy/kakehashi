@@ -55,7 +55,7 @@ impl CancelToken {
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
-            if self.polls_before_cancel.fetch_update(
+            if self.polls_before_cancel.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |remaining| (remaining > 0).then_some(remaining - 1),
