@@ -600,13 +600,21 @@ impl ConnectionHandle {
                 "bridge: server does not advertise virtualDocumentPrepare",
             ));
         }
-        // Like routing, preparation is control traffic: its own deadline
-        // cancels and retires the router entry, off the liveness timer.
+        // Its own deadline, shorter than the liveness timer's, cancels it.
+        // But it is on that timer as any request is: a peer that stopped
+        // reading stdin mid-frame must fail its connection, or its answers
+        // never come and its documents stay held, retry after retry queued
+        // behind the stalled frame.
         let request_id = RequestId::new(self.next_request_id());
-        let response_rx = self
+        let (response_rx, liveness_epoch) = self
             .router()
-            .register_tracked(request_id)
-            .ok_or_else(|| io::Error::other("bridge: duplicate prepare request ID"))?;
+            .register_tracked_liveness(request_id)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
+        }
         let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
         let request = JsonRpcRequest::new(request_id.as_i64(), PREPARE_METHOD, params);
         self.send_request(request, request_id)
@@ -621,6 +629,11 @@ impl ConnectionHandle {
                 ));
             }
             Err(_) => {
+                // Retired as any request at its deadline: a frame still being
+                // written stays, so the liveness timer sees the stalled
+                // writer (see `ResponseRouter::retire_on_timeout`).
+                self.router().retire_on_timeout(request_id);
+                cleanup.disarm();
                 let cancel = JsonRpcNotification::new(
                     "$/cancelRequest",
                     serde_json::json!({"id": request_id.as_i64()}),
@@ -1644,6 +1657,133 @@ mod tests {
                 "{lost}: {error}"
             );
         }
+    }
+
+    fn prepare_layout(text: &str) -> crate::lsp::bridge::protocol::VirtualLayout {
+        crate::lsp::bridge::protocol::VirtualLayout::single(text)
+    }
+
+    fn prepare_params<'a>(
+        layout: &'a crate::lsp::bridge::protocol::VirtualLayout,
+    ) -> crate::lsp::bridge::protocol::PrepareParams<'a> {
+        use crate::lsp::bridge::protocol::{
+            PrepareHostTextDocument, PrepareParams, PrepareTextDocument,
+        };
+        PrepareParams::new(
+            PrepareTextDocument {
+                uri: "file:///virtual.lua",
+                language_id: "lua",
+                version: 1,
+            },
+            PrepareHostTextDocument {
+                uri: "file:///host.md",
+                language_id: "markdown",
+            },
+            layout,
+        )
+    }
+
+    /// A prepare request is on the liveness timer as any request is: a peer
+    /// that reads its stdin but never answers fails its connection once the
+    /// timer runs out, and the attempt learns it got no answer (retried),
+    /// rather than each attempt only timing out on its own.
+    #[tokio::test]
+    async fn a_prepare_request_starts_the_liveness_timer() {
+        use crate::lsp::bridge::actor::spawn_reader_task_with_liveness;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(50)),
+        );
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        ));
+        handle.set_virtual_document_prepare(true);
+        let layout = prepare_layout("a");
+        let error = handle
+            .request_virtual_document_prepare(&prepare_params(&layout))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+        assert_eq!(handle.state(), ConnectionState::Failed);
+    }
+
+    /// A prepare request timing out while its frame is still being written
+    /// keeps that frame for the liveness timer, as any request does: the
+    /// peer stopped reading stdin, and nothing else would show it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prepare_timeout_keeps_a_frame_the_writer_is_still_writing() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            FULL_PIPE_PAYLOAD_BYTES, create_handle_with_command,
+        };
+
+        let (handle, _pid) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("wedged"),
+            vec!["sleep".to_string(), "30".to_string()],
+            None,
+        )
+        .await;
+        handle.set_virtual_document_prepare(true);
+        // Park the writer on a frame the child never reads, so the prepare
+        // frame waits in the queue for the claim below.
+        let huge = crate::lsp::bridge::protocol::JsonRpcNotification::new(
+            "blocked",
+            serde_json::json!({ "data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES) }),
+        );
+        assert_eq!(
+            handle.send_notification(huge),
+            NotificationSendResult::Queued
+        );
+        let dequeued = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.tx.capacity() < handle.tx.max_capacity() {
+            assert!(
+                std::time::Instant::now() < dequeued,
+                "the writer never picked up the frame"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let layout = prepare_layout("a");
+        let params = prepare_params(&layout);
+        let request = handle.request_virtual_document_prepare(&params);
+        tokio::pin!(request);
+        let id = loop {
+            tokio::select! {
+                _ = &mut request => panic!("answered before it was queued"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if let Some(id) = handle.router().pending_ids().first().copied() {
+                break id;
+            }
+        };
+        // As the writer does once it reaches the frame.
+        assert!(handle.router().claim_for_write(id));
+        tokio::time::pause();
+        let error = request.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(handle.router().awaiting_downstream_count(), 1);
     }
 
     /// The generic timeout must not erase the one entry that proves the

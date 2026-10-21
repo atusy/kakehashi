@@ -182,16 +182,15 @@ impl ResponseRouter {
         self.register_with_upstream(id, None)
     }
 
-    /// [`Self::register`], recording why the router failed it, if it does
-    /// (see [`Self::take_failure`]): for a request whose caller must tell
-    /// the router's synthetic error reply from the peer's own.
-    pub(crate) fn register_tracked(
+    /// [`Self::register_with_upstream_liveness`] with no upstream id,
+    /// recording why the router failed it, if it does (see
+    /// [`Self::take_failure`]): for a request whose caller must tell the
+    /// router's synthetic error reply from the peer's own.
+    pub(in crate::lsp::bridge) fn register_tracked_liveness(
         &self,
         id: RequestId,
-    ) -> Option<oneshot::Receiver<serde_json::Value>> {
+    ) -> Result<(oneshot::Receiver<serde_json::Value>, Option<u64>), RegisterError> {
         self.register_with_upstream_liveness_mode(id, None, true, None)
-            .ok()
-            .map(|(rx, _)| rx)
     }
 
     /// Register a pending request with upstream ID mapping for cancel forwarding.
