@@ -707,19 +707,21 @@ pub(crate) fn layer_answers<T>(
     has_result(&sourced.value) && (!sourced.is_prepared() || may_keep(sourced))
 }
 
-/// A prepared answer a layers' race passed over as one it cannot keep
-/// ([`layer_answers`]), kept for when no other layer answers: a method
-/// that answers a dropped answer otherwise than with nothing (a rename's
-/// `ContentModified`) then still does, through its final check.
-pub(crate) struct PassedOverAnswer<T>(std::sync::Mutex<Option<Sourced<T>>>);
+/// The stale fallback: a prepared answer a layers' race passed over as one
+/// it cannot keep ([`layer_answers`]), kept for when no other layer
+/// answers, so a method that answers a dropped answer otherwise than with
+/// nothing (a rename's `ContentModified`) still does, through its final
+/// check. Unlike code actions' refused fallback, what it keeps is never
+/// returned as it is: the final check drops it.
+pub(crate) struct StaleAnswerFallback<T>(std::sync::Mutex<Option<Sourced<T>>>);
 
-impl<T> Default for PassedOverAnswer<T> {
+impl<T> Default for StaleAnswerFallback<T> {
     fn default() -> Self {
         Self(std::sync::Mutex::new(None))
     }
 }
 
-impl<T: Clone> PassedOverAnswer<T> {
+impl<T: Clone> StaleAnswerFallback<T> {
     /// [`layer_answers`], keeping aside, once (the race asks in priority
     /// order: the highest-ranked), an answer with a result it passes over.
     pub(crate) fn answers(
@@ -747,7 +749,7 @@ impl<T: Clone> PassedOverAnswer<T> {
     /// The race's `result`, or, when it found no answer (nothing, or only
     /// a layer's error, which the answer passed over would have
     /// outranked), the answer kept aside. A cancel stays a cancel.
-    pub(crate) fn or_passed_over(
+    pub(crate) fn or_kept(
         self,
         result: tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>> {

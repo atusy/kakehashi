@@ -35,7 +35,7 @@ impl Kakehashi {
                 .await?;
             Ok(edit.map(Sourced::unprepared))
         };
-        let passed_over = super::super::bridge_context::PassedOverAnswer::default();
+        let passed_over = super::super::bridge_context::StaleAnswerFallback::default();
         let answer = self
             .walk_layers_with_native(
                 &lsp_uri,
@@ -64,7 +64,7 @@ impl Kakehashi {
                 },
             )
             .await;
-        let answer = passed_over.or_passed_over(answer)?;
+        let answer = passed_over.or_kept(answer)?;
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held. A rename comes
         // once per action, like formatting, so the check waits for the
@@ -218,7 +218,8 @@ mod tests {
         let walk = |host: Result<Option<Sourced<WorkspaceEdit>>>| {
             let virt = Sourced::prepared_for_test(edit.clone(), &host_uri, "lua", "r", &map, 1, 0);
             async move {
-                let passed_over = super::super::super::bridge_context::PassedOverAnswer::default();
+                let passed_over =
+                    super::super::super::bridge_context::StaleAnswerFallback::default();
                 let result = race_layers_preferred(
                     &[Virt, Host, Native],
                     std::future::ready(Ok(Some(virt))),
@@ -229,7 +230,7 @@ mod tests {
                     },
                 )
                 .await;
-                passed_over.or_passed_over(result)
+                passed_over.or_kept(result)
             }
         };
         for host in [Ok(None), Err(Error::internal_error())] {
