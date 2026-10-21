@@ -2875,42 +2875,44 @@ mod tests {
         assert_eq!(text.as_deref(), Some("\n> x"));
     }
 
-    /// The host prefixes of a list item's fence holding `a = 1`, a blank
-    /// row, and `b = 2`: the blank row keeps no indentation, so it records
-    /// none, and the synthetic row after the last line break records none.
-    fn list_fence_prefixes() -> Vec<String> {
-        vec![
-            "  ".to_string(),
-            String::new(),
-            "  ".to_string(),
-            String::new(),
-        ]
+    /// The offset and host prefixes of a list item's fence holding `a = 1`,
+    /// a blank row, and `b = 2`, as injection discovery records them: the
+    /// blank row keeps no indentation, so it records none, and the synthetic
+    /// row after the last line break records none.
+    fn list_fence() -> (RegionOffset, Vec<String>) {
+        (
+            RegionOffset::with_per_line_offsets(3, vec![2, 0, 2, 0]),
+            vec![
+                "  ".to_string(),
+                String::new(),
+                "  ".to_string(),
+                String::new(),
+            ],
+        )
     }
 
     #[test]
     fn pipeline_indents_a_list_fence_whose_line_count_changes() {
+        let (offset, prefixes) = list_fence();
         // The blank row's empty prefix says nothing about the item's
         // indentation; counting it would collapse the common prefix to ""
         // and end the list item at every continuation line.
-        let text = pipeline_region_text(
-            "a = 1\n\nb = 2\n",
-            "a = 1\n\n\nb = 2\n",
-            &RegionOffset::with_per_line_offsets(3, vec![2, 0, 2, 0]),
-            &list_fence_prefixes(),
-        );
+        let text =
+            pipeline_region_text("a = 1\n\nb = 2\n", "a = 1\n\n\nb = 2\n", &offset, &prefixes);
 
         assert_eq!(text.as_deref(), Some("a = 1\n\n\n  b = 2\n"));
     }
 
     #[test]
     fn pipeline_indents_text_it_puts_on_a_list_fence_blank_row() {
+        let (offset, prefixes) = list_fence();
         // Same line count, but the formatter put `b = 2` on the blank row,
         // whose own prefix would put it at host column 0.
         let text = pipeline_region_text(
             "a = 1\n\nb = 2\n",
             "a = 1\nb = 2\nc = 3\n",
-            &RegionOffset::with_per_line_offsets(3, vec![2, 0, 2, 0]),
-            &list_fence_prefixes(),
+            &offset,
+            &prefixes,
         );
 
         assert_eq!(text.as_deref(), Some("a = 1\n  b = 2\n  c = 3\n"));
@@ -2965,9 +2967,11 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_leaves_a_lazy_line_unprefixed() {
-        // A row holding text with no prefix is content, unlike a blank one:
-        // it still collapses the common prefix, as before.
+    fn pipeline_lets_a_text_row_without_prefix_shrink_the_common_prefix() {
+        // A row holding text with no prefix is content, unlike a blank one,
+        // so the common prefix of the rows holding text is "". Markdown
+        // discovery yields no such fence (a lazy line ends the blockquote);
+        // the rule reads only the region's own text and prefixes.
         let text = pipeline_region_text(
             "a\nb\nc\n",
             "a\nb\nc\nd\n",
