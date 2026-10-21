@@ -35,9 +35,8 @@
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
 //! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
-//!   triple, the edit-producing formatting/rename/color-presentation requests
-//!   (on-type formatting among them only with experimental features on), and
-//!   pull diagnostics) snapshot the current
+//!   triple, the edit-producing formatting/rename/color-presentation requests, and pull
+//!   diagnostics) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
 //!   request observes every edit that preceded it on the wire — without
 //!   serializing its computation against later edits or other documents.
@@ -431,9 +430,6 @@ pub(crate) fn normalize_uri(raw: &str) -> String {
 pub struct IngressOrderGate<S> {
     inner: S,
     sequencer: Arc<DocumentSequencer>,
-    /// Whether `textDocument/onTypeFormatting` is a reader too: so with
-    /// experimental features on (see [`Self::order_on_type_formatting`]).
-    order_on_type: bool,
 }
 
 impl<S> IngressOrderGate<S> {
@@ -441,19 +437,7 @@ impl<S> IngressOrderGate<S> {
         Self {
             inner,
             sequencer: Arc::new(DocumentSequencer::default()),
-            order_on_type: crate::experimental::enabled(),
         }
-    }
-
-    /// Order `textDocument/onTypeFormatting` as a reader when `ordered`:
-    /// with experimental features on, an answer on a prepared document is
-    /// checked against the host's content version as it is chosen, and one
-    /// read before the trigger keystroke's own didChange applied would be
-    /// dropped as moved. Off, on-type keeps passing through ungated, as it
-    /// always has.
-    pub fn order_on_type_formatting(mut self, ordered: bool) -> Self {
-        self.order_on_type = ordered;
-        self
     }
 }
 
@@ -472,12 +456,7 @@ where
     }
 
     fn call(&mut self, req: Request) -> Self::Future {
-        let role = classify(&req).or_else(|| {
-            (self.order_on_type && req.method() == "textDocument/onTypeFormatting")
-                .then(|| text_document_uri(&req))
-                .flatten()
-                .map(|uri| Role::Reader { uri })
-        });
+        let role = classify(&req);
         // The inner call must stay synchronous inside `call` so nested
         // middleware (e.g. RequestIdCapture) keeps seeing wire order too.
         let inner_fut = self.inner.call(req);
@@ -1128,54 +1107,6 @@ mod tests {
             *log.lock().recover_poison("ingress_order::tests"),
             vec!["change", "reader"]
         );
-    }
-
-    #[test]
-    fn on_type_formatting_is_ordered_exactly_when_experimental_features_are_on() {
-        let gate = IngressOrderGate::new(MissingSaveInner);
-        assert_eq!(gate.order_on_type, crate::experimental::enabled());
-    }
-
-    #[tokio::test]
-    async fn on_type_formatting_waits_for_a_preceding_change_only_when_ordered() {
-        for ordered in [true, false] {
-            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let mut gate = IngressOrderGate::new(MockInner {
-                log: Arc::clone(&log),
-                stall_method: "textDocument/didChange",
-                release: Some(release_rx),
-            })
-            .order_on_type_formatting(ordered);
-
-            // Wire order: the trigger keystroke's didChange, then on-type.
-            let writer_fut = gate.call(notification("textDocument/didChange", URI));
-            let on_type_fut = gate.call(notification("textDocument/onTypeFormatting", URI));
-            let mut writer = tokio_test::task::spawn(writer_fut);
-            let mut on_type = tokio_test::task::spawn(on_type_fut);
-
-            assert!(
-                writer.poll().is_pending(),
-                "didChange stalls on the oneshot"
-            );
-            assert_eq!(
-                on_type.poll().is_pending(),
-                ordered,
-                "on-type waits behind the change only when ordered"
-            );
-            release_tx.send(()).expect("didChange is waiting");
-            assert!(writer.poll().is_ready());
-            if ordered {
-                assert!(on_type.is_woken(), "the change's completion wakes on-type");
-                assert!(on_type.poll().is_ready());
-            }
-            let expected = if ordered {
-                vec!["change", "reader"]
-            } else {
-                vec!["reader", "change"]
-            };
-            assert_eq!(*log.lock().recover_poison("ingress_order::tests"), expected);
-        }
     }
 
     #[tokio::test]
