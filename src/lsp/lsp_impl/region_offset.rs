@@ -574,4 +574,26 @@ mod tests {
         let edited = crate::text::edit::apply_text_edits(host, &[change]);
         assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n");
     }
+
+    /// A blank-only list fence's region ends at column 0 of its closing
+    /// fence's row, which records no prefix either: text written there lands
+    /// before the fence's indentation and ends the item, so it is refused,
+    /// as on the boundary row of a fence with text. A blank line inserted
+    /// there still applies and reads back, and so does text on the leading
+    /// protected row's refusal.
+    #[test]
+    fn a_blank_only_list_fence_refuses_text_at_its_region_end() {
+        let host = "- item\n\n  ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        let (_, region_end, _, _) = resolved_region_geometry(resolved());
+        assert_eq!(region_end, Position::new(4, 0));
+        assert!(!accepts(resolved(), &edit((4, 0), (4, 0), "pass\n")));
+        // The leading edge: the protected first row refuses text already.
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+
+        let change = edit((4, 0), (4, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n");
+    }
 }

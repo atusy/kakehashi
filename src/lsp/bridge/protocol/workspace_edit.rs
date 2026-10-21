@@ -453,15 +453,20 @@ pub(crate) fn text_edit_preserves_line_prefixes(
     if columns.iter().all(|&column| column == 0) {
         // A list item's fence holding only blank rows records no prefix on
         // any row, yet its rows are protected: text written on one is
-        // refused. Every other edit is judged as in a plain fence.
-        let writes_on_protected_row = e
-            .range
-            .start
+        // refused, and so is text written at the region end, column 0 of
+        // the closing fence's row, which lies before the fence's
+        // indentation (the boundary a fence with text refuses edits on).
+        // Every other edit is judged as in a plain fence.
+        let start = e.range.start;
+        let on_protected_row = start
             .line
             .checked_sub(offset.line())
-            .is_some_and(|row| offset.is_protected_blank_row(row as usize))
-            && !crate::text::is_markdown_blank(&e.new_text);
-        return !writes_on_protected_row;
+            .is_some_and(|row| offset.is_protected_blank_row(row as usize));
+        let on_closing_row = offset.has_protected_blank_rows()
+            && region_end.character == 0
+            && start.line >= region_end.line;
+        let writes_text = !crate::text::is_markdown_blank(&e.new_text);
+        return !((on_protected_row || on_closing_row) && writes_text);
     }
     let content_prefixed = columns.len() > 1;
     let boundary_at = |host_line: u32| {
