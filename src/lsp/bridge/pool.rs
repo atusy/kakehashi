@@ -5875,13 +5875,61 @@ impl Default for PrepareAdvertisements {
     }
 }
 
+/// How many buckets the clearings of one server's, or one host's, start
+/// failures are counted in (see [`StartFailures`]).
+const CLEARING_BUCKETS: usize = 32;
+
 /// See `PrepareAdvertisements::start_failures`.
 #[derive(Default)]
 struct StartFailures {
     failed: std::collections::HashSet<(String, Url)>,
-    /// Bumped by every clearing: a failure seen by an attempt that began
-    /// acquiring before one is not recorded after it.
-    cleared: u64,
+    /// Clearings, counted by what they could clear: a failure seen by an
+    /// attempt that began acquiring before one that could have cleared it
+    /// is not recorded after it. Every pair's (settings), and one
+    /// server's (its handshake advertising) or one host's (its close) by
+    /// the bucket its name or URI hashes to. A clearing of another server
+    /// or host blocks no record, but for one sharing its bucket, which only
+    /// costs that attempt a retry: the count stays bounded.
+    cleared_all: u64,
+    cleared_servers: [u64; CLEARING_BUCKETS],
+    cleared_hosts: [u64; CLEARING_BUCKETS],
+}
+
+/// What a start-failure clearing clears.
+#[derive(Clone, Copy)]
+enum StartFailureScope<'a> {
+    /// Every pair: the settings that failed to start them changed.
+    All,
+    /// One server's pairs: a handshake of it advertised the request.
+    Server(&'a str),
+    /// One host's pairs: it closed.
+    Host(&'a Url),
+}
+
+/// The clearings an attempt saw that could clear one (server, host) pair's
+/// start failure (see [`LanguageServerPool::prepare_start_failures_cleared`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StartFailureClearings {
+    all: u64,
+    server: u64,
+    host: u64,
+}
+
+fn clearing_bucket(key: impl std::hash::Hash) -> usize {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    let hash =
+        BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(key);
+    (hash % CLEARING_BUCKETS as u64) as usize
+}
+
+impl StartFailures {
+    fn clearings(&self, server_name: &str, host_uri: &Url) -> StartFailureClearings {
+        StartFailureClearings {
+            all: self.cleared_all,
+            server: self.cleared_servers[clearing_bucket(server_name)],
+            host: self.cleared_hosts[clearing_bucket(host_uri.as_str())],
+        }
+    }
 }
 
 impl PrepareAdvertisements {
@@ -5963,7 +6011,8 @@ impl PrepareAdvertisements {
         // A handshake advertising the request: the server started somewhere,
         // and is tried again where it could not be — the answers given
         // without it (as is, or a later candidate's) are asked again.
-        let retried = advertised && self.forget_start_failures(|server, _| server == server_name);
+        let retried =
+            advertised && self.forget_start_failures(StartFailureScope::Server(server_name));
         let (server_changed, connection_changed) = {
             let mut connections = self.by_server.entry(server_name.to_string()).or_default();
             let previous = Self::aggregate(&connections);
@@ -5980,15 +6029,27 @@ impl PrepareAdvertisements {
         changed
     }
 
-    /// Forget the start failures `matches` accepts; `true` when any went.
-    /// A clearing either way: a failure an attempt saw before it is not
-    /// recorded (see [`StartFailures::cleared`]).
-    fn forget_start_failures(&self, matches: impl Fn(&str, &Url) -> bool) -> bool {
+    /// Forget the start failures of `scope`; `true` when any went. A
+    /// clearing of `scope` either way: a failure of it an attempt saw
+    /// before is not recorded (see [`StartFailures::cleared_all`]).
+    fn forget_start_failures(&self, scope: StartFailureScope<'_>) -> bool {
         let mut failures = self.start_failures();
-        failures.cleared += 1;
+        match scope {
+            StartFailureScope::All => failures.cleared_all += 1,
+            StartFailureScope::Server(server_name) => {
+                failures.cleared_servers[clearing_bucket(server_name)] += 1;
+            }
+            StartFailureScope::Host(host_uri) => {
+                failures.cleared_hosts[clearing_bucket(host_uri.as_str())] += 1;
+            }
+        }
         let mut removed = false;
         failures.failed.retain(|(server, host)| {
-            let goes = matches(server, host);
+            let goes = match scope {
+                StartFailureScope::All => true,
+                StartFailureScope::Server(server_name) => server == server_name,
+                StartFailureScope::Host(host_uri) => host == host_uri,
+            };
             removed |= goes;
             !goes
         });
@@ -6088,29 +6149,41 @@ impl LanguageServerPool {
         }
     }
 
-    /// The start failures' clearing count, read by an attempt before it
-    /// acquires a candidate (see [`Self::record_prepare_start_failure`]).
-    pub(crate) fn prepare_start_failures_cleared(&self) -> u64 {
-        self.prepare_advertisements
-            .as_ref()
-            .map_or(0, |advertisements| advertisements.start_failures().cleared)
+    /// The clearings that could clear `server_name`'s start failure for
+    /// `host_uri`, read by an attempt before it acquires that candidate
+    /// (see [`Self::record_prepare_start_failure`]).
+    pub(crate) fn prepare_start_failures_cleared(
+        &self,
+        server_name: &str,
+        host_uri: &Url,
+    ) -> StartFailureClearings {
+        self.prepare_advertisements.as_ref().map_or_else(
+            StartFailureClearings::default,
+            |advertisements| {
+                advertisements
+                    .start_failures()
+                    .clearings(server_name, host_uri)
+            },
+        )
     }
 
     /// Note that `server_name` could not be started for `host_uri`'s
-    /// documents to prepare them — unless failures were cleared since
-    /// `cleared` was read: the settings that failed to start it changed, or
-    /// it started since. `false` then: the failure says nothing current.
+    /// documents to prepare them — unless a clearing that could clear it
+    /// came since `cleared` was read: the settings that failed to start it
+    /// changed, it started since, or the host closed. `false` then: the
+    /// failure says nothing current. A clearing of another server's or
+    /// host's failures says nothing about this one.
     pub(crate) fn record_prepare_start_failure(
         &self,
         server_name: &str,
         host_uri: &Url,
-        cleared: u64,
+        cleared: StartFailureClearings,
     ) -> bool {
         let Some(advertisements) = &self.prepare_advertisements else {
             return false;
         };
         let mut failures = advertisements.start_failures();
-        if failures.cleared != cleared {
+        if failures.clearings(server_name, host_uri) != cleared {
             return false;
         }
         failures
@@ -6142,10 +6215,10 @@ impl LanguageServerPool {
         };
         match host_uri {
             Some(host_uri) => {
-                advertisements.forget_start_failures(|_, host| host == host_uri);
+                advertisements.forget_start_failures(StartFailureScope::Host(host_uri));
             }
             None => {
-                if advertisements.forget_start_failures(|_, _| true) {
+                if advertisements.forget_start_failures(StartFailureScope::All) {
                     advertisements.advance();
                 }
             }
@@ -6178,7 +6251,7 @@ mod tests {
         assert!(pool.record_prepare_start_failure(
             "peer",
             &b,
-            pool.prepare_start_failures_cleared()
+            pool.prepare_start_failures_cleared("peer", &b)
         ));
         assert!(pool.prepare_start_failed("peer", &b));
         assert!(!pool.prepare_start_failed("peer", &a));
@@ -6193,7 +6266,7 @@ mod tests {
         assert!(pool.record_prepare_start_failure(
             "peer",
             &b,
-            pool.prepare_start_failures_cleared()
+            pool.prepare_start_failures_cleared("peer", &b)
         ));
         pool.forget_prepare_start_failures(Some(&a));
         assert!(pool.prepare_start_failed("peer", &b));
@@ -6203,19 +6276,39 @@ mod tests {
         assert_eq!(pool.prepare_epoch(), epoch + 1);
         // A failure an attempt saw before failures were cleared is not
         // recorded after: the peer may have started since.
-        let seen = pool.prepare_start_failures_cleared();
-        pool.forget_prepare_start_failures(Some(&a));
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.forget_prepare_start_failures(Some(&b));
         assert!(!pool.record_prepare_start_failure("peer", &b, seen));
         assert!(!pool.prepare_start_failed("peer", &b));
+        // Nor one seen before its server started elsewhere.
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        assert!(!pool.record_prepare_start_failure("peer", &b, seen));
+        let epoch = pool.prepare_epoch();
+        // Another host closing, or another server starting, clears nothing
+        // of it: still recorded, and the attempt passes the candidate over.
+        // (Counted apart: their buckets differ.)
+        assert_ne!(clearing_bucket("peer"), clearing_bucket("other"));
+        assert_ne!(clearing_bucket(a.as_str()), clearing_bucket(b.as_str()));
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.forget_prepare_start_failures(Some(&a));
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("other"), true);
+        assert!(pool.record_prepare_start_failure("peer", &b, seen));
+        assert!(pool.prepare_start_failed("peer", &b));
+        pool.forget_prepare_start_failures(Some(&b));
+        assert_eq!(pool.prepare_epoch(), epoch);
         // A settings change does move the epoch.
         assert!(pool.record_prepare_start_failure(
             "peer",
             &b,
-            pool.prepare_start_failures_cleared()
+            pool.prepare_start_failures_cleared("peer", &b)
         ));
+        let seen = pool.prepare_start_failures_cleared("peer", &a);
         pool.forget_prepare_start_failures(None);
         assert!(!pool.prepare_start_failed("peer", &b));
-        assert_eq!(pool.prepare_epoch(), epoch + 2);
+        assert_eq!(pool.prepare_epoch(), epoch + 1);
+        // A settings change clears every pair's.
+        assert!(!pool.record_prepare_start_failure("peer", &a, seen));
     }
 
     #[tokio::test]
