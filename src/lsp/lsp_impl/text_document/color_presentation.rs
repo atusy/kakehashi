@@ -60,7 +60,7 @@ impl Kakehashi {
         color: Color,
     ) -> Result<Option<Sourced<Vec<ColorPresentation>>>> {
         // Before the text is read: see `Sourced::from_region`.
-        let content_version = self.prepared_request_content_version(lsp_uri);
+        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
@@ -105,12 +105,7 @@ impl Kakehashi {
             })
             .await?;
         Ok(presentations.map(|items| {
-            Sourced::from_region(
-                &ctx.document,
-                items,
-                self.bridge.node_tracker(),
-                content_version,
-            )
+            Sourced::from_region(&ctx.document, items, self.bridge.node_tracker(), revision)
         }))
     }
 
