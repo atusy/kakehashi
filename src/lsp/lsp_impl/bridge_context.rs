@@ -863,6 +863,32 @@ impl Kakehashi {
         )
     }
 
+    /// The final check of the one answer chosen for a request on `lsp_uri`
+    /// (see [`Self::settled_verdict_of`]): its value while still current,
+    /// else the verdict that drops it, logged at `level` as `{method}`'s
+    /// result dropped.
+    pub(crate) async fn settled_answer<T>(
+        &self,
+        lsp_uri: &Uri,
+        sourced: Sourced<T>,
+        method: &str,
+        level: log::Level,
+    ) -> Result<T, Verdict> {
+        let verdict = self
+            .settled_verdict_of(lsp_uri, std::iter::once(&sourced))
+            .await;
+        if !verdict.keeps() {
+            log::log!(
+                target: "kakehashi::bridge",
+                level,
+                "{method} result for {} dropped: {verdict}",
+                lsp_uri.as_str()
+            );
+            return Err(verdict);
+        }
+        Ok(sourced.value)
+    }
+
     /// The host's current content version.
     pub(crate) fn host_content_version(&self, lsp_uri: &Uri) -> Option<u64> {
         let uri = uri_to_url(lsp_uri).ok()?;

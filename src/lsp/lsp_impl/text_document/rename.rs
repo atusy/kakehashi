@@ -76,20 +76,17 @@ impl Kakehashi {
         let Some(sourced) = answer else {
             return Ok(None);
         };
-        let verdict = self
-            .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
-            .await;
-        if !verdict.keeps() {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "rename result for {} dropped: {verdict}",
-                lsp_uri.as_str()
-            );
-            let mut error = crate::error::content_modified_error();
-            error.message = format!("kakehashi: rename result dropped: {verdict}").into();
-            return Err(error);
+        match self
+            .settled_answer(&lsp_uri, sourced, "rename", log::Level::Warn)
+            .await
+        {
+            Ok(edit) => Ok(Some(edit)),
+            Err(verdict) => {
+                let mut error = crate::error::content_modified_error();
+                error.message = format!("kakehashi: rename result dropped: {verdict}").into();
+                Err(error)
+            }
         }
-        Ok(Some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.
