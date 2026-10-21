@@ -33,7 +33,16 @@ impl Kakehashi {
                 raw_params,
                 virt,
                 |value| parse_host_verbatim::<LinkedEditingRanges>(value).map(Sourced::unprepared),
-                |r: &Sourced<LinkedEditingRanges>| !r.value.ranges.is_empty(),
+                // Read as the race decides: a prepared answer moved or stale
+                // is no answer of its layer, and the race falls through to
+                // the next layer's.
+                |sourced: &Sourced<LinkedEditingRanges>| {
+                    super::formatting::layer_answers(
+                        sourced,
+                        |linked| !linked.ranges.is_empty(),
+                        |sourced| self.answer_may_keep(&lsp_uri, sourced),
+                    )
+                },
             )
             .await?;
         // The final answer chosen: ranges the client types into, checked
@@ -108,5 +117,39 @@ impl Kakehashi {
         Ok(ranges.map(|ranges| {
             Sourced::from_region(&ctx.document, ranges, self.bridge.node_tracker(), revision)
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under a cross-layer `preferred`, a prepared answer the race finds
+    /// moved or stale is no answer: the host layer's wins, waited for when
+    /// it is still running. One that may be kept wins as ever.
+    #[tokio::test]
+    async fn linked_ranges_that_may_not_be_kept_fall_through_to_the_host_layers() {
+        let range = |line: u32| LinkedEditingRanges {
+            ranges: vec![tower_lsp_server::ls_types::Range::new(
+                Position::new(line, 0),
+                Position::new(line, 1),
+            )],
+            word_pattern: None,
+        };
+        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+            let won = super::super::formatting::race_prepared_virt_against_host(
+                range(1),
+                range(2),
+                host_delay_ms,
+                may_keep,
+                |linked: &LinkedEditingRanges| !linked.ranges.is_empty(),
+            )
+            .await;
+            assert_eq!(
+                won,
+                range(if may_keep { 1 } else { 2 }),
+                "{may_keep} {host_delay_ms}"
+            );
+        }
     }
 }

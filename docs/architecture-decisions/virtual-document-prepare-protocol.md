@@ -507,7 +507,10 @@ moved or stale as the layers' race decides is no answer of its layer, and
 the race falls through to the host layer's, while one chosen and then
 dropped — settling as the race decided, or moved since — leaves none
 until asked again), and linked
-editing ranges answer nothing. Code actions and linked editing ranges
+editing ranges answer nothing. Under a cross-layer `preferred`, a rename's,
+prepareRename's or linked editing ranges' virt answer already moved or
+stale as the race decides is likewise no answer of its layer: the host
+layer's wins. Code actions and linked editing ranges
 wait, as formatting does (below), while the host's last edit settles or a
 region's hold clears: an editor may ask them once right after an edit
 elsewhere (Neovim asks code actions once per keypress), and an answer

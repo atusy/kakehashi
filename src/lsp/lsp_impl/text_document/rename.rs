@@ -35,6 +35,7 @@ impl Kakehashi {
                 .await?;
             Ok(edit.map(Sourced::unprepared))
         };
+        let passed_over = super::formatting::PassedOverAnswer::default();
         let answer = self
             .walk_layers_with_native(
                 &lsp_uri,
@@ -51,9 +52,19 @@ impl Kakehashi {
                     strip_bridge_local_versions(&mut edit);
                     Some(Sourced::unprepared(edit))
                 },
-                |sourced: &Sourced<WorkspaceEdit>| rename_workspace_edit_has_result(&sourced.value),
+                // Read as the race decides: a prepared answer moved or stale
+                // is no answer of its layer, and the race falls through to
+                // the next layer's (a settling one still wins, then waited on
+                // below). Passed over, it is still the answer when no other
+                // layer's is, which the check below drops as ContentModified.
+                |sourced: &Sourced<WorkspaceEdit>| {
+                    passed_over.answers(sourced, rename_workspace_edit_has_result, |sourced| {
+                        self.answer_may_keep(&lsp_uri, sourced)
+                    })
+                },
             )
-            .await?;
+            .await;
+        let answer = passed_over.or_passed_over(answer)?;
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held. A rename comes
         // once per action, like formatting, so the check waits for the
@@ -182,5 +193,99 @@ mod tests {
 
         assert!(rename_workspace_edit_has_result(&edit));
         assert!(rename_option_has_result(&Some(edit)));
+    }
+
+    /// Passed over, a prepared rename is still the answer when no other
+    /// layer answers (nothing, or an error), for the final check to answer
+    /// ContentModified; a cancel stays a cancel.
+    #[tokio::test]
+    async fn a_rename_passed_over_answers_when_no_other_layer_does() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        use tower_lsp_server::jsonrpc::{Error, ErrorCode};
+        let host_uri = url::Url::parse("file:///test/rename-race.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let edit = WorkspaceEdit {
+            changes: Some(std::collections::HashMap::from([(
+                "file:///test/a.lua".parse::<Uri>().unwrap(),
+                vec![tower_lsp_server::ls_types::TextEdit::default()],
+            )])),
+            ..Default::default()
+        };
+        let walk = |host: Result<Option<Sourced<WorkspaceEdit>>>| {
+            let virt = Sourced::prepared_for_test(edit.clone(), &host_uri, "lua", "r", &map, 1, 0);
+            async move {
+                let passed_over = super::super::formatting::PassedOverAnswer::default();
+                let result = race_layers_preferred(
+                    &[Virt, Host, Native],
+                    std::future::ready(Ok(Some(virt))),
+                    std::future::ready(host),
+                    std::future::ready(Ok(None)),
+                    |sourced: &Sourced<WorkspaceEdit>| {
+                        passed_over.answers(sourced, rename_workspace_edit_has_result, |_| false)
+                    },
+                )
+                .await;
+                passed_over.or_passed_over(result)
+            }
+        };
+        for host in [Ok(None), Err(Error::internal_error())] {
+            let answer = walk(host).await.unwrap().expect("the passed-over answer");
+            assert!(answer.is_prepared());
+        }
+        assert_eq!(
+            walk(Err(Error::request_cancelled()))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            ErrorCode::RequestCancelled
+        );
+        let host_answer = walk(Ok(Some(Sourced::unprepared(edit.clone()))))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!host_answer.is_prepared());
+    }
+
+    /// Under a cross-layer `preferred`, a prepared rename the race finds
+    /// moved or stale is no answer: the host layer's wins, waited for when
+    /// it is still running. One that may be kept wins as ever.
+    #[tokio::test]
+    async fn a_rename_that_may_not_be_kept_falls_through_to_the_host_layers() {
+        let edit = |name: &str| {
+            let uri: Uri = format!("file:///test/{name}.lua").parse().unwrap();
+            WorkspaceEdit {
+                changes: Some(std::collections::HashMap::from([(
+                    uri,
+                    vec![tower_lsp_server::ls_types::TextEdit {
+                        range: Default::default(),
+                        new_text: name.to_string(),
+                    }],
+                )])),
+                ..Default::default()
+            }
+        };
+        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+            let won = super::super::formatting::race_prepared_virt_against_host(
+                edit("virt"),
+                edit("host"),
+                host_delay_ms,
+                may_keep,
+                rename_workspace_edit_has_result,
+            )
+            .await;
+            assert_eq!(
+                won,
+                edit(if may_keep { "virt" } else { "host" }),
+                "{may_keep} {host_delay_ms}"
+            );
+        }
     }
 }
