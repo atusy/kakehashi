@@ -1801,7 +1801,9 @@ fn reapply_host_line_prefixes(
             let prefix = if line_count_preserved {
                 let own = host_line_prefixes[i].as_str();
                 // Text written on a blank row needs the region's prefix,
-                // which the row itself may record only part of.
+                // which the row itself may record only part of. The LCP
+                // only ever extends the row's own prefix: a lazy row can
+                // shrink it below a blank row's, which then keeps its own.
                 if !line_is_empty && blank_rows.get(i) == Some(&true) && lcp.starts_with(own) {
                     lcp
                 } else {
@@ -3019,6 +3021,23 @@ mod tests {
     #[test]
     fn host_line_prefix_count_follows_lsp_lines() {
         assert_eq!(lsp_line_count("a\rb\r\nc\n"), 4);
+    }
+
+    #[test]
+    fn reapply_keeps_a_blank_row_prefix_the_region_prefix_falls_short_of() {
+        // The lazy row shrinks the region's prefix to "", which would put
+        // text written on the blank `>` row outside the blockquote.
+        let prefixes = vec![
+            "> ".to_string(),
+            String::new(),
+            ">".to_string(),
+            "> ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\n\nc\n", "a\nb\nx\nc\n", &prefixes),
+            "a\nb\n>x\n> c\n"
+        );
     }
 
     #[test]
