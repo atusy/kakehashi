@@ -92,6 +92,17 @@ is synced again without waiting for an edit — a server that starts
 advertising later has its pairs' documents prepared, and one that withdraws
 it has them asked of the next candidate (or sent as is).
 
+The epoch is one of two validity axes. It decides which answers a lookup
+may read, but it cannot reach a map already given out, which a connection
+holds or a request is built on. The second axis is **revocation**:
+- A failure of an input revokes every map answered for that same input
+  (its text, segments and host language, whatever the epoch or candidates)
+  before the failed attempt's input was taken.
+- A revoked map translates nothing more, for any path that reads it.
+- A map answered after the failure, for a newer text, is not revoked.
+An answer is read only while both hold: its epoch is current, and its map
+is not revoked.
+
 The feature is present only with `KAKEHASHI_EXPERIMENTAL=true`; without it
 no advertisement is recorded and nothing is looked up. Only pairs that are
 bridged and have a server for the injection language are prepared.
@@ -355,12 +366,18 @@ nothing on the wire tells it which one it holds. Fail-closed keeps every
 document's coordinates describable; a peer that wants the fallback can
 answer `null`.
 
-### Forgetting or revoking answers when something changes
+### Forgetting answers when something changes
 
 Each change that can alter an answer would need its own hook to find and
 drop the answers it affects, and an attempt in flight across the change to
 be revoked. One epoch, read with every answer, makes every such change one
 move: an answer from before it is simply not read.
+
+The epoch cannot reach a map already given out, though. So a failure, the
+one change that has to stop coordinates from being read through answers in
+use, also revokes those maps (see Configuration and Discovery). Revocation
+is kept per input and is triggered only by that input's failure. It is not
+a hook per kind of change.
 
 ## Consequences
 
