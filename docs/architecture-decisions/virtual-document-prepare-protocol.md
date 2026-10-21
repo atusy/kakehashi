@@ -328,8 +328,9 @@ Completion keeps to what the client inserts where it asked:
   sees it elsewhere, and its items would edit away from it.
 - An item's edit must contain the caret once mapped (a caret right after a
   gap the peer emptied reaches the server where the gap's start does); an
-  insert/replace edit maps through both ranges, which must map the shared
-  text alike and keep their shared start.
+  insert/replace edit maps through both ranges, which must start at the
+  same position as sent, map the shared text alike and keep their shared
+  start.
 - A snippet is kept only when it is literal text: what a client expands
   tabstops, placeholders, variables or escapes to is not the text checked.
   Kept, it is sent as plain text, which no snippet engine re-indents.

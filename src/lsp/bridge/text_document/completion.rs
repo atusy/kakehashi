@@ -595,6 +595,11 @@ fn translate_insert_replace_edit_to_host(
     offset: &RegionOffset,
 ) -> Option<bool> {
     use tower_lsp_server::ls_types::TextEdit;
+    // LSP has both ranges start at the same position. Sent apart, no
+    // realignment below would send a range that was checked.
+    if edit.insert.start != edit.replace.start {
+        return None;
+    }
     let new_text = std::mem::take(&mut edit.new_text);
     let mut mains = [
         TextEdit {
@@ -1752,6 +1757,29 @@ mod tests {
         assert_eq!(edit.insert.start, Position::new(11, 4));
         assert_eq!(edit.replace.end, Position::new(11, 5));
         assert_eq!(edit.new_text, "yes\n    z");
+    }
+
+    #[test]
+    fn prepared_insert_replace_ranges_sent_with_unequal_starts_are_refused() {
+        // `ab`, dedented: the replace range starts before the insert range
+        // (against LSP). Moving the mapped replace start up to the insert
+        // start would send a replacement the server never asked for, and
+        // which no check saw.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "x".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 2),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 2),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(&mut edit, None, &dedented_offset("  ab\n  c\n")),
+            None
+        );
     }
 
     #[test]
