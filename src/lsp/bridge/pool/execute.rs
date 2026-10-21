@@ -17,8 +17,8 @@ use super::{
 };
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::protocol::{
-    JsonRpcRequest, PREPARE_TIMEOUT, RegionOffset, RequestId, VirtualDocumentUri,
-    host_position_hidden_by_prepare, host_position_within_region_bounds,
+    JsonRpcRequest, PREPARE_TIMEOUT, PositionRefusal, RegionOffset, RequestId, VirtualDocumentUri,
+    host_position_admitted,
 };
 
 /// How long a request waits for the lifecycle pass to send the text it was
@@ -538,7 +538,8 @@ impl LanguageServerPool {
     /// the region's end-of-content (a caret inside a trailing child the query
     /// excluded). The bound is snapshot-scoped — see the comment at the guard
     /// below for the in-flight-edit window it does not cover — and checked by
-    /// [`host_position_within_region_bounds`].
+    /// [`host_position_admitted`], which also refuses a position the prepared
+    /// document has no place for.
     ///
     /// Translating an out-of-region position would silently mistranslate it
     /// (clamping line and/or character via `saturating_sub`) and forward
@@ -653,9 +654,8 @@ impl LanguageServerPool {
         // the content actually opened — the same in-flight staleness every
         // LSP position request has, which downstream servers clamp. Closing
         // it needs generation-bound opens (issue #996).
-        let hidden = host_position_hidden_by_prepare(host_position, offset);
-        if hidden || !host_position_within_region_bounds(host_position, offset, region_end) {
-            if hidden {
+        if let Err(refusal) = host_position_admitted(host_position, offset, region_end) {
+            if refusal == PositionRefusal::HiddenByPrepare {
                 // Strictly inside a gap, or on a blank line the prepare peer
                 // deleted: the prepared document has no such position, and
                 // would answer for another.
