@@ -1087,6 +1087,50 @@ impl PreparedMap {
                 == self.virtual_lines.text[virtual_start..virtual_end]
     }
 
+    /// [`Self::range_reads_alike`] for every one of `ranges`, each mapped to
+    /// V as ranges are when all read alike (`None` otherwise): their ends
+    /// converted all at once, a pass over each line they fall on, not one
+    /// conversion each (many ranges on a long line, linked ones say, would
+    /// cost the line's length each).
+    pub(crate) fn map_ranges_alike(
+        &self,
+        ranges: &[tower_lsp_server::ls_types::Range],
+    ) -> Option<Vec<tower_lsp_server::ls_types::Range>> {
+        if ranges.iter().any(|range| range.start > range.end) {
+            return None;
+        }
+        let ends: Vec<Position> = ranges
+            .iter()
+            .flat_map(|range| [range.start, range.end])
+            .collect();
+        let offsets = self.prepared_lines.offsets_clamped(&ends);
+        let mut virtual_ends = Vec::with_capacity(offsets.len());
+        for &[start, end] in offsets.as_chunks::<2>().0 {
+            let virtual_start = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
+            let virtual_end = if start == end {
+                virtual_start
+            } else {
+                map_offset(&self.runs, end, Bias::End, Side::Prepared)
+            };
+            if virtual_start > virtual_end
+                || self.prepared_lines.text[start..end]
+                    != self.virtual_lines.text[virtual_start..virtual_end]
+            {
+                return None;
+            }
+            virtual_ends.extend([virtual_start, virtual_end]);
+        }
+        let positions = self.virtual_lines.positions(&virtual_ends);
+        Some(
+            positions
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[start, end]| tower_lsp_server::ls_types::Range { start, end })
+                .collect(),
+        )
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
@@ -1440,7 +1484,7 @@ impl LineMap {
 #[cfg(test)]
 thread_local! {
     /// Positions or offsets converted one by one (see `LineMap::position`).
-    static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Bytes the batch conversions scanned (see `LineMap::positions`).
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Lines `LineMap::positions` looked up to find its offsets' lines.

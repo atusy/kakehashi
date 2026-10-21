@@ -6261,3 +6261,66 @@ fn touching_in_line_edits_replay_as_the_one_edit_they_make() {
         replayed(virtual_text, &map, &merged)
     );
 }
+
+#[test]
+fn many_ranges_on_a_long_line_convert_in_one_pass_as_one_by_one() {
+    // 2,000 linked occurrences on one line of non-ASCII text: mapped all
+    // at once, each as on its own, without a conversion each (which would
+    // rescan the line's text before it every time).
+    let count = 2_000;
+    let virtual_text = format!("  {}\n", vec!["\u{3042}a"; count].join(" "));
+    let map = dedent_by_two(&virtual_text);
+    let ranges: Vec<LspRange> = (0..count as u32)
+        .map(|at| LspRange::new(pos(0, at * 3 + 1), pos(0, at * 3 + 2)))
+        .collect();
+    let one_by_one: Vec<LspRange> = ranges
+        .iter()
+        .map(|range| {
+            assert!(map.range_reads_alike(*range));
+            LspRange::new(
+                map.to_virtual(range.start, Bias::Start),
+                map.to_virtual(range.end, Bias::End),
+            )
+        })
+        .collect();
+    use super::super::{CONVERSIONS, SCANNED};
+    CONVERSIONS.with(|conversions| conversions.set(0));
+    SCANNED.with(|scanned| scanned.set(0));
+    let at_once = map.map_ranges_alike(&ranges).expect("all alike");
+    assert_eq!(at_once, one_by_one);
+    assert_eq!(CONVERSIONS.with(|conversions| conversions.get()), 0);
+    let scanned = SCANNED.with(|scanned| scanned.get());
+    assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
+    // Any range not alike refuses them all: one reaching into the next
+    // line's removed indentation.
+    let text = "  a\n  b\n";
+    let map = dedent_by_two(text);
+    assert_eq!(
+        map.map_ranges_alike(&[
+            LspRange::new(pos(0, 0), pos(0, 1)),
+            LspRange::new(pos(0, 1), pos(1, 1)),
+        ]),
+        None
+    );
+    // Empty ranges stay empty; CRLF and lone-CR lines map as one by one.
+    let text = "  é\r\n  x\r  y\n";
+    let map = dedent_by_two(text);
+    let ranges = [
+        LspRange::new(pos(0, 1), pos(0, 1)),
+        LspRange::new(pos(1, 0), pos(1, 1)),
+        LspRange::new(pos(2, 0), pos(2, 1)),
+    ];
+    let expected: Vec<LspRange> = ranges
+        .iter()
+        .map(|range| {
+            let start = map.to_virtual(range.start, Bias::Start);
+            let end = if range.start == range.end {
+                start
+            } else {
+                map.to_virtual(range.end, Bias::End)
+            };
+            LspRange::new(start, end)
+        })
+        .collect();
+    assert_eq!(map.map_ranges_alike(&ranges), Some(expected));
+}
