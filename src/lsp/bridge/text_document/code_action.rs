@@ -33,7 +33,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+    ConnectionHandle, ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
@@ -1134,7 +1134,7 @@ impl LanguageServerPool {
         let request = JsonRpcRequest::new(request_id.as_i64(), "codeAction/resolve", &action);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        let mut held = None;
+        let mut held = HeldNote::default();
         // Verify `handle` is still the pool's LIVE connection for its key
         // before sending, under the `connections` lock (the same guard the
         // executeCommand and generic execute paths use): a respawn between
@@ -1169,7 +1169,9 @@ impl LanguageServerPool {
             }
             // What the producer holds for the virtual document as the
             // resolve is queued: the reply must be computed on that text.
-            held = virtual_uri.map(|uri| self.note_held(uri, connection_key));
+            if let Some(uri) = virtual_uri {
+                held = self.note_held(uri, connection_key);
+            }
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
                 // DEBUG: see the register-failure note above.
@@ -1206,7 +1208,7 @@ impl LanguageServerPool {
         // Computed on another text than the one noted (a prepared one sent
         // ahead of it after its pair gained a peer, say): its edit is not in
         // the envelope's coordinates.
-        if held.is_some_and(|held| !self.held_unchanged(&held)) {
+        if !self.held_unchanged(&held) {
             return None;
         }
         // Retirement alone does not invalidate a matched reply. Callers retain

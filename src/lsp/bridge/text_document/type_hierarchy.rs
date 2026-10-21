@@ -14,7 +14,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::pool::ConnectionKey;
-use super::super::pool::{ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver};
+use super::super::pool::{
+    ConnectionState, HeldNote, LanguageServerPool, UpstreamId, VirtualUriObserver,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
     translate_contained_ranges_to_host, translate_host_position_to_virtual,
@@ -240,7 +242,7 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         // What the producer holds for the virtual document as the request
         // is queued: the reply must be computed on that text.
-        let mut held = None;
+        let mut held = HeldNote::default();
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
@@ -262,7 +264,7 @@ impl LanguageServerPool {
                     envelope.connection_generation,
                 );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
-                    held = Some(self.note_held(&uri, connection_key));
+                    held = self.note_held(&uri, connection_key);
                     observer.insert(uri);
                 }
                 let queued = if handle.has_static_type_hierarchy_provider() {
@@ -317,7 +319,7 @@ impl LanguageServerPool {
         // Computed on another text than the one noted (a prepared one sent
         // ahead of it after its pair gained a peer, say): its items are not
         // in the envelope's coordinates.
-        if held.is_some_and(|held| !self.held_unchanged(&held)) {
+        if !self.held_unchanged(&held) {
             return None;
         }
         transform_type_hierarchy_expansion_response_to_host(
