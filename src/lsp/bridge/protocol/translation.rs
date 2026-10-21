@@ -561,6 +561,35 @@ pub(crate) fn host_position_within_region_bounds(
     host_position_within_region(host_position, offset) && host_position <= region_end
 }
 
+/// Why a host position is not sent to a region's downstream servers (see
+/// [`host_position_admitted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PositionRefusal {
+    /// [`host_position_hidden_by_prepare`]: no place in the prepared
+    /// document.
+    HiddenByPrepare,
+    /// Not [`host_position_within_region_bounds`].
+    OutsideRegion,
+}
+
+/// Whether a position request at `host_position` is sent to the region's
+/// downstream servers, or why not: one rule for every path that answers
+/// for such a request, so a shortcut answering without sending agrees with
+/// the request it stands in for.
+pub(crate) fn host_position_admitted(
+    host_position: Position,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> Result<(), PositionRefusal> {
+    if host_position_hidden_by_prepare(host_position, offset) {
+        return Err(PositionRefusal::HiddenByPrepare);
+    }
+    if !host_position_within_region_bounds(host_position, offset, region_end) {
+        return Err(PositionRefusal::OutsideRegion);
+    }
+    Ok(())
+}
+
 /// Translate a single host position to virtual coordinates.
 ///
 /// Subtracts the line offset, then applies the per-line column offset for the

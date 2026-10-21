@@ -18,8 +18,7 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_editable_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    host_position_hidden_by_prepare, host_position_within_region_bounds,
-    response_has_jsonrpc_error,
+    host_position_admitted, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -91,11 +90,11 @@ fn default_behavior_at(
     offset: &RegionOffset,
     region_end: Position,
 ) -> Option<PrepareRenameResponse> {
-    (host_position_within_region_bounds(host_position, offset, region_end)
-        && !host_position_hidden_by_prepare(host_position, offset))
-    .then_some(PrepareRenameResponse::DefaultBehavior {
-        default_behavior: true,
-    })
+    host_position_admitted(host_position, offset, region_end)
+        .is_ok()
+        .then_some(PrepareRenameResponse::DefaultBehavior {
+            default_behavior: true,
+        })
 }
 
 /// Build a JSON-RPC prepareRename request for a downstream language server.
