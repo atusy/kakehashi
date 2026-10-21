@@ -527,16 +527,12 @@ pub struct LanguageServerPool {
     /// At `MAX_CONSECUTIVE_PANICS` we stop retrying, preventing an infinite
     /// retry loop when a connection's handshake consistently panics.
     consecutive_panic_counts: std::sync::Mutex<HashMap<ConnectionKey, u32>>,
-    /// Workspace root URI forwarded from upstream client.
-    ///
-    /// Seeded during initialize and updated when the primary workspace folder changes.
-    /// Passed to downstream servers during LSP handshake so they can provide
-    /// workspace-aware features (diagnostics, go-to-definition, etc.).
-    root_uri: arc_swap::ArcSwap<Option<String>>,
-    /// Current workspace folders from the upstream client. Seeded during
-    /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
-    /// snapshotted for each later downstream handshake.
-    workspace_folders: super::WorkspaceFolderSet,
+    /// The upstream client's workspace folders and the root URI that goes
+    /// with them. Seeded during initialize, then updated by
+    /// `workspace/didChangeWorkspaceFolders` and snapshotted for each later
+    /// downstream handshake, so servers can provide workspace-aware features
+    /// (diagnostics, go-to-definition, etc.).
+    client_workspace: super::ClientWorkspace,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -652,8 +648,7 @@ impl LanguageServerPool {
             upstream_cancel_handles: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
-            root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
-            workspace_folders: super::WorkspaceFolderSet::new(None),
+            client_workspace: super::ClientWorkspace::default(),
             client_capabilities: OnceLock::new(),
             log_message_level: AtomicU8::new(
                 crate::config::settings::LogMessageLevel::Info.as_u8(),
@@ -819,33 +814,20 @@ impl LanguageServerPool {
         self.upstream_tx.clone()
     }
 
-    /// Set the workspace root URI.
-    ///
-    /// Called during initialize and when the primary workspace folder changes.
-    pub(crate) fn set_root_uri(&self, uri: Option<String>) {
-        self.root_uri.store(Arc::new(uri));
-    }
-
-    /// Get the workspace root URI.
-    fn root_uri(&self) -> Option<String> {
-        self.root_uri.load().as_ref().clone()
-    }
-
-    /// Set the workspace folders.
-    ///
-    /// Called during upstream initialize to seed the workspace-folder snapshot.
-    pub(crate) fn set_workspace_folders(
+    /// Seed the client workspace from upstream initialize: the client's root
+    /// URI and the folders forwarded to downstream servers.
+    pub(crate) fn seed_client_workspace(
         &self,
+        root_uri: Option<String>,
         folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
     ) {
-        self.workspace_folders.replace(folders);
+        self.client_workspace.seed(root_uri, folders);
     }
 
-    /// Get the workspace folders.
-    pub(crate) fn workspace_folders(
-        &self,
-    ) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
-        self.workspace_folders.snapshot()
+    /// The client workspace folders and their root, read
+    /// together: callers needing both must take them from one snapshot.
+    pub(crate) fn client_workspace(&self) -> super::ClientWorkspaceSnapshot {
+        self.client_workspace.snapshot()
     }
 
     /// Update the upstream client workspace snapshot used by future
@@ -861,7 +843,7 @@ impl LanguageServerPool {
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) -> bool {
         // An event naming neither an addition nor a removal describes no
-        // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
+        // change: `ClientWorkspace::apply_change` is a no-op for it, so the
         // client workspace snapshot cannot move. Returning here rather than
         // letting the body run unconditionally matters beyond that snapshot,
         // though — the recycle loop below does not look at the event either,
@@ -872,11 +854,11 @@ impl LanguageServerPool {
             return false;
         }
 
-        self.workspace_folders.apply_change(added.clone(), removed);
-        self.set_root_uri(
-            self.workspace_folders()
-                .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
-        );
+        // The root is derived from the folder list on read, under the same
+        // lock, so no interleaving of changes and readers can pair a root
+        // with folders it does not belong to (#955) — whether or not the
+        // caller serializes changes.
+        self.client_workspace.apply_change(added.clone(), removed);
 
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
@@ -3851,11 +3833,14 @@ impl LanguageServerPool {
         let folders: Vec<tower_lsp_server::ls_types::WorkspaceFolder> = match marker {
             Some((_root, folder)) => vec![folder.clone()],
             None => {
-                let snapshot = self.workspace_folders().unwrap_or_default();
+                // One snapshot for both rungs: the root must be the one
+                // that goes with the folders just found empty.
+                let client = self.client_workspace();
+                let snapshot = client.folders.unwrap_or_default();
                 if !snapshot.is_empty() {
                     snapshot
-                } else if let Some((_root, folder)) = self
-                    .root_uri()
+                } else if let Some((_root, folder)) = client
+                    .root
                     .and_then(|root| Url::parse(&root).ok())
                     .and_then(super::root_markers::workspace_at_root)
                 {
@@ -4332,7 +4317,10 @@ impl LanguageServerPool {
             (None, Some(Vec::new()))
         } else {
             super::root_markers::workspace_from_marker(marker, || {
-                (self.root_uri(), self.workspace_folders())
+                // Root and folders from one snapshot, so the handshake never
+                // pairs a root with a folder list it was not derived from.
+                let client = self.client_workspace();
+                (client.root, client.folders)
             })
         };
         log::debug!(
@@ -5424,14 +5412,70 @@ mod tests {
         };
         let original = folder("file:///original");
         let replacement = folder("file:///replacement");
-        pool.set_root_uri(Some(original.uri.to_string()));
-        pool.set_workspace_folders(Some(vec![original.clone()]));
+        pool.seed_client_workspace(Some(original.uri.to_string()), Some(vec![original.clone()]));
 
         pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
             .await;
 
-        assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
-        assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
+        let client = pool.client_workspace();
+        assert_eq!(client.root.as_deref(), Some("file:///replacement"));
+        assert_eq!(client.folders, Some(vec![replacement]));
+    }
+
+    /// Concurrent folder changes must leave the forwarded root naming the
+    /// first folder of the set they converged on (#955), even without the
+    /// settings-reload lock the production handler serializes them under.
+    /// Each change replaces the whole set with its own single folder, so
+    /// whichever lands last owns both the set and the root; a root published
+    /// apart from the set can be overwritten by an earlier change's stale read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_workspace_folder_changes_keep_root_on_the_converged_set() {
+        const WRITERS: usize = 8;
+        const ROUNDS: usize = 500;
+        let folders: Vec<_> = (0..WRITERS)
+            .map(|i| tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: format!("file:///folder-{i}").parse().unwrap(),
+                name: format!("folder-{i}"),
+            })
+            .collect();
+        let pool = Arc::new(LanguageServerPool::new());
+        pool.seed_client_workspace(
+            Some(folders[0].uri.to_string()),
+            Some(vec![folders[0].clone()]),
+        );
+
+        for round in 0..ROUNDS {
+            let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+            let tasks: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let pool = Arc::clone(&pool);
+                    let barrier = Arc::clone(&barrier);
+                    let added = folders[i].clone();
+                    let removed: Vec<_> = folders
+                        .iter()
+                        .filter(|folder| folder.uri != added.uri)
+                        .cloned()
+                        .collect();
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        pool.apply_workspace_folder_change(vec![added], &removed)
+                            .await;
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+
+            let client = pool.client_workspace();
+            let first = client
+                .folders
+                .and_then(|set| set.first().map(|folder| folder.uri.to_string()));
+            assert_eq!(
+                client.root, first,
+                "round {round}: the root must name the first folder of the converged set"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5605,8 +5649,7 @@ mod tests {
             uri: "file:///original".parse().unwrap(),
             name: "original".to_string(),
         };
-        pool.set_root_uri(Some(original.uri.to_string()));
-        pool.set_workspace_folders(Some(vec![original.clone()]));
+        pool.seed_client_workspace(Some(original.uri.to_string()), Some(vec![original.clone()]));
 
         pool.apply_workspace_folder_change(Vec::new(), &[]).await;
 
@@ -5619,11 +5662,13 @@ mod tests {
             "and must not arm it for a re-open it never earned"
         );
         assert_eq!(
-            pool.root_uri(),
-            Some("file:///original".to_string()),
+            pool.client_workspace(),
+            super::super::ClientWorkspaceSnapshot {
+                root: Some("file:///original".to_string()),
+                folders: Some(vec![original]),
+            },
             "and must not touch the client workspace snapshot"
         );
-        assert_eq!(pool.workspace_folders(), Some(vec![original]));
     }
 
     #[tokio::test]
@@ -6702,7 +6747,7 @@ mod tests {
             .0
             .expect("B has a marker root")
             .1;
-        pool.set_workspace_folders(Some(vec![folder_a.clone(), folder_b.clone()]));
+        pool.seed_client_workspace(None, Some(vec![folder_a.clone(), folder_b.clone()]));
 
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
@@ -6751,8 +6796,7 @@ mod tests {
 
         let (marker, _) = pool.resolve_marker_and_key("lua", &config, Some(&doc));
         let (client_root, client_folder) = marker.expect("tmp dir has a marker root");
-        pool.set_root_uri(Some(String::from(client_root)));
-        pool.set_workspace_folders(Some(Vec::new())); // rootUri only, empty folder list
+        pool.seed_client_workspace(Some(String::from(client_root)), Some(Vec::new())); // rootUri only, empty folder list
 
         let handle =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
@@ -12241,8 +12285,7 @@ mod tests {
         let folder = super::super::root_markers::workspace_at_root(root.clone())
             .unwrap()
             .1;
-        pool.set_root_uri(Some(root.to_string()));
-        pool.set_workspace_folders(Some(vec![folder]));
+        pool.seed_client_workspace(Some(root.to_string()), Some(vec![folder]));
         // Rootless routing uses a shared key even WITHOUT preferSharedInstance.
         let config = devnull_config();
         pool.set_host_routing_workspace_folders(&document, "lua", Some(Some(vec![])));
