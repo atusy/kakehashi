@@ -285,14 +285,8 @@ impl Kakehashi {
                 .await?;
             Ok(actions.map(|actions| vec![(actions, None)]))
         };
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
         let passed_over = RefusedActionsFallback::default();
-        let may_keep = |source: &Sourced<()>| {
-            super::super::bridge_context::source_may_keep(source, pool, tracker, || {
-                self.host_content_version(&lsp_uri)
-            })
-        };
+        let may_keep = |source: &Sourced<()>| self.answer_may_keep(&lsp_uri, source);
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
         // non-empty layer; `concatenated` merges every layer's actions in priority
