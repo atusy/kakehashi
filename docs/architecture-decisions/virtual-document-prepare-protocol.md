@@ -182,9 +182,9 @@ existing host translation, so every position, range, diagnostic, folding
 range and `window/showDocument` selection a server sends or receives is
 translated through P ↔ V ↔ host. Deleted edge blank lines stay in V: P's
 start maps after the leading ones and P's end before the trailing ones. A
-request at a host position P has no place for — strictly inside a gap, or
-on a deleted edge line — is not made at all, since the server would answer
-for another place.
+request is not made at all at a host position with no corresponding
+position in P, such as one strictly inside a gap or on a deleted edge line,
+since the server would answer it for another place.
 
 No edit is mapped back through a prepared document. The methods closed to
 a non-contiguous combined document — codeAction, colorPresentation,
