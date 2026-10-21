@@ -29,19 +29,23 @@ enum Piece {
 }
 
 impl Expansion {
-    /// The expansion of `snippet`, when every client agrees on it: literal
-    /// text, tabstops, and at most one placeholder per tabstop whose
-    /// default holds no `$` — no nesting, no mirror inside a default — all
-    /// on one line, without a tab. `None` for anything else: text the
-    /// client decides at insert time (a variable), that this expansion
-    /// does not compute (a transform), or that clients resolve differently
-    /// (several defaults for one tabstop, defaults holding defaults, a
-    /// choice — VS Code inserts its first option, Neovim nothing until the
-    /// user reaches it —, a default escaping anything but `$`, `}` or `\`,
-    /// a `$` opening nothing, the final tabstop twice, a line break — a
-    /// snippet engine indents the lines after the first by the caret
-    /// line's, whatever the item asks — or a tab — one turns tabs into
-    /// spaces); and for an expansion far longer than the snippet (one
+    /// The expansion of `snippet`, when it is written only in forms every
+    /// client expands alike:
+    ///
+    /// - literal text, escaping nothing but `$`, `}` and `\`;
+    /// - tabstops `$n` and `${n}`, `n` written without a leading zero and at
+    ///   most 9999, the final tabstop `0` at most once;
+    /// - at most one placeholder `${n:default}` per tabstop, on its first
+    ///   occurrence (later ones mirror it), its default literal text
+    ///   escaping only the same three;
+    /// - all on one line, with no tab, and holding a `$` that opens a word
+    ///   after anything but a backslash when it holds a tabstop (see
+    ///   [`reads_as_snippet`]).
+    ///
+    /// `None` for anything else — a choice, a variable, a transform, a
+    /// nested placeholder or mirror in a default, a `$` opening nothing —
+    /// each refused where it is read below, with the client behaviour
+    /// behind it; and for an expansion far longer than the snippet (one
     /// default mirrored many times).
     pub(super) fn of(snippet: &str) -> Option<Self> {
         // Neovim's vim.snippet.expand (and mini.snippets) prefix every line
