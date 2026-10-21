@@ -433,11 +433,7 @@ fn build_prepared(
                     if closing_indent {
                         closing = Some(&virtual_text[deletion.clone()]);
                     } else if kind == RunKind::Deleted {
-                        let rest_of_line = virtual_text[deletion.end..]
-                            .split(['\n', '\r'])
-                            .next()
-                            .unwrap_or_default();
-                        if rest_of_line.chars().all(|c| matches!(c, ' ' | '\t')) {
+                        if rest_of_line_blank(virtual_text, deletion.end) {
                             blank.push(&virtual_text[deletion.clone()]);
                         } else {
                             deleted.push(&virtual_text[deletion.clone()]);
@@ -903,6 +899,12 @@ impl PreparedMap {
     /// the same runs (the maps' equality), whichever answers they came from.
     /// What decides whether a server holding one needs the other's text sent
     /// (it does not), or reads a reply computed on one through the other.
+    /// The indentation the peer removed right at P offset `prepared` (a
+    /// deleted run P shows nothing of), if any.
+    fn removed_indent_at(&self, prepared: usize) -> Option<&Run> {
+        empty_run(&self.runs, prepared, |kind| kind == RunKind::Deleted)
+    }
+
     pub(crate) fn same_coordinates(a: Option<&PreparedMap>, b: Option<&PreparedMap>) -> bool {
         a == b
     }
@@ -1394,6 +1396,17 @@ fn splits_crlf(text: &str, offset: usize) -> bool {
 
 fn is_line_start(text: &str, offset: usize) -> bool {
     offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
+}
+
+/// Whether the rest of `text`'s line from `offset` holds nothing but spaces
+/// and tabs (or nothing).
+fn rest_of_line_blank(text: &str, offset: usize) -> bool {
+    text[offset..]
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .all(|c| matches!(c, ' ' | '\t'))
 }
 
 #[cfg(test)]
