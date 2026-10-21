@@ -59,11 +59,8 @@ impl Kakehashi {
             .await?;
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held.
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
         Ok(hints.map(|hints| {
-            let current =
-                hints.still_current(pool, tracker, || self.host_content_version(&lsp_uri));
+            let current = self.sourced_still_current(&hints, &lsp_uri);
             inlay_hints_still_current(hints.value, current)
         }))
     }
