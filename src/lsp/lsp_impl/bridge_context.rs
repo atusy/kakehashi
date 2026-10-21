@@ -450,10 +450,14 @@ impl<T> Sourced<T> {
     /// was made, which the host's store is open for (not deleted,
     /// invalidated, nor its host closed or reopened) — and its recorded text
     /// still the request's (`LanguageServerPool::host_text_still_current`).
-    /// Read once, where the final answer is chosen, after every fan-in and
-    /// layer await, and nowhere per reply: a reply refused as it arrived
-    /// would count as no answer, and a server ranked below it replying once
-    /// the host settled (the region's content unchanged) would win.
+    /// Read where an answer is chosen, and nowhere per reply: a reply refused
+    /// as it arrived would count as no answer, and a server ranked below it
+    /// replying once the host settled (the region's content unchanged) would
+    /// win. Completion and color presentations read it as the layer race
+    /// decides on the injected layer's answer, so a stale one falls through
+    /// to the host layer's; inlay hints only once the answer is chosen, a
+    /// stale answer's hints staying shown without their edits. Every carrier
+    /// reads it again as it returns the answer, after the last await.
     pub(crate) fn still_current(
         &self,
         pool: &crate::lsp::bridge::LanguageServerPool,

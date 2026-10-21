@@ -257,14 +257,21 @@ No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
 An answer's edits are mapped only while they would land where the server
-meant them. This is read once, when the final answer is chosen, not as
-each reply arrives: the servers' fan-in or the layer race can hold an
-answer while the host moves, and a reply refused on arrival would count
-as no answer, so a server ranked below it whose reply came once the host
-settled (with the region's content unchanged, after an edit to another
-fence or a hold clearing) would win against the configured order. A
-reply is mapped through its request's map whatever happened since; only
-the answer chosen is checked:
+meant them. This is read where an answer is chosen, not as each reply
+arrives: the servers' fan-in or the layer race can hold an answer while
+the host moves, and a reply refused on arrival would count as no answer,
+so a server ranked below it whose reply came once the host settled (with
+the region's content unchanged, after an edit to another fence or a hold
+clearing) would win against the configured order. A reply is mapped
+through its request's map whatever happened since. Completion and color
+presentations read it as the layer race decides on the injected layer's
+answer: a stale one is no answer of that layer, and the race falls
+through to the host layer's (waited for if still running), a stale
+incomplete completion list still asking to re-query. Inlay hints read it
+only once the answer is chosen: a stale answer's hints stay shown
+without their edits, which keeps more than the host layer's answer would
+give. Every answer is read once more as it is returned, with no await
+since. The answer is checked against:
 
 - the host was edited since the request's text was read (anywhere: an
   edit above the region moves the host coordinates its edits were
