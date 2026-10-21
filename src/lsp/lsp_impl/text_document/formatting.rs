@@ -3107,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn reapply_prefixes_no_empty_line_landing_on_a_blank_row() {
+    fn reapply_leaves_an_empty_line_on_a_blank_row_unprefixed() {
         // Text on the blank `>` row takes the region's `> `; the empty last
         // line lands on the synthetic row, blank too, and must stay empty,
         // or the closing fence's own `> ` would follow a stray `>`.
