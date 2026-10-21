@@ -10311,6 +10311,37 @@ mod tests {
         assert_eq!(opened_text(&mut rx), "x = 1");
     }
 
+    /// A hold outlives every forget of its region's answers in the
+    /// registry it shares a table with (a replaced, invalidated or re-routed
+    /// region): a request resolved before still opens nothing as is.
+    #[tokio::test]
+    async fn a_held_region_is_not_opened_as_is_after_its_answers_are_forgotten() {
+        let host_uri = Url::parse("file:///test/held-forgotten.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        let forgets: [fn(&super::super::prepare_registry::PrepareRegistry, &Url); 3] = [
+            |registry, host| registry.forget_region(host, Some("lua"), TEST_ULID_LUA_0),
+            |registry, host| registry.forget_regions(host, &[TEST_ULID_LUA_0.to_string()]),
+            |registry, host| registry.forget_region_except(host, TEST_ULID_LUA_0, Some("python")),
+        ];
+        for forget in forgets {
+            let pool = LanguageServerPool::preparing();
+            let registry = super::super::prepare_registry::PrepareRegistry::default();
+            pool.install_prepare_failures(registry.failures());
+            pool.open_host_incarnation(&host_uri, 1).await;
+            pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+            pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+            forget(&registry, &host_uri);
+            let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+            assert!(
+                pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                    .await
+                    .is_err()
+            );
+            assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        }
+    }
+
     #[tokio::test]
     async fn a_region_held_for_its_peer_is_not_opened_as_is() {
         let pool = LanguageServerPool::preparing();
