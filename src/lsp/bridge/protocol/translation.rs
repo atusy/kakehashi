@@ -602,7 +602,7 @@ mod tests {
             &offset
         ));
         assert!(!host_range_selects_nothing(
-            range((10, 10), (11, 2)),
+            range((10, 11), (11, 2)),
             &offset
         ));
         // Unprepared, every character is kept.
