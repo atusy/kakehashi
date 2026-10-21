@@ -62,13 +62,7 @@ impl Expansion {
         let mut text = String::new();
         while let Some(c) = chars.next() {
             match c {
-                '\\' => match chars.next() {
-                    Some(escaped @ ('$' | '}' | '\\')) => text.push(escaped),
-                    // Neovim's vim.snippet reads other escapes into a
-                    // pattern (`x\%$0` fails), and VS Code keeps their
-                    // backslash; a trailing one escapes nothing.
-                    _ => return None,
-                },
+                '\\' => text.push(escaped(&mut chars)?),
                 '$' => {
                     let number = if chars.next_if_eq(&'{').is_some() {
                         // A variable (or anything but a tabstop).
@@ -196,12 +190,7 @@ fn placeholder(chars: &mut Chars<'_>) -> Option<String> {
     let mut text = String::new();
     loop {
         match chars.next()? {
-            '\\' => match chars.next()? {
-                escaped @ ('$' | '}' | '\\') => text.push(escaped),
-                // VS Code keeps the backslash; Neovim's grammar reads no
-                // other escape in a default.
-                _ => return None,
-            },
+            '\\' => text.push(escaped(chars)?),
             '}' => break,
             // A nested placeholder, a mirror or a variable in a default.
             '$' => return None,
@@ -209,6 +198,15 @@ fn placeholder(chars: &mut Chars<'_>) -> Option<String> {
         }
     }
     Some(text)
+}
+
+/// The character a `\` escapes, read after it: `$`, `}` or `\` only, the
+/// escapes every client reads alike. `None` for any other, and at the end:
+/// Neovim's vim.snippet reads other escapes into a pattern (`x\%$0`
+/// fails) and its grammar none in a default, VS Code keeps their
+/// backslash, and a trailing one escapes nothing.
+fn escaped(chars: &mut Chars<'_>) -> Option<char> {
+    chars.next_if(|c| matches!(c, '$' | '}' | '\\'))
 }
 
 #[cfg(test)]
