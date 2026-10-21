@@ -239,10 +239,7 @@ pub(crate) fn translate_virtual_formatting_edits_to_host(
         return Ok(());
     };
     let mut mapped = prepared.map_formatting_answer(edits)?;
-    for edit in &mut mapped {
-        translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
-        translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
-    }
+    shift_to_host(&mut mapped, offset);
     *edits = mapped;
     Ok(())
 }
@@ -283,11 +280,17 @@ fn map_to_host(
     mode: EditMode,
 ) -> Option<Vec<TextEdit>> {
     let mut mapped = prepared.map_edits(edits, mode)?;
-    for edit in &mut mapped {
+    shift_to_host(&mut mapped, offset);
+    Some(mapped)
+}
+
+/// Place `edits`, already mapped out of the prepared document onto the
+/// virtual one, in host coordinates.
+fn shift_to_host(edits: &mut [TextEdit], offset: &RegionOffset) {
+    for edit in edits {
         translate_unprepared_virtual_position_to_host(&mut edit.range.start, offset);
         translate_unprepared_virtual_position_to_host(&mut edit.range.end, offset);
     }
-    Some(mapped)
 }
 
 /// Translate, in place, a main edit and the additional edits a client
