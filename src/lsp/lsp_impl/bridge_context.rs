@@ -2819,6 +2819,51 @@ mod tests {
         }
     }
 
+    /// Several regions of one request whose peer never answers: their
+    /// attempts all started before the first is waited for, the request
+    /// waits about as long as for one region, not one wait per region.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_its_regions_prepare_attempts_together() {
+        let waited = |count: usize| async move {
+            let (service, first, uri) = kakehashi_with_an_unlooked_region();
+            let server = service.inner();
+            server.bridge.pool().record_prepare_advertisement(
+                &crate::lsp::bridge::ConnectionKey::for_server("peer"),
+                true,
+            );
+            let regions: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut resolved = first.clone();
+                    resolved.region.region_id = format!("01J000000000000000000000{index}B");
+                    resolved.virtual_content = format!("  a{index}");
+                    resolved
+                })
+                .collect();
+            let start = tokio::time::Instant::now();
+            start_prepare_attempts(
+                &server.bridge,
+                "markdown",
+                regions.iter().map(|resolved| (&uri, resolved)),
+            );
+            for resolved in &regions {
+                let _ = prepare_request_context_for(
+                    &server.bridge,
+                    "markdown",
+                    formatting_ctx(&uri, resolved),
+                    "textDocument/formatting",
+                )
+                .await;
+            }
+            start.elapsed()
+        };
+        let one = waited(1).await;
+        let three = waited(3).await;
+        assert!(
+            three < one + std::time::Duration::from_secs(1),
+            "one region {one:?}, three {three:?}"
+        );
+    }
+
     /// A context for `resolved` of `uri` as the formatting fan-out builds
     /// one.
     fn formatting_ctx(
