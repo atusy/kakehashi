@@ -188,9 +188,9 @@ fn transform_edits(
 ///
 /// The region's mapped edits and the host URI's direct ones never overlap:
 /// those reaching into the region are refused, and mapped ones stay inside
-/// it, so the two can at most meet at its edges; meeting there, in
-/// `changes` (one set, applied in no order the edits state), the edit is
-/// refused too.
+/// it, so the two can at most meet at its edges; where one inserts at the
+/// other's start there, in `changes` (one set, whose order there no edit
+/// states), the edit is refused too.
 fn transform_prepared_workspace_edit(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
@@ -264,14 +264,19 @@ fn transform_prepared_workspace_edit(
         return false;
     }
     // In `changes` the host's own edits and the mapped ones are one set,
-    // the mapped ones after: a direct edit meeting a mapped one where the
-    // region starts or ends (an insertion there, one replaced up to there)
-    // would leave their order to the client, against what each meant.
+    // applied in no order the set states where two share a start and one
+    // inserts there (several insertions, or an insertion and a replacement
+    // at one place): a direct and a mapped one so meeting at the region's
+    // edge would leave the order of their text to the client. One ending
+    // where the other starts is ordered by the text itself.
+    let inserts_at = |insertion: &Range, other: &Range| {
+        insertion.start == insertion.end && insertion.start == other.start
+    };
     !direct_changes.iter().any(|direct| {
         replayed
             .mapped_changes
             .iter()
-            .any(|mapped| direct.end == mapped.start || mapped.end == direct.start)
+            .any(|mapped| inserts_at(direct, mapped) || inserts_at(mapped, direct))
     })
 }
 
@@ -1981,20 +1986,63 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_host_edit_meeting_a_mapped_one_at_the_regions_edge_refuses_the_edit() {
+    fn a_direct_host_insertion_where_a_mapped_edit_starts_refuses_the_edit() {
         let virtual_uri = make_virtual_uri_string();
         let host_uri = make_host_uri();
-        // The region's last line deleted up to its end, and text inserted
-        // on the host right there: which goes first no edit states.
-        let mut edit = parse_workspace_edit(json!({"changes": {
-            virtual_uri.clone(): [{"range": range_json((1, 0), (2, 0)), "newText": ""}],
-            host_uri.as_str(): [{"range": range_json((12, 0), (12, 0)), "newText": "after\n"}]
-        }}));
-        assert!(!transform_workspace_edit_to_host(
-            &mut edit,
-            &virtual_uri,
-            &host_uri,
-            &prepared_offset()
-        ));
+        let edit = |mapped: serde_json::Value, direct: serde_json::Value| {
+            parse_workspace_edit(json!({"changes": {
+                virtual_uri.clone(): [mapped],
+                host_uri.as_str(): [direct]
+            }}))
+        };
+        let refused = [
+            // A line appended at P's end, and text inserted on the host
+            // right where the region ends: which goes first no edit states.
+            (
+                json!({"range": range_json((2, 0), (2, 0)), "newText": "x\n"}),
+                json!({"range": range_json((12, 0), (12, 0)), "newText": "after\n"}),
+            ),
+            // The region's first line deleted (its indent with it), and text
+            // inserted on the host right where the region starts.
+            (
+                json!({"range": range_json((0, 0), (1, 0)), "newText": ""}),
+                json!({"range": range_json((10, 0), (10, 0)), "newText": "before\n"}),
+            ),
+        ];
+        for (mapped, direct) in refused {
+            let mut edit = edit(mapped.clone(), direct.clone());
+            assert!(
+                !transform_workspace_edit_to_host(
+                    &mut edit,
+                    &virtual_uri,
+                    &host_uri,
+                    &prepared_offset()
+                ),
+                "{mapped} {direct}"
+            );
+        }
+        // One ending where the other starts: ordered by their text.
+        let kept = [
+            (
+                json!({"range": range_json((1, 0), (2, 0)), "newText": ""}),
+                json!({"range": range_json((12, 0), (12, 0)), "newText": "after\n"}),
+            ),
+            (
+                json!({"range": range_json((0, 0), (1, 0)), "newText": ""}),
+                json!({"range": range_json((9, 0), (10, 0)), "newText": ""}),
+            ),
+        ];
+        for (mapped, direct) in kept {
+            let mut edit = edit(mapped.clone(), direct.clone());
+            assert!(
+                transform_workspace_edit_to_host(
+                    &mut edit,
+                    &virtual_uri,
+                    &host_uri,
+                    &prepared_offset()
+                ),
+                "{mapped} {direct}"
+            );
+        }
     }
 }
