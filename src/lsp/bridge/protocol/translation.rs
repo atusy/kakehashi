@@ -239,7 +239,9 @@ pub(crate) fn translate_virtual_text_edits_to_host(
 /// when every set maps, with its main edit mapping as it does alone (so the
 /// edits sent are the set checked), and the additional edits mapping alike
 /// in every set. With no main edit there is no set to check: refused. An
-/// unprepared document's edits translate as ranges, allocating nothing.
+/// unprepared document's main edits translate as ranges, allocating
+/// nothing; its additional edits are not passed here (callers translate
+/// them once the main edit is accepted, as no set needs checking).
 pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
     mains: &mut [TextEdit],
     additional: Option<&mut Vec<TextEdit>>,
@@ -248,11 +250,15 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
 ) -> Option<bool> {
     // No additional edits is nothing to check or drop.
     let additional = additional.filter(|additional| !additional.is_empty());
+    debug_assert!(
+        additional.is_none() || offset.prepared().is_some(),
+        "an unprepared document's additional edits are translated by the caller"
+    );
     // The main edits as sent, to map with the additional ones: cloned only
-    // on a prepared document that has any.
+    // when there are any.
     let sent: Vec<TextEdit> = match &additional {
-        Some(_) if offset.prepared().is_some() => mains.to_vec(),
-        _ => Vec::new(),
+        Some(_) => mains.to_vec(),
+        None => Vec::new(),
     };
     for main in mains.iter_mut() {
         if !translate_virtual_text_edits_to_host(std::slice::from_mut(main), offset, mode) {
@@ -262,11 +268,6 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
     let Some(additional) = additional else {
         return Some(true);
     };
-    if offset.prepared().is_none() {
-        return Some(translate_virtual_text_edits_to_host(
-            additional, offset, mode,
-        ));
-    }
     let mut agreed: Option<Vec<TextEdit>> = None;
     for (sent, mapped) in sent.into_iter().zip(mains.iter()) {
         let mut set = Vec::with_capacity(additional.len() + 1);
