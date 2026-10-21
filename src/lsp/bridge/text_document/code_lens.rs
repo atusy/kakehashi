@@ -37,7 +37,9 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
@@ -469,7 +471,7 @@ impl LanguageServerPool {
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
-        let mut held = None;
+        let mut held = HeldNote::default();
         let send_result = if envelope.is_host_layer() {
             self.enqueue_host_resolve(
                 &handle,
@@ -554,7 +556,7 @@ impl LanguageServerPool {
         // Computed on another text than the one noted (a prepared one sent
         // ahead of it, or after it, once its region gained a peer): not on
         // the text the lens was minted from.
-        if !producer_is_still_live || held.is_some_and(|held| !self.held_unchanged(&held)) {
+        if !producer_is_still_live || !self.held_unchanged(&held) {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }

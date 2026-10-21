@@ -397,7 +397,9 @@ impl RegionAdmission {
 /// What a connection held for a virtual document as a resolve was queued
 /// (see [`LanguageServerPool::note_held`]): its URI, the connection, the
 /// generation of the text on record, and whether that text is held as is.
-/// Empty without the prepare layer.
+/// Empty without the prepare layer, and before anything is noted: an
+/// empty note is unchanged (see [`LanguageServerPool::held_unchanged`]).
+#[derive(Default)]
 pub(crate) struct HeldNote(Option<(String, ConnectionKey, Option<u64>, bool)>);
 
 /// The latest text forwarded for a virtual document, which a deferred
@@ -3240,7 +3242,7 @@ impl LanguageServerPool {
 
     /// [`Self::note_held`] for the virtual document of `region_id` (under
     /// `injection_language`) of `host_uri`, as a resolve names it by its
-    /// envelope. `None` without the prepare layer, where nothing is noted
+    /// envelope. Empty without the prepare layer, where nothing is noted
     /// (and no URI is built), or for a host URI no virtual document is named
     /// under.
     pub(crate) fn note_region_held(
@@ -3249,13 +3251,15 @@ impl LanguageServerPool {
         injection_language: &str,
         region_id: &str,
         connection_key: &ConnectionKey,
-    ) -> Option<HeldNote> {
+    ) -> HeldNote {
         if !self.prepares() {
-            return None;
+            return HeldNote::default();
         }
-        let host = crate::lsp::lsp_impl::url_to_uri(host_uri).ok()?;
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return HeldNote::default();
+        };
         let virtual_uri = VirtualDocumentUri::new(&host, injection_language, region_id);
-        Some(self.note_held(&virtual_uri.to_uri_string(), connection_key))
+        self.note_held(&virtual_uri.to_uri_string(), connection_key)
     }
 
     /// Whether the reply to a resolve noted as `note` was computed on a text

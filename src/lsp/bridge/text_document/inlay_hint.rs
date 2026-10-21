@@ -38,7 +38,9 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
+};
 use super::host::{HostResolveContext, HostResolveReader};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
@@ -493,9 +495,9 @@ impl LanguageServerPool {
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
         // What the producer holds for the virtual document as the resolve
         // is queued: the reply must be computed on that text.
-        let held = virt
-            .as_ref()
-            .map(|virt| self.note_held(&virt.virtual_uri, connection_key));
+        let held = virt.as_ref().map_or_else(HeldNote::default, |virt| {
+            self.note_held(&virt.virtual_uri, connection_key)
+        });
         let send_result = if envelope.is_host_layer() {
             self.enqueue_host_resolve(
                 &handle,
@@ -573,7 +575,7 @@ impl LanguageServerPool {
         // Computed on another text than the one noted (a prepared one sent
         // ahead of it after its pair gained a peer, say): its coordinates are
         // not the envelope's.
-        if !producer_is_still_live || held.is_some_and(|held| !self.held_unchanged(&held)) {
+        if !producer_is_still_live || !self.held_unchanged(&held) {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         }
