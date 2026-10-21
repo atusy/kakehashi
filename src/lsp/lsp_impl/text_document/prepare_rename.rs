@@ -46,7 +46,16 @@ impl Kakehashi {
                 |value| {
                     parse_host_verbatim::<PrepareRenameResponse>(value).map(Sourced::unprepared)
                 },
-                |_| true,
+                // Read as the race decides: a prepared answer moved or stale
+                // is no answer of its layer, and the race falls through to
+                // the next layer's.
+                |sourced: &Sourced<PrepareRenameResponse>| {
+                    super::formatting::layer_answers(
+                        sourced,
+                        |_| true,
+                        |sourced| self.answer_may_keep(&lsp_uri, sourced),
+                    )
+                },
             )
             .await?;
         // The final answer chosen: a range in host coordinates, checked once
@@ -121,5 +130,38 @@ impl Kakehashi {
         Ok(answer.map(|answer| {
             Sourced::from_region(&ctx.document, answer, self.bridge.node_tracker(), revision)
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under a cross-layer `preferred`, a prepared answer the race finds
+    /// moved or stale is no answer: the host layer's wins, waited for when
+    /// it is still running. One that may be kept wins as ever.
+    #[tokio::test]
+    async fn a_rename_range_that_may_not_be_kept_falls_through_to_the_host_layers() {
+        let range = |line: u32| {
+            PrepareRenameResponse::Range(tower_lsp_server::ls_types::Range::new(
+                Position::new(line, 0),
+                Position::new(line, 1),
+            ))
+        };
+        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+            let won = super::super::formatting::race_prepared_virt_against_host(
+                range(1),
+                range(2),
+                host_delay_ms,
+                may_keep,
+                |_| true,
+            )
+            .await;
+            assert_eq!(
+                won,
+                range(if may_keep { 1 } else { 2 }),
+                "{may_keep} {host_delay_ms}"
+            );
+        }
     }
 }
