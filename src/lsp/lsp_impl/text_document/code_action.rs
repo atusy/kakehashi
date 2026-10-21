@@ -793,9 +793,20 @@ impl Kakehashi {
         // No `cancel_rx` here: the caller holds a single cancel subscription for
         // the whole multi-region walk and aborts it on cancel.
         match ctx.document.strategy {
+            AggregationStrategy::Preferred if ctx.document.prepared.is_none() => {
+                dispatch_preferred(
+                    &ctx.document,
+                    pool.clone(),
+                    f,
+                    |opt| matches!(opt, Some(v) if !v.is_empty()),
+                    None,
+                )
+                .await
+                .handle(&self.notifier(), "code action", None, Ok)
+                .await
+            }
             AggregationStrategy::Preferred => {
-                let prepared = ctx.document.prepared.is_some();
-                // A prepared document's answers of disabled actions only,
+                // A prepared document's answers of refused actions only,
                 // passed over in the fan-in, as they arrived: the answer
                 // when no server's actions answer.
                 let passed_over =
@@ -809,8 +820,7 @@ impl Kakehashi {
                     let answer = f(t);
                     async move {
                         let answer = answer.await;
-                        if prepared
-                            && let Ok(Some(actions)) = &answer
+                        if let Ok(Some(actions)) = &answer
                             && !actions.is_empty()
                             && !actions_answer(actions, true)
                         {
@@ -825,7 +835,7 @@ impl Kakehashi {
                     &ctx.document,
                     pool.clone(),
                     f,
-                    |opt| matches!(opt, Some(v) if actions_answer(v, prepared)),
+                    |opt| matches!(opt, Some(v) if actions_answer(v, true)),
                     None,
                 )
                 .await;
