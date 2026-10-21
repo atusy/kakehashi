@@ -611,6 +611,53 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_where_formatting_is_disabled() {
+    // The same failing peer, on a region with formatting disabled
+    // (`priorities = []`): no formatting request would have been sent, so
+    // none failed, and the run exits 0.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+priorities = []
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a region with formatting disabled must exit 0 whatever its peer \
+         answers; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
 fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
     // The same region, prepared by its peer, is no failure: the run
     // exits 0.

@@ -309,20 +309,8 @@ impl Kakehashi {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
             // would replace those real host gaps as well and corrupt the document.
-            // A prepared document's edits are not mapped back through its map:
-            // closed as a non-contiguous one is.
-            match self
-                .method_gate(uri, language_name, resolved, "textDocument/formatting")
-                .await
-            {
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => {}
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => continue,
-                // Left unformatted because its peer failed: a failed request
-                // (`kakehashi format` exits 2), as `diagnose` counts it.
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => {
-                    count_request_errors(&cancel_state.request_error_sink, 1);
-                    continue;
-                }
+            if !resolved.contiguous {
+                continue;
             }
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
@@ -360,6 +348,23 @@ impl Kakehashi {
                     continue;
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
+            }
+            // A prepared document's edits are not mapped back through its map:
+            // closed as a non-contiguous one is. Asked only of a region that
+            // formats: one that would not sends no request, so its peer is
+            // not waited for and no failure of it is counted.
+            match self
+                .method_gate(uri, language_name, resolved, "textDocument/formatting")
+                .await
+            {
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => {}
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => continue,
+                // Left unformatted because its peer failed: a failed request
+                // (`kakehashi format` exits 2), as `diagnose` counts it.
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => {
+                    count_request_errors(&cancel_state.request_error_sink, 1);
+                    continue;
+                }
             }
             // Same-range query alternatives are tried in discovery priority
             // order, but an unconfigured or explicitly disabled language is
