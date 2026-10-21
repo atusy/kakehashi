@@ -23,6 +23,27 @@ fn property_cases(cases: u32) -> u32 {
         .unwrap_or(cases)
 }
 
+/// The floor a property defaulting to `cases` cases asserts it passes
+/// more than `floor` times (measured at that default) over the cases it
+/// runs: the same share of them, so a run of another number of cases
+/// (`KAKEHASHI_PROPTEST_CASES`) is held to what its default run is.
+fn property_floor(floor: usize, cases: u32) -> usize {
+    scaled_floor(floor, cases, property_cases(cases))
+}
+
+/// `floor` out of `default` cases, as the same share of `cases`.
+fn scaled_floor(floor: usize, default: u32, cases: u32) -> usize {
+    (floor as u64 * u64::from(cases) / u64::from(default)) as usize
+}
+
+#[test]
+fn a_property_floor_is_the_same_share_of_the_cases_run() {
+    assert_eq!(scaled_floor(2000, 4000, 4000), 2000);
+    assert_eq!(scaled_floor(2000, 4000, 1000), 500);
+    assert_eq!(scaled_floor(2000, 4000, 40_000), 20_000);
+    assert_eq!(scaled_floor(450, 4000, 1), 0);
+}
+
 /// A property's runner over `cases` cases, from a fixed seed: a run is
 /// repeatable, and a failure it finds found again. `PROPTEST_RNG_SEED` picks
 /// another seed, `KAKEHASHI_PROPTEST_RANDOM` set a random one, and
@@ -1508,9 +1529,17 @@ mod properties {
             })
             .unwrap();
         // Not vacuous: most documents are prepared, and many edit sets map.
-        assert!(answered.get() > 2000, "answered {}", answered.get());
+        assert!(
+            answered.get() > property_floor(2000, 4000),
+            "answered {}",
+            answered.get()
+        );
         // Measured over 40 runs: mean 605, sd 22, min 561.
-        assert!(mapped_sets.get() > 450, "mapped {}", mapped_sets.get());
+        assert!(
+            mapped_sets.get() > property_floor(450, 4000),
+            "mapped {}",
+            mapped_sets.get()
+        );
     }
 
     /// Every non-empty line of `prepared` indented by `indent`.
@@ -1593,7 +1622,11 @@ mod properties {
                 Ok(())
             })
             .unwrap();
-        assert!(mapped_sets.get() > 600, "mapped {}", mapped_sets.get());
+        assert!(
+            mapped_sets.get() > property_floor(600, 3000),
+            "mapped {}",
+            mapped_sets.get()
+        );
     }
 }
 
@@ -2261,7 +2294,11 @@ mod exact_reference {
                 },
             )
             .unwrap();
-        assert!(mapped_sets.get() > 400, "mapped {}", mapped_sets.get());
+        assert!(
+            mapped_sets.get() > property_floor(400, 12000),
+            "mapped {}",
+            mapped_sets.get()
+        );
     }
 
     /// Edits on maps with gaps whose result differs from the reference:
@@ -5463,7 +5500,10 @@ mod formatting_reference {
         let (mapped, changing) = check(FORMATTING_DIFF_BUDGET, 3000);
         // Every refusal is checked above; this only keeps the run from
         // passing on nothing.
-        assert!(changing > 1000, "mapped {mapped}, {changing} changing P");
+        assert!(
+            changing > property_floor(1000, 3000),
+            "mapped {mapped}, {changing} changing P"
+        );
     }
 
     #[test]
@@ -5753,7 +5793,11 @@ fn random_replayed_edit_sets_give_p_edited_and_indented() {
             Ok(())
         })
         .unwrap();
-    assert!(mapped.get() > 2000, "mapped {}", mapped.get());
+    assert!(
+        mapped.get() > property_floor(2000, 4000),
+        "mapped {}",
+        mapped.get()
+    );
 }
 
 /// A rename's or a code action's edit set replayed (see [`EditMode::Replay`])
@@ -6143,7 +6187,11 @@ mod replay_reference {
         assert_eq!(replay[0].refused, 0, "{:?}", replay[0]);
         assert_eq!(renames[1].refused, 0, "{:?}", renames[1]);
         assert!(renames[1].exact > 0, "{:?}", renames[1]);
-        assert!(replay[0].exact > 1000, "{:?}", replay[0]);
+        assert!(
+            replay[0].exact > property_floor(1000, 6000),
+            "{:?}",
+            replay[0]
+        );
     }
 }
 
