@@ -2997,7 +2997,19 @@ fn main() {
             ),
             "textDocument/linkedEditingRange" if mode == "echo-document" => {
                 // Every occurrence, as a word, of the word at the position,
-                // in this server's own text and coordinates.
+                // in this server's own text and coordinates; with
+                // `MOCK_LINKED_AFTER_RELEASE` set, once the file
+                // `MOCK_RELEASE_FILE` names exists (or a minute later).
+                if std::env::var_os("MOCK_LINKED_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 let uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)

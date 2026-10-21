@@ -76,6 +76,9 @@ struct Setup {
     /// Also bridge lua to a `code-action` mock, ranked below the echo mock
     /// for code actions under `preferred`.
     second_code_action: bool,
+    /// Have the echo mock answer linked editing ranges only once the test
+    /// creates `release` in its directory.
+    linked_after_release: bool,
 }
 
 impl Default for Setup {
@@ -98,6 +101,7 @@ impl Default for Setup {
             code_action_after_release: false,
             apply_edit_after_change: false,
             second_code_action: false,
+            linked_after_release: false,
         }
     }
 }
@@ -172,6 +176,9 @@ impl Setup {
         }
         if self.code_action_after_release {
             builder = builder.env("MOCK_CODE_ACTION_AFTER_RELEASE", "1");
+        }
+        if self.linked_after_release {
+            builder = builder.env("MOCK_LINKED_AFTER_RELEASE", "1");
         }
         if self.apply_edit_after_change {
             builder = builder.env("MOCK_APPLY_EDIT_AFTER_CHANGE", "1");
@@ -1268,6 +1275,43 @@ fn a_rename_range_the_host_moved_under_is_no_answer() {
             );
         }
     }
+}
+
+#[test]
+fn linked_editing_ranges_the_host_moved_under_are_no_answer() {
+    // The echo mock answers linked ranges only once released: the host
+    // edited above the region while the request is out, its ranges, for
+    // the text before the edit, are no answer.
+    let (mut client, dir) = Setup {
+        linked_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/linked-moved.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let id = client.send_request_async(
+        "textDocument/linkedEditingRange",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+    );
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/linkedEditingRange\t"))
+    {
+        assert!(Instant::now() < until, "linkedEditingRange not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u\n{text}"));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
 }
 
 #[test]
