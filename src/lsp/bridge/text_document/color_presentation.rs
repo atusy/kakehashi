@@ -74,30 +74,13 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                color_presentation_response_to_host(response, ctx, region_end, host_range)
+                transform_color_presentation_response_to_host(
+                    response, ctx.offset, region_end, host_range,
+                )
             },
         )
         .await
     }
-}
-
-/// [`transform_color_presentation_response_to_host`] for a response as the
-/// executor hands it over. Whether the host moved under a prepared request's
-/// map is read once, as the final answer is chosen (`Sourced::still_current`,
-/// dropping the prepared part), not here, where an empty answer would let a
-/// server ranked below win once the host settled.
-fn color_presentation_response_to_host(
-    response: serde_json::Value,
-    ctx: &super::super::pool::BridgeResponseContext<'_>,
-    region_end: Position,
-    host_request_range: Range,
-) -> Vec<ColorPresentation> {
-    transform_color_presentation_response_to_host(
-        response,
-        ctx.offset,
-        region_end,
-        host_request_range,
-    )
 }
 
 /// Build a JSON-RPC color presentation request, translating the color's range from
@@ -954,13 +937,13 @@ mod tests {
         pool.open_host_incarnation(&host, 1).await;
         pool.record_latest_prepared_for_test(&host, 1, "css", region, &prepared);
         let reply = |label: &str| {
-            let ctx = pool.response_context_for_test(&host_lsp, (&host, "css", region), &offset);
-            color_presentation_response_to_host(
+            let ctx = pool.response_context_for_test(&host_lsp, &offset);
+            transform_color_presentation_response_to_host(
                 json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": label, "textEdit": {
                     "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}},
                     "newText": label
                 }}]}),
-                &ctx,
+                ctx.offset,
                 Position::new(2, 0),
                 Range::new(Position::new(1, 2), Position::new(1, 3)),
             )

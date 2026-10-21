@@ -40,6 +40,12 @@ fn request_text_not_held(connection_key: &super::ConnectionKey) -> io::Error {
 /// This struct holds the data that response transformers commonly need to
 /// translate coordinates and URIs from virtual document space back to host
 /// document space.
+///
+/// Whether the host moved under a prepared offset since the request is not
+/// part of it, nor read per response: the carriers mapping prepared edits
+/// read it once, as the final answer is chosen (`Sourced::still_current`).
+/// Refused per reply instead, a reply would count as no answer, and a server
+/// ranked below it, replying once the host settled, would win.
 pub(crate) struct BridgeResponseContext<'a> {
     /// The virtual document URI string (for matching against response URIs
     /// to determine whether locations point to the same virtual document).
@@ -48,11 +54,6 @@ pub(crate) struct BridgeResponseContext<'a> {
     /// URIs back to the host URI in goto responses).
     pub host_uri_lsp: &'a Uri,
     /// The injection region offset for coordinate translation back to host space.
-    /// Whether the host moved under a prepared one since the request is not
-    /// read per response: the carriers mapping prepared edits read it once,
-    /// as the final answer is chosen (`Sourced::still_current`). Refused per
-    /// reply instead, a reply would count as no answer and a server ranked
-    /// below it, replying once the host settled, would win.
     pub offset: &'a RegionOffset,
 }
 
@@ -369,7 +370,6 @@ impl LanguageServerPool {
     pub(crate) fn response_context_for_test<'a>(
         &self,
         host_uri_lsp: &'a Uri,
-        _region: (&Url, &str, &str),
         offset: &'a RegionOffset,
     ) -> BridgeResponseContext<'a> {
         Self::response_context("virtual", host_uri_lsp, offset)
