@@ -10335,6 +10335,26 @@ mod tests {
             pool.open_host_incarnation(&host_uri, 1).await;
             pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
             pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+            // An answer to forget, so no forget is skipped as nothing was
+            // ever looked up.
+            let target = super::super::prepare_registry::PrepareTarget {
+                candidates: Arc::from([]),
+                epoch: pool.prepare_epoch(),
+            };
+            registry.answer_for_test(
+                &target,
+                super::super::prepare_registry::PrepareInput {
+                    host_uri: &host_uri,
+                    host_language: "markdown",
+                    injection_language: "lua",
+                    region_id: TEST_ULID_LUA_0,
+                    virtual_text: "  x = 1",
+                    gaps: &[],
+                },
+                super::super::prepare_registry::Answer::AsIs,
+                true,
+            );
+            assert!(!registry.unused());
             forget(&registry, &host_uri);
             let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
             assert!(
