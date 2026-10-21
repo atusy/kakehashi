@@ -8,9 +8,7 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
-use crate::lsp::lsp_impl::bridge_context::{
-    Sourced, Verdict, parse_host_verbatim, poll_verdict, sources_verdict,
-};
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim, sources_verdict};
 
 const METHOD: &str = "textDocument/colorPresentation";
 
@@ -294,7 +292,9 @@ impl PassedOver {
         if answer.has_result(|source| source.still_current(pool, tracker, &current_version)) {
             return true;
         }
-        if answer.has_result(|source| prepared_may_keep(source, pool, tracker, &current_version)) {
+        if answer.has_result(|source| {
+            super::formatting::source_may_keep(source, pool, tracker, &current_version)
+        }) {
             let mut kept = self
                 .kept
                 .lock()
@@ -392,76 +392,9 @@ impl PassedOver {
     }
 }
 
-/// Whether a prepared part may still be kept, read at once for the
-/// layers' race: current now, or its host's last edit still settling and
-/// the host unedited since the request read its text. `false` once moved
-/// or stale, which no wait brings back; the final check still judges the
-/// answer chosen.
-fn prepared_may_keep(
-    source: &Sourced<()>,
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    tracker: &crate::language::NodeTracker,
-    current_version: impl Fn() -> Option<u64>,
-) -> bool {
-    matches!(
-        poll_verdict(
-            || source.still_current(pool, tracker, &current_version),
-            || source.moved(current_version()),
-            || source.settling(pool, tracker),
-        ),
-        None | Some(Verdict::Current)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The race keeps a prepared part current or still settling, and
-    /// passes over one moved or stale: only a part the final check may
-    /// still keep outranks the host layer's answer.
-    #[tokio::test]
-    async fn a_prepared_part_may_be_kept_while_current_or_settling_only() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        let prepare = |text: &str| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{
-                "type": "content", "changes": [{
-                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                    "newText": ""
-                }]
-            }]}))
-            .unwrap();
-            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
-        };
-        let prepared = prepare("  red\n");
-        for case in ["current", "settling", "settling, moved", "moved", "stale"] {
-            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
-            let host = url::Url::parse("file:///test/color-keep.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let region = tracker
-                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-                .unwrap()
-                .to_string();
-            pool.open_host_incarnation(&host, 1).await;
-            pool.record_latest_prepared_for_test(&host, 1, "css", &region, &prepared);
-            if case.starts_with("settling") {
-                pool.note_host_edited(&host, 1, 1);
-            }
-            if case == "stale" {
-                // Re-prepared to other coordinates, the host unedited.
-                let other = prepare("  blue\n");
-                pool.record_latest_prepared_for_test(&host, 1, "css", &region, &other);
-            }
-            let version = if case.ends_with("moved") { 2 } else { 1 };
-            let source = Sourced::prepared_for_test((), &host, "css", &region, &prepared.map, 1, 1);
-            assert_eq!(
-                prepared_may_keep(&source, &pool, &tracker, || Some(version)),
-                matches!(case, "current" | "settling"),
-                "{case}"
-            );
-        }
-    }
 
     /// A presentation whose reply came before the host's last edit settled
     /// (another fence edited, this region's text unchanged) is kept once

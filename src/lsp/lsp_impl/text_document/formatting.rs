@@ -55,7 +55,7 @@ use crate::lsp::bridge::{
     UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
 use crate::lsp::lsp_impl::bridge_context::{
-    DocumentRequestContext, Sourced, Verdict, sources_verdict,
+    DocumentRequestContext, Sourced, Verdict, poll_verdict, sources_verdict,
 };
 use crate::lsp::lsp_impl::text_document::{
     RequestErrorSink, count_no_winner_errors, count_request_errors,
@@ -2478,6 +2478,34 @@ pub(super) async fn finalize_formatting_edits(
     Ok((!all_edits.is_empty()).then_some((all_edits, sources)))
 }
 
+/// One poll of
+/// [`settled_verdict`](crate::lsp::lsp_impl::bridge_context::settled_verdict)
+/// for an answer mapped through `source`, read at once, never waited on:
+/// whether it may still be judged current — current now, or not yet (the
+/// host's last edit settling, or its region held, while it can still
+/// become current) and the host unedited since the request read its text.
+/// `false` once moved or stale, which no wait brings back. For a race
+/// choosing among answers, where one that may not be kept is no answer;
+/// the final check still judges the one chosen.
+pub(super) fn source_may_keep<T>(
+    source: &Sourced<T>,
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+) -> bool {
+    if !source.is_prepared() {
+        return true;
+    }
+    matches!(
+        poll_verdict(
+            || source.still_current(pool, tracker, &current_version),
+            || source.moved(current_version()),
+            || source.live(pool, tracker) && source.settling(pool, tracker),
+        ),
+        None | Some(Verdict::Current)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2617,6 +2645,60 @@ mod tests {
             assert_eq!(edits, expected, "{case}");
             assert_eq!(refused, verdict, "{case}");
         }
+    }
+
+    /// Read at once, an answer may still be kept while current or settling
+    /// (it would be waited on), and may not once moved or stale.
+    #[tokio::test]
+    async fn an_answer_may_be_kept_while_current_or_settling_only() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let prepare = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let prepared = prepare("  red\n");
+        for case in ["current", "settling", "settling, moved", "moved", "stale"] {
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            let host = url::Url::parse("file:///test/keep.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            if case.starts_with("settling") {
+                pool.note_host_edited(&host, 1, 1);
+            }
+            if case == "stale" {
+                // Re-prepared to other coordinates, the host unedited.
+                let other = prepare("  blue\n");
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &other);
+            }
+            let version = if case.ends_with("moved") { 2 } else { 1 };
+            let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
+            assert_eq!(
+                source_may_keep(&source, &pool, &tracker, || Some(version)),
+                matches!(case, "current" | "settling"),
+                "{case}"
+            );
+        }
+        // Unprepared: nothing read.
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let tracker = crate::language::NodeTracker::new();
+        assert!(source_may_keep(
+            &Sourced::unprepared(()),
+            &pool,
+            &tracker,
+            || unreachable!()
+        ));
     }
 
     /// A prepared region whose formatter answered nothing is not judged

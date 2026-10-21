@@ -498,8 +498,11 @@ Dropped, completion answers nothing (an empty incomplete list when it
 asked to re-query), color presentations answer nothing, inlay hints
 stay shown without their edits, code actions answer without the stale
 region's actions (the host layer's and other regions' stay when
-concatenated; under a cross-layer `preferred` the virt layer's answer,
-chosen and then dropped, leaves none until asked again), and linked
+concatenated; under a cross-layer `preferred` a virt answer already
+moved or stale as the layers' race decides is no answer of its layer, and
+the race falls through to the host layer's, while one chosen and then
+dropped — settling as the race decided, or moved since — leaves none
+until asked again), and linked
 editing ranges answer nothing. Code actions and linked editing ranges
 wait, as formatting does (below), while the host's last edit settles or a
 region's hold clears: an editor may ask them once right after an edit
