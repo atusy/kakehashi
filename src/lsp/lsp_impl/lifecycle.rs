@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::analysis::{LEGEND_MODIFIERS, LEGEND_TYPES};
 use crate::config::WorkspaceSettings;
+use crate::lsp::bridge::ResyncCause;
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 use crate::lsp::{SettingsSource, load_settings};
 
@@ -114,39 +115,32 @@ fn resyncs_on_epoch_move(
         .into_iter()
         .map(|host_uri| crate::lsp::bridge::Resync {
             host_uri,
-            ready: false,
-            recollect: !nothing_looked_up,
-            edited: false,
+            cause: if nothing_looked_up {
+                ResyncCause::Retry
+            } else {
+                ResyncCause::Recollect { edited: false }
+            },
         })
         .collect()
 }
 
 /// Hosts to sync again, each once: several documents of one host usually
-/// finish together. Ready, or recollecting, when any of a host's resyncs
-/// is; edited only when every ready or recollecting one is (any other
-/// collects at once).
+/// finish together. Their causes merge (see `ResyncCause::merge`).
 fn merge_resyncs(
     resyncs: impl IntoIterator<Item = crate::lsp::bridge::Resync>,
 ) -> std::collections::HashMap<Url, crate::lsp::bridge::Resync> {
     let mut hosts: std::collections::HashMap<Url, crate::lsp::bridge::Resync> =
         std::collections::HashMap::new();
     for resync in resyncs {
-        let merged = hosts
-            .entry(resync.host_uri.clone())
-            .or_insert(crate::lsp::bridge::Resync {
-                host_uri: resync.host_uri,
-                ready: false,
-                recollect: false,
-                edited: true,
-            });
-        merged.ready |= resync.ready;
-        merged.recollect |= resync.recollect;
-        if resync.ready || resync.recollect {
-            merged.edited &= resync.edited;
+        match hosts.entry(resync.host_uri.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut merged) => {
+                let merged = merged.get_mut();
+                merged.cause = merged.cause.merge(resync.cause);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(resync);
+            }
         }
-    }
-    for merged in hosts.values_mut() {
-        merged.edited &= merged.ready || merged.recollect;
     }
     hosts
 }
@@ -164,7 +158,7 @@ enum CollectAfterResync {
 }
 
 fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAfterResync> {
-    match (resync.ready || resync.recollect, resync.edited) {
+    match (resync.cause.collects(), resync.cause.edited()) {
         (false, _) => None,
         (true, false) => Some(CollectAfterResync::AtOnce),
         (true, true) => Some(CollectAfterResync::Debounced),
@@ -960,7 +954,7 @@ impl Kakehashi {
                         .chain(std::iter::from_fn(|| resync_rx.try_recv().ok())),
                 );
                 for (uri, resync) in hosts {
-                    let ready = resync.ready;
+                    let ready = resync.cause.ready();
                     // A save the held regions missed is replayed by the
                     // pass too; one it could not look at the regions for
                     // keeps it, and is retried.
@@ -3238,61 +3232,59 @@ async fn upstream_forwarding_loop_with_cancel(
 mod tests {
     #[test]
     fn an_epoch_move_syncs_every_open_host_even_before_any_lookup() {
-        use crate::lsp::bridge::Resync;
+        use crate::lsp::bridge::{Resync, ResyncCause};
         let hosts =
             || ["a", "b"].map(|name| url::Url::parse(&format!("file:///{name}.md")).unwrap());
-        let resync = |host: url::Url, recollect| Resync {
+        let resync = |host: url::Url, cause| Resync {
             host_uri: host,
-            ready: false,
-            recollect,
-            edited: false,
+            cause,
         };
         let [a, b] = hosts();
         assert_eq!(
             super::resyncs_on_epoch_move(hosts(), true),
-            [resync(a.clone(), false), resync(b.clone(), false)]
+            [
+                resync(a.clone(), ResyncCause::Retry),
+                resync(b.clone(), ResyncCause::Retry)
+            ]
         );
+        let recollect = ResyncCause::Recollect { edited: false };
         assert_eq!(
             super::resyncs_on_epoch_move(hosts(), false),
-            [resync(a, true), resync(b, true)]
+            [resync(a, recollect), resync(b, recollect)]
         );
     }
 
     #[test]
     fn a_host_is_synced_again_once_per_batch_of_resyncs() {
-        use crate::lsp::bridge::Resync;
+        use crate::lsp::bridge::{Resync, ResyncCause};
         let host = |name: &str| url::Url::parse(&format!("file:///{name}.md")).unwrap();
         let hosts = super::merge_resyncs([
             Resync {
                 host_uri: host("a"),
-                ready: true,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Ready { edited: false },
             },
             Resync {
                 host_uri: host("b"),
-                ready: false,
-                recollect: false,
-                edited: false,
+                cause: ResyncCause::Retry,
             },
             Resync {
                 host_uri: host("a"),
-                ready: false,
-                recollect: true,
-                edited: false,
+                cause: ResyncCause::Recollect { edited: false },
             },
         ]);
         assert_eq!(hosts.len(), 2);
-        let flags = |resync: &Resync| (resync.ready, resync.recollect, resync.edited);
-        assert_eq!(flags(&hosts[&host("a")]), (true, true, false));
-        assert_eq!(flags(&hosts[&host("b")]), (false, false, false));
+        assert_eq!(
+            hosts[&host("a")].cause,
+            ResyncCause::Ready { edited: false }
+        );
+        assert_eq!(hosts[&host("b")].cause, ResyncCause::Retry);
     }
 
     /// The pass collects an edit's answer through the debounce, and any
     /// other at once.
     #[tokio::test]
     async fn a_resync_pass_routes_an_edits_answer_to_the_debounce() {
-        use crate::lsp::bridge::Resync;
+        use crate::lsp::bridge::{Resync, ResyncCause};
         let (service, _socket) =
             tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
         let server = service.inner();
@@ -3306,9 +3298,7 @@ mod tests {
         let diagnostics = server.diagnostic_scheduler();
         let resync = |edited| Resync {
             host_uri: uri.clone(),
-            ready: true,
-            recollect: false,
-            edited,
+            cause: ResyncCause::Ready { edited },
         };
         super::collect_diagnostics_after_resync(
             &diagnostics,
@@ -3333,7 +3323,7 @@ mod tests {
     /// didOpen schedules nothing (#489): no editor reads it.
     #[tokio::test]
     async fn a_cli_run_collects_nothing_after_a_resync_pass() {
-        use crate::lsp::bridge::Resync;
+        use crate::lsp::bridge::{Resync, ResyncCause};
         for cli_mode in [true, false] {
             let (service, _socket) =
                 tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
@@ -3349,9 +3339,7 @@ mod tests {
             for edited in [false, true] {
                 let resync = Resync {
                     host_uri: uri.clone(),
-                    ready: true,
-                    recollect: false,
-                    edited,
+                    cause: ResyncCause::Ready { edited },
                 };
                 super::collect_diagnostics_after_resync(
                     &diagnostics,
@@ -3378,13 +3366,16 @@ mod tests {
     #[test]
     fn an_edits_answer_waits_for_the_debounced_collection() {
         use super::{CollectAfterResync, collect_after_resync, merge_resyncs};
-        use crate::lsp::bridge::Resync;
+        use crate::lsp::bridge::{Resync, ResyncCause};
         let host = url::Url::parse("file:///edited.md").unwrap();
         let resync = |ready, recollect, edited| Resync {
             host_uri: host.clone(),
-            ready,
-            recollect,
-            edited,
+            cause: match (ready, recollect) {
+                (true, false) => ResyncCause::Ready { edited },
+                (false, true) => ResyncCause::Recollect { edited },
+                (false, false) => ResyncCause::Retry,
+                (true, true) => unreachable!("one cause per resync"),
+            },
         };
         let collect = |resyncs: Vec<Resync>| collect_after_resync(&merge_resyncs(resyncs)[&host]);
         assert_eq!(
