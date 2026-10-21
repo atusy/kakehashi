@@ -18,7 +18,8 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_editable_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    host_position_within_region_bounds, response_has_jsonrpc_error,
+    host_position_hidden_by_prepare, host_position_within_region_bounds,
+    response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -54,16 +55,7 @@ impl LanguageServerPool {
             // Returning None would cause clients to treat the symbol as "not renameable",
             // silently disabling rename for servers that only advertise textDocument/rename.
             if handle.has_capability("textDocument/rename") {
-                // The shortcut must respect the same bounds the dispatch path
-                // enforces: a caret outside the region's content is not
-                // renameable-at-position, and a phantom DefaultBehavior would
-                // win preferred aggregation over real lower-priority results.
-                if !host_position_within_region_bounds(host_position, &offset, region_end) {
-                    return Ok(None);
-                }
-                return Ok(Some(PrepareRenameResponse::DefaultBehavior {
-                    default_behavior: true,
-                }));
+                return Ok(default_behavior_at(host_position, &offset, region_end));
             }
             return Ok(None);
         }
@@ -85,6 +77,25 @@ impl LanguageServerPool {
         )
         .await?
     }
+}
+
+/// The answer for a server that renames but does not prepare: the client's
+/// default behavior, where the caret is one the dispatch path would send.
+/// The shortcut respects the same bounds: a caret outside the region's
+/// content, or on host text the prepared document leaves out (a deleted
+/// edge line, a gap), is not renameable-at-position, and a phantom
+/// DefaultBehavior would win preferred aggregation over real lower-priority
+/// results.
+fn default_behavior_at(
+    host_position: Position,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> Option<PrepareRenameResponse> {
+    (host_position_within_region_bounds(host_position, offset, region_end)
+        && !host_position_hidden_by_prepare(host_position, offset))
+    .then_some(PrepareRenameResponse::DefaultBehavior {
+        default_behavior: true,
+    })
 }
 
 /// Build a JSON-RPC prepareRename request for a downstream language server.
@@ -356,6 +367,50 @@ mod tests {
             }
             _ => panic!("Expected Range variant"),
         }
+    }
+
+    /// A server that renames but does not prepare answers the default
+    /// behavior only where the dispatch path would send the request: not on
+    /// a blank line the prepare peer deleted, nor outside the region.
+    #[test]
+    fn the_default_behavior_shortcut_skips_host_text_the_prepared_document_leaves_out() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `\n  foo\n` at host line 10: the opening blank line goes, and the
+        // indent of `foo`.
+        let virtual_text = "\n  foo\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let region_end = Position::new(12, 0);
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let default = Some(PrepareRenameResponse::DefaultBehavior {
+            default_behavior: true,
+        });
+        assert_eq!(
+            default_behavior_at(Position::new(10, 0), &offset, region_end),
+            None
+        );
+        assert_eq!(
+            default_behavior_at(Position::new(11, 3), &offset, region_end),
+            default
+        );
+        assert_eq!(
+            default_behavior_at(Position::new(13, 0), &offset, region_end),
+            None
+        );
+        // Unprepared, the deleted line's place is the region's own.
+        assert_eq!(
+            default_behavior_at(Position::new(10, 0), &RegionOffset::new(10, 0), region_end),
+            default
+        );
     }
 
     /// `  a = 1\n  b\n`, dedented by two, at host line 3.
