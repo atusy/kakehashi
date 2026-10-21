@@ -3106,6 +3106,23 @@ mod tests {
     }
 
     #[test]
+    fn reapply_prefixes_no_empty_line_landing_on_a_blank_row() {
+        // Text on the blank `>` row takes the region's `> `; the empty last
+        // line lands on the synthetic row, blank too, and must stay empty,
+        // or the closing fence's own `> ` would follow a stray `>`.
+        let prefixes = vec![
+            "> ".to_string(),
+            ">".to_string(),
+            "> ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            reapply_host_line_prefixes("a\n\nb\n", "a\nb\nc\n", &prefixes),
+            "a\n> b\n> c\n"
+        );
+    }
+
+    #[test]
     fn reapply_lcp_keeps_trailing_empty_output_line_unprefixed() {
         // Even with `> ` on every content line, a trailing empty
         // output line abuts the host's own prefix on the region's end line —
