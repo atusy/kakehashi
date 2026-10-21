@@ -380,18 +380,14 @@ fn prepared_may_keep(
     tracker: &crate::language::NodeTracker,
     current_version: impl Fn() -> Option<u64>,
 ) -> bool {
-    // Read before `current`: a settle landing between the two reads then
-    // shows as current, never as stale.
-    let settling = source.settling(pool, tracker);
-    if source.still_current(pool, tracker, &current_version) {
-        return true;
-    }
-    let moved = current_version().is_some_and(|now| {
-        source
-            .request_content_version()
-            .is_some_and(|version| version != now)
-    });
-    settling && !moved
+    matches!(
+        super::formatting::poll_verdict(
+            || source.still_current(pool, tracker, &current_version),
+            || source.moved(current_version()),
+            || source.settling(pool, tracker),
+        ),
+        None | Some(super::formatting::Verdict::Current)
+    )
 }
 
 #[cfg(test)]
