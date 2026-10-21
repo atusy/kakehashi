@@ -505,7 +505,10 @@ impl PreparedMap {
     /// diffed together. The mapped set is checked as a whole.
     fn map_replayed(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
         let prepared = &self.prepared_lines.text;
-        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, false)?;
+        // An end at the start of the line just past P's last names P's end,
+        // as whole-document replacements (a fix-all's) send it, read as a
+        // formatting answer's is.
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, true)?;
         // The edited P, and where each edit's text lands in it.
         let mut edited = String::with_capacity(prepared.len());
         let mut landed = vec![0..0; edits.len()];

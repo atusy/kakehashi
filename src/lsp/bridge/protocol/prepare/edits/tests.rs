@@ -6324,3 +6324,37 @@ fn many_ranges_on_a_long_line_convert_in_one_pass_as_one_by_one() {
         .collect();
     assert_eq!(map.map_ranges_alike(&ranges), Some(expected));
 }
+
+#[test]
+fn a_replayed_whole_document_replacement_may_end_past_the_last_line() {
+    // `(lineCount, 0)` names P's end, as a fix-all sends it; replayed, it
+    // maps as a replacement up to P's end does.
+    let cases = [
+        ("  foo", ((1, 0), "bar"), "  bar"),
+        ("  foo\n", ((2, 0), "bar\n"), "  bar\n"),
+        (
+            "  foo\r\n  baz\r\n",
+            ((3, 0), "bar\r\nbaz\r\n"),
+            "  bar\r\n  baz\r\n",
+        ),
+    ];
+    for (virtual_text, ((line, character), new_text), expected) in cases {
+        let map = dedent_by_two(virtual_text);
+        assert_eq!(
+            replayed(
+                virtual_text,
+                &map,
+                &[edit((0, 0), (line, character), new_text)]
+            )
+            .as_deref(),
+            Some(expected),
+            "{virtual_text:?}"
+        );
+        // A line further past still names no place in P.
+        assert_eq!(
+            replayed(virtual_text, &map, &[edit((0, 0), (line + 1, 0), new_text)]),
+            None,
+            "{virtual_text:?}"
+        );
+    }
+}

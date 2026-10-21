@@ -2121,4 +2121,32 @@ mod tests {
             Err(WorkspaceEditRefusal::Unmappable)
         );
     }
+
+    #[test]
+    fn a_prepared_whole_document_replacement_ending_past_the_last_line_maps() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        // A fix-all replacing P whole, up to `(lineCount, 0)`.
+        let mut edit = parse_workspace_edit(json!({"changes": {virtual_uri.clone(): [
+            {"range": range_json((0, 0), (3, 0)), "newText": "def g(a):\n  return a\n"}
+        ]}}));
+        let offset = prepared_offset();
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &offset
+        ));
+        let region_end = region_host_end(
+            offset.prepared().unwrap().virtual_text(),
+            &RegionOffset::new(10, 0),
+        );
+        assert!(workspace_edit_within_region(
+            &edit, &host_uri, &offset, region_end
+        ));
+        assert_eq!(
+            host_region_after(&edit.changes.unwrap()[&host_uri]),
+            "  def g(a):\n    return a\n"
+        );
+    }
 }
