@@ -1730,8 +1730,8 @@ fn pipeline_region_text(
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
     Some(reapply_host_line_prefixes(
-        &final_text,
         original_virtual,
+        &final_text,
         &host_line_prefixes,
     ))
 }
@@ -1763,8 +1763,8 @@ fn pipeline_region_text(
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
 fn reapply_host_line_prefixes(
-    final_text: &str,
     original_virtual: &str,
+    final_text: &str,
     host_line_prefixes: &[String],
 ) -> String {
     let lines = split_lsp_lines(final_text);
@@ -2991,7 +2991,7 @@ mod tests {
         // later line re-gains its own original prefix.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc", &prefixes),
             "a\n> b\n> c"
         );
     }
@@ -3005,7 +3005,7 @@ mod tests {
         // too, so the output must be split the same way to keep the mapping.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
         assert_eq!(
-            reapply_host_line_prefixes(final_text, "x\ny\n", &prefixes),
+            reapply_host_line_prefixes("x\ny\n", final_text, &prefixes),
             expected
         );
     }
@@ -3021,7 +3021,7 @@ mod tests {
         // per line (not the first line's prefix everywhere).
         let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc", &prefixes),
             "a\n> > b\n> c"
         );
     }
@@ -3033,13 +3033,13 @@ mod tests {
         // region's longest common prefix (ADR point 4).
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb", &prefixes),
             "a\n> b"
         );
         // Non-uniform prefixes: the LCP is the shared "> ".
         let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc\nd", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc\nd", &prefixes),
             "a\n> b\n> c\n> d"
         );
     }
@@ -3057,7 +3057,7 @@ mod tests {
         // output line sits at the region end and must stay unprefixed (the
         // host's own "> " follows it).
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc\n", "x\ny\n", &prefixes),
+            reapply_host_line_prefixes("x\ny\n", "a\nb\nc\n", &prefixes),
             "a\n> b\n> c\n"
         );
     }
@@ -3068,7 +3068,7 @@ mod tests {
         // blank rows' `>` is the only prefix there is to keep.
         let prefixes = vec![">".to_string(), ">".to_string(), String::new()];
         assert_eq!(
-            reapply_host_line_prefixes("x\ny\nz\n", "\n\n", &prefixes),
+            reapply_host_line_prefixes("\n\n", "x\ny\nz\n", &prefixes),
             "x\n>y\n>z\n"
         );
     }
@@ -3080,7 +3080,7 @@ mod tests {
         // prefixing it would double the marker (">> ```").
         let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
         assert_eq!(
-            reapply_host_line_prefixes("a\n", "x\ny\n", &prefixes),
+            reapply_host_line_prefixes("x\ny\n", "a\n", &prefixes),
             "a\n"
         );
     }
@@ -3091,12 +3091,12 @@ mod tests {
         // emit ">" (not "> "), and leave a space-only prefix off entirely.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\n\nb", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\n\nb", &prefixes),
             "a\n>\n> b"
         );
         let prefixes = vec!["  ".to_string(), "  ".to_string(), "  ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\n\nb", "x\ny\nz", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\n\nb", &prefixes),
             "a\n\n  b"
         );
     }
@@ -3106,7 +3106,7 @@ mod tests {
         // A single-line output sits entirely after the first line's host
         // prefix; nothing to re-apply.
         let prefixes = vec!["> ".to_string()];
-        assert_eq!(reapply_host_line_prefixes("a", "x", &prefixes), "a");
+        assert_eq!(reapply_host_line_prefixes("x", "a", &prefixes), "a");
     }
 
     #[test]
@@ -3116,11 +3116,11 @@ mod tests {
         // preserved and changed line counts.
         let prefixes = vec![String::new(), String::new()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb", "x\ny", &prefixes),
+            reapply_host_line_prefixes("x\ny", "a\nb", &prefixes),
             "a\nb"
         );
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc", "x\ny", &prefixes),
+            reapply_host_line_prefixes("x\ny", "a\nb\nc", &prefixes),
             "a\nb\nc"
         );
     }
