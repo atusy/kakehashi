@@ -3792,7 +3792,7 @@ mod tests {
         use super::*;
         use crate::lsp::bridge::PreparedMap;
         use crate::lsp::bridge::protocol::exact_reference::{
-            self, Document, apply_to, property_runner,
+            self, Document, apply_to, property_floor, property_runner,
         };
         use proptest::prelude::*;
         use proptest::test_runner::TestCaseError;
@@ -4230,7 +4230,7 @@ mod tests {
         #[test]
         fn kept_snippets_give_exactly_the_reference_host_text() {
             let kept = check(8000, Host::Fence);
-            assert!(kept > 200, "kept {kept}");
+            assert!(kept as usize > property_floor(200, 8000), "kept {kept}");
         }
 
         /// On a list item's fence the empty rows record no indentation: a
@@ -4242,7 +4242,7 @@ mod tests {
         #[ignore = "needs the shared region guard's protected empty rows (the list-fence empty-row fix), the offset built with them"]
         fn kept_snippets_on_a_list_item_fence_give_exactly_the_reference_host_text() {
             let kept = check(8000, Host::ListItem);
-            assert!(kept > 50, "kept {kept}");
+            assert!(kept as usize > property_floor(50, 8000), "kept {kept}");
         }
 
         /// The list-item shape the property generates, a snippet completed

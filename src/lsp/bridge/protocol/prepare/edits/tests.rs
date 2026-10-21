@@ -27,7 +27,7 @@ fn property_cases(cases: u32) -> u32 {
 /// more than `floor` times (measured at that default) over the cases it
 /// runs: the same share of them, so a run of another number of cases
 /// (`KAKEHASHI_PROPTEST_CASES`) is held to what its default run is.
-fn property_floor(floor: usize, cases: u32) -> usize {
+pub(crate) fn property_floor(floor: usize, cases: u32) -> usize {
     scaled_floor(floor, cases, property_cases(cases))
 }
 
@@ -1865,7 +1865,7 @@ fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
 /// which other features' properties reuse for the text their edits insert.
 pub(crate) mod exact_reference {
     use super::*;
-    pub(crate) use super::{apply_to, property_runner};
+    pub(crate) use super::{apply_to, property_floor, property_runner};
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
     use std::cell::Cell;
