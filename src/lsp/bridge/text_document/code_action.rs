@@ -33,7 +33,8 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
+    ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, ResolveDocument,
+    UpstreamId,
 };
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
@@ -596,8 +597,13 @@ impl LanguageServerPool {
                 async move {
                     (
                         idx,
-                        self.send_code_action_resolve_on_handle(handle, action, upstream_id, None)
-                            .await,
+                        self.send_code_action_resolve_on_handle(
+                            handle,
+                            action,
+                            upstream_id,
+                            ResolveTarget::Unchecked,
+                        )
+                        .await,
                     )
                 }
             }))
@@ -772,6 +778,20 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
+        // A replaced host server gets the host document back only from the
+        // asynchronous re-open; until then the enqueue below finds it not open
+        // and fails. Checked before taking any host lock.
+        if !self
+            .resolve_document_ready(
+                "codeAction/resolve (host)",
+                handle.key(),
+                ResolveDocument::Host(&host_url),
+            )
+            .await
+        {
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
 
         // Forward with the ORIGINAL (unsuffixed) title restored; keep the
         // suffixed title to re-apply. Host coordinates: no range translation.
@@ -784,7 +804,7 @@ impl LanguageServerPool {
                 &handle,
                 outgoing,
                 upstream_id,
-                Some(HostResolveContext {
+                ResolveTarget::Host(HostResolveContext {
                     uri: &host_url,
                     incarnation: envelope.incarnation,
                     content_version: envelope.content_version,
@@ -886,9 +906,43 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         }
+        // A just-replaced origin re-opens its virtual documents asynchronously
+        // after `Ready`, and the outbound queue is FIFO: sending before the
+        // re-open could hand the downstream a resolve for a document it has not
+        // opened, and nothing downstream of here checks that it is open. An
+        // envelope with no valid virtual identity names no document; it keeps
+        // the host-URI fallback its connection was acquired with, ungated.
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
+        let virtual_uri = if VirtualDocumentUri::is_valid_identity(
+            &envelope.injection_language,
+            &envelope.region_id,
+        ) {
+            let Some(host_uri_lsp) = host_uri_lsp.as_ref() else {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                host_uri_lsp,
+                &envelope.injection_language,
+                &envelope.region_id,
+            );
+            if !self
+                .resolve_document_ready(
+                    "codeAction/resolve",
+                    handle.key(),
+                    ResolveDocument::Virtual(&virtual_uri),
+                )
+                .await
+            {
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            }
+            Some(virtual_uri)
+        } else {
+            None
+        };
 
         let offset = RegionOffset::from(&envelope.offset);
-        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
 
         // Forward with the ORIGINAL (unsuffixed) title restored and any
         // client-supplied ranges translated back to virtual coordinates. Keep
@@ -899,7 +953,14 @@ impl LanguageServerPool {
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
         let Some(resolved) = self
-            .send_code_action_resolve_on_handle(&handle, outgoing, upstream_id, None)
+            .send_code_action_resolve_on_handle(
+                &handle,
+                outgoing,
+                upstream_id,
+                virtual_uri
+                    .as_ref()
+                    .map_or(ResolveTarget::Unchecked, ResolveTarget::Virtual),
+            )
             .await
         else {
             // Per-selection warn (bounded: one per user-selected action) — the
@@ -1061,6 +1122,19 @@ fn finalize_virt_resolved_action(
     resolved
 }
 
+/// What a `codeAction/resolve` refers to on the connection it is sent on,
+/// which decides the checks made while it is enqueued.
+enum ResolveTarget<'a> {
+    /// No document check at enqueue: the eager pass right after the
+    /// producing request opened the document, or a resolve envelope that
+    /// names no virtual document.
+    Unchecked,
+    /// A host-layer action: synchronize and verify the host document.
+    Host(HostResolveContext<'a>),
+    /// A virtual-layer action: its virtual document must still be open.
+    Virtual(&'a VirtualDocumentUri),
+}
+
 impl LanguageServerPool {
     /// Send a `codeAction/resolve` request on an already-connected handle and
     /// parse the response into a resolved `CodeAction`. Returns `None` on any
@@ -1070,7 +1144,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
-        host_context: Option<HostResolveContext<'_>>,
+        target: ResolveTarget<'_>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1103,7 +1177,7 @@ impl LanguageServerPool {
         // fetching the handle — earliest on the eager-resolve pass — and this
         // send would queue the resolve and its cancel bookkeeping on a dead
         // handle, losing cancel forwarding and waiting out the full timeout.
-        if let Some(context) = host_context {
+        if let ResolveTarget::Host(context) = target {
             if let Err(error) = self
                 .enqueue_host_resolve(handle, context, request, request_id)
                 .await
@@ -1129,6 +1203,36 @@ impl LanguageServerPool {
                 }
                 return None;
             }
+            // The gate saw the virtual document open, but a close may have
+            // landed since. Recheck under its transition lock and hold that
+            // through enqueue, so the resolve cannot follow a didClose. Lock
+            // order is `connections` then transition, as in completion resolve
+            // and didChange; never take them the other way round.
+            let _transition = match target {
+                ResolveTarget::Virtual(virtual_uri) => {
+                    let transition = self.open_transition_lock(virtual_uri, connection_key);
+                    let guard = Arc::clone(&transition).lock_owned().await;
+                    if !self.is_document_opened_on_connection(virtual_uri, connection_key) {
+                        drop(guard);
+                        self.remove_open_transition_lock_if_unshared(
+                            virtual_uri,
+                            connection_key,
+                            &transition,
+                        );
+                        drop(connections);
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "codeAction/resolve: the document closed on {connection_key} before send"
+                        );
+                        if let Some(ref id) = upstream_id {
+                            self.unregister_upstream_request(id, connection_key);
+                        }
+                        return None;
+                    }
+                    Some(guard)
+                }
+                _ => None,
+            };
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
                 // DEBUG: see the register-failure note above.
@@ -1732,7 +1836,7 @@ mod tests {
                         ..Default::default()
                     },
                     Some(upstream_id),
-                    None,
+                    ResolveTarget::Unchecked,
                 )
                 .await
             })
@@ -1831,6 +1935,374 @@ mod tests {
             "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
         }));
         assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// A replaced host server gets its host document back only from the
+    /// re-open sweep; a resolve arriving first must wait for it rather than
+    /// find the document "no longer open" and fail.
+    #[tokio::test]
+    async fn host_code_action_resolve_waits_for_the_pending_reopen() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = crate::lsp::bridge::test_helpers::create_handle_advertising_resolve_methods(
+            key.clone(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The replacement's handshake claimed a re-open that has not run yet.
+        let done = pool.claim_reopen_for_test(&key);
+        let envelope = CodeActionEnvelope {
+            origin: "ruff".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(1),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            original_title: "old".into(),
+            inner: None,
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(78);
+        let mut request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_host_code_action_resolve(
+                    &BridgeServerConfig::default(),
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    caps_resolve(),
+                    Some(upstream_id),
+                    &super::super::test_helpers::resolve_host_snapshot,
+                )
+                .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut request)
+                .await
+                .is_err(),
+            "resolve must wait for the outstanding re-open, not give up on it"
+        );
+
+        // The re-open lands: the host document is open on the replacement.
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
+        done.send(true).unwrap();
+
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// The host-layer twin of the open-document shortcut: the host document is
+    /// already open on the replacement, so an unsettled re-open must not hold
+    /// the resolve.
+    #[tokio::test]
+    async fn host_code_action_resolve_skips_the_barrier_for_an_open_document() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("ruff");
+        let handle = crate::lsp::bridge::test_helpers::create_handle_advertising_resolve_methods(
+            key.clone(),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_uri = Url::parse("file:///test.lua").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        super::super::test_helpers::open_resolve_host(&pool, &handle, &host_uri).await;
+        // A re-open is outstanding and never settles within this test.
+        let _done = pool.claim_reopen_for_test(&key);
+        let envelope = CodeActionEnvelope {
+            origin: "ruff".into(),
+            host_uri: host_uri.to_string(),
+            region_id: String::new(),
+            injection_language: String::new(),
+            incarnation: Some(1),
+            content_version: Some(1),
+            offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+            original_title: "old".into(),
+            inner: None,
+            host_layer: true,
+        };
+        let upstream_id = UpstreamId::Number(79);
+        let request = {
+            let pool = Arc::clone(&pool);
+            let upstream_id = upstream_id.clone();
+            tokio::spawn(async move {
+                pool.send_host_code_action_resolve(
+                    &BridgeServerConfig::default(),
+                    CodeAction {
+                        title: "old".into(),
+                        ..Default::default()
+                    },
+                    envelope,
+                    caps_resolve(),
+                    Some(upstream_id),
+                    &super::super::test_helpers::resolve_host_snapshot,
+                )
+                .await
+            })
+        };
+        let downstream_id = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_sent_request(&handle, &upstream_id),
+        )
+        .await
+        .expect("an already-open document must not wait on the re-open barrier");
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// A virtual-layer resolve target: a ready, resolve-capable connection
+    /// under the key the envelope routes to, with the host incarnation open.
+    /// The sink discards whatever is sent; tests answer through the router.
+    #[cfg(unix)]
+    async fn virtual_resolve_fixture() -> (
+        Arc<LanguageServerPool>,
+        Arc<ConnectionHandle>,
+        CodeActionEnvelope,
+        VirtualDocumentUri,
+        BridgeServerConfig,
+    ) {
+        use crate::lsp::bridge::test_helpers::{create_handle_with_command, devnull_config};
+        use tower_lsp_server::ls_types::{CodeActionOptions, CodeActionProviderCapability};
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_url = Url::parse("file:///test.md").unwrap();
+        let config = devnull_config();
+        let (_marker, key) = pool.resolve_acquire("ruff", &config, Some(&host_url)).await;
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key,
+            vec!["sh".into(), "-c".into(), "cat > /dev/null".into()],
+            Some(tower_lsp_server::ls_types::ServerCapabilities {
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        resolve_provider: Some(true),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            }),
+        )
+        .await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+        pool.open_host_incarnation(&host_url, 1).await;
+        let envelope = CodeActionEnvelope {
+            origin: "ruff".into(),
+            host_uri: host_url.to_string(),
+            region_id: "region-0".into(),
+            injection_language: "lua".into(),
+            incarnation: Some(1),
+            content_version: None,
+            offset: EnvelopeOffset::from(&RegionOffset::new(3, 0)),
+            original_title: "old".into(),
+            inner: None,
+            host_layer: false,
+        };
+        let virtual_uri = VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0");
+        (pool, handle, envelope, virtual_uri, config)
+    }
+
+    #[cfg(unix)]
+    fn spawn_virtual_resolve(
+        pool: &Arc<LanguageServerPool>,
+        envelope: &CodeActionEnvelope,
+        config: &BridgeServerConfig,
+        upstream_id: &UpstreamId,
+    ) -> tokio::task::JoinHandle<CodeAction> {
+        let pool = Arc::clone(pool);
+        let envelope = envelope.clone();
+        let config = config.clone();
+        let upstream_id = upstream_id.clone();
+        tokio::spawn(async move {
+            pool.send_code_action_resolve_request(
+                &config,
+                CodeAction {
+                    title: "old".into(),
+                    ..Default::default()
+                },
+                envelope,
+                caps_resolve(),
+                Some(upstream_id),
+                Position::new(5, 0),
+            )
+            .await
+        })
+    }
+
+    /// A document the replacement already has open (a fresh request opened
+    /// it) needs no barrier: its didOpen is ahead in the FIFO. Waiting anyway
+    /// would stall — or, when the sweep reports another document unsettled,
+    /// fail — a resolve that is already safe to send.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_skips_the_barrier_for_an_open_document() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let (pool, handle, envelope, virtual_uri, config) = virtual_resolve_fixture().await;
+        let host_url = Url::parse(&envelope.host_uri).unwrap();
+        pool.ensure_document_opened(
+            &mut crate::lsp::bridge::pool::ConnectionHandleSender(&handle),
+            &host_url,
+            &virtual_uri,
+            "local x = 1",
+            handle.key(),
+        )
+        .await
+        .unwrap();
+        // A re-open is outstanding and never settles within this test.
+        let _done = pool.claim_reopen_for_test(handle.key());
+
+        let upstream_id = UpstreamId::Number(80);
+        let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+        let downstream_id = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_sent_request(&handle, &upstream_id),
+        )
+        .await
+        .expect("an already-open document must not wait on the re-open barrier");
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// A legacy or client-modified envelope without a virtual identity keeps
+    /// the pre-routing host-URI fallback (see `get_or_create_virtual_connection`):
+    /// no virtual document can be named for it, so it is sent ungated rather
+    /// than asserting on an empty region or dropping a resolve main sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_without_identity_keeps_the_fallback() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let (pool, handle, mut envelope, _virtual_uri, config) = virtual_resolve_fixture().await;
+        envelope.region_id = String::new();
+        envelope.injection_language = String::new();
+
+        let upstream_id = UpstreamId::Number(83);
+        let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// The sweep can re-open THIS document and then stall on another one, so
+    /// the connection-wide wait times out although this resolve's didOpen is
+    /// already ahead of it in the FIFO. That resolve must still be sent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_sends_when_its_document_reopened_before_a_timeout() {
+        use crate::lsp::bridge::test_helpers::wait_for_sent_request;
+        let (pool, handle, envelope, virtual_uri, config) = virtual_resolve_fixture().await;
+        // The re-open is claimed and never reports within this test.
+        let _done = pool.claim_reopen_for_test(handle.key());
+        let upstream_id = UpstreamId::Number(84);
+        let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The sweep reaches this document, then goes on to stall elsewhere.
+        pool.ensure_document_opened(
+            &mut crate::lsp::bridge::pool::ConnectionHandleSender(&handle),
+            &Url::parse(&envelope.host_uri).unwrap(),
+            &virtual_uri,
+            "local x = 1",
+            handle.key(),
+        )
+        .await
+        .unwrap();
+
+        // Past the barrier's budget: the resolve is either sent or refused.
+        tokio::time::timeout(
+            crate::lsp::bridge::REOPEN_WAIT + std::time::Duration::from_secs(2),
+            async {
+                while !request.is_finished()
+                    && handle
+                        .router()
+                        .lookup_downstream_ids(&upstream_id)
+                        .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            },
+        )
+        .await
+        .expect("the resolve must settle once the barrier's budget is spent");
+        assert!(
+            !request.is_finished(),
+            "a document re-opened before the timeout must still be resolved"
+        );
+        let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+        let _ = handle.router().route(json!({
+            "jsonrpc": "2.0", "id": downstream_id.as_i64(), "result": {"title": "resolved"}
+        }));
+        assert!(request.await.unwrap().title.starts_with("resolved"));
+    }
+
+    /// The gate's open check runs before the send, so a close can land in
+    /// between. The send must recheck under the document's transition lock, as
+    /// completion resolve does, or the resolve follows the didClose in the FIFO.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_is_not_sent_for_a_document_closed_before_enqueue() {
+        let (pool, handle, _envelope, virtual_uri, _config) = virtual_resolve_fixture().await;
+        let upstream_id = UpstreamId::Number(85);
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.send_code_action_resolve_on_handle(
+                &handle,
+                CodeAction {
+                    title: "old".into(),
+                    ..Default::default()
+                },
+                Some(upstream_id.clone()),
+                ResolveTarget::Virtual(&virtual_uri),
+            ),
+        )
+        .await
+        .expect("a resolve for a closed document must fail soft, not wait for a reply");
+        assert!(resolved.is_none());
+    }
+
+    /// A settled barrier does not prove THIS document is open: a re-open that
+    /// failed is retired by its first waiter, and later waiters see nothing
+    /// outstanding. The resolve must still not reach a process that never
+    /// received the document.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtual_code_action_resolve_never_sends_for_an_unopened_document() {
+        let (pool, handle, envelope, _virtual_uri, config) = virtual_resolve_fixture().await;
+        let done = pool.claim_reopen_for_test(handle.key());
+        // The re-open reports that it could not repair this connection.
+        done.send(false).unwrap();
+        drop(done);
+
+        for id in [81, 82] {
+            let upstream_id = UpstreamId::Number(id);
+            let request = spawn_virtual_resolve(&pool, &envelope, &config, &upstream_id);
+            let action = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+                .await
+                .expect("a resolve for an unopened document must fail soft, not send")
+                .unwrap();
+            assert!(action.edit.is_none(), "attempt {id} must stay unresolved");
+            assert!(
+                handle
+                    .router()
+                    .lookup_downstream_ids(&upstream_id)
+                    .is_empty(),
+                "attempt {id} must not reach the downstream"
+            );
+        }
     }
 
     fn range(start_line: u32, end_line: u32) -> Range {
