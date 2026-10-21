@@ -3671,7 +3671,12 @@ mod formatting {
         let answer = [edit((0, 0), (2 * count as u32, 0), &formatted)];
         assert!(map.map_formatting_answer(&answer).is_ok());
         assert_eq!(
-            map.map_formatting_within(&answer, FORMATTING_DIFF_BUDGET, 15),
+            map.map_formatting_within(
+                &answer,
+                FORMATTING_DIFF_BUDGET,
+                15,
+                Some(FORMATTING_DIFF_BUDGET_CAP)
+            ),
             Err(FormattingRefusal::OutOfWork)
         );
     }
