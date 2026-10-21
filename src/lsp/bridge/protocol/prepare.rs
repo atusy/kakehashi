@@ -895,16 +895,16 @@ impl PreparedMap {
         self.revocation = Some(revocation);
     }
 
-    /// Whether `a` and `b` translate alike: built from the same texts with
-    /// the same runs (the maps' equality), whichever answers they came from.
-    /// What decides whether a server holding one needs the other's text sent
-    /// (it does not), or reads a reply computed on one through the other.
     /// The indentation the peer removed right at P offset `prepared` (a
     /// deleted run P shows nothing of), if any.
     fn removed_indent_at(&self, prepared: usize) -> Option<&Run> {
         empty_run(&self.runs, prepared, |kind| kind == RunKind::Deleted)
     }
 
+    /// Whether `a` and `b` translate alike: built from the same texts with
+    /// the same runs (the maps' equality), whichever answers they came from.
+    /// What decides whether a server holding one needs the other's text sent
+    /// (it does not), or reads a reply computed on one through the other.
     pub(crate) fn same_coordinates(a: Option<&PreparedMap>, b: Option<&PreparedMap>) -> bool {
         a == b
     }
