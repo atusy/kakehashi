@@ -95,11 +95,13 @@ it has them asked of the next candidate (or sent as is).
 The epoch is one of two validity axes. It decides which answers a lookup
 may read, but it cannot reach a map already given out, which a connection
 holds or a request is built on. The second axis is **revocation**:
-- A failure of an input revokes every map answered for that same input
-  (its text, segments and host language, whatever the epoch or candidates)
-  before the failed attempt's input was taken.
+- A failure of an input revokes every map answered for that same input of
+  that same region before the failed attempt's input was taken. "The same
+  input" means the same text, segments and host language, whatever the
+  epoch or candidates.
 - A revoked map translates nothing more, for any path that reads it.
-- A map answered after the failure, for a newer text, is not revoked.
+- A map whose input was taken after the failure is not revoked, whether it
+  is for a newer text or for the same text asked again.
 An answer is read only while both hold: its epoch is current, and its map
 is not revoked.
 
