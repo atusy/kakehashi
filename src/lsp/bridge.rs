@@ -96,7 +96,7 @@ pub(crate) use protocol::host_range_selects_nothing;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
-pub(crate) use protocol::transform_workspace_edit_to_host;
+pub(crate) use protocol::transform_workspace_edit_to_host_explained;
 pub(crate) use protocol::translate_virtual_formatting_edits_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;

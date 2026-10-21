@@ -47,7 +47,15 @@ impl Kakehashi {
         let verdict = self
             .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
             .await;
-        Ok(verdict.keeps().then_some(sourced.value))
+        if !verdict.keeps() {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "linkedEditingRange result for {} dropped: {verdict}",
+                lsp_uri.as_str()
+            );
+            return Ok(None);
+        }
+        Ok(Some(sourced.value))
     }
 
     /// Virt layer: bridge the injection region under the cursor.

@@ -125,11 +125,17 @@ fn transform_linked_editing_range_response_to_host(
     // a prepared document each must cover in the host exactly the text it
     // covers there, or the answer is none (one range typed into elsewhere
     // than the server meant would desynchronize the others).
-    linked
+    let alike = linked
         .ranges
         .iter_mut()
-        .all(|range| translate_editable_virtual_range_to_host(range, offset))
-        .then_some(linked)
+        .all(|range| translate_editable_virtual_range_to_host(range, offset));
+    if !alike {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "linkedEditingRange: a range covers other host text than it covers in the prepared virtual document; no answer"
+        );
+    }
+    alike.then_some(linked)
 }
 
 #[cfg(test)]

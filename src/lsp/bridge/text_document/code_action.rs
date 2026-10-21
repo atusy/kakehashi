@@ -36,11 +36,12 @@ use super::super::pool::{
     ConnectionHandle, ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcRequest, PreparedMap, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    JsonRpcRequest, PreparedMap, RegionOffset, RequestId, VirtualDocumentUri, WorkspaceEditRefusal,
+    encode_command, host_position_within_region, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host_explained,
+    translate_host_range_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    workspace_edit_has_effect, workspace_edit_preserves_line_prefixes,
+    workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 use super::host::{HostResolveContext, HostResolveReader};
@@ -385,8 +386,12 @@ fn translate_edit_host_ward_strict(
     if workspace_edit_touches_foreign_region(edit, request_virtual_uri) {
         return Err(REASON_CROSS_REGION);
     }
-    if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
-        return Err(REASON_CROSS_REGION);
+    match transform_workspace_edit_to_host_explained(edit, request_virtual_uri, host_uri, offset) {
+        Ok(()) => {}
+        Err(WorkspaceEditRefusal::VirtualFileOperation) => return Err(REASON_CROSS_REGION),
+        Err(WorkspaceEditRefusal::DirectHostEditInRegion | WorkspaceEditRefusal::Unmappable) => {
+            return Err(REASON_PREPARED);
+        }
     }
     // Reached directly by the client-driven resolve path (which bypasses
     // bridge_code_action's own strip): versions on OTHER real files are
@@ -1593,6 +1598,8 @@ pub(crate) fn bridge_code_actions(
 
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
+const REASON_PREPARED: &str =
+    "the edit cannot be mapped back through the prepared virtual document it was computed on";
 const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";

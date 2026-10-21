@@ -155,6 +155,12 @@ fn transform_prepare_rename_response_to_host(
         }
     };
 
+    if !mapped {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "prepareRename: the range covers other host text than it covers in the prepared virtual document; no answer"
+        );
+    }
     Ok(mapped.then_some(prepare_rename))
 }
 
