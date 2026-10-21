@@ -485,8 +485,9 @@ The answer is checked against:
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
   host's newer text waits for its prepare answer — dropped, but for the
-  formatting methods, renames, color presentations, code actions and
-  linked editing ranges, which wait for that to clear (see below);
+  formatting methods, renames, color presentations, code actions,
+  linked editing ranges and prepareRename, which wait for that to clear
+  (see below);
 - the peer failed the request's input (see Failure; a reply arriving
   after that is refused whole, and one the failure lands under keeps no
   edit) — dropped;
