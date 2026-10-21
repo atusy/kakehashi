@@ -432,54 +432,21 @@ impl PreparedMap {
                 .take_while(|run| run.virtual_.end == virtual_start)
                 .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
         };
-        let first = match start_indent {
-            _ if lines_before_own_indent => FirstIndent::Uniform,
-            // Whole lines deleted before an existing line, or replaced by
-            // text without a line break before a non-blank one: what remains
-            // is that line, which keeps its own indent (deleting a line must
-            // not re-indent the next). Text joining a blank line is that
-            // line's content instead, indented as the replaced line was.
-            _ if whole_lines
-                && is_line_start(virtual_text, virtual_start)
-                && !new_text.contains(['\n', '\r'])
-                && tail.is_some()
-                && (new_text.is_empty() || begins_line(following)) =>
-            {
-                FirstIndent::Existing(tail.unwrap_or_default())
-            }
-            _ if whole_lines && let Some(indent) = end_line_indent => FirstIndent::Exact(indent),
-            // Text on a blank line is a line of the content.
-            Some(_) if blank_at_start.is_some() => FirstIndent::Uniform,
-            // Likewise replacing whole lines from a whitespace-only line the
-            // peer kept as is: that whitespace says nothing of the indent.
-            None if whole_lines
-                && is_line_start(virtual_text, virtual_start)
-                && rest_of_line_blank(virtual_text, virtual_start) =>
-            {
-                FirstIndent::Uniform
-            }
-            // The replaced line's own removed indent comes back.
-            Some(run) => FirstIndent::Exact(&virtual_text[run.virtual_.clone()]),
-            // Text landing at a V line start that kept no indent before it
-            // starts a line of its own — at a blank line or the document end,
-            // or when it breaks the line — and needs the indent too. Text that
-            // just joins a non-blank line the peer did not dedent belongs to
-            // that line, which has no indent to restore.
-            None if is_line_start(virtual_text, virtual_start)
-                && (is_line_start(prepared, old.start) || after_gap)
-                && (is_line_end(virtual_text, virtual_start)
-                    || new_text.contains(['\n', '\r'])) =>
-            {
-                FirstIndent::Uniform
-            }
-            None => FirstIndent::None,
-        };
-        // An empty insertion inserts nothing, not even an indent.
-        let first = if old.is_empty() && new_text.is_empty() {
-            FirstIndent::None
-        } else {
-            first
-        };
+        let first = first_indent(&EdgeShape {
+            whole_lines,
+            lines_before_own_indent,
+            start_indent: start_indent.map(|run| &virtual_text[run.virtual_.clone()]),
+            blank_at_start: blank_at_start.is_some(),
+            end_line_indent,
+            starts_virtual_line: is_line_start(virtual_text, virtual_start),
+            starts_prepared_line_or_after_gap: is_line_start(prepared, old.start) || after_gap,
+            ends_virtual_line: is_line_end(virtual_text, virtual_start),
+            virtual_rest_blank: rest_of_line_blank(virtual_text, virtual_start),
+            text_breaks_line: new_text.contains(['\n', '\r']),
+            tail,
+            text_joins_line: new_text.is_empty() || begins_line(following),
+            inserts_nothing: old.is_empty() && new_text.is_empty(),
+        });
         // Text joining that line takes its indent only from a line of text
         // or one holding the indent the peer removed: joining a blank line,
         // it starts a new line of the content — a blank line the peer
@@ -491,35 +458,13 @@ impl PreparedMap {
         let joined =
             tail.filter(|_| removed_at_end.is_some() && !emptied_at_end || begins_line(following));
         let inserted = self.reindent(virtual_start, first, new_text, following, tail, joined)?;
-        // A CR and an LF meeting at either edge of the change make one line
-        // break in P, or two in V where host text the change stops beside (an
-        // emptied gap) sits between them: the server's lines would no longer
-        // be V's. Each edge must join or keep apart alike on both sides.
-        let fuses =
-            |before: Option<char>, after: Option<char>| before == Some('\r') && after == Some('\n');
         let prepared_before = prepared[..old.start].chars().next_back();
         let virtual_before = virtual_text[..virtual_start].chars().next_back();
         let virtual_after = virtual_text[virtual_end..].chars().next();
-        let edges = [
-            (
-                fuses(prepared_before, new_text.chars().next().or(prepared_after)),
-                fuses(virtual_before, inserted.chars().next().or(virtual_after)),
-            ),
-            (
-                fuses(
-                    new_text.chars().next_back().or(prepared_before),
-                    prepared_after,
-                ),
-                fuses(
-                    inserted.chars().next_back().or(virtual_before),
-                    virtual_after,
-                ),
-            ),
-        ];
-        if edges
-            .iter()
-            .any(|(prepared, virtual_)| prepared != virtual_)
-        {
+        if !line_breaks_agree(
+            (prepared_before, new_text, prepared_after),
+            (virtual_before, &inserted, virtual_after),
+        ) {
             return None;
         }
         Some((virtual_start..virtual_end, inserted))
@@ -627,6 +572,112 @@ impl PreparedMap {
         }
         Some(output)
     }
+}
+
+/// What decides the indentation an edit's first line regains: where its
+/// edges fall in P and V, and what its text does there (see
+/// [`first_indent`]).
+struct EdgeShape<'a> {
+    /// The change covers whole lines from a line start (see
+    /// `PreparedMap::hunk_to_virtual`).
+    whole_lines: bool,
+    /// Lines inserted at a line start whose removed indent is not the
+    /// content's: lines of the content, going before that indent.
+    lines_before_own_indent: bool,
+    /// The removed indent the change starts before, covering it.
+    start_indent: Option<&'a str>,
+    /// That indent is a blank line's the peer emptied, not the content's.
+    blank_at_start: bool,
+    /// The removed indent of the later line text without a line break is
+    /// left the start of (see `PreparedMap::hunk_to_virtual`).
+    end_line_indent: Option<&'a str>,
+    /// The mapped start is a V line start.
+    starts_virtual_line: bool,
+    /// The change starts at a P line start, or right after a gap's own line
+    /// break.
+    starts_prepared_line_or_after_gap: bool,
+    /// The mapped start ends its V line.
+    ends_virtual_line: bool,
+    /// The rest of the V line from the mapped start is only spaces and tabs.
+    virtual_rest_blank: bool,
+    /// The edit's text holds a line break.
+    text_breaks_line: bool,
+    /// The removed indent of the existing line the change ends before.
+    tail: Option<&'a str>,
+    /// The edit's text, or what follows it, begins a line of text.
+    text_joins_line: bool,
+    /// An empty insertion.
+    inserts_nothing: bool,
+}
+
+/// The indentation the edit `shape` describes regains on its first line.
+fn first_indent<'a>(shape: &EdgeShape<'a>) -> FirstIndent<'a> {
+    // An empty insertion inserts nothing, not even an indent.
+    if shape.inserts_nothing {
+        return FirstIndent::None;
+    }
+    match shape.start_indent {
+        _ if shape.lines_before_own_indent => FirstIndent::Uniform,
+        // Whole lines deleted before an existing line, or replaced by text
+        // without a line break before a non-blank one: what remains is that
+        // line, which keeps its own indent (deleting a line must not
+        // re-indent the next). Text joining a blank line is that line's
+        // content instead, indented as the replaced line was.
+        _ if shape.whole_lines
+            && shape.starts_virtual_line
+            && !shape.text_breaks_line
+            && shape.tail.is_some()
+            && shape.text_joins_line =>
+        {
+            FirstIndent::Existing(shape.tail.unwrap_or_default())
+        }
+        _ if shape.whole_lines
+            && let Some(indent) = shape.end_line_indent =>
+        {
+            FirstIndent::Exact(indent)
+        }
+        // Text on a blank line is a line of the content.
+        Some(_) if shape.blank_at_start => FirstIndent::Uniform,
+        // Likewise replacing whole lines from a whitespace-only line the peer
+        // kept as is: that whitespace says nothing of the indent.
+        None if shape.whole_lines && shape.starts_virtual_line && shape.virtual_rest_blank => {
+            FirstIndent::Uniform
+        }
+        // The replaced line's own removed indent comes back.
+        Some(indent) => FirstIndent::Exact(indent),
+        // Text landing at a V line start that kept no indent before it starts
+        // a line of its own — at a blank line or the document end, or when it
+        // breaks the line — and needs the indent too. Text that just joins a
+        // non-blank line the peer did not dedent belongs to that line, which
+        // has no indent to restore.
+        None if shape.starts_virtual_line
+            && shape.starts_prepared_line_or_after_gap
+            && (shape.ends_virtual_line || shape.text_breaks_line) =>
+        {
+            FirstIndent::Uniform
+        }
+        None => FirstIndent::None,
+    }
+}
+
+/// Whether a CR and an LF meet alike at either edge of a change in both
+/// documents: each side is the character before the change, its text, and
+/// the character after it. Meeting, they make one line break in P, or two
+/// in V where host text the change stops beside (an emptied gap) sits
+/// between them: the server's lines would no longer be V's.
+fn line_breaks_agree(
+    prepared: (Option<char>, &str, Option<char>),
+    virtual_: (Option<char>, &str, Option<char>),
+) -> bool {
+    let fuses =
+        |before: Option<char>, after: Option<char>| before == Some('\r') && after == Some('\n');
+    let at_start = |(before, text, after): (Option<char>, &str, Option<char>)| {
+        fuses(before, text.chars().next().or(after))
+    };
+    let at_end = |(before, text, after): (Option<char>, &str, Option<char>)| {
+        fuses(text.chars().next_back().or(before), after)
+    };
+    at_start(prepared) == at_start(virtual_) && at_end(prepared) == at_end(virtual_)
 }
 
 /// The byte ranges `edits` replace in `lines`' text (a column past its
