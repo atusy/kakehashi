@@ -106,8 +106,10 @@ holds or a request is built on. The second axis is **revocation**:
 An answer is read only while both hold: its epoch is current, and its map
 is not revoked.
 
-The feature is present only with `KAKEHASHI_EXPERIMENTAL=true`; without it
-no advertisement is recorded and nothing is looked up. Only pairs that are
+The feature is present only with `KAKEHASHI_EXPERIMENTAL=true`. Without
+it, a server's `initialize` result is still parsed, and its advertisement
+is noted on its connection, but it is never recorded for its pairs, so
+nothing is looked up or asked. Only pairs that are
 bridged and have a server for the injection language are prepared.
 
 ### The Request
@@ -315,7 +317,9 @@ latest the lifecycle pass recorded.
   asked, no record is stamped, no region text is copied for placement, and
   no request waits. What runs regardless is small: each send's text is
   recorded as what its connection holds, and the advertisement in a
-  server's `initialize` result is read.
+  server's `initialize` result is parsed and noted on its connection. It is
+  never recorded for its pairs (see Configuration and Discovery), so
+  nothing reads it.
 
 ## Considered Options
 
