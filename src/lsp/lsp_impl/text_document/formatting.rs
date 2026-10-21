@@ -1744,7 +1744,8 @@ fn pipeline_region_text(
 /// without this step a blockquoted/indented injection loses its `> ` markers
 /// or indentation on every continuation line.
 ///
-/// A *row* is a line of `original_virtual`; output line `i` lands on row `i`.
+/// A *row* is a line of `original_virtual`; when the line count is kept,
+/// output line `i` lands on row `i`.
 ///
 /// - **Line count preserved** (output lines == rows): each output line `i`
 ///   re-gains its own original prefix `host_line_prefixes[i]` — a 1:1
@@ -1873,9 +1874,9 @@ fn is_blank_line(line: &str) -> bool {
     line.chars().all(|c| c == ' ' || c == '\t')
 }
 
-/// The host prefix shared by the region's rows, for output lines with no
-/// original counterpart and for text written on a blank row (Decision
-/// point 4).
+/// The host prefix shared by the region's rows, for every continuation line
+/// once the line count changes, and for text written on a blank row
+/// (Decision point 4).
 ///
 /// Taken over the rows of the original virtual text that hold text, since a
 /// blank row's prefix is not the region's (see
