@@ -1316,6 +1316,67 @@ impl InjectionResolver {
         Self::resolve_from_regions(coordinator, tracker, uri, &injections, text, incarnation)
     }
 
+    /// [`resolve_all`](Self::resolve_all) restricted to the regions that may
+    /// intersect the host byte span `host_bytes` (both ends inclusive, so a
+    /// zero-length span at a region's edge still reaches it).
+    ///
+    /// The filter runs on the raw captures, before any virtual content,
+    /// offset table or region id is built, so a range request over a
+    /// document with many injections pays only for the ones it touches. It
+    /// is a superset filter: each capture is tested by the union of its node
+    /// and effective (`#offset!`) spans, and a combined group by the union of
+    /// all its members, which is the span its one document covers, so a span
+    /// inside a gap between members still selects the group. Callers apply
+    /// their exact intersection to the result.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve_intersecting(
+        coordinator: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        uri: &Url,
+        tree: &Tree,
+        text: &str,
+        injection_query: &Query,
+        incarnation: u64,
+        host_bytes: Range<usize>,
+    ) -> Vec<ResolvedInjection> {
+        let Some(injections) =
+            collect_all_injections(&tree.root_node(), text, Some(injection_query))
+        else {
+            return Vec::new();
+        };
+        let span = |region: &InjectionRegionInfo<'_>| {
+            let effective = effective_content_range(region, text);
+            let node = &region.content_node;
+            node.start_byte().min(effective.start)..node.end_byte().max(effective.end)
+        };
+        let mut combined_spans: std::collections::HashMap<(&str, usize), Range<usize>> =
+            std::collections::HashMap::new();
+        for region in injections.iter().filter(|region| region.combined) {
+            let member = span(region);
+            combined_spans
+                .entry((region.language.as_str(), region.pattern_index))
+                .and_modify(|group| {
+                    group.start = group.start.min(member.start);
+                    group.end = group.end.max(member.end);
+                })
+                .or_insert(member);
+        }
+        let touches =
+            |span: &Range<usize>| span.start <= host_bytes.end && host_bytes.start <= span.end;
+        let selected: Vec<InjectionRegionInfo<'_>> = injections
+            .iter()
+            .filter(|region| {
+                if region.combined {
+                    touches(&combined_spans[&(region.language.as_str(), region.pattern_index)])
+                } else {
+                    touches(&span(region))
+                }
+            })
+            .cloned()
+            .collect();
+        Self::resolve_from_regions(coordinator, tracker, uri, &selected, text, incarnation)
+    }
+
     /// Resolve the exact bridge layer identified by an opaque region ID.
     ///
     /// A byte lookup alone is ambiguous when multiple query patterns assign
@@ -2665,6 +2726,150 @@ mod tests {
         .expect("a non-first combined capture resolves the shared document");
         assert_eq!(via_second.region.region_id, resolved[0].region.region_id);
         assert_eq!(via_second.virtual_content, resolved[0].virtual_content);
+    }
+
+    /// Whether the tracker has minted an id for `region` in `layer`: a
+    /// region id is minted only when the region is materialized.
+    fn region_was_materialized(
+        tracker: &NodeTracker,
+        uri: &Url,
+        region: &InjectionRegionInfo<'_>,
+        layer: usize,
+    ) -> bool {
+        let node = &region.content_node;
+        tracker
+            .lookup_in_layer(
+                uri,
+                node.start_byte(),
+                node.end_byte(),
+                crate::language::loader::static_node_kind(node),
+                layer,
+            )
+            .is_some()
+    }
+
+    /// A range request materializes only the regions its span touches: a
+    /// region outside it gets no virtual content and no region id.
+    #[test]
+    fn resolve_intersecting_materializes_only_touched_regions() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let a = "aaa"; let b = "bbb"; }"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_content) @injection.content
+                 (#set! injection.language "html"))"#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("intersecting");
+        let first = text.find("aaa").unwrap();
+        let second = text.find("bbb").unwrap();
+
+        let resolved = InjectionResolver::resolve_intersecting(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+            first + 1..first + 2,
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, "aaa");
+        let regions = collect_all_injections(&tree.root_node(), text, Some(&query)).unwrap();
+        // Both captures share one (pattern, language) identity layer; read it
+        // from the id the touched region was given.
+        let id = Ulid::from_string(&resolved[0].region.region_id).unwrap();
+        let (_, _, _, layer, _) = tracker.lookup_node(&uri, &id).unwrap();
+        assert!(region_was_materialized(&tracker, &uri, &regions[0], layer));
+        assert!(
+            !region_was_materialized(&tracker, &uri, &regions[1], layer),
+            "a region outside the span must not be materialized"
+        );
+
+        // Both ends are inclusive: a zero-length span at a region's end
+        // still reaches it, and the full span reaches both.
+        let at_end = first + 3;
+        let resolved = InjectionResolver::resolve_intersecting(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+            at_end..at_end,
+        );
+        assert_eq!(resolved.len(), 1);
+        let resolved = InjectionResolver::resolve_intersecting(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+            0..text.len(),
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|r| r.virtual_content.as_str())
+                .collect::<Vec<_>>(),
+            ["aaa", "bbb"]
+        );
+        assert!(second > at_end);
+    }
+
+    /// A combined group is one document spanning all its members, so a span
+    /// in the gap between members selects the whole group, and one outside
+    /// the group's span selects nothing.
+    #[test]
+    fn resolve_intersecting_tests_a_combined_group_by_its_whole_span() {
+        let mut parser = create_rust_parser();
+        let text = r#"fn main() { let open = "<div>"; let close = "</div>"; } fn tail() {}"#;
+        let tree = parse_rust_code(&mut parser, text);
+        let query = Query::new(
+            &tree_sitter_rust::LANGUAGE.into(),
+            r#"((string_literal
+                  (string_content) @injection.content)
+                (#set! injection.language "html")
+                (#set! injection.combined))"#,
+        )
+        .expect("valid query");
+        let coordinator = test_coordinator();
+        let tracker = NodeTracker::new();
+        let uri = test_uri("intersecting_combined");
+        let gap = text.find("let close").unwrap();
+
+        let resolved = InjectionResolver::resolve_intersecting(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+            gap..gap + 3,
+        );
+        assert_eq!(resolved.len(), 1, "a gap span selects the combined group");
+        assert!(resolved[0].virtual_content.contains("</div>"));
+
+        let tail = text.find("fn tail").unwrap();
+        let resolved = InjectionResolver::resolve_intersecting(
+            &coordinator,
+            &tracker,
+            &uri,
+            &tree,
+            text,
+            &query,
+            0,
+            tail..text.len(),
+        );
+        assert!(resolved.is_empty());
     }
 
     #[test]

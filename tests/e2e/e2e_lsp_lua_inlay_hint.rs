@@ -165,6 +165,29 @@ fn inlay_hints_with_retry(
     panic!("timed out waiting for inlay hints");
 }
 
+fn inlay_hints_once(
+    client: &mut LspClient,
+    uri: &str,
+    start_line: u64,
+    end_line: u64,
+) -> Vec<Value> {
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": 0 },
+                "end": { "line": end_line, "character": 0 }
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected inlay hints: {response}"))
+        .clone()
+}
+
 /// Block until the mock resolver reports `inlay-hint-resolve-started`, the
 /// sent-state barrier the delayed and slow resolver modes raise on receipt.
 /// kakehashi forwards its own `window/logMessage` lines too (query loading,
@@ -1133,6 +1156,473 @@ fn e2e_host_inlay_hint_resolve_cancel_targets_downstream_request() {
         json!(request_id),
         "the downstream must see its own request id, not the editor's"
     );
+
+    shutdown_client(&mut client);
+}
+
+/// Editors ask for the visible or the whole document's range, which starts
+/// in host text before any injection: every region the range intersects is
+/// bridged, and the hints are merged in document order. A range that stops
+/// before a later region does not reach it.
+#[test]
+fn e2e_inlay_hint_range_starting_before_regions_covers_every_intersected_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_whole_document.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal y = 2\n```\n"
+        }}),
+    );
+
+    // Warm both regions with in-region requests, so the assertions below see
+    // live virtual documents and never accept a partial merge on a retry.
+    inlay_hints_with_retry(&mut client, uri, 3, 4);
+    inlay_hints_with_retry(&mut client, uri, 9, 10);
+
+    let whole = inlay_hints_once(&mut client, uri, 0, 11);
+    let positions: Vec<&Value> = whole.iter().map(|hint| &hint["position"]).collect();
+    assert_eq!(
+        positions,
+        [
+            &json!({ "line": 3, "character": 1 }),
+            &json!({ "line": 9, "character": 1 })
+        ],
+        "{whole:?}"
+    );
+    assert_ne!(
+        whole[0]["data"]["kakehashi"]["region_id"], whole[1]["data"]["kakehashi"]["region_id"],
+        "each hint is enveloped for the region that produced it"
+    );
+
+    // Each region is asked for the range clipped to its content, which is
+    // one line in both fences: virtual (0,0)-(1,0).
+    let whole_line = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 1, "character": 0 }
+    });
+    for hint in &whole {
+        assert_eq!(
+            hint["data"]["kakehashi"]["inner"]["receivedRange"], whole_line,
+            "{hint}"
+        );
+    }
+
+    // A range that only touches a region's edge reaches no region: one
+    // ending exactly where the first fence's content starts (3,0), and one
+    // starting exactly where it ends (4,0) and stopping before the second.
+    // Main asked no region for either.
+    for (start, end) in [(0, 3), (4, 9)] {
+        let response = client.send_request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": start, "character": 0 },
+                    "end": { "line": end, "character": 0 }
+                }
+            }),
+        );
+        assert!(response["result"].is_null(), "{start}..{end}: {response}");
+    }
+
+    let first_only = inlay_hints_once(&mut client, uri, 0, 6);
+    let positions: Vec<&Value> = first_only.iter().map(|hint| &hint["position"]).collect();
+    assert_eq!(positions, [&json!({ "line": 3, "character": 1 })]);
+
+    // A range from inside the first fence to inside the second is clipped at
+    // both ends: the first region keeps its start, the second its end.
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 4 },
+                "end": { "line": 9, "character": 5 }
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let received: Vec<&Value> = response["result"]
+        .as_array()
+        .expect("hints for both regions")
+        .iter()
+        .map(|hint| &hint["data"]["kakehashi"]["inner"]["receivedRange"])
+        .collect();
+    assert_eq!(
+        received,
+        [
+            &json!({
+                "start": { "line": 0, "character": 4 },
+                "end": { "line": 1, "character": 0 }
+            }),
+            &json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 5 }
+            })
+        ]
+    );
+
+    // The resolve of the later region's hint routes back to that region.
+    let response = client.send_request("inlayHint/resolve", whole[1].clone());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["tooltip"], "mock resolved:hint-1");
+    assert_eq!(response["result"]["position"], whole[1]["position"]);
+
+    shutdown_client(&mut client);
+}
+
+/// The editor's work-done progress covers the whole request: every region
+/// routes its downstream's progress into the one lifecycle on the editor's
+/// token, so the progress ends only once every region settles rather than
+/// when the first one does.
+#[test]
+fn e2e_inlay_hint_work_done_progress_spans_every_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal y = 2\n```\n"
+        }}),
+    );
+    inlay_hints_with_retry(&mut client, uri, 3, 4);
+    inlay_hints_with_retry(&mut client, uri, 9, 10);
+
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 11, "character": 0 }
+            },
+            "workDoneToken": "editor-inlay-progress"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let hints = response["result"]
+        .as_array()
+        .expect("hints for both regions");
+    assert_eq!(hints.len(), 2, "{response}");
+    for hint in hints {
+        let token = &hint["data"]["kakehashi"]["inner"]["receivedWorkDoneToken"];
+        assert!(
+            token.is_string() || token.is_number(),
+            "every region's downstream must get a bridge progress token: {hint}"
+        );
+        assert_ne!(
+            token,
+            &json!("editor-inlay-progress"),
+            "the downstream gets a bridge token, not the editor's"
+        );
+    }
+
+    shutdown_client(&mut client);
+}
+
+const PROGRESS_TOKEN: &str = "editor-inlay-progress";
+const HELD_REGION_TEXT: &str =
+    "# Test\n\n```lua\nlocal x = 1\n```\n\ntext\n\n```lua\nlocal slow = 2\n```\n";
+
+/// Open the two-fence document whose second fence the `inlay-hint-progress`
+/// mock holds, warm both regions, and send a whole-document request carrying
+/// the editor's work-done token. Returns the request id once the fast
+/// region's Begin and Report reached the editor and a quiet window showed no
+/// End and no answer while the held region is still in flight.
+fn start_held_progress_request(client: &mut LspClient, uri: &str) -> (i64, Vec<String>) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": HELD_REGION_TEXT
+        }}),
+    );
+    inlay_hints_with_retry(client, uri, 3, 4);
+    inlay_hints_with_retry(client, uri, 9, 10);
+
+    let id = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 11, "character": 0 }
+            },
+            "workDoneToken": PROGRESS_TOKEN
+        }),
+    );
+    let mut kinds = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !kinds.iter().any(|kind| kind == "report") {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = client
+            .receive_any_message(remaining)
+            .expect("the fast region's progress must reach the editor");
+        assert_ne!(
+            message["id"],
+            json!(id),
+            "answered while a region is held: {message}"
+        );
+        record_progress(&message, &mut kinds);
+    }
+    // The fast region has reported and sent its own End; its answer follows
+    // on the same pipe. A lifecycle that relayed that End, or that was tied to
+    // that region, would end now, while the other region is held.
+    let quiet_until = std::time::Instant::now() + std::time::Duration::from_millis(700);
+    loop {
+        let remaining = quiet_until.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(message) = client.receive_any_message(remaining) else {
+            break;
+        };
+        assert_ne!(
+            message["id"],
+            json!(id),
+            "answered while a region is held: {message}"
+        );
+        record_progress(&message, &mut kinds);
+    }
+    assert_eq!(
+        kinds,
+        ["begin", "report"],
+        "progress must stay open while a region is still in flight"
+    );
+    (id, kinds)
+}
+
+fn record_progress(message: &Value, kinds: &mut Vec<String>) {
+    if message["method"] == "$/progress" && message["params"]["token"] == PROGRESS_TOKEN {
+        let value = &message["params"]["value"];
+        let kind = value["kind"].as_str().expect("progress kind");
+        // An End records its message, so a test can tell the server's own End
+        // (relayed late) from a synthetic one.
+        kinds.push(match value["message"].as_str() {
+            Some(text) if kind == "end" => format!("end:{text}"),
+            _ => kind.to_string(),
+        });
+    }
+}
+
+/// Collect messages until `id` and every id in `also` are answered and the
+/// editor's progress ended, returning `id`'s answer. The other answers are
+/// awaited here too, as they can interleave with it in either order.
+fn finish_held_progress_request(
+    client: &mut LspClient,
+    id: i64,
+    also: &[i64],
+    kinds: &mut Vec<String>,
+) -> Value {
+    let mut response = None;
+    let mut pending: Vec<i64> = also.to_vec();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while response.is_none()
+        || !pending.is_empty()
+        || !kinds.iter().any(|kind| kind.starts_with("end"))
+    {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = client.receive_any_message(remaining).unwrap_or_else(|| {
+            panic!("no answer or no End: {kinds:?} {response:?} pending {pending:?}")
+        });
+        if message.get("method").is_none()
+            && let Some(answered) = message["id"].as_i64()
+        {
+            if answered == id {
+                response = Some(message);
+            } else {
+                pending.retain(|other| *other != answered);
+            }
+        } else {
+            record_progress(&message, kinds);
+        }
+    }
+    response.expect("answered")
+}
+
+/// The editor's work-done progress is one lifecycle for the whole request:
+/// the region that reports first owns it, and its End, even the server's own,
+/// reaches the editor only after the last region settles, not when the first
+/// one does.
+#[test]
+fn e2e_inlay_hint_work_done_progress_ends_after_the_last_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-progress", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress_held.md";
+    let (id, mut kinds) = start_held_progress_request(&mut client, uri);
+
+    // Any later inlay hint request releases the held region's answer.
+    let release = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 9, "character": 0 },
+                "end": { "line": 10, "character": 0 }
+            }
+        }),
+    );
+    let response = finish_held_progress_request(&mut client, id, &[release], &mut kinds);
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(
+        response["result"].as_array().map(Vec::len),
+        Some(2),
+        "{response}"
+    );
+    assert_eq!(
+        kinds,
+        ["begin", "report", "end:fast region done"],
+        "the fast region's own End is relayed once the held region settled"
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// A cancel that lands while a region is held still ends the editor's
+/// progress, once, with the cancelled answer.
+#[test]
+fn e2e_inlay_hint_work_done_progress_ends_on_cancel() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-progress", "lua", false, None);
+    let uri = "file:///test_inlay_hint_progress_cancel.md";
+    let (id, mut kinds) = start_held_progress_request(&mut client, uri);
+
+    client.send_notification("$/cancelRequest", json!({ "id": id }));
+    let response = finish_held_progress_request(&mut client, id, &[], &mut kinds);
+    assert_eq!(response["error"]["code"], -32800, "{response}");
+    assert_eq!(kinds, ["begin", "report", "end:fast region done"]);
+
+    shutdown_client(&mut client);
+}
+
+/// A range wholly inside the stripped `> ` prefix of a blockquoted fence
+/// line covers no embedded text, so no region is asked (as for a range that
+/// starts there on a single-region request). A range from the prefix into
+/// the line's text is asked from where the text starts.
+#[test]
+fn e2e_inlay_hint_range_inside_a_stripped_prefix_asks_no_region() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    let uri = "file:///test_inlay_hint_blockquote_prefix.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({ "textDocument": {
+            "uri": uri,
+            "languageId": "markdown",
+            "version": 1,
+            "text": "> ```lua\n> local x = 1\n> local y = 2\n> ```\n"
+        }}),
+    );
+    inlay_hints_with_retry(&mut client, uri, 1, 2);
+
+    let request = |client: &mut LspClient, start: u64, end: u64| {
+        client.send_request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 2, "character": start },
+                    "end": { "line": 2, "character": end }
+                }
+            }),
+        )
+    };
+    let prefix_only = request(&mut client, 0, 1);
+    assert!(prefix_only.get("error").is_none(), "{prefix_only}");
+    assert!(prefix_only["result"].is_null(), "{prefix_only}");
+    let caret_in_prefix = request(&mut client, 1, 1);
+    assert!(caret_in_prefix["result"].is_null(), "{caret_in_prefix}");
+
+    let into_text = request(&mut client, 1, 5);
+    let hints = into_text["result"]
+        .as_array()
+        .expect("hints for the line's text");
+    assert_eq!(
+        hints[0]["data"]["kakehashi"]["inner"]["receivedRange"],
+        json!({
+            "start": { "line": 1, "character": 0 },
+            "end": { "line": 1, "character": 3 }
+        })
+    );
+
+    shutdown_client(&mut client);
+}
+
+/// The closing-fence line's stripped prefix (a blockquote's `> `, a list
+/// item's indent) is outside the virtual document, whose last line is the
+/// empty one after the final line break. A whole-document range is asked
+/// up to that virtual end, never past it, and a range wholly inside the
+/// closing prefix asks no region.
+#[test]
+fn e2e_inlay_hint_range_stops_at_the_virtual_end_before_a_closing_prefix() {
+    let (mut client, _config_dir) =
+        init_mock_inlay_hint_client("inlay-hint-resolve", "lua", false, None);
+    // (uri, text, closing-fence line, its prefix width)
+    let cases = [
+        (
+            "file:///test_inlay_hint_blockquote_eof.md",
+            "> ```lua\n> local x = 1\n> ```\n",
+            2,
+            2,
+        ),
+        (
+            "file:///test_inlay_hint_list_eof.md",
+            "- item\n\n  ```lua\n  local x = 1\n  ```\n",
+            4,
+            2,
+        ),
+    ];
+    for (uri, text, closing, prefix) in cases {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({ "textDocument": {
+                "uri": uri, "languageId": "markdown", "version": 1, "text": text
+            }}),
+        );
+        inlay_hints_with_retry(&mut client, uri, closing - 1, closing);
+        let request = |client: &mut LspClient, start: (u64, u64), end: (u64, u64)| {
+            client.send_request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start.0, "character": start.1 },
+                        "end": { "line": end.0, "character": end.1 }
+                    }
+                }),
+            )
+        };
+
+        let whole = request(&mut client, (0, 0), (closing + 1, 0));
+        let hints = whole["result"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{uri}: {whole}"));
+        assert_eq!(
+            hints[0]["data"]["kakehashi"]["inner"]["receivedRange"],
+            json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
+            }),
+            "{uri}: the request must stop at the virtual end"
+        );
+
+        let in_closing_prefix = request(&mut client, (closing, 0), (closing, prefix - 1));
+        assert!(
+            in_closing_prefix["result"].is_null(),
+            "{uri}: {in_closing_prefix}"
+        );
+    }
 
     shutdown_client(&mut client);
 }

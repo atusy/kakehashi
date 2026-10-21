@@ -1,8 +1,9 @@
 //! Inlay hint methods for Kakehashi.
 //!
 //! `textDocument/inlayHint` walks the resolved layer order
-//! (cross-layer-aggregation): the virt layer bridges the injection region
-//! under the requested range, the host layer (host-document-bridge) bridges
+//! (cross-layer-aggregation): the virt layer bridges every injection region
+//! the requested range intersects and merges their hints in document order,
+//! the host layer (host-document-bridge) bridges
 //! the host document itself with the real URI and its coordinates verbatim.
 //! Either layer re-keys label-part commands for `workspace/executeCommand`
 //! routing and, when the producer advertises `inlayHint/resolve` (or its
@@ -14,20 +15,25 @@
 //! forwards to the exact producing connection, and re-checks the content
 //! version and host incarnation after the response.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintParams, NumberOrString, Range, Uri};
 
 use super::super::Kakehashi;
 use super::super::region_offset::resolve_region_offset;
 use crate::lsp::aggregation::server::{
-    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    FanInResult, FanOutTask, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    dispatch_preferred_with_tokens, mint_region_progress_source,
 };
 use crate::lsp::bridge::{
-    HostDocument, InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
+    ClientProgressAggregator, ClientProgressDeregisterGuard, HostDocument,
+    InlayHintDocumentRevision, InlayHintEnvelope, envelope_host_inlay_hints,
     extract_inlay_hint_envelope,
 };
 use crate::lsp::current_upstream_id;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{RangeRequestContext, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/inlayHint";
 
@@ -134,7 +140,10 @@ impl Kakehashi {
         .await
     }
 
-    /// Virt layer: bridge the injection region under the requested range.
+    /// Virt layer: bridge every injection region the requested range
+    /// intersects, each with the range clipped to it, and merge the hints in
+    /// document order. Editors ask for the visible or the whole document's
+    /// range, which usually starts in host text before any injection.
     async fn inlay_hint_virt_layer(
         &self,
         lsp_uri: &Uri,
@@ -157,49 +166,143 @@ impl Kakehashi {
         }) else {
             return Ok(None);
         };
-        let Some(mut ctx) = self
-            .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
+        // A region's stripped prefixes (a blockquote's `> `, a list item's
+        // indent) carry no embedded text: each endpoint is moved to where its
+        // line's text starts, the end stops at the virtual document's end
+        // (before the closing-fence line's prefix), and a region the range
+        // meets only there is not asked at all, as translation would
+        // otherwise saturate the range onto text it does not cover or past
+        // the virtual EOF.
+        let contexts: Vec<_> = self
+            .resolve_bridge_contexts_for_all_overlapping_regions(lsp_uri, range, METHOD)
             .await
-        else {
+            .into_iter()
+            .filter_map(|mut ctx| {
+                let resolved = &ctx.document.resolved;
+                let offset = crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+                    resolved.region.line_range.start,
+                    resolved.line_column_offsets.clone(),
+                );
+                let text_end = ctx.document.region_end.unwrap_or_else(|| {
+                    crate::lsp::bridge::region_host_end(&resolved.virtual_content, &offset)
+                });
+                ctx.range = clip_to_region_text(ctx.range, &offset, text_end)?;
+                Some(ctx)
+            })
+            .collect();
+        let Some(first) = contexts.first() else {
             return Ok(None);
         };
-        ctx.document.client_progress_token = client_progress_token;
 
+        // Every region shares this request's upstream id, so one cancel
+        // subscription covers the whole walk; the per-region dispatches get
+        // none of their own. Registry cleanup is left to the layer race's
+        // request-wide sweep, as the host layer shares the id.
         let (cancel_rx, _cancel_guard) =
-            self.subscribe_cancel(ctx.document.upstream_request_id.as_ref());
+            self.subscribe_cancel(first.document.upstream_request_id.as_ref());
 
-        // Fan-out inlay hint requests to all matching servers
+        // The editor's work-done progress spans the whole request: ONE
+        // aggregator and ONE teardown guard, with each region's tracked
+        // source minted into it, so the aggregator's winner rule shows one
+        // `Begin → … → End` (ls-bridge-client-progress). Over several regions
+        // the winner's own `End` is held and relayed only at teardown, after
+        // every region settled, so a fast region cannot close the editor's
+        // progress while another is in flight; a single region relays it as
+        // it arrives. `None` when the request carries no `workDoneToken`.
         let pool = self.bridge.pool_arc();
-        let range = ctx.range;
-        let result = dispatch_preferred(
-            &ctx.document,
-            pool.clone(),
-            |t| async move {
-                t.pool
-                    .send_inlay_hint_request(
-                        &t.server_name,
-                        &t.server_config,
-                        &t.uri,
-                        range,
-                        t.region_end(),
-                        &t.injection_language,
-                        &t.region_id,
-                        t.offset,
-                        &t.virtual_content,
-                        revision,
-                        t.upstream_id,
-                        t.client_progress_token,
-                    )
-                    .await
+        let several_regions = contexts.len() > 1;
+        let shared_progress = client_progress_token.map(|client_token| {
+            let aggregator = if several_regions {
+                ClientProgressAggregator::deferring_end(client_token)
+            } else {
+                ClientProgressAggregator::new(client_token)
+            };
+            (
+                Arc::new(Mutex::new(aggregator)),
+                Arc::clone(pool.client_progress_registry()),
+            )
+        });
+        let mut minted = Vec::new();
+        let regions: Vec<_> = contexts
+            .into_iter()
+            .map(|ctx| {
+                let tokens = shared_progress.as_ref().and_then(|(aggregator, registry)| {
+                    mint_region_progress_source(&ctx.document, registry, aggregator)
+                });
+                if let Some(tokens) = &tokens {
+                    minted.extend(tokens.values().cloned());
+                }
+                (ctx, tokens)
+            })
+            .collect();
+        let progress_guard = shared_progress.map(|(aggregator, registry)| {
+            ClientProgressDeregisterGuard::new(registry, minted, aggregator, pool.upstream_tx())
+        });
+
+        // The regions are independent documents, so they are asked at once;
+        // `join_all` keeps region order for the merge.
+        let walk = futures::future::join_all(
+            regions
+                .into_iter()
+                .map(|(ctx, tokens)| self.dispatch_virt_region_inlay_hint(ctx, tokens, revision)),
+        );
+        let result = match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => FanInResult::Cancelled,
+                results = walk => merge_region_results(results, |hint: &InlayHint| hint.position),
             },
-            |opt| matches!(opt, Some(v) if !v.is_empty()),
-            cancel_rx,
-        )
-        .await;
+            None => merge_region_results(walk.await, |hint: &InlayHint| hint.position),
+        };
+        // Every region settled (or the walk was cancelled and dropped them):
+        // end the editor's progress now, before the no-result log, in the
+        // order a single dispatch tears its own guard down.
+        drop(progress_guard);
 
         result
             .handle(&self.notifier(), "inlay hint", None, Ok)
             .await
+    }
+
+    /// Fan `textDocument/inlayHint` out across the servers bridging ONE
+    /// injection region (`preferred`). Cancellation and the client-progress
+    /// teardown are held by the caller for the whole multi-region walk;
+    /// `progress_tokens` routes this region's tracked source into the
+    /// request's shared aggregator.
+    async fn dispatch_virt_region_inlay_hint(
+        &self,
+        ctx: RangeRequestContext,
+        progress_tokens: Option<HashMap<String, NumberOrString>>,
+        revision: crate::lsp::bridge::HostRevision,
+    ) -> FanInResult<Option<Vec<InlayHint>>> {
+        let pool = self.bridge.pool_arc();
+        let range = ctx.range;
+        let send = |t: FanOutTask| async move {
+            t.pool
+                .send_inlay_hint_request(
+                    &t.server_name,
+                    &t.server_config,
+                    &t.uri,
+                    range,
+                    t.region_end(),
+                    &t.injection_language,
+                    &t.region_id,
+                    t.offset,
+                    &t.virtual_content,
+                    revision,
+                    t.upstream_id,
+                    t.client_progress_token,
+                )
+                .await
+        };
+        let is_nonempty = |opt: &Option<Vec<InlayHint>>| matches!(opt, Some(v) if !v.is_empty());
+        match progress_tokens {
+            Some(tokens) => {
+                dispatch_preferred_with_tokens(&ctx.document, pool, send, is_nonempty, None, tokens)
+                    .await
+            }
+            None => dispatch_preferred(&ctx.document, pool, send, is_nonempty, None).await,
+        }
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {
@@ -372,6 +475,83 @@ fn inlay_hint_region_is_resolvable(
         && envelope.injection_language == live_language
 }
 
+/// Clip a host `range` already clamped to a region to the region's embedded
+/// text. Each endpoint moves past its line's stripped prefix (`offset`'s
+/// per-line column), and the end stops at `text_end`, the host position of
+/// the virtual document's end: the closing-fence line's prefix lies past it
+/// (the virtual document's last line is the empty one after the final line
+/// break), and an end there would translate past the virtual EOF. `None`
+/// when no embedded text remains: a range starting past `text_end`, a
+/// non-empty range covering only prefix bytes, or a caret inside a prefix.
+fn clip_to_region_text(
+    range: Range,
+    offset: &crate::lsp::bridge::RegionOffset,
+    text_end: tower_lsp_server::ls_types::Position,
+) -> Option<Range> {
+    if range.start > text_end {
+        return None;
+    }
+    let snap = |position: tower_lsp_server::ls_types::Position| {
+        let text_start = position
+            .line
+            .checked_sub(offset.line())
+            .map_or(0, |virtual_line| offset.column_for_line(virtual_line));
+        tower_lsp_server::ls_types::Position {
+            character: position.character.max(text_start),
+            ..position
+        }
+    };
+    let start = snap(range.start);
+    let end = snap(range.end.min(text_end)).min(text_end);
+    if start > end {
+        return None;
+    }
+    let clipped = Range { start, end };
+    let emptied = clipped.start == clipped.end && (range.start != range.end || clipped != range);
+    (!emptied).then_some(clipped)
+}
+
+/// Merge the per-region fan-in results of one request in document order.
+///
+/// Any region that answered makes the merge an answer, with every answering
+/// region's hints. Only when none answered does it report no result (once,
+/// counting every region's errors), so a request over several regions logs
+/// as one request. A single region's result passes through unchanged.
+///
+/// When several regions answered, the hints are stably sorted by `position`:
+/// regions come in document order of their starts, but overlapping
+/// same-depth regions interleave, so appending alone would not keep the
+/// hints in document order. Hints at one position keep their arrival order.
+fn merge_region_results<T, K: Ord>(
+    results: Vec<FanInResult<Option<Vec<T>>>>,
+    position: impl Fn(&T) -> K,
+) -> FanInResult<Option<Vec<T>>> {
+    let mut merged: Option<Vec<T>> = None;
+    let mut answered = 0usize;
+    let mut errors = None;
+    for result in results {
+        match result {
+            FanInResult::Done(Some(items)) => {
+                answered += 1;
+                merged.get_or_insert_with(Vec::new).extend(items);
+            }
+            FanInResult::Done(None) => {}
+            FanInResult::NoResult { errors: e } => *errors.get_or_insert(0) += e,
+            FanInResult::Cancelled => return FanInResult::Cancelled,
+        }
+    }
+    if answered > 1
+        && let Some(items) = merged.as_mut()
+    {
+        items.sort_by_key(|item| position(item));
+    }
+    match (merged, errors) {
+        (Some(items), _) => FanInResult::Done(Some(items)),
+        (None, Some(errors)) => FanInResult::NoResult { errors },
+        (None, None) => FanInResult::Done(None),
+    }
+}
+
 struct HostInlayHints {
     hints: Vec<InlayHint>,
     server_name: String,
@@ -418,6 +598,220 @@ mod tests {
             "inner": null
         }))
         .unwrap()
+    }
+
+    fn render(result: FanInResult<Option<Vec<u8>>>) -> String {
+        format!("{result:?}")
+    }
+
+    /// One region's result passes through as it is, so a range inside a
+    /// single region answers exactly as it did before regions were merged.
+    #[test]
+    fn merge_region_results_passes_a_single_region_through() {
+        for single in [
+            FanInResult::Done(Some(vec![1])),
+            FanInResult::Done(Some(vec![])),
+            FanInResult::Done(None),
+            FanInResult::NoResult { errors: 0 },
+            FanInResult::NoResult { errors: 2 },
+            FanInResult::Cancelled,
+        ] {
+            let expected = render(match &single {
+                FanInResult::Done(v) => FanInResult::Done(v.clone()),
+                FanInResult::NoResult { errors } => FanInResult::NoResult { errors: *errors },
+                FanInResult::Cancelled => FanInResult::Cancelled,
+            });
+            assert_eq!(
+                render(merge_region_results(vec![single], |item| *item)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn merge_region_results_appends_answers_in_document_order() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![1, 2])),
+                FanInResult::NoResult { errors: 1 },
+                FanInResult::Done(None),
+                FanInResult::Done(Some(vec![3])),
+            ],
+            |item| *item,
+        );
+        assert_eq!(
+            render(merged),
+            render(FanInResult::Done(Some(vec![1, 2, 3])))
+        );
+    }
+
+    /// Overlapping same-depth regions (#350) interleave their hints, so
+    /// appending them region by region would break document order: the
+    /// merge sorts by position, stably, so hints at one position keep the
+    /// order they arrived in (region order, then each response's order).
+    #[test]
+    fn merge_region_results_orders_interleaved_regions_by_position() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![(3, 'a'), (9, 'a')])),
+                FanInResult::Done(Some(vec![(4, 'b'), (3, 'b'), (8, 'b')])),
+            ],
+            |&(line, _)| line,
+        );
+        let FanInResult::Done(Some(items)) = merged else {
+            panic!("expected merged hints");
+        };
+        assert_eq!(items, [(3, 'a'), (3, 'b'), (4, 'b'), (8, 'b'), (9, 'a')]);
+    }
+
+    /// A single region's hints keep the server's own order, even unsorted,
+    /// as they did before regions were merged.
+    #[test]
+    fn merge_region_results_leaves_a_single_regions_order_alone() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::Done(Some(vec![9, 3])),
+                FanInResult::Done(None),
+                FanInResult::NoResult { errors: 0 },
+            ],
+            |item| *item,
+        );
+        assert_eq!(render(merged), render(FanInResult::Done(Some(vec![9, 3]))));
+    }
+
+    /// With no region answering, the request reports no result once, with
+    /// every region's errors, so its log level reflects any failure.
+    #[test]
+    fn merge_region_results_reports_no_result_once_with_all_errors() {
+        let merged = merge_region_results(
+            vec![
+                FanInResult::<Option<Vec<u8>>>::NoResult { errors: 1 },
+                FanInResult::Done(None),
+                FanInResult::NoResult { errors: 2 },
+            ],
+            |item| *item,
+        );
+        assert_eq!(render(merged), render(FanInResult::NoResult { errors: 3 }));
+        let merged = merge_region_results(
+            vec![
+                FanInResult::<Option<Vec<u8>>>::Done(None),
+                FanInResult::Done(None),
+            ],
+            |item| *item,
+        );
+        assert_eq!(render(merged), render(FanInResult::Done(None)));
+    }
+
+    fn range(start: (u32, u32), end: (u32, u32)) -> Range {
+        Range {
+            start: tower_lsp_server::ls_types::Position::new(start.0, start.1),
+            end: tower_lsp_server::ls_types::Position::new(end.0, end.1),
+        }
+    }
+
+    /// A virtual end past every range the prefix tests use.
+    const FAR: tower_lsp_server::ls_types::Position = tower_lsp_server::ls_types::Position {
+        line: 9,
+        character: 0,
+    };
+
+    /// `> ```lua` / `> local x = 1` / `> ````: content at host line 1, and
+    /// the virtual document's empty last line maps to the closing line with
+    /// offset 0, so its end is host (2,0), before the closing `> `.
+    fn blockquoted() -> (
+        crate::lsp::bridge::RegionOffset,
+        tower_lsp_server::ls_types::Position,
+    ) {
+        (
+            crate::lsp::bridge::RegionOffset::with_per_line_offsets(1, vec![2, 0]),
+            tower_lsp_server::ls_types::Position::new(2, 0),
+        )
+    }
+
+    #[test]
+    fn clip_to_region_text_stops_at_the_virtual_end() {
+        let (offset, text_end) = blockquoted();
+        assert_eq!(
+            clip_to_region_text(range((1, 2), (2, 2)), &offset, text_end),
+            Some(range((1, 2), (2, 0)))
+        );
+        assert_eq!(
+            clip_to_region_text(range((1, 4), (1, 6)), &offset, text_end),
+            Some(range((1, 4), (1, 6)))
+        );
+    }
+
+    #[test]
+    fn clip_to_region_text_drops_a_range_inside_the_closing_prefix() {
+        let (offset, text_end) = blockquoted();
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 1)), &offset, text_end),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 2)), &offset, text_end),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 1), (2, 1)), &offset, text_end),
+            None
+        );
+        // A caret exactly at the virtual end is a valid position there.
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 0)), &offset, text_end),
+            Some(range((2, 0), (2, 0)))
+        );
+    }
+
+    /// A region at host line 1 whose lines carry a two-column prefix.
+    fn prefixed() -> crate::lsp::bridge::RegionOffset {
+        crate::lsp::bridge::RegionOffset::with_per_line_offsets(1, vec![2, 2, 2])
+    }
+
+    #[test]
+    fn clip_to_region_text_drops_a_range_inside_a_prefix() {
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 1)), &prefixed(), FAR),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 0), (2, 2)), &prefixed(), FAR),
+            None
+        );
+        assert_eq!(
+            clip_to_region_text(range((2, 1), (2, 1)), &prefixed(), FAR),
+            None
+        );
+    }
+
+    #[test]
+    fn clip_to_region_text_moves_prefix_endpoints_to_the_text() {
+        assert_eq!(
+            clip_to_region_text(range((2, 1), (2, 5)), &prefixed(), FAR),
+            Some(range((2, 2), (2, 5)))
+        );
+        assert_eq!(
+            clip_to_region_text(range((1, 4), (3, 0)), &prefixed(), FAR),
+            Some(range((1, 4), (3, 2)))
+        );
+    }
+
+    /// Ranges already on embedded text, including a caret at a line's text
+    /// start and any range in a region without prefixes, are kept as they
+    /// are.
+    #[test]
+    fn clip_to_region_text_keeps_ranges_on_text() {
+        for kept in [
+            range((2, 2), (2, 2)),
+            range((1, 2), (3, 7)),
+            range((2, 3), (2, 4)),
+        ] {
+            assert_eq!(clip_to_region_text(kept, &prefixed(), FAR), Some(kept));
+        }
+        let unprefixed = crate::lsp::bridge::RegionOffset::with_per_line_offsets(3, vec![0, 0]);
+        for kept in [range((3, 0), (4, 0)), range((4, 0), (4, 0))] {
+            assert_eq!(clip_to_region_text(kept, &unprefixed, FAR), Some(kept));
+        }
     }
 
     #[test]

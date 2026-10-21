@@ -391,7 +391,8 @@ fn main() {
                     | "inlay-hint-delayed-resolve"
                     | "inlay-hint-reopen-delayed-resolve"
                     | "inlay-hint-escaping-resolve"
-                    | "inlay-hint-slow-resolve" => json!({
+                    | "inlay-hint-slow-resolve"
+                    | "inlay-hint-progress" => json!({
                         "inlayHintProvider": { "resolveProvider": true },
                         "executeCommandProvider": { "commands": ["mock.hint", "mock.resolved"] },
                         "textDocumentSync": 1
@@ -2061,10 +2062,58 @@ fn main() {
                 // answered on the next `textDocument/inlayHint`. The test
                 // sends that only after closing and reopening the host, so
                 // the reply lands after the reopen was processed upstream.
-                if mode == "inlay-hint-reopen-delayed-resolve"
-                    && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
+                // `inlay-hint-progress`: a request carrying a work-done token
+                // either reports progress on it (Begin, Report, then its own
+                // End) and answers, or, for a document containing
+                // `slow`, is parked unanswered until the next request WITHOUT
+                // a token releases it. Token-carrying requests never release
+                // it: they are the parked request's own siblings, which can
+                // arrive in either order.
+                let progress_token = message.pointer("/params/workDoneToken").cloned();
+                let releases = match mode.as_str() {
+                    "inlay-hint-reopen-delayed-resolve" => true,
+                    "inlay-hint-progress" => progress_token.is_none(),
+                    _ => false,
+                };
+                if releases && let Some((pending_id, pending_result)) = pending_inlay_resolve.take()
                 {
                     respond(&mut writer, pending_id, pending_result);
+                }
+                let parks = mode == "inlay-hint-progress"
+                    && progress_token.is_some()
+                    && message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .is_some_and(|text| text.contains("slow"));
+                if mode == "inlay-hint-progress"
+                    && !parks
+                    && let Some(token) = &progress_token
+                {
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "begin", "title": "mock inlay hints" }
+                        }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "report", "message": "fast region working" }
+                        }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "end", "message": "fast region done" }
+                        }),
+                    );
                 }
                 let result = message
                     .pointer("/params/textDocument/uri")
@@ -2074,7 +2123,12 @@ fn main() {
                         let data = if mode == "inlay-hint-no-resolve-reserved-data" {
                             json!({ "kakehashi": { "origin": "downstream" } })
                         } else {
-                            json!({ "mock": "hint-1", "uri": uri })
+                            json!({
+                                "mock": "hint-1",
+                                "uri": uri,
+                                "receivedRange": message.pointer("/params/range"),
+                                "receivedWorkDoneToken": message.pointer("/params/workDoneToken")
+                            })
                         };
                         json!([{
                             "position": { "line": 0, "character": 1 },
@@ -2100,7 +2154,11 @@ fn main() {
                         }])
                     })
                     .unwrap_or(Value::Null);
-                respond(&mut writer, id, result);
+                if parks {
+                    pending_inlay_resolve = Some((id, result));
+                } else {
+                    respond(&mut writer, id, result);
+                }
             }
             "textDocument/prepareCallHierarchy" => {
                 let result = message
