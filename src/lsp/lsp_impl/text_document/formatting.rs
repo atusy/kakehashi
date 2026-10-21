@@ -1729,7 +1729,11 @@ fn pipeline_region_text(
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    Some(reapply_host_line_prefixes(&final_text, &host_line_prefixes))
+    Some(reapply_host_line_prefixes(
+        original_virtual,
+        &final_text,
+        &host_line_prefixes,
+    ))
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -1740,62 +1744,89 @@ fn pipeline_region_text(
 /// without this step a blockquoted/indented injection loses its `> ` markers
 /// or indentation on every continuation line.
 ///
-/// - **Line count preserved** (output lines == region lines): each output
-///   line `i` re-gains its own original prefix `host_line_prefixes[i]` — a
-///   1:1 mapping, exact even when prefixes differ per line (nested
-///   blockquotes).
+/// A *row* is a line of `original_virtual`; when the line count is kept,
+/// output line `i` lands on row `i`.
+///
+/// - **Line count preserved** (output lines == rows): each output line `i`
+///   re-gains its own original prefix `host_line_prefixes[i]` — a 1:1
+///   mapping, exact even when prefixes differ per line (nested blockquotes)
+///   — except text landing on a blank row (below).
 /// - **Line count changed**: the pipeline computes no diff/alignment, so
 ///   every continuation line takes the region's longest common prefix — exact
 ///   for the usual uniform-prefix region, a documented limitation otherwise.
-///   The LCP excludes trailing empty-prefix entries: a region whose content
-///   ends with `\n` carries a synthetic final line bucket whose host prefix
-///   belongs to the line *after* the replacement range, and including its
-///   empty prefix would collapse the LCP to `""` for uniformly prefixed
-///   blockquotes. Symmetrically, a trailing **empty** output line stays
-///   unprefixed — it abuts the host's own prefix at the region end.
+///   A trailing **empty** output line stays unprefixed — it abuts the host's
+///   own prefix at the region end.
+/// - **Blank rows** say nothing about the region's prefix: a list item's
+///   fence may leave them unindented (no prefix) and a blockquote leaves its
+///   marker without the space (`>`). So the LCP is taken over the rows
+///   holding text ([`region_common_prefix`]), and output text that lands on a
+///   blank row takes the LCP when the row's own prefix falls short of it. On
+///   the first row, whose own prefix precedes the replacement range, that
+///   means the rest of the LCP, whatever the line count.
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
-fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -> String {
+fn reapply_host_line_prefixes(
+    original_virtual: &str,
+    final_text: &str,
+    host_line_prefixes: &[String],
+) -> String {
     let lines = split_lsp_lines(final_text);
-    if lines.len() <= 1 {
+    let line_count_preserved = lines.len() == host_line_prefixes.len();
+    let blank_rows: Vec<bool> = split_lsp_lines(original_virtual)
+        .iter()
+        .map(|&(line, _)| is_blank_line(line))
+        .collect();
+    // The caller sizes the prefixes by the same text's LSP lines.
+    debug_assert_eq!(blank_rows.len(), host_line_prefixes.len());
+    let lcp = region_common_prefix(host_line_prefixes, &blank_rows);
+
+    // The first output line sits after the first row's own host prefix, so
+    // text on a blank first row takes only the rest of the region's.
+    let first_line_rest = match (
+        host_line_prefixes.first(),
+        blank_rows.first(),
+        lines.first(),
+    ) {
+        (Some(own), Some(true), Some(&(line, _))) if !line.is_empty() => {
+            lcp.strip_prefix(own.as_str()).unwrap_or("")
+        }
+        _ => "",
+    };
+    if lines.len() <= 1 && first_line_rest.is_empty() {
         // Single-line output sits entirely after the first line's host prefix.
         return final_text.to_string();
     }
 
-    let line_count_preserved = lines.len() == host_line_prefixes.len();
-    let lcp = if line_count_preserved {
-        ""
-    } else {
-        // A region whose content ends with '\n' carries a trailing
-        // empty-prefix entry for the synthetic line bucket after the final
-        // newline; that host line's own prefix sits OUTSIDE the replacement
-        // range (the range ends at its column 0). Including it would
-        // collapse the LCP to "" for a uniformly prefixed blockquote, so the
-        // LCP is computed over the content lines' prefixes only.
-        let mut content_prefixes = host_line_prefixes;
-        while let [rest @ .., last] = content_prefixes {
-            if !last.is_empty() {
-                break;
-            }
-            content_prefixes = rest;
-        }
-        longest_common_prefix(content_prefixes)
-    };
-
     // Reserve for the prefixes being prepended too (slight over-reserve when
-    // empty lines get a trimmed prefix), so the string never reallocates.
+    // empty lines get a trimmed prefix or rows keep their own prefix), so the
+    // string never reallocates.
     let added_len = if line_count_preserved {
-        host_line_prefixes.iter().skip(1).map(String::len).sum()
+        host_line_prefixes
+            .iter()
+            .skip(1)
+            .map(|prefix| prefix.len().max(lcp.len()))
+            .sum()
     } else {
-        (lines.len() - 1) * lcp.len()
+        lines.len().saturating_sub(1) * lcp.len()
     };
-    let mut out = String::with_capacity(final_text.len() + added_len);
+    let mut out = String::with_capacity(final_text.len() + first_line_rest.len() + added_len);
     for (i, &(line, line_end)) in lines.iter().enumerate() {
-        if i > 0 {
+        if i == 0 {
+            out.push_str(first_line_rest);
+        } else {
             let line_is_empty = line.is_empty();
             let prefix = if line_count_preserved {
-                host_line_prefixes[i].as_str()
+                let own = host_line_prefixes[i].as_str();
+                // Text written on a blank row needs the region's prefix,
+                // which the row itself may record only part of. The LCP
+                // only ever extends the row's own prefix: a lazy row can
+                // shrink it below a blank row's, which then keeps its own.
+                if !line_is_empty && blank_rows.get(i) == Some(&true) && lcp.starts_with(own) {
+                    lcp
+                } else {
+                    own
+                }
             } else if line_is_empty && i == lines.len() - 1 {
                 // The trailing empty output line sits at the region end, where
                 // the host's own prefix (e.g. the closing fence's "> ") follows
@@ -1854,15 +1885,53 @@ fn lsp_line_count(text: &str) -> usize {
         .count()
 }
 
+/// Whether an LSP line holds nothing but spaces and tabs.
+fn is_blank_line(line: &str) -> bool {
+    line.chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// The host prefix shared by the region's rows, for every continuation line
+/// once the line count changes, and for text written on a blank row
+/// (Decision point 4).
+///
+/// Taken over the rows of the original virtual text that hold text, since a
+/// blank row's prefix is not the region's (see
+/// [`reapply_host_line_prefixes`]). That leaves out the synthetic row after
+/// a final '\n' too: it is blank, and its host prefix sits OUTSIDE the
+/// replacement range (the range ends at its column 0). When no row holds
+/// text, the blank rows' prefixes are all there is; the LCP is then taken
+/// over every row but the trailing empty-prefix ones, since including the
+/// synthetic row's would collapse it to "" for a blockquoted fence of blank
+/// rows.
+fn region_common_prefix<'a>(host_line_prefixes: &'a [String], blank_rows: &[bool]) -> &'a str {
+    let holds_text = |i: usize| blank_rows.get(i) != Some(&true);
+    if (0..host_line_prefixes.len()).any(holds_text) {
+        return longest_common_prefix(
+            host_line_prefixes
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| holds_text(i))
+                .map(|(_, prefix)| prefix.as_str()),
+        );
+    }
+    let mut content_prefixes = host_line_prefixes;
+    while let [rest @ .., last] = content_prefixes {
+        if !last.is_empty() {
+            break;
+        }
+        content_prefixes = rest;
+    }
+    longest_common_prefix(content_prefixes.iter().map(String::as_str))
+}
+
 /// Longest common prefix of all strings, on char boundaries. Empty input or
 /// any empty string yields the empty prefix. Returns a slice of the first
 /// string (the prefix is by definition a substring of it), so no allocation.
-fn longest_common_prefix(strings: &[String]) -> &str {
-    let mut iter = strings.iter();
-    let Some(first) = iter.next() else {
+fn longest_common_prefix<'a>(strings: impl IntoIterator<Item = &'a str>) -> &'a str {
+    let mut iter = strings.into_iter();
+    let Some(mut prefix) = iter.next() else {
         return "";
     };
-    let mut prefix = first.as_str();
     for s in iter {
         let common_len = prefix
             .chars()
@@ -2823,9 +2892,164 @@ mod tests {
         assert_eq!(text.as_deref(), Some("\n> x"));
     }
 
+    /// The offset and host prefixes of a list item's fence holding `a = 1`,
+    /// a blank row, and `b = 2`, as injection discovery records them: the
+    /// blank row keeps no indentation, so it records none, and the synthetic
+    /// row after the last line break records none.
+    fn list_fence() -> (RegionOffset, Vec<String>) {
+        (
+            RegionOffset::with_per_line_offsets(3, vec![2, 0, 2, 0]),
+            vec![
+                "  ".to_string(),
+                String::new(),
+                "  ".to_string(),
+                String::new(),
+            ],
+        )
+    }
+
+    #[test]
+    fn pipeline_indents_a_list_fence_whose_line_count_changes() {
+        let (offset, prefixes) = list_fence();
+        // The blank row's empty prefix says nothing about the item's
+        // indentation; counting it would collapse the common prefix to ""
+        // and end the list item at every continuation line.
+        let text =
+            pipeline_region_text("a = 1\n\nb = 2\n", "a = 1\n\n\nb = 2\n", &offset, &prefixes);
+
+        assert_eq!(text.as_deref(), Some("a = 1\n\n\n  b = 2\n"));
+    }
+
+    #[test]
+    fn pipeline_indents_text_it_puts_on_a_list_fence_blank_row() {
+        let (offset, prefixes) = list_fence();
+        // Same line count, but the formatter put `b = 2` on the blank row,
+        // whose own prefix would put it at host column 0.
+        let text = pipeline_region_text(
+            "a = 1\n\nb = 2\n",
+            "a = 1\nb = 2\nc = 3\n",
+            &offset,
+            &prefixes,
+        );
+
+        assert_eq!(text.as_deref(), Some("a = 1\n  b = 2\n  c = 3\n"));
+    }
+
+    #[test]
+    fn pipeline_keeps_the_marker_space_of_a_blockquoted_fence_with_blank_rows() {
+        // A blank `>` row records `>` without the space; counting it would
+        // glue every continuation line to its marker.
+        let text = pipeline_region_text(
+            "a\n\nb\n",
+            "a\n\n\nb\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 1, 2, 0]),
+            &[
+                "> ".to_string(),
+                ">".to_string(),
+                "> ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\n>\n>\n> b\n"));
+    }
+
+    #[test]
+    fn pipeline_keeps_the_marker_space_of_a_one_line_blockquoted_fence() {
+        // Only the first row holds text: the blank `>` row after it still
+        // says nothing about the region's prefix.
+        let text = pipeline_region_text(
+            "x\n\n",
+            "{\n  a\n}\n\n",
+            &RegionOffset::with_per_line_offsets(1, vec![2, 1, 0]),
+            &["> ".to_string(), ">".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("{\n>   a\n> }\n>\n"));
+    }
+
+    #[test]
+    fn pipeline_indents_a_one_line_list_fence_whose_blank_row_keeps_a_space() {
+        // A blank row keeping one of the item's two columns records that
+        // column; taking it as the region's prefix would put `x` at host
+        // column 1 and end the list item.
+        let text = pipeline_region_text(
+            "def f(): pass\n\n",
+            "def f():\n    pass\n\nx\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 1, 0]),
+            &["  ".to_string(), " ".to_string(), String::new()],
+        );
+
+        assert_eq!(text.as_deref(), Some("def f():\n      pass\n\n  x\n"));
+    }
+
+    #[test]
+    fn pipeline_indents_text_it_puts_on_a_list_fence_leading_blank_row() {
+        // The replacement starts after the first row's own prefix, which a
+        // blank first row leaves empty: the first output line needs the rest
+        // of the item's indentation, or it ends the list item.
+        let text = pipeline_region_text(
+            "\na\nb\n",
+            "a\nb\n",
+            &RegionOffset::with_per_line_offsets(3, vec![0, 2, 2, 0]),
+            &[
+                String::new(),
+                "  ".to_string(),
+                "  ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("  a\n  b\n"));
+    }
+
+    #[test]
+    fn pipeline_spaces_text_it_puts_on_a_blockquoted_fence_leading_blank_row() {
+        // The first row's `>` is already in the host; only its space is not.
+        let text = pipeline_region_text(
+            "\na\nb\n",
+            "a\nb\n",
+            &RegionOffset::with_per_line_offsets(3, vec![1, 2, 2, 0]),
+            &[
+                ">".to_string(),
+                "> ".to_string(),
+                "> ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some(" a\n> b\n"));
+    }
+
+    #[test]
+    fn pipeline_lets_a_text_row_without_prefix_shrink_the_common_prefix() {
+        // A row holding text with no prefix is content, unlike a blank one,
+        // so the common prefix of the rows holding text is "". Markdown
+        // discovery yields no such fence (a lazy line ends the blockquote);
+        // the rule reads only the region's own text and prefixes.
+        let text = pipeline_region_text(
+            "a\nb\nc\n",
+            "a\nb\nc\nd\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 0, 2, 0]),
+            &[
+                "> ".to_string(),
+                String::new(),
+                "> ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\nb\nc\nd\n"));
+    }
+
     #[test]
     fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
-        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+        let text = pipeline_region_text(
+            "\nx\n",
+            "x\n",
+            &RegionOffset::new(1, 0),
+            &[String::new(), String::new(), String::new()],
+        );
 
         assert_eq!(text.as_deref(), Some("x\n"));
     }
@@ -2837,7 +3061,7 @@ mod tests {
         // later line re-gains its own original prefix.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc", &prefixes),
             "a\n> b\n> c"
         );
     }
@@ -2850,7 +3074,10 @@ mod tests {
         // The prefixes are indexed by LSP line, where a lone CR ends a line
         // too, so the output must be split the same way to keep the mapping.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
-        assert_eq!(reapply_host_line_prefixes(final_text, &prefixes), expected);
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny\n", final_text, &prefixes),
+            expected
+        );
     }
 
     #[test]
@@ -2859,12 +3086,29 @@ mod tests {
     }
 
     #[test]
+    fn reapply_keeps_a_blank_row_prefix_the_region_prefix_falls_short_of() {
+        // The lazy row shrinks the region's prefix to "", which would put
+        // text written on the blank `>` row outside the blockquote.
+        let prefixes = vec![
+            "> ".to_string(),
+            String::new(),
+            ">".to_string(),
+            "> ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            reapply_host_line_prefixes("a\nb\n\nc\n", "a\nb\nx\nc\n", &prefixes),
+            "a\nb\n>x\n> c\n"
+        );
+    }
+
+    #[test]
     fn reapply_handles_per_line_prefixes_that_differ() {
         // Nested blockquote: line prefixes differ per line and must be applied
         // per line (not the first line's prefix everywhere).
         let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc", &prefixes),
             "a\n> > b\n> c"
         );
     }
@@ -2875,11 +3119,14 @@ mod tests {
         // there is no diff/alignment, so every continuation line takes the
         // region's longest common prefix (ADR point 4).
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
-        assert_eq!(reapply_host_line_prefixes("a\nb", &prefixes), "a\n> b");
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny\nz", "a\nb", &prefixes),
+            "a\n> b"
+        );
         // Non-uniform prefixes: the LCP is the shared "> ".
         let prefixes = vec!["> ".to_string(), "> > ".to_string(), "> ".to_string()];
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc\nd", &prefixes),
+            reapply_host_line_prefixes("x\ny\nz", "a\nb\nc\nd", &prefixes),
             "a\n> b\n> c\n> d"
         );
     }
@@ -2897,18 +3144,49 @@ mod tests {
         // output line sits at the region end and must stay unprefixed (the
         // host's own "> " follows it).
         assert_eq!(
-            reapply_host_line_prefixes("a\nb\nc\n", &prefixes),
+            reapply_host_line_prefixes("x\ny\n", "a\nb\nc\n", &prefixes),
+            "a\n> b\n> c\n"
+        );
+    }
+
+    #[test]
+    fn reapply_lcp_of_blank_rows_ignores_trailing_synthetic_empty_prefix() {
+        // A blockquoted fence of blank rows: with no row holding text, the
+        // blank rows' `>` is the only prefix there is to keep.
+        let prefixes = vec![">".to_string(), ">".to_string(), String::new()];
+        assert_eq!(
+            reapply_host_line_prefixes("\n\n", "x\ny\nz\n", &prefixes),
+            "x\n>y\n>z\n"
+        );
+    }
+
+    #[test]
+    fn reapply_leaves_an_empty_line_on_a_blank_row_unprefixed() {
+        // Text on the blank `>` row takes the region's `> `; the empty last
+        // line lands on the synthetic row, blank too, and must stay empty,
+        // or the closing fence's own `> ` would follow a stray `>`.
+        let prefixes = vec![
+            "> ".to_string(),
+            ">".to_string(),
+            "> ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            reapply_host_line_prefixes("a\n\nb\n", "a\nb\nc\n", &prefixes),
             "a\n> b\n> c\n"
         );
     }
 
     #[test]
     fn reapply_lcp_keeps_trailing_empty_output_line_unprefixed() {
-        // Even with a uniformly non-empty prefix list, a trailing empty
+        // Even with `> ` on every content line, a trailing empty
         // output line abuts the host's own prefix on the region's end line —
         // prefixing it would double the marker (">> ```").
         let prefixes = vec!["> ".to_string(), "> ".to_string(), String::new()];
-        assert_eq!(reapply_host_line_prefixes("a\n", &prefixes), "a\n");
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny\n", "a\n", &prefixes),
+            "a\n"
+        );
     }
 
     #[test]
@@ -2916,9 +3194,15 @@ mod tests {
         // ADR point 4: an empty output line must not gain trailing whitespace —
         // emit ">" (not "> "), and leave a space-only prefix off entirely.
         let prefixes = vec!["> ".to_string(), "> ".to_string(), "> ".to_string()];
-        assert_eq!(reapply_host_line_prefixes("a\n\nb", &prefixes), "a\n>\n> b");
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny\nz", "a\n\nb", &prefixes),
+            "a\n>\n> b"
+        );
         let prefixes = vec!["  ".to_string(), "  ".to_string(), "  ".to_string()];
-        assert_eq!(reapply_host_line_prefixes("a\n\nb", &prefixes), "a\n\n  b");
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny\nz", "a\n\nb", &prefixes),
+            "a\n\n  b"
+        );
     }
 
     #[test]
@@ -2926,7 +3210,7 @@ mod tests {
         // A single-line output sits entirely after the first line's host
         // prefix; nothing to re-apply.
         let prefixes = vec!["> ".to_string()];
-        assert_eq!(reapply_host_line_prefixes("a", &prefixes), "a");
+        assert_eq!(reapply_host_line_prefixes("x", "a", &prefixes), "a");
     }
 
     #[test]
@@ -2935,8 +3219,14 @@ mod tests {
         // host column 0, so the output passes through unchanged — both for
         // preserved and changed line counts.
         let prefixes = vec![String::new(), String::new()];
-        assert_eq!(reapply_host_line_prefixes("a\nb", &prefixes), "a\nb");
-        assert_eq!(reapply_host_line_prefixes("a\nb\nc", &prefixes), "a\nb\nc");
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny", "a\nb", &prefixes),
+            "a\nb"
+        );
+        assert_eq!(
+            reapply_host_line_prefixes("x\ny", "a\nb\nc", &prefixes),
+            "a\nb\nc"
+        );
     }
 
     #[test]
