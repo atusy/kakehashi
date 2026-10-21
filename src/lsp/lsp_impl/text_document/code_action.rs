@@ -98,18 +98,26 @@ fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) ->
 struct PassedOver(std::sync::Mutex<Option<ActionParts>>);
 
 impl PassedOver {
-    /// [`parts_answer`], keeping `parts` aside when they hold actions but
-    /// do not answer. Asked in priority order, never of a layer before the
-    /// ones above it have come, the first kept is the highest-ranked.
+    /// [`parts_answer`], keeping `parts` aside when they hold actions, do
+    /// not answer, and may still be kept (`may_keep`): only refused ones,
+    /// never a moved or stale answer the race passed over for that, which
+    /// the final check would drop. Asked in priority order, never of a
+    /// layer before the ones above it have come, the first kept is the
+    /// highest-ranked.
     fn answers(&self, parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) -> bool {
-        if parts_answer(parts, may_keep) {
+        if parts_answer(parts, &may_keep) {
             return true;
         }
         let mut kept = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if kept.is_none() && parts.iter().any(|(actions, _)| !actions.is_empty()) {
+        if kept.is_none()
+            && parts.iter().any(|(actions, _)| !actions.is_empty())
+            && parts.iter().all(|(actions, source)| {
+                actions.is_empty() || source.as_ref().is_none_or(&may_keep)
+            })
+        {
             *kept = Some(parts.clone());
         }
         false
@@ -117,21 +125,43 @@ impl PassedOver {
 
     /// The walk's `result`, or, when it found no answer (nothing, or only
     /// a layer's error, which an answer would have outranked), the actions
-    /// kept aside. A cancel stays a cancel.
-    fn or_kept(self, result: Result<Option<ActionParts>>) -> Result<Option<ActionParts>> {
+    /// kept aside, with the error they displace: the answer still if they
+    /// are dropped at the final check (see [`judged_or_displaced`]). A
+    /// cancel stays a cancel.
+    fn or_kept(
+        self,
+        result: Result<Option<ActionParts>>,
+    ) -> (
+        Result<Option<ActionParts>>,
+        Option<tower_lsp_server::jsonrpc::Error>,
+    ) {
         let kept = self
             .0
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match (result, kept) {
-            (Ok(None), Some(parts)) => Ok(Some(parts)),
+            (Ok(None), Some(parts)) => (Ok(Some(parts)), None),
             (Err(error), Some(parts))
                 if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
             {
-                Ok(Some(parts))
+                (Ok(Some(parts)), Some(error))
             }
-            (result, _) => result,
+            (result, _) => (result, None),
         }
+    }
+}
+
+/// The answer once the actions chosen are judged: those kept, or, none
+/// left, the error kept-aside actions displaced (`displaced`), if any —
+/// they never turn a layer's error into an empty answer.
+fn judged_or_displaced(
+    judged: std::result::Result<CodeActionResponse, ()>,
+    displaced: Option<tower_lsp_server::jsonrpc::Error>,
+) -> Result<Option<CodeActionResponse>> {
+    match (judged, displaced) {
+        (Ok(actions), _) => Ok(Some(actions)),
+        (Err(()), Some(error)) => Err(error),
+        (Err(()), None) => Ok(None),
     }
 }
 
@@ -276,7 +306,7 @@ impl Kakehashi {
                 },
             )
             .await;
-        let result = passed_over.or_kept(result);
+        let (result, displaced) = passed_over.or_kept(result);
         // The final answer chosen: each prepared region's actions checked
         // once more against the host text, which may have moved while they
         // were held (see `judged_actions`). A stale region's actions are
@@ -288,21 +318,23 @@ impl Kakehashi {
         // answer that was settling then and is dropped here, or that the
         // host moved under since, leaves none, until the editor asks again.
         let result = match result {
-            Ok(Some(parts)) => Ok(judged_actions(
-                self.bridge.pool(),
-                self.bridge.node_tracker(),
-                || self.host_content_version(&lsp_uri),
-                parts,
-            )
-            .await
-            .inspect_err(|()| {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
-                    lsp_uri.as_str()
-                );
-            })
-            .ok()),
+            Ok(Some(parts)) => judged_or_displaced(
+                judged_actions(
+                    self.bridge.pool(),
+                    self.bridge.node_tracker(),
+                    || self.host_content_version(&lsp_uri),
+                    parts,
+                )
+                .await
+                .inspect_err(|()| {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
+                        lsp_uri.as_str()
+                    );
+                }),
+                displaced,
+            ),
             other => other.map(|_| None),
         };
         // Collapse the cross-source isPreferred collision on the FINAL menu,
@@ -1289,7 +1321,7 @@ mod tests {
                     |parts: &ActionParts| passed_over.answers(parts, |_| true),
                 )
                 .await;
-                passed_over.or_kept(result)
+                passed_over.or_kept(result).0
             }
         };
         // The host layer answering: its actions.
@@ -1316,7 +1348,65 @@ mod tests {
             ErrorCode::RequestCancelled
         );
         // Nothing kept, the walk's result as it was.
-        assert_eq!(titles(PassedOver::default().or_kept(Ok(None))), Ok(vec![]));
+        assert_eq!(
+            titles(PassedOver::default().or_kept(Ok(None)).0),
+            Ok(vec![])
+        );
+    }
+
+    /// A virt answer passed over as moved or stale is not kept aside: with
+    /// the host layer erring, the walk answers that error, not actions the
+    /// final check drops. Kept-aside actions dropped there leave the error
+    /// they displaced.
+    #[tokio::test]
+    async fn a_stale_answer_passed_over_never_displaces_a_layers_error() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        use tower_lsp_server::jsonrpc::Error;
+        let host_uri = url::Url::parse("file:///test/stale-error.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let virt: ActionParts = vec![(
+            vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: "stale".into(),
+                ..Default::default()
+            })],
+            Some(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host_uri,
+                    "lua",
+                    "r",
+                    &map,
+                    1,
+                    0,
+                ),
+            ),
+        )];
+        let passed_over = PassedOver::default();
+        let result = race_layers_preferred(
+            &[Virt, Host, Native],
+            std::future::ready(Ok(Some(virt))),
+            std::future::ready(Err(Error::internal_error())),
+            std::future::ready(Ok(None)),
+            |parts: &ActionParts| passed_over.answers(parts, |_| false),
+        )
+        .await;
+        let (result, displaced) = passed_over.or_kept(result);
+        assert_eq!(result.map(|_| ()).unwrap_err(), Error::internal_error());
+        assert!(displaced.is_none());
+        // Kept aside, then dropped: the error they displaced.
+        assert_eq!(
+            judged_or_displaced(Err(()), Some(Error::internal_error())).unwrap_err(),
+            Error::internal_error()
+        );
+        assert_eq!(judged_or_displaced(Err(()), None).unwrap(), None);
+        assert_eq!(judged_or_displaced(Ok(vec![]), None).unwrap(), Some(vec![]));
     }
 
     /// The final check drops only a stale prepared region's actions; an
