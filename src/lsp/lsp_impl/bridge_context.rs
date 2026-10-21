@@ -321,6 +321,7 @@ impl Drop for UpstreamRegistrySweepGuard {
 /// A layer's answer, with the prepared region its edits were mapped
 /// through, if any: what the final answer is checked against once, as it
 /// is chosen (see [`Self::still_current`]).
+#[derive(Clone)]
 pub(crate) struct Sourced<T> {
     pub(crate) value: T,
     prepared: Option<PreparedSource>,
@@ -330,6 +331,7 @@ pub(crate) struct Sourced<T> {
 /// and the host lifetime the region was tracked under as it was (`None`:
 /// not tracked even then, or tracked under another lifetime than the
 /// request's content version was read under).
+#[derive(Clone)]
 struct PreparedSource {
     host_uri: Url,
     language: String,
