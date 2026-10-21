@@ -168,9 +168,7 @@ impl PreparedMap {
     /// restored before they are mapped (on-type ones) are refused so.
     pub(crate) fn drops_the_break_before_the_closing(&self, edits: &[TextEdit]) -> bool {
         let prepared = &self.prepared_lines.text;
-        if !prepared.ends_with(['\n', '\r'])
-            || empty_run(&self.runs, prepared.len(), |kind| kind == RunKind::Deleted).is_none()
-        {
+        if !prepared.ends_with(['\n', '\r']) || self.removed_indent_at(prepared.len()).is_none() {
             return false;
         }
         let Some((ranges, order)) = sorted_extents(&self.prepared_lines, edits, true) else {
@@ -230,7 +228,8 @@ impl PreparedMap {
                 {
                     return false;
                 }
-                let own = empty_run(&self.runs, start, |kind| kind == RunKind::Deleted)
+                let own = self
+                    .removed_indent_at(start)
                     .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()]);
                 let at = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
                 self.uniform_indent_at(at) != Some(own)
