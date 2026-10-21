@@ -1600,6 +1600,23 @@ const REASON_RESOLVE: &str = "this action could not be resolved to an applicable
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
 const REASON_PREPARED: &str =
     "the edit cannot be mapped back through the prepared virtual document it was computed on";
+
+#[cfg(test)]
+pub(crate) fn prepared_map_refusal_for_test() -> tower_lsp_server::ls_types::CodeActionDisabled {
+    tower_lsp_server::ls_types::CodeActionDisabled {
+        reason: REASON_PREPARED.into(),
+    }
+}
+
+/// Whether `action` came back disabled because a prepared map refused its
+/// edit: an answer only a prepared document gives, unlike an action its
+/// server disabled, or one any document's edit transform refuses.
+pub(crate) fn refused_by_prepared_map(action: &CodeAction) -> bool {
+    action
+        .disabled
+        .as_ref()
+        .is_some_and(|disabled| disabled.reason == REASON_PREPARED)
+}
 const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";
