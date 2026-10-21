@@ -464,10 +464,19 @@ pub(super) fn transform_completion_item(
             // The edit may replace whitespace around the caret on its line
             // (a blank line the peer emptied, whose whitespace the content's
             // indent replaces); it must stay on that line and contain the
-            // caret, as LSP requires of an item's edit.
-            if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent) {
+            // caret, as LSP requires of an item's edit. The additional edits
+            // map with it as the one set the client applies, should it go
+            // out as that edit.
+            let Some(additional_kept_with_probe) =
+                translate_virtual_main_and_additional_edits_to_host(
+                    &mut probe,
+                    item.additional_text_edits.as_mut(),
+                    offset,
+                    EditMode::Extent,
+                )
+            else {
                 return false;
-            }
+            };
             let range = probe[0].range;
             if range.start.line != caret.line
                 || range.end.line != caret.line
@@ -486,6 +495,7 @@ pub(super) fn transform_completion_item(
                 }
                 let [edit] = probe;
                 item.text_edit = Some(CompletionTextEdit::Edit(edit));
+                additional_kept = additional_kept_with_probe;
             }
         }
     }
@@ -498,7 +508,9 @@ pub(super) fn transform_completion_item(
     // semantically incomplete (e.g. without its auto-import) — availability
     // over fidelity, never corruption. On a prepared document an item
     // without a textEdit has no primary to check them with (the client
-    // inserts at the caret, over a range it picks): they are dropped.
+    // inserts at the caret, over a range it picks): they are dropped, unless
+    // the item goes out as the edit the caret probe made, with which they
+    // were checked.
     if !prepared && let Some(additional_edits) = item.additional_text_edits.as_mut() {
         additional_kept =
             translate_virtual_text_edits_to_host(additional_edits, offset, EditMode::Extent);
@@ -1571,6 +1583,45 @@ mod tests {
         assert_eq!(explicit.text_edit, expected);
         let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
         assert!(!transform(&mut multi));
+    }
+
+    /// An item without a textEdit that goes out as the caret probe's edit
+    /// keeps its additional edits (an auto-import) checked with that edit,
+    /// as for an item with one; left inserted at the caret, it drops them.
+    #[test]
+    fn an_implicit_item_made_an_edit_keeps_its_additional_edits() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range, TextEdit};
+        // A blank line among dedented ones: the probe regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let mut completed = item(json!({
+            "label": "foo",
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "newText": "use x;\n"
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(
+            completed.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(11, 0), Position::new(11, 0)),
+                new_text: "  foo".to_string(),
+            }))
+        );
+        assert_eq!(
+            completed.additional_text_edits,
+            // After line 0's indent, regaining it for the line it keeps.
+            Some(vec![TextEdit {
+                range: Range::new(Position::new(10, 2), Position::new(10, 2)),
+                new_text: "use x;\n  ".to_string(),
+            }])
+        );
     }
 
     #[test]
