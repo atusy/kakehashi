@@ -831,7 +831,8 @@ a hook per kind of change.
   `workspace/applyEdit` is available on a prepared document with gaps;
   completion items are snippets only as literal text, and are not
   resolved.
-- A rename's or code action's edit adding, removing or rewriting lines on a
+- A rename's, code action's or server's own `workspace/applyEdit` edit
+  adding, removing or rewriting lines on a
   region the peer dedented unevenly is refused whole (in-line edits, a
   rename's, still map): the property above refuses every such change
   there, where mapping each edit keeping its extent would map many of them

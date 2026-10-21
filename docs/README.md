@@ -967,8 +967,9 @@ the error lets the user retry; a server's `workspace/applyEdit` is answered `app
 it is versioned or seen to be stale). Linked
 editing ranges and a rename's range are offered only where they cover in
 the host exactly the text the server saw. On a region the prepare server
-dedented unevenly (a line left at its own indentation), a rename or code
-action that adds, removes or rewrites lines is refused. None of the
+dedented unevenly (a line left at its own indentation), a rename, code
+action or server's `workspace/applyEdit` that adds, removes or rewrites
+lines is refused. None of the
 edit-producing methods is available on a prepared document whose
 injection is combined from separate pieces. Items listed from a prepared
 document other than code actions are not resolved further:
