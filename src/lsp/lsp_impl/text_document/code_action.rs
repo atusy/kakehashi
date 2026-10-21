@@ -92,15 +92,18 @@ fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) ->
     })
 }
 
-/// What a cross-layer `preferred` walk answers when no layer's actions
-/// answer it: the highest-ranked layer's actions that came, though none
-/// answered (on a prepared document, all disabled: refused by its map) —
-/// as the walk would choose them were the document unprepared, so a client
-/// showing disabled actions shows why the fix is refused.
+/// The refused fallback: what a cross-layer `preferred` walk answers when
+/// no layer's actions answer it — the highest-ranked layer's actions that
+/// came, though none answered (on a prepared document, all disabled:
+/// refused by its map) — as the walk would choose them were the document
+/// unprepared, so a client showing disabled actions shows why the fix is
+/// refused. Unlike the stale fallback, what it keeps may still be kept,
+/// and it stands in for a layer's error only while the final check keeps
+/// it.
 #[derive(Default)]
-struct PassedOver(std::sync::Mutex<Option<ActionParts>>);
+struct RefusedActionsFallback(std::sync::Mutex<Option<ActionParts>>);
 
-impl PassedOver {
+impl RefusedActionsFallback {
     /// [`parts_answer`], keeping `parts` aside when they hold actions, do
     /// not answer, and may still be kept (`may_keep`): only refused ones,
     /// never a moved or stale answer the race passed over for that, which
@@ -284,7 +287,7 @@ impl Kakehashi {
         };
         let pool = self.bridge.pool();
         let tracker = self.bridge.node_tracker();
-        let passed_over = PassedOver::default();
+        let passed_over = RefusedActionsFallback::default();
         let may_keep = |source: &Sourced<()>| {
             super::super::bridge_context::source_may_keep(source, pool, tracker, || {
                 self.host_content_version(&lsp_uri)
@@ -1328,7 +1331,7 @@ mod tests {
             })
         };
         let walk = |host: Result<Option<ActionParts>>| {
-            let passed_over = PassedOver::default();
+            let passed_over = RefusedActionsFallback::default();
             let virt = refused();
             async move {
                 let result = race_layers_preferred(
@@ -1367,7 +1370,7 @@ mod tests {
         );
         // Nothing kept, the walk's result as it was.
         assert_eq!(
-            titles(PassedOver::default().or_kept(Ok(None)).0),
+            titles(RefusedActionsFallback::default().or_kept(Ok(None)).0),
             Ok(vec![])
         );
     }
@@ -1406,7 +1409,7 @@ mod tests {
                 ),
             ),
         )];
-        let passed_over = PassedOver::default();
+        let passed_over = RefusedActionsFallback::default();
         let result = race_layers_preferred(
             &[Virt, Host, Native],
             std::future::ready(Ok(Some(virt))),
