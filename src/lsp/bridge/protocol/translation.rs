@@ -295,11 +295,8 @@ pub(crate) fn translate_virtual_replayed_edits_to_host(
 /// edit must go through the map. `None` for an unprepared document.
 pub(crate) fn prepared_region_host_span(offset: &RegionOffset) -> Option<Range> {
     let prepared = offset.prepared()?;
-    let virtual_text = prepared.virtual_text();
     let mut start = Position::new(0, 0);
-    let mut end = crate::text::PositionMapper::new(virtual_text)
-        .byte_to_position(virtual_text.len())
-        .unwrap_or(start);
+    let mut end = prepared.virtual_end();
     translate_unprepared_virtual_position_to_host(&mut start, offset);
     translate_unprepared_virtual_position_to_host(&mut end, offset);
     Some(Range { start, end })

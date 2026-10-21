@@ -964,6 +964,12 @@ impl PreparedMap {
         self.virtual_lines.position(end).character
     }
 
+    /// Where V ends, read from its line index.
+    pub(crate) fn virtual_end(&self) -> Position {
+        self.virtual_lines
+            .positions(&[self.virtual_lines.text.len()])[0]
+    }
+
     /// The virtual text this map's answer was given for.
     pub(crate) fn virtual_text(&self) -> &str {
         &self.virtual_lines.text
@@ -1967,6 +1973,22 @@ mod tests {
             "no such line"
         );
         assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
+
+    /// V's end read from its line index is where a position mapper over the
+    /// whole text puts it, whatever its line breaks.
+    #[test]
+    fn the_virtual_end_is_where_a_mapper_over_the_text_puts_it() {
+        for text in ["", "a", "a\n", "a\r\nb", "a\rb\r", "é𝄞\n\nx", "\r\n\r\n"] {
+            let map = apply_prepare_result(text, &VirtualLayout::single(text), None)
+                .unwrap()
+                .map;
+            assert_eq!(
+                Some(map.virtual_end()),
+                crate::text::PositionMapper::new(text).byte_to_position(text.len()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

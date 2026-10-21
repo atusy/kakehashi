@@ -197,10 +197,13 @@ fn transform_prepared_workspace_edit(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> bool {
-    let Some(region) = prepared_region_host_span(offset) else {
-        return false;
-    };
+    // The region's host span, read only for an edit holding edits to the
+    // host URI directly: most hold none.
+    let region = std::cell::OnceCell::new();
     let reaches_in = |range: &Range| {
+        let Some(region) = region.get_or_init(|| prepared_region_host_span(offset)) else {
+            return true;
+        };
         if range.start == range.end {
             region.start < range.start && range.start < region.end
         } else {
