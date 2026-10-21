@@ -47,7 +47,7 @@ impl Kakehashi {
             return Ok(None);
         };
         let verdict = self
-            .sources_verdict(&lsp_uri, std::iter::once(&sourced))
+            .settled_verdict_of(&lsp_uri, std::iter::once(&sourced))
             .await;
         if !verdict.keeps() {
             log::debug!(
