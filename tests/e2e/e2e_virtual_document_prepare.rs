@@ -76,6 +76,8 @@ struct Setup {
     /// Also bridge lua to a `code-action` mock, ranked below the echo mock
     /// for code actions under `preferred`.
     second_code_action: bool,
+    /// Rank the echo mock alone under a `preferred` code action walk.
+    echo_code_action_preferred: bool,
     /// Have the echo mock answer linked editing ranges only once the test
     /// creates `release` in its directory.
     linked_after_release: bool,
@@ -101,6 +103,7 @@ impl Default for Setup {
             code_action_after_release: false,
             apply_edit_after_change: false,
             second_code_action: false,
+            echo_code_action_preferred: false,
             linked_after_release: false,
         }
     }
@@ -128,6 +131,10 @@ impl Setup {
         if self.second_code_action {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/codeAction"] =
                 json!({ "strategy": "preferred", "priorities": ["echo", "second"] });
+        }
+        if self.echo_code_action_preferred {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/codeAction"] =
+                json!({ "strategy": "preferred", "priorities": ["echo"] });
         }
         if self.concatenated {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
@@ -1188,6 +1195,38 @@ fn a_prepared_answer_of_refused_actions_does_not_win_a_preferred_walk() {
         !titles.iter().any(|title| title.starts_with("echo-refused")),
         "{response}"
     );
+}
+
+#[test]
+fn a_prepared_answer_of_refused_actions_answers_a_preferred_walk_nothing_else_answers() {
+    // The echo mock, alone under `preferred`, answers one action whose edit
+    // the map refuses: no server ranked below answers, so it is offered
+    // disabled, for this editor to show why.
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "codeAction": { "disabledSupport": true } } }),
+        echo_code_action_preferred: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action-refused-alone.md";
+    let text = "# t\n\n```lua\n  local x = 1 -- REFUSE\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+    let actions = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    let refused = actions
+        .iter()
+        .find(|action| {
+            action["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("echo-refused"))
+        })
+        .unwrap_or_else(|| panic!("{response}"));
+    assert!(refused["disabled"]["reason"].is_string(), "{response}");
+    assert!(refused.get("edit").is_none(), "{response}");
 }
 
 #[test]

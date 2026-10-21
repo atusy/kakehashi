@@ -439,7 +439,11 @@ map); the reply must be computed on that text (noted, with the map, as the
 resolve is queued, and unchanged as it answers), and the final check below
 must hold for the region. Otherwise the action comes back unresolved. For
 an editor that cannot resolve actions, they are resolved within the list
-request, through its map, the same way.
+request, through its map, the same way. An action whose edit the map
+refuses comes back disabled, for an editor that shows disabled actions
+(dropped for one that does not): under `preferred`, among servers or
+layers, an answer of only such actions does not win over one ranked below
+that answers, and is the answer when none does.
 
 A server's `workspace/applyEdit` maps through the map of the text its
 connection held as the request was read: a text recorded after that is
