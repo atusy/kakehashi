@@ -87,7 +87,7 @@ use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
     BridgeCoordinator, ConnectionKey, RegionOffset, VirtualDocumentUri,
-    strip_bridge_local_versions, transform_workspace_edit_to_host,
+    strip_bridge_local_versions, transform_workspace_edit_to_host_explained,
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
@@ -407,15 +407,8 @@ fn transform_params_to_host(
     offset: &RegionOffset,
     region_end: Position,
 ) -> Result<(), String> {
-    if !transform_workspace_edit_to_host(&mut params.edit, virtual_uri, host_uri, offset) {
-        return Err(if offset.prepared().is_some() {
-            "kakehashi: the edit performs file operations on a virtual document, or cannot be \
-             mapped back through the prepared virtual document it was computed on"
-                .to_string()
-        } else {
-            "kakehashi: the edit performs file operations on a virtual document".to_string()
-        });
-    }
+    transform_workspace_edit_to_host_explained(&mut params.edit, virtual_uri, host_uri, offset)
+        .map_err(|refusal| format!("kakehashi: {refusal}"))?;
     // Bound the edit to the region on both ends, per line, so a pass-through
     // host-URI edit can't reach host text above/below the region or into a
     // line's prefix (blockquote `> `).

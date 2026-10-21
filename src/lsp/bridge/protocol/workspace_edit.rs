@@ -40,13 +40,52 @@ pub(crate) fn transform_workspace_edit_to_host(
     host_uri: &Uri,
     offset: &RegionOffset,
 ) -> bool {
+    transform_workspace_edit_to_host_explained(edit, request_virtual_uri, host_uri, offset).is_ok()
+}
+
+/// Why a workspace edit was refused (see
+/// [`transform_workspace_edit_to_host_explained`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceEditRefusal {
+    /// A file operation references a virtual document.
+    VirtualFileOperation,
+    /// An edit made to the host URI directly reaches into a prepared
+    /// region (see [`transform_prepared_workspace_edit`]).
+    DirectHostEditInRegion,
+    /// The edits to a prepared document cannot be mapped back through it,
+    /// or read as one set of host edits.
+    Unmappable,
+}
+
+impl std::fmt::Display for WorkspaceEditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::VirtualFileOperation => "the edit performs file operations on a virtual document",
+            Self::DirectHostEditInRegion => {
+                "the edit edits the host document directly inside a prepared virtual document's region"
+            }
+            Self::Unmappable => {
+                "the edit cannot be mapped back through the prepared virtual document it was computed on"
+            }
+        })
+    }
+}
+
+/// [`transform_workspace_edit_to_host`], saying why when the edit is
+/// refused.
+pub(crate) fn transform_workspace_edit_to_host_explained(
+    edit: &mut WorkspaceEdit,
+    request_virtual_uri: &str,
+    host_uri: &Uri,
+    offset: &RegionOffset,
+) -> Result<(), WorkspaceEditRefusal> {
     if let Some(DocumentChanges::Operations(ops)) = &edit.document_changes {
         let has_virtual_file_op = ops.iter().any(|op| match op {
             DocumentChangeOperation::Op(op) => !resource_op_targets_real_files_only(op),
             DocumentChangeOperation::Edit(_) => false,
         });
         if has_virtual_file_op {
-            return false;
+            return Err(WorkspaceEditRefusal::VirtualFileOperation);
         }
     }
 
@@ -54,7 +93,9 @@ pub(crate) fn transform_workspace_edit_to_host(
         return transform_prepared_workspace_edit(edit, request_virtual_uri, host_uri, offset);
     }
 
-    transform_edits(edit, request_virtual_uri, host_uri, &mut Ranges(offset))
+    // An unprepared document's edits translate as ranges: none refused.
+    transform_edits(edit, request_virtual_uri, host_uri, &mut Ranges(offset));
+    Ok(())
 }
 
 /// How the request's virtual document's edits translate to the host
@@ -196,7 +237,7 @@ fn transform_prepared_workspace_edit(
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
-) -> bool {
+) -> Result<(), WorkspaceEditRefusal> {
     // The region's host span, read only for an edit holding edits to the
     // host URI directly: most hold none.
     let region = std::cell::OnceCell::new();
@@ -235,7 +276,7 @@ fn transform_prepared_workspace_edit(
                 .flat_map(|entry| entry.edits.iter().map(edit_range)),
         );
     if direct.into_iter().any(reaches_in) {
-        return false;
+        return Err(WorkspaceEditRefusal::DirectHostEditInRegion);
     }
     let with_edits = |uri: &str| {
         entries
@@ -245,7 +286,7 @@ fn transform_prepared_workspace_edit(
     };
     let region_entries = with_edits(request_virtual_uri);
     if region_entries > 1 || region_entries == 1 && with_edits(host_uri.as_str()) > 0 {
-        return false;
+        return Err(WorkspaceEditRefusal::Unmappable);
     }
 
     let direct_changes: Vec<Range> = edit
@@ -261,7 +302,7 @@ fn transform_prepared_workspace_edit(
         mapped_changes: Vec::new(),
     };
     if !transform_edits(edit, request_virtual_uri, host_uri, &mut replayed) {
-        return false;
+        return Err(WorkspaceEditRefusal::Unmappable);
     }
     // In `changes` the host's own edits and the mapped ones are one set,
     // applied in no order the set states where two share a start and one
@@ -272,12 +313,15 @@ fn transform_prepared_workspace_edit(
     let inserts_at = |insertion: &Range, other: &Range| {
         insertion.start == insertion.end && insertion.start == other.start
     };
-    !direct_changes.iter().any(|direct| {
+    if direct_changes.iter().any(|direct| {
         replayed
             .mapped_changes
             .iter()
             .any(|mapped| inserts_at(direct, mapped) || inserts_at(mapped, direct))
-    })
+    }) {
+        return Err(WorkspaceEditRefusal::Unmappable);
+    }
+    Ok(())
 }
 
 /// An edit's range, annotated or not.
@@ -2044,5 +2088,37 @@ mod tests {
                 "{mapped} {direct}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_prepared_workspace_edit_says_why() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let refusal = |value: serde_json::Value| {
+            transform_workspace_edit_to_host_explained(
+                &mut parse_workspace_edit(value),
+                &virtual_uri,
+                &host_uri,
+                &prepared_offset(),
+            )
+        };
+        assert_eq!(
+            refusal(json!({"documentChanges": [
+                {"kind": "delete", "uri": virtual_uri.clone()}
+            ]})),
+            Err(WorkspaceEditRefusal::VirtualFileOperation)
+        );
+        assert_eq!(
+            refusal(json!({"changes": {
+                host_uri.as_str(): [{"range": range_json((10, 3), (10, 4)), "newText": "z"}]
+            }})),
+            Err(WorkspaceEditRefusal::DirectHostEditInRegion)
+        );
+        assert_eq!(
+            refusal(json!({"changes": {
+                virtual_uri.clone(): [{"range": range_json((7, 0), (7, 0)), "newText": "x"}]
+            }})),
+            Err(WorkspaceEditRefusal::Unmappable)
+        );
     }
 }
