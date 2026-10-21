@@ -3206,13 +3206,14 @@ impl LanguageServerPool {
         // Nothing is held without the prepare layer. Kept in the prepare
         // registry's table by the incarnation it is for: read under another
         // (a reopen's), it holds nothing.
+        // The table is the prepare layer's, installed with it before any
+        // pass runs.
         if self.prepares()
+            && let Some(failures) = self.prepare_failures.get()
             && let Some(host) = self.latest_virtual_contents.get(host_uri)
             && host.incarnation == incarnation
         {
-            self.prepare_failures
-                .get_or_init(Default::default)
-                .withhold(host_uri, language, region_id, incarnation);
+            failures.withhold(host_uri, language, region_id, incarnation);
             drop(host);
         }
     }
@@ -3323,7 +3324,10 @@ impl LanguageServerPool {
         &self,
         failures: super::prepare_registry::PrepareFailures,
     ) {
-        let _ = self.prepare_failures.set(failures);
+        // Once, before anything reads it: a table read before would be
+        // another than the registry's, where no failure is ever recorded.
+        let installed = self.prepare_failures.set(failures).is_ok();
+        debug_assert!(installed, "the prepare failures were read before installed");
     }
 
     /// The failures [`Self::prepare_failed`] reads, installed on first use
@@ -9841,6 +9845,8 @@ mod tests {
     #[tokio::test]
     async fn a_held_region_opens_with_a_prepared_request_text_over_a_newer_one_as_is() {
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/lazy-open-held-newer.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -9872,6 +9878,8 @@ mod tests {
     #[tokio::test]
     async fn a_region_held_while_its_open_awaits_its_claim_is_not_opened_as_is() {
         let pool = Arc::new(LanguageServerPool::preparing());
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/lazy-open-held-late.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -10220,6 +10228,8 @@ mod tests {
     #[tokio::test]
     async fn a_text_as_is_is_refused_over_a_prepared_or_held_region() {
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/refuse-as-is.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -10264,6 +10274,8 @@ mod tests {
     #[tokio::test]
     async fn a_snapshot_open_of_a_held_region_is_refused_as_is() {
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/snapshot-open-held.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -10302,6 +10314,8 @@ mod tests {
     #[tokio::test]
     async fn a_region_held_for_its_peer_is_not_opened_as_is() {
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let host_uri = Url::parse("file:///test/lazy-open-held.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let key = ConnectionKey::for_server("lua");
@@ -10373,6 +10387,8 @@ mod tests {
                 .held
         );
         let preparing = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        preparing.prepare_failures_for_test();
         preparing.open_host_incarnation(&host_uri, 1).await;
         preparing.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
         assert!(
@@ -10389,6 +10405,8 @@ mod tests {
     async fn a_hold_stands_only_under_its_incarnation() {
         let host_uri = Url::parse("file:///test/hold-incarnation.md").unwrap();
         let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
         let held = || {
             pool.region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
                 .held
