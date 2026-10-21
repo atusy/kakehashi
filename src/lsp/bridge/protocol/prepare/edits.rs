@@ -158,7 +158,12 @@ impl PreparedMap {
         &self,
         edits: &[TextEdit],
     ) -> Result<Vec<TextEdit>, FormattingRefusal> {
-        self.map_formatting_within(edits, FORMATTING_DIFF_BUDGET, FORMATTING_DIFF_WORK_PER_BYTE)
+        self.map_formatting_within(
+            edits,
+            FORMATTING_DIFF_BUDGET,
+            FORMATTING_DIFF_WORK_PER_BYTE,
+            Some(FORMATTING_DIFF_BUDGET_CAP),
+        )
     }
 
     /// Whether a formatting answer of `edits` drops P's final line break
@@ -199,7 +204,7 @@ impl PreparedMap {
         edits: &[TextEdit],
         budget: usize,
     ) -> Result<Vec<TextEdit>, FormattingRefusal> {
-        self.map_formatting_within(edits, budget, 0)
+        self.map_formatting_within(edits, budget, 0, None)
     }
 
     /// Whether a line of the content (not whitespace alone, nor starting in
@@ -238,12 +243,13 @@ impl PreparedMap {
 
     /// [`Self::map_formatting_answer`], the diff doing at most `budget`
     /// steps of work and `per_byte` more for each byte of P and the edited
-    /// P.
+    /// P, all of it no more than `cap`, if any.
     fn map_formatting_within(
         &self,
         edits: &[TextEdit],
         budget: usize,
         per_byte: usize,
+        cap: Option<usize>,
     ) -> Result<Vec<TextEdit>, FormattingRefusal> {
         let prepared = &self.prepared_lines.text;
         let (ranges, order) =
@@ -265,11 +271,7 @@ impl PreparedMap {
 
         let budget = budget
             .saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()))
-            .min(if per_byte > 0 {
-                FORMATTING_DIFF_BUDGET_CAP
-            } else {
-                usize::MAX
-            });
+            .min(cap.unwrap_or(usize::MAX));
         let mut work = Work::new(budget);
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
