@@ -348,35 +348,29 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+        // Non-contiguous combined injections contain masked host-only gaps.
+        // A formatter returns a contiguous whole-document replacement, which
+        // would replace those real host gaps as well and corrupt the document.
+        let eligible: Vec<_> = all_regions
+            .iter()
+            .filter(|resolved| {
+                !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                    resolved,
+                    "textDocument/formatting",
+                    false,
+                )
+            })
+            .collect();
         // Every region's prepare attempt started before any is waited for:
         // the waits in the loop below then share attempts already running,
         // the request waiting about the slowest, not one after another.
         crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
             &self.bridge,
             language_name,
-            all_regions
-                .iter()
-                .filter(|resolved| {
-                    !crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                        resolved,
-                        "textDocument/formatting",
-                        false,
-                    )
-                })
-                .map(|resolved| (uri, resolved)),
+            eligible.iter().map(|resolved| (uri, *resolved)),
         );
         let mut spans = SpanReservations::default();
-        for resolved in all_regions.iter() {
-            // Non-contiguous combined injections contain masked host-only gaps.
-            // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                resolved,
-                "textDocument/formatting",
-                false,
-            ) {
-                continue;
-            }
+        for resolved in eligible {
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {

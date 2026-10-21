@@ -181,39 +181,34 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+            // The regions the request overlaps, each with the request clipped
+            // to it. Non-contiguous combined injections contain masked
+            // host-only gaps. Even a covering range may fall back to full
+            // formatting, whose single replacement would overwrite those real
+            // gaps.
+            let eligible: Vec<_> = all_regions
+                .iter()
+                .filter(|resolved| {
+                    !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                        resolved,
+                        "textDocument/rangeFormatting",
+                        false,
+                    )
+                })
+                .filter_map(|resolved| {
+                    clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
+                        .map(|clipped| (resolved, clipped))
+                })
+                .collect();
             // Every overlapped region's prepare attempt started before any
             // is waited for (see `formatting`).
             crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
                 &self.bridge,
                 &language_name,
-                all_regions
-                    .iter()
-                    .filter(|resolved| {
-                        !crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                            resolved,
-                            "textDocument/rangeFormatting",
-                            false,
-                        ) && clip_request_to_region(
-                            &request_bytes,
-                            &resolved.region.byte_range,
-                            &mapper,
-                        )
-                        .is_some()
-                    })
-                    .map(|resolved| (&uri, resolved)),
+                eligible.iter().map(|(resolved, _)| (&uri, *resolved)),
             );
             let mut spans = super::formatting::SpanReservations::default();
-            for resolved in all_regions.iter() {
-                // Non-contiguous combined injections contain masked host-only
-                // gaps. Even a covering range may fall back to full formatting,
-                // whose single replacement would overwrite those real gaps.
-                if crate::lsp::lsp_impl::bridge_context::method_closed_to(
-                    resolved,
-                    "textDocument/rangeFormatting",
-                    false,
-                ) {
-                    continue;
-                }
+            for (resolved, clipped) in eligible {
                 // A covering request (its byte span encloses the whole region)
                 // prefers full formatting; a partial request range-formats the
                 // clipped span. Either way we compute the clipped+content-clamped
@@ -224,11 +219,6 @@ impl Kakehashi {
                 let is_covering =
                     request_covers_region(&request_bytes, &resolved.region.byte_range);
 
-                let Some(clipped) =
-                    clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
-                else {
-                    continue;
-                };
                 // The byte-range clip can still leave an endpoint inside a stripped
                 // per-line prefix (e.g. blockquoted code's `> `); pull both
                 // endpoints onto the actual injected content. A partial selection
