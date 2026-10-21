@@ -327,14 +327,9 @@ pub(crate) struct PrepareRegistry {
     /// The last scan of [`Self::any_region_prepared`]: `(epoch, held
     /// changes, result)`.
     prepared_scan: std::sync::Mutex<Option<(u64, u64, bool)>>,
-    /// Hosts closed, until reopened: a request
-    /// still running past the close looks nothing up for them, and an
-    /// attempt for one asks no peer. Shared with the attempts. Each entry
-    /// goes on a reopen, or once [`CLOSED_HOSTS_KEPT`] later closes were
-    /// recorded (keyed by the order of closes).
-    closed_hosts: Arc<DashMap<String, u64>>,
-    /// Source of `closed_hosts`' order.
-    closes: AtomicU64,
+    /// Hosts closed, until reopened (see [`ClosedHosts`]). Shared with the
+    /// attempts.
+    closed_hosts: Arc<ClosedHosts>,
     /// How many answers re-synced each host, since it was last forgotten:
     /// what tells a pull that skipped a host's documents whether any of
     /// their answers landed while it ran. Shared with the attempts.
@@ -369,7 +364,6 @@ impl Default for PrepareRegistry {
             held_changes: Arc::default(),
             prepared_scan: std::sync::Mutex::new(None),
             closed_hosts: Arc::default(),
-            closes: AtomicU64::new(0),
             host_answers: Arc::default(),
             next_revision: Arc::new(AtomicI32::new(1)),
             resync_tx,
@@ -377,6 +371,48 @@ impl Default for PrepareRegistry {
             #[cfg(test)]
             slot_checked: std::sync::Mutex::new(None),
         }
+    }
+}
+
+/// Hosts closed, until reopened: a request still running past the close
+/// looks nothing up for them, and an attempt for one asks no peer. Each entry
+/// goes on a reopen, or once [`CLOSED_HOSTS_KEPT`] later closes were
+/// recorded (keyed by the order of closes).
+///
+/// A set of hosts closed now, not a compare of host incarnations. A request
+/// resolved before a close and a reopen looks up under the reopen as any
+/// does. And a host counts as closed from the registry's own forget on, not
+/// from the moment the pool drops its documents. An incarnation compare
+/// would refuse the first and move the second, and some lookups (a pull
+/// owed a refresh) carry no incarnation to compare.
+#[derive(Default)]
+struct ClosedHosts {
+    hosts: DashMap<String, u64>,
+    /// Source of `hosts`' order.
+    closes: AtomicU64,
+}
+
+impl ClosedHosts {
+    fn contains(&self, host_uri: &str) -> bool {
+        self.hosts.contains_key(host_uri)
+    }
+
+    fn close(&self, host_uri: &str) {
+        let order = self.closes.fetch_add(1, Ordering::AcqRel);
+        self.hosts.insert(host_uri.to_string(), order);
+        if self.hosts.len() > CLOSED_HOSTS_KEPT
+            && let Some(oldest) = self
+                .hosts
+                .iter()
+                .min_by_key(|entry| *entry.value())
+                .map(|entry| entry.key().clone())
+        {
+            self.hosts.remove(&oldest);
+        }
+    }
+
+    fn reopen(&self, host_uri: &str) {
+        self.hosts.remove(host_uri);
     }
 }
 
@@ -873,12 +909,12 @@ impl PrepareRegistry {
 
     /// Whether `host_uri` closed (see `closed_hosts`).
     pub(crate) fn host_closed(&self, host_uri: &Url) -> bool {
-        self.closed_hosts.contains_key(host_uri.as_str())
+        self.closed_hosts.contains(host_uri.as_str())
     }
 
     /// `host_uri` opened (again): its documents are looked up as any.
     pub(crate) fn host_opened(&self, host_uri: &Url) {
-        self.closed_hosts.remove(host_uri.as_str());
+        self.closed_hosts.reopen(host_uri.as_str());
     }
 
     /// How many answers re-synced `host_uri` (see `host_answers`).
@@ -894,17 +930,7 @@ impl PrepareRegistry {
         self.host_answers.remove(host_uri.as_str());
         // Every close, whether anything was looked up yet or not: a request
         // resolved before the close may still be about to look up.
-        let order = self.closes.fetch_add(1, Ordering::AcqRel);
-        self.closed_hosts.insert(host_uri.to_string(), order);
-        if self.closed_hosts.len() > CLOSED_HOSTS_KEPT
-            && let Some(oldest) = self
-                .closed_hosts
-                .iter()
-                .min_by_key(|entry| *entry.value())
-                .map(|entry| entry.key().clone())
-        {
-            self.closed_hosts.remove(&oldest);
-        }
+        self.closed_hosts.close(host_uri.as_str());
         // Withheld marks too: they were set under the incarnation that
         // closed, which no open reads them under.
         let mut removed = false;
@@ -975,7 +1001,7 @@ impl PrepareRegistry {
         let host_uri = input.host_uri.as_str();
         // Closed: whatever still runs past the close finds nothing, and
         // starts nothing.
-        if self.closed_hosts.contains_key(host_uri) {
+        if self.closed_hosts.contains(host_uri) {
             return None;
         }
         #[cfg(test)]
@@ -1045,7 +1071,7 @@ impl PrepareRegistry {
         // before this one went in (it marks the host closed first, so a
         // sweep that missed this region is seen here). Nothing is kept for
         // a closed host.
-        if self.closed_hosts.contains_key(host_uri) {
+        if self.closed_hosts.contains(host_uri) {
             let removed = self
                 .regions
                 .remove_if(&hash, |_, region| {
@@ -1119,7 +1145,7 @@ impl PrepareRegistry {
             // the settings may no longer name.
             let admitted = || {
                 pool.prepare_epoch() == cell.epoch
-                    && !closed_hosts.contains_key(job.host_uri.as_str())
+                    && !closed_hosts.contains(job.host_uri.as_str())
                     && regions.get(&region).is_some_and(|region| region.has(&cell))
             };
             let held = || {
@@ -2579,7 +2605,7 @@ mod tests {
             host
         };
         let hosts: Vec<Url> = (0..=CLOSED_HOSTS_KEPT).map(closed).collect();
-        assert_eq!(registry.closed_hosts.len(), CLOSED_HOSTS_KEPT);
+        assert_eq!(registry.closed_hosts.hosts.len(), CLOSED_HOSTS_KEPT);
         assert!(!registry.host_closed(&hosts[0]));
         assert!(registry.host_closed(&hosts[1]));
         assert!(registry.host_closed(hosts.last().unwrap()));
