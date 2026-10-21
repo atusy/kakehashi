@@ -502,15 +502,16 @@ fn content_deletions(
     if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
         return Err("content changes overlap");
     }
-    // Deletions that touch within one line are one: a peer may split a
-    // line's indentation across edits, each but the first then starting
-    // past the line's start. Never across a line break, which would join a
-    // deleted blank line to the next line's indentation into no whole line.
-    let within_line = |range: &Range<usize>| !segment_text[range.clone()].contains(['\n', '\r']);
+    // Deletions that touch inside a line are one: a peer may split a line's
+    // indentation, or a blank line's indentation and its line break, across
+    // edits, each but the first then starting past the line's start. Never
+    // where they touch at a line start, which would join a deleted blank
+    // line to the next line's indentation into no whole line.
+    let touch_inside_a_line = |at: usize| !is_line_start(virtual_text, segment_start + at);
     let mut joined: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
         match joined.last_mut() {
-            Some(last) if last.end == range.start && within_line(last) && within_line(&range) => {
+            Some(last) if last.end == range.start && touch_inside_a_line(range.start) => {
                 last.end = range.end;
             }
             _ => joined.push(range),
@@ -2021,8 +2022,9 @@ mod tests {
 
     /// A line's indentation deleted in pieces, in any order, is deleted as
     /// one: the text is V with those bytes gone, and the map is the one the
-    /// whole deletion gives. Never joined across a line break, so a deleted
-    /// blank line and the next line's indentation still go apart.
+    /// whole deletion gives, a blank line's indentation and line break
+    /// included. Never joined where pieces touch at a line start, so a
+    /// deleted blank line and the next line's indentation still go apart.
     #[test]
     fn indentation_deleted_in_pieces_is_deleted_as_one() {
         let change = |start: (u32, u32), end: (u32, u32)| {
@@ -2039,7 +2041,7 @@ mod tests {
             )
         };
         // (V, the pieces, the whole deletions, the bytes of V they delete)
-        let cases: [(&str, Vec<_>, Vec<_>, std::ops::Range<usize>); 4] = [
+        let cases: [(&str, Vec<_>, Vec<_>, std::ops::Range<usize>); 8] = [
             (
                 "  a",
                 vec![change((0, 0), (0, 1)), change((0, 1), (0, 2))],
@@ -2067,6 +2069,31 @@ mod tests {
                 vec![change((0, 0), (1, 0)), change((1, 0), (1, 2))],
                 vec![change((0, 0), (1, 0)), change((1, 0), (1, 2))],
                 0..3,
+            ),
+            // A blank line's indentation and its line break, apart.
+            (
+                "  \n  a",
+                vec![change((0, 0), (0, 2)), change((0, 2), (1, 0))],
+                vec![change((0, 0), (1, 0))],
+                0..3,
+            ),
+            (
+                "  \n  a",
+                vec![change((0, 2), (1, 0)), change((0, 0), (0, 2))],
+                vec![change((0, 0), (1, 0))],
+                0..3,
+            ),
+            (
+                "  \r\n  a",
+                vec![change((0, 0), (0, 1)), change((0, 1), (1, 0))],
+                vec![change((0, 0), (1, 0))],
+                0..4,
+            ),
+            (
+                "a\n  \n",
+                vec![change((1, 0), (1, 2)), change((1, 2), (2, 0))],
+                vec![change((1, 0), (2, 0))],
+                2..5,
             ),
         ];
         for (virtual_text, pieces, whole, deleted) in cases {
