@@ -10,6 +10,10 @@
 
 use std::collections::HashMap;
 
+use tower_lsp_server::ls_types::{CompletionItem, InsertTextFormat};
+
+use super::completion::inserted_text_mut;
+
 /// A snippet and the text it expands to with every tabstop and placeholder
 /// left at its default: what the client inserts unless the user types over
 /// it. Every later occurrence of a tabstop mirrors the default of its first
@@ -151,6 +155,63 @@ impl Expansion {
             return None;
         }
         Some(format!("{indent}{}", self.snippet))
+    }
+}
+
+/// A snippet's expansion standing in for it in a completion item, as the
+/// text the item's checks read: installed in place of the item's inserted
+/// text (its edit's, else its insertText, else its label), and the snippet
+/// put back once the item is kept ([`Self::restore`]). An item refused in
+/// between is dropped as it stands.
+pub(super) struct SnippetStandIn {
+    expansion: Expansion,
+    /// The insertText an item without an edit came with, where the
+    /// expansion stands in for its insertText or label.
+    insert_text: Option<Option<String>>,
+}
+
+impl SnippetStandIn {
+    /// Write `expansion`'s text into `item` where the client takes the text
+    /// it inserts.
+    pub(super) fn install(item: &mut CompletionItem, expansion: Expansion) -> Self {
+        let text = expansion.text().to_string();
+        let insert_text = match inserted_text_mut(item) {
+            Some(edit_text) => {
+                *edit_text = text;
+                None
+            }
+            None => Some(item.insert_text.replace(text)),
+        };
+        Self {
+            expansion,
+            insert_text,
+        }
+    }
+
+    /// Put the snippet back where its expansion was checked, expanding to
+    /// the text checked: the indentation the map wrote before the expansion
+    /// written before the snippet (see [`Expansion::carry`]), and an item
+    /// without an edit given back the insertText it came with. One without
+    /// a tabstop is the text its escapes stand for: it goes out as that
+    /// plain text, as checked; sent as a snippet, a client may take it as
+    /// plain text, backslashes and all (mini.completion expands only text
+    /// holding a tabstop). `false` when the item is refused.
+    pub(super) fn restore(self, item: &mut CompletionItem) -> bool {
+        let plain = !self.expansion.has_tabstop();
+        if let Some(mapped) = inserted_text_mut(item)
+            && !plain
+        {
+            let Some(snippet) = self.expansion.carry(mapped) else {
+                return false;
+            };
+            *mapped = snippet;
+        }
+        if plain {
+            item.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
+        } else if let Some(sent) = self.insert_text {
+            item.insert_text = sent;
+        }
+        true
     }
 }
 
