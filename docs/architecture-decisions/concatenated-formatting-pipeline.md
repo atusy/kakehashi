@@ -152,18 +152,19 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    resolve. The host prefix is tracked **per line** (`RegionOffset::columns`) and
    can differ line to line (e.g. nested blockquote levels). When the formatter
    preserves the line count, each output line takes its original per-line offset
-   (a 1:1 mapping). When the formatter changes the line count, new lines have no
-   original counterpart and — since the pipeline computes no diff/alignment — the
-   **region's common prefix** is applied to them — the longest leading host
-   prefix shared by the region's lines that hold text (their LCP). A blank
-   line's prefix is not the region's: a list item's fence leaves its blank
-   lines unindented and a blockquote leaves a blank line's `>` without its
-   space, so blank lines are left out of the LCP, and output text that lands
-   on a blank line takes the LCP when the line's own prefix falls short of
-   it. This is exact for the usual
-   uniform-prefix injection (single-level indentation, or a uniform `> `) and is a
-   documented limitation for the rare region whose per-line prefixes genuinely
-   differ across a line-count change. On **empty** output lines the prefix's
+   (a 1:1 mapping), except that text landing on a line that was blank takes the
+   region's common prefix when the line's own prefix falls short of it. When the
+   formatter changes the line count, new lines have no original counterpart
+   and — since the pipeline computes no diff/alignment — the **region's common
+   prefix** is applied to them: the longest leading host prefix shared by the
+   region's lines that hold text (their LCP), or, when no line holds text, by
+   all of its lines. A blank line's prefix is not the region's: a list item's
+   fence may leave its blank lines unindented and a blockquote leaves a blank
+   line's `>` without its space, so blank lines are left out of the LCP. This
+   is exact for the usual uniform-prefix injection (single-level indentation,
+   or a uniform `> `) and is a documented limitation for the rare region whose
+   per-line prefixes genuinely differ across a line-count change. On **empty**
+   output lines the prefix's
    trailing whitespace is trimmed (emit `>` not `> `, and leave a space-only prefix
    off entirely) so the pipeline does not introduce trailing-whitespace violations.
 
