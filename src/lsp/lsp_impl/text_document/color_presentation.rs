@@ -31,11 +31,7 @@ impl Kakehashi {
                 .await?;
             Ok(presentations.map(ColorAnswer::unprepared))
         };
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        let current = |source: &Sourced<()>| {
-            source.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-        };
+        let current = |source: &Sourced<()>| self.sourced_still_current(source, &lsp_uri);
         let answer = self
             .walk_layers_by_strategy(
                 &lsp_uri,

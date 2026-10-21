@@ -497,6 +497,15 @@ impl Kakehashi {
         self.host_content_version(lsp_uri)
     }
 
+    /// Whether `sourced`'s edits, made for `lsp_uri`, still land where they
+    /// were mapped (see [`Sourced::still_current`]), read against the host
+    /// as it is now.
+    pub(crate) fn sourced_still_current<T>(&self, sourced: &Sourced<T>, lsp_uri: &Uri) -> bool {
+        sourced.still_current(self.bridge.pool(), self.bridge.node_tracker(), || {
+            self.host_content_version(lsp_uri)
+        })
+    }
+
     /// The host's current content version.
     pub(crate) fn host_content_version(&self, lsp_uri: &Uri) -> Option<u64> {
         let uri = uri_to_url(lsp_uri).ok()?;

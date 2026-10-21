@@ -42,15 +42,12 @@ impl Kakehashi {
             let response = self.completion_host_layer(&lsp_uri, raw_params).await?;
             Ok(response.map(Sourced::unprepared))
         };
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
         // Whether the host moved under a prepared answer is read as the race
         // decides on it: a stale one is no answer of its layer, and the race
         // falls through to the next layer's (the host's, waited for if need
         // be), its ask to re-query kept.
-        let current = |sourced: &Sourced<CompletionResponse>| {
-            sourced.still_current(pool, tracker, || self.host_content_version(&lsp_uri))
-        };
+        let current =
+            |sourced: &Sourced<CompletionResponse>| self.sourced_still_current(sourced, &lsp_uri);
         let (response, layers) = self
             .walk_layer_futures_in_order(
                 &lsp_uri,
@@ -69,8 +66,7 @@ impl Kakehashi {
         // did there).
         let response = response.map(|response| {
             response.and_then(|sourced| {
-                let current =
-                    sourced.still_current(pool, tracker, || self.host_content_version(&lsp_uri));
+                let current = self.sourced_still_current(&sourced, &lsp_uri);
                 completion_still_current(sourced.value, current)
             })
         });
