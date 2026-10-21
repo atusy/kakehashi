@@ -685,26 +685,9 @@ impl Kakehashi {
         }
 
         let mut region_offsets = HashMap::new();
-        // The language and virtual text place a slot through the text its
-        // connection held (see `BridgeCoordinator::place_held`), needed only
-        // once anything was prepared.
-        let places_as_is = self.bridge.places_pushes_as_is();
-        let region_texts: HashMap<&str, (&str, &str)> = if places_as_is {
-            HashMap::new()
-        } else {
-            regions
-                .iter()
-                .map(|region| {
-                    (
-                        region.region.region_id.as_str(),
-                        (
-                            region.injection_language.as_str(),
-                            region.virtual_content.as_str(),
-                        ),
-                    )
-                })
-                .collect()
-        };
+        // A slot places through the text its connection held (see
+        // `BridgeCoordinator::place_held`).
+        let place = self.bridge.push_placement(host, regions);
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
@@ -765,21 +748,6 @@ impl Kakehashi {
                         && priorities_admit(&ctx.priorities, server)
                 }),
                 DiagnosticSource::PullLayer => false,
-            }
-        };
-        let place = |region_id: &str, slot: &crate::lsp::diagnostic_cache::SlotEntry| {
-            if places_as_is {
-                return crate::lsp::bridge::Presentation::AsIs;
-            }
-            match region_texts.get(region_id) {
-                Some((language, virtual_text)) => self.bridge.place_held(
-                    host,
-                    language,
-                    region_id,
-                    virtual_text,
-                    slot.held.as_ref(),
-                ),
-                None => crate::lsp::bridge::Presentation::Unavailable,
             }
         };
         let (region_push, host_push) =
