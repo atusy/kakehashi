@@ -263,15 +263,18 @@ the host moves, and a reply refused on arrival would count as no answer,
 so a server ranked below it whose reply came once the host settled (with
 the region's content unchanged, after an edit to another fence or a hold
 clearing) would win against the configured order. A reply is mapped
-through its request's map whatever happened since. Completion and color
-presentations read it as the layer race decides on the injected layer's
-answer: a stale one is no answer of that layer, and the race falls
-through to the host layer's (waited for if still running), a stale
-incomplete completion list still asking to re-query. Inlay hints read it
-only once the answer is chosen: a stale answer's hints stay shown
-without their edits, which keeps more than the host layer's answer would
-give. Every answer is read once more as it is returned, with no await
-since. The answer is checked against:
+through its request's map whatever happened since. Completion, and color
+presentations under the `preferred` strategy, read it as the layer race
+decides on the injected layer's answer: a stale one is no answer of that
+layer, and the race falls through to the host layer's (waited for if
+still running), a stale incomplete completion list still asking to
+re-query; they read it once more as they return the answer, with no await
+since the race decided. Under `concatenated`, color presentations read it
+once, after every layer answered: a stale prepared part is dropped from
+the merged answer, the host layer's part kept. Inlay hints read it only
+once the answer is chosen: a stale answer's hints stay shown without
+their edits, which keeps more than the host layer's answer would give.
+The answer is checked against:
 
 - the host was edited since the request's text was read (anywhere: an
   edit above the region moves the host coordinates its edits were
