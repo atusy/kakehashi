@@ -390,6 +390,10 @@ fn transform_prepared_completion_item(
     insert_mode: ClientInsertMode,
 ) -> bool {
     use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextMode, TextEdit};
+    // Whether the server sent a snippet, as it came (the format may be
+    // rewritten below).
+    let snippet =
+        item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET);
     // The text the map checks must be the text the client inserts: a
     // snippet's expansion, every tabstop at its default, kept only when
     // every client expands it alike. The expansion stands in for the
@@ -401,7 +405,7 @@ fn transform_prepared_completion_item(
     // An item without an edit is inserted as its insertText (or label): the
     // expansion stands in for it, and it is put back as it came.
     let mut insert_text_sent: Option<Option<String>> = None;
-    if item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET) {
+    if snippet {
         let inserted = match &item.text_edit {
             Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
             Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
@@ -635,6 +639,11 @@ fn transform_prepared_completion_item(
         } else if let Some(sent) = insert_text_sent {
             item.insert_text = sent;
         }
+    }
+    // A snippet item inserting its label says so: a client may otherwise
+    // insert its filterText (mini.completion does), not the text checked.
+    if snippet && item.text_edit.is_none() && item.insert_text.is_none() {
+        item.insert_text = Some(item.label.clone());
     }
     // A client may insert an item of the snippet kind as a snippet whatever
     // its format says (mini.completion does, for text with a line break, a
@@ -1509,10 +1518,14 @@ mod tests {
                 plain.unwrap_or(snippet),
                 "{completed}"
             );
+            // An item inserting its label says so (see
+            // `a_prepared_snippet_inserting_its_label_says_so`).
             if plain.is_none() {
                 assert_eq!(
-                    transformed.insert_text,
-                    completed["insertText"].as_str().map(str::to_string),
+                    transformed.insert_text.as_deref(),
+                    completed["insertText"]
+                        .as_str()
+                        .or(completed.get("textEdit").is_none().then_some(snippet)),
                     "{completed}"
                 );
             }
@@ -2004,6 +2017,44 @@ mod tests {
                 Some(InsertTextFormat::SNIPPET)
             );
         }
+    }
+
+    /// A prepared snippet item inserting its label goes out with the label
+    /// as its insertText, so that a client reaching for its filterText
+    /// first still inserts the text checked; unprepared, it goes as sent.
+    #[rstest]
+    #[case::snippet("f(${1:x})$0", "f(${1:x})$0", 2)]
+    #[case::literal("fx", "fx", 1)]
+    #[case::escapes_only("f\\$", "f$", 1)]
+    fn a_prepared_snippet_inserting_its_label_says_so(
+        #[case] label: &str,
+        #[case] insert_text: &str,
+        #[case] format: u8,
+    ) {
+        let completed = json!({"label": label, "filterText": "f", "insertTextFormat": 2});
+        let mut prepared = item(completed.clone());
+        assert!(transform_completion_item(
+            &mut prepared,
+            &dedented_offset("  a\n"),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(prepared.text_edit, None);
+        assert_eq!(prepared.insert_text.as_deref(), Some(insert_text));
+        assert_eq!(
+            serde_json::to_value(prepared.insert_text_format).unwrap(),
+            json!(format)
+        );
+        let mut unprepared = item(completed.clone());
+        assert!(transform_completion_item(
+            &mut unprepared,
+            &RegionOffset::new(10, 0),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(unprepared, item(completed));
     }
 
     /// An item of the snippet kind sent as plain text is refused where a
