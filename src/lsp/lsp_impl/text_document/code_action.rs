@@ -31,8 +31,8 @@ use super::super::bridge_context::{RangeRequestContext, Sourced};
 use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
 use crate::lsp::aggregation::server::{
-    FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
-    dispatch_host_preferred, dispatch_preferred,
+    FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
+    dispatch_host_preferred, dispatch_preferred, preferred_among,
 };
 use crate::lsp::bridge::{
     CodeActionEnvelope, HostDocument, UpstreamCodeActionCaps, bridge_code_actions,
@@ -87,6 +87,52 @@ fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) ->
     parts.iter().any(|(actions, source)| {
         actions_answer(actions, source.is_some()) && source.as_ref().is_none_or(&may_keep)
     })
+}
+
+/// What a cross-layer `preferred` walk answers when no layer's actions
+/// answer it: the highest-ranked layer's actions that came, though none
+/// answered (on a prepared document, all disabled: refused by its map) —
+/// as the walk would choose them were the document unprepared, so a client
+/// showing disabled actions shows why the fix is refused.
+#[derive(Default)]
+struct PassedOver(std::sync::Mutex<Option<ActionParts>>);
+
+impl PassedOver {
+    /// [`parts_answer`], keeping `parts` aside when they hold actions but
+    /// do not answer. Asked in priority order, never of a layer before the
+    /// ones above it have come, the first kept is the highest-ranked.
+    fn answers(&self, parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) -> bool {
+        if parts_answer(parts, may_keep) {
+            return true;
+        }
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.is_none() && parts.iter().any(|(actions, _)| !actions.is_empty()) {
+            *kept = Some(parts.clone());
+        }
+        false
+    }
+
+    /// The walk's `result`, or, when it found no answer (nothing, or only
+    /// a layer's error, which an answer would have outranked), the actions
+    /// kept aside. A cancel stays a cancel.
+    fn or_kept(self, result: Result<Option<ActionParts>>) -> Result<Option<ActionParts>> {
+        let kept = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (result, kept) {
+            (Ok(None), Some(parts)) => Ok(Some(parts)),
+            (Err(error), Some(parts))
+                if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+            {
+                Ok(Some(parts))
+            }
+            (result, _) => result,
+        }
+    }
 }
 
 /// The actions of `parts` judged kept, in order: `Err` when judging emptied
@@ -205,6 +251,7 @@ impl Kakehashi {
         };
         let pool = self.bridge.pool();
         let tracker = self.bridge.node_tracker();
+        let passed_over = PassedOver::default();
         let may_keep = |source: &Sourced<()>| {
             super::formatting::source_may_keep(source, pool, tracker, || {
                 self.host_content_version(&lsp_uri)
@@ -222,13 +269,14 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |parts: &ActionParts| parts_answer(parts, may_keep),
+                |parts: &ActionParts| passed_over.answers(parts, may_keep),
                 |mut parts: ActionParts, next| {
                     parts.extend(next);
                     parts
                 },
             )
             .await;
+        let result = passed_over.or_kept(result);
         // The final answer chosen: each prepared region's actions checked
         // once more against the host text, which may have moved while they
         // were held (see `judged_actions`). A stale region's actions are
@@ -715,16 +763,53 @@ impl Kakehashi {
         match ctx.document.strategy {
             AggregationStrategy::Preferred => {
                 let prepared = ctx.document.prepared.is_some();
-                dispatch_preferred(
+                // A prepared document's answers of disabled actions only,
+                // passed over in the fan-in, as they arrived: the answer
+                // when no server's actions answer.
+                let passed_over =
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        Vec::<(String, CodeActionResponse)>::new(),
+                    ));
+                let kept = std::sync::Arc::clone(&passed_over);
+                let f = move |t: FanOutTask| {
+                    let server_name = t.server_name.clone();
+                    let kept = std::sync::Arc::clone(&kept);
+                    let answer = f(t);
+                    async move {
+                        let answer = answer.await;
+                        if prepared
+                            && let Ok(Some(actions)) = &answer
+                            && !actions.is_empty()
+                            && !actions_answer(actions, true)
+                        {
+                            kept.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((server_name, actions.clone()));
+                        }
+                        answer
+                    }
+                };
+                let result = dispatch_preferred(
                     &ctx.document,
                     pool.clone(),
                     f,
                     |opt| matches!(opt, Some(v) if actions_answer(v, prepared)),
                     None,
                 )
-                .await
-                .handle(&self.notifier(), "code action", None, Ok)
-                .await
+                .await;
+                if matches!(result, FanInResult::NoResult { .. }) {
+                    let arrived = std::mem::take(
+                        &mut *passed_over
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                    if let Some(actions) = preferred_among(&ctx.document, arrived) {
+                        return Ok(Some(actions));
+                    }
+                }
+                result
+                    .handle(&self.notifier(), "code action", None, Ok)
+                    .await
             }
             AggregationStrategy::Concatenated => {
                 dispatch_concatenated(&ctx.document, pool.clone(), f, None, None, None)
@@ -1134,6 +1219,104 @@ mod tests {
             &vec![(action("as is"), None)],
             |_| unreachable!()
         ));
+    }
+
+    /// Under a cross-layer `preferred`, a prepared region's answer of only
+    /// disabled actions does not win over a layer ranked below that answers,
+    /// but is the walk's answer when none does (nothing, or an error): a
+    /// client showing disabled actions shows why the fix was refused. A
+    /// cancel stays a cancel.
+    #[tokio::test]
+    async fn a_prepared_answer_of_refused_actions_answers_when_nothing_else_does() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        use tower_lsp_server::jsonrpc::{Error, ErrorCode};
+        let action = |title: &str, disabled: bool| {
+            vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.into(),
+                disabled: disabled.then(|| tower_lsp_server::ls_types::CodeActionDisabled {
+                    reason: "cannot map".into(),
+                }),
+                ..Default::default()
+            })]
+        };
+        let host_uri = url::Url::parse("file:///test/refused.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let refused = || -> ActionParts {
+            vec![(
+                action("refused", true),
+                Some(
+                    crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                        (),
+                        &host_uri,
+                        "lua",
+                        "r",
+                        &map,
+                        1,
+                        0,
+                    ),
+                ),
+            )]
+        };
+        let titles = |result: Result<Option<ActionParts>>| {
+            result.map(|parts| {
+                parts
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|(actions, _)| actions)
+                    .map(|action| match action {
+                        CodeActionOrCommand::CodeAction(action) => action.title,
+                        CodeActionOrCommand::Command(command) => command.title,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let walk = |host: Result<Option<ActionParts>>| {
+            let passed_over = PassedOver::default();
+            let virt = refused();
+            async move {
+                let result = race_layers_preferred(
+                    &[Virt, Host, Native],
+                    std::future::ready(Ok(Some(virt))),
+                    std::future::ready(host),
+                    std::future::ready(Ok(None)),
+                    |parts: &ActionParts| passed_over.answers(parts, |_| true),
+                )
+                .await;
+                passed_over.or_kept(result)
+            }
+        };
+        // The host layer answering: its actions.
+        assert_eq!(
+            titles(walk(Ok(Some(vec![(action("host", false), None)]))).await),
+            Ok(vec!["host".to_string()])
+        );
+        // Nothing else, or only an error: the refused ones.
+        assert_eq!(
+            titles(walk(Ok(None)).await),
+            Ok(vec!["refused".to_string()])
+        );
+        assert_eq!(
+            titles(walk(Err(Error::internal_error())).await),
+            Ok(vec!["refused".to_string()])
+        );
+        // Cancelled: cancelled.
+        assert_eq!(
+            walk(Err(Error::request_cancelled()))
+                .await
+                .map(|_| ())
+                .unwrap_err()
+                .code,
+            ErrorCode::RequestCancelled
+        );
+        // Nothing kept, the walk's result as it was.
+        assert_eq!(titles(PassedOver::default().or_kept(Ok(None))), Ok(vec![]));
     }
 
     /// The final check drops only a stale prepared region's actions; an

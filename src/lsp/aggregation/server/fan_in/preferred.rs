@@ -35,7 +35,7 @@ fn take_first_group_win<T>(buffered_wins: &mut IndexMap<String, T>, names: &[Str
 /// The trailing index-0 fallback covers a buffered win from a server outside
 /// every entry — unreachable via dispatch (fan-out spawns only entry
 /// members), kept as defense in depth.
-fn pick_best_buffered<T>(
+pub(crate) fn pick_best_buffered<T>(
     buffered_wins: &mut IndexMap<String, T>,
     entries: &[PriorityEntry],
 ) -> Option<T> {
