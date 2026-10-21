@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::{Range as LspRange, TextEdit};
 
 use super::{
     Bias, LineMap, PreparedMap, Run, RunKind, Side, empty_run, is_line_start, map_offset,
-    map_offset_stopping, splits_crlf,
+    map_offset_stopping, rest_of_line_blank, splits_crlf,
 };
 
 /// How a set of edits to P is read when mapped to V
@@ -50,9 +50,10 @@ impl PreparedMap {
     /// mapped set is then checked as a whole against the host text V holds
     /// and P does not show (see [`Self::mapped_edits_keep_host_text`]).
     /// `None` — refuse the set — when an edit is reversed, reaches a line
-    /// past P's last, edits overlap in P or once mapped (or touch where either's text bears on the other),
-    /// an edit reaches into a gap, a line created in content has no single
-    /// indentation to regain, or the host text would not survive.
+    /// past P's last, edits overlap in P or once mapped (or touch where
+    /// either's text bears on the other), an edit reaches into a gap, a line
+    /// created in content has no single indentation to regain, or the host
+    /// text would not survive.
     ///
     /// The host's own text, gaps and edge lines, is always kept; but on a
     /// map with gaps the indentation lines regain is not yet exact in some
@@ -83,7 +84,7 @@ impl PreparedMap {
         // break shows in P mid-line in V starts no existing host line, whose
         // indent the inserted lines' last break could give back.
         let host_line_start = |offset: usize| {
-            empty_run(&self.runs, offset, |kind| kind == RunKind::Deleted).is_some()
+            self.removed_indent_at(offset).is_some()
                 || is_line_start(
                     &self.virtual_lines.text,
                     map_offset(&self.runs, offset, Bias::Start, Side::Prepared),
@@ -314,8 +315,8 @@ impl PreparedMap {
         // (A line start in V that P shows mid-line, after a gap whose
         // placeholder holds no line break, counts: its removed indent sits
         // there.)
-        let starts_line = is_line_start(prepared, old.start)
-            || empty_run(&self.runs, old.start, |kind| kind == RunKind::Deleted).is_some();
+        let starts_line =
+            is_line_start(prepared, old.start) || self.removed_indent_at(old.start).is_some();
         let whole_lines = starts_line
             && (prepared[old.clone()].contains(['\n', '\r'])
                 || clears_line && !old.is_empty()
@@ -329,7 +330,8 @@ impl PreparedMap {
         };
         // The removed indent right before where the start plainly maps — not
         // one beyond a gap the peer emptied at the same P offset.
-        let removed_at_start = empty_run(&self.runs, old.start, |kind| kind == RunKind::Deleted)
+        let removed_at_start = self
+            .removed_indent_at(old.start)
             .filter(|run| run.virtual_.end == plain_start);
         // Lines inserted at a line start whose removed indent is not the
         // content's (the indentation-only last line's, shallower than the
@@ -370,17 +372,12 @@ impl PreparedMap {
         let ends_in_later_line = prepared[old.clone()].contains(['\n', '\r'])
             && !is_line_start(prepared, old.end)
             && !new_text.contains(['\n', '\r'])
-            && !prepared[old.end..]
-                .split(['\n', '\r'])
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .all(|c| matches!(c, ' ' | '\t'));
+            && !rest_of_line_blank(prepared, old.end);
         let end_line_indent = ends_in_later_line.then(|| {
             let line_start = prepared[..old.end]
                 .rfind(['\n', '\r'])
                 .map_or(0, |at| at + 1);
-            empty_run(&self.runs, line_start, |kind| kind == RunKind::Deleted)
+            self.removed_indent_at(line_start)
                 .map_or("", |run| &self.virtual_lines.text[run.virtual_.clone()])
         });
         let virtual_start = start_indent.map_or(plain_start, |run| run.virtual_.start);
@@ -414,7 +411,8 @@ impl PreparedMap {
         // the indentation-only last line too. The change took that indent
         // along (or, inserting, left it before its own text): it gives it
         // back. With nothing after P's end, there is no such line.
-        let removed_at_end = empty_run(&self.runs, old.end, |kind| kind == RunKind::Deleted)
+        let removed_at_end = self
+            .removed_indent_at(old.end)
             .filter(|run| run.virtual_.end == virtual_end);
         // (A P line start a gap's placeholder opened mid-line in V starts
         // no existing line: what follows is the rest of that V line.)
@@ -456,12 +454,7 @@ impl PreparedMap {
             // peer kept as is: that whitespace says nothing of the indent.
             None if whole_lines
                 && is_line_start(virtual_text, virtual_start)
-                && virtual_text[virtual_start..]
-                    .split(['\n', '\r'])
-                    .next()
-                    .unwrap_or_default()
-                    .chars()
-                    .all(|c| matches!(c, ' ' | '\t')) =>
+                && rest_of_line_blank(virtual_text, virtual_start) =>
             {
                 FirstIndent::Uniform
             }
