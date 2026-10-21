@@ -1786,6 +1786,45 @@ mod tests {
         );
     }
 
+    /// `changes` and `documentChanges` are alternatives, the latter
+    /// preferred by a client handling versioned edits: an edit giving the
+    /// same change in both maps each on its own, to the same host text,
+    /// whichever the client applies.
+    #[test]
+    fn a_prepared_change_given_in_both_representations_maps_each_alike() {
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let wrap = json!([
+            {"range": range_json((0, 0), (0, 0)), "newText": "if x:\n"},
+            {"range": range_json((0, 0), (0, 0)), "newText": "  "},
+            {"range": range_json((1, 0), (1, 0)), "newText": "  "}
+        ]);
+        let mut edit = parse_workspace_edit(json!({
+            "changes": {virtual_uri.clone(): wrap.clone()},
+            "documentChanges": [{
+                "textDocument": {"uri": virtual_uri.clone(), "version": 3},
+                "edits": wrap
+            }]
+        }));
+        assert!(transform_workspace_edit_to_host(
+            &mut edit,
+            &virtual_uri,
+            &host_uri,
+            &prepared_offset()
+        ));
+        let expected = "  if x:\n    def f(a):\n      return a\n";
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(host_region_after(&changes[&host_uri]), expected);
+        let Some(DocumentChanges::Edits(entries)) = edit.document_changes else {
+            panic!("edits variant kept");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text_document.uri, host_uri);
+        let edits: Vec<TextEdit> = entries[0].edits.iter().map(edit_range_and_text).collect();
+        assert_eq!(host_region_after(&edits), expected);
+    }
+
     fn edit_range_and_text(one_of: &OneOf<TextEdit, AnnotatedTextEdit>) -> TextEdit {
         match one_of {
             OneOf::Left(text_edit) => text_edit.clone(),
