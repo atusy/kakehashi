@@ -414,7 +414,11 @@ it never went through the map, so nothing keeps it off the text P hides,
 nor tells which text it was computed on; more than one `documentChanges`
 entry with edits for the virtual document, or one beside an entry with
 edits for the host URI — entries apply in turn, each to the text the ones
-before left, while the region's edits map as the server's text was. A file
+before left, while the region's edits map as the server's text was; or, in
+`changes`, a direct host edit and a mapped one where one inserts at the
+other's start, at the region's edge (a host insertion where the region
+ends, beside a line appended at P's end) — which text goes first there no
+edit states (one ending where the other starts is kept). A file
 operation on a virtual document refuses the whole edit, and other regions'
 virtual documents are dropped, as on any document.
 
@@ -834,9 +838,12 @@ a hook per kind of change.
   change annotations) whose edits add, remove or rewrite lines is refused:
   its edits cannot be replayed one for each.
 - A workspace edit editing the host document directly inside a prepared
-  region, or holding a `documentChanges` entry with edits for the host
-  beside its region's (or more than one for the region), is refused; edits a server makes to another region's virtual document are
-  dropped, as on any document.
+  region, holding a `documentChanges` entry with edits for the host
+  beside its region's (or more than one for the region), or in `changes`
+  inserting on the host at the region's edge where a mapped edit starts
+  (or a mapped insertion where a host edit starts), is refused; edits a
+  server makes to another region's virtual document are dropped, as on
+  any document.
 - An unversioned `workspace/applyEdit` computed on a text before one
   already sent but not yet read by its server (no notification is
   acknowledged) maps through the newer text's map: nothing tells the two
