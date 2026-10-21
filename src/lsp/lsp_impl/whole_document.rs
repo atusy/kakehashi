@@ -183,7 +183,13 @@ impl Kakehashi {
                     client_progress_token: None,
                 };
                 // The lifecycle pass has started every region's attempt already:
-                // waiting for each in turn costs the slowest one.
+                // waiting for each in turn costs the slowest one. A region with
+                // no answer after that wait is left out of the reply. Its peer
+                // failed, gave no answer and is backing off, or the epoch moved
+                // under it. Nothing refreshes the reply when the answer comes
+                // later: LSP has no refresh for links or colors, so the next
+                // edit (or scroll) that re-asks covers the region. Waiting for
+                // the backoff would hold every other region's items behind it.
                 let Ok(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
                     &self.bridge,
                     &language_name,

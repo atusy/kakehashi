@@ -423,6 +423,14 @@ a hook per kind of change.
   a prepared text (right after its pair lost its peer).
 - A save made while a document's answer is pending reaches no server that
   has not started opening the document by the time the answer arrives.
+- A whole-document request (folding ranges, document links, colors, code
+  lenses) waits for each region's attempt in flight. A region still without
+  an answer after that is left out of the reply, and nothing refreshes the
+  reply once the answer arrives. This happens when its peer gave no answer
+  and is backing off, or when the epoch moved meanwhile. The editor's next
+  request covers the region. Only diagnostics are refreshed
+  (`workspace/diagnostic/refresh`): LSP offers no refresh for links or
+  colors.
 - A push without a document version, computed for one prepared text but
   read after the next was recorded under another map, is placed through
   the newer map: without a version nothing tells the two apart.
