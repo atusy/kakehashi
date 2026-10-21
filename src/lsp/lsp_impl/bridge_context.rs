@@ -572,6 +572,25 @@ pub(crate) async fn sources_verdict<'a, T: 'a>(
     current_version: impl Fn() -> Option<u64>,
     sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
 ) -> Verdict {
+    sources_verdict_within(
+        pool,
+        tracker,
+        current_version,
+        sources,
+        crate::lsp::bridge::PREPARE_TIMEOUT,
+    )
+    .await
+}
+
+/// [`sources_verdict`], waiting at most `within` (what is left of a wait
+/// shared with other answers).
+pub(crate) async fn sources_verdict_within<'a, T: 'a>(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+    within: std::time::Duration,
+) -> Verdict {
     if !sources.clone().any(Sourced::is_prepared) {
         return Verdict::Current;
     }
@@ -593,7 +612,7 @@ pub(crate) async fn sources_verdict<'a, T: 'a>(
             sources.clone().all(|source| source.live(pool, tracker))
                 && sources.clone().any(|source| source.settling(pool, tracker))
         },
-        crate::lsp::bridge::PREPARE_TIMEOUT,
+        within,
     )
     .await
 }

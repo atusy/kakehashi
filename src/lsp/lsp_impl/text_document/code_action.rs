@@ -104,29 +104,50 @@ fn current_actions(
 /// ([`sources_verdict`](super::super::bridge_context::sources_verdict)): kept when
 /// current, which it reads at once in the common case; waited on only
 /// while the host's last edit is settling or its region held for its
-/// answer (an edit to another fence just before the request, say), dropped
-/// at once when moved or stale. The others are kept as they are.
+/// answer (an edit to another fence just before the request, say), all
+/// parts within one prepare timeout; dropped at once when moved or stale.
+/// Every part kept is read again once the last wait ends, together: one
+/// judged current before another's wait may no longer be (the host
+/// edited, a region re-prepared to other coordinates). The others are kept
+/// as they are.
 async fn judged_actions(
     pool: &crate::lsp::bridge::LanguageServerPool,
     tracker: &crate::language::NodeTracker,
     current_version: impl Fn() -> Option<u64>,
     parts: ActionParts,
 ) -> std::result::Result<CodeActionResponse, ()> {
+    // One wait for all parts, not one for each: what is left of it bounds
+    // each part's.
+    let deadline = tokio::time::Instant::now() + crate::lsp::bridge::PREPARE_TIMEOUT;
     let mut judged = Vec::with_capacity(parts.len());
     for (actions, source) in parts {
         let keep = match &source {
             None => true,
-            Some(source) => super::super::bridge_context::sources_verdict(
+            Some(source) => super::super::bridge_context::sources_verdict_within(
                 pool,
                 tracker,
                 &current_version,
                 std::iter::once(source),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
             .keeps(),
         };
-        judged.push((actions, keep));
+        judged.push((actions, source, keep));
     }
+    // A part judged current before another was waited on may not be by
+    // now (the host edited during that wait): every part kept is read
+    // once more, together, with no await between that read and the answer.
+    let judged = judged
+        .into_iter()
+        .map(|(actions, source, keep)| {
+            let keep = keep
+                && source
+                    .as_ref()
+                    .is_none_or(|source| source.still_current(pool, tracker, &current_version));
+            (actions, keep)
+        })
+        .collect();
     current_actions(judged)
 }
 
@@ -847,6 +868,139 @@ fn code_action_resolve_failed() -> tower_lsp_server::jsonrpc::Error {
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
+
+    /// A region's actions judged current before another region's were
+    /// waited on (held for its prepare answer) are judged again once that
+    /// wait ends: the host edited during it, or the first region
+    /// re-prepared to other coordinates (an epoch move, no edit), the first
+    /// region's are not kept. Every part waits within one prepare timeout.
+    #[tokio::test(start_paused = true)]
+    async fn actions_judged_before_another_regions_wait_are_judged_again_after_it() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let prepared = Arc::new(dedented("  red\n"));
+        // What happens while the held regions' part waits: the host edited,
+        // the first region re-prepared and the held one answered, or
+        // nothing at all.
+        for case in ["edited", "re-prepared", "never answered"] {
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            // The prepare layer's table, which holds are kept in.
+            pool.prepare_failures_for_test();
+            let host = url::Url::parse("file:///test/regions.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let regions: Vec<String> = [(0, 6), (10, 16), (20, 26)]
+                .into_iter()
+                .map(|(start, end)| {
+                    tracker
+                        .get_or_create_for_incarnation(&host, start, end, "block", 1)
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            pool.open_host_incarnation(&host, 1).await;
+            for region in &regions {
+                pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared);
+            }
+            // The second and third held for their answers.
+            for region in &regions[1..] {
+                pool.hold_latest_virtual_content(&host, 1, "lua", region);
+            }
+            let part = |region: &str| {
+                (
+                    vec![CodeActionOrCommand::CodeAction(CodeAction {
+                        title: region.into(),
+                        ..Default::default()
+                    })],
+                    Some(
+                        crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                            (),
+                            &host,
+                            "lua",
+                            region,
+                            &prepared.map,
+                            1,
+                            1,
+                        ),
+                    ),
+                )
+            };
+            let version = Arc::new(AtomicU64::new(1));
+            let during = {
+                let (pool, host, version, regions, prepared) = (
+                    Arc::clone(&pool),
+                    host.clone(),
+                    Arc::clone(&version),
+                    regions.clone(),
+                    Arc::clone(&prepared),
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    match case {
+                        "edited" => version.store(2, Ordering::SeqCst),
+                        "re-prepared" => {
+                            let other = dedented("  blue\n");
+                            pool.record_latest_prepared_for_test(
+                                &host,
+                                1,
+                                "lua",
+                                &regions[0],
+                                &other,
+                            );
+                            for region in &regions[1..] {
+                                pool.record_latest_prepared_for_test(
+                                    &host, 1, "lua", region, &prepared,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                })
+            };
+            let started = tokio::time::Instant::now();
+            let answer = judged_actions(
+                &pool,
+                &tracker,
+                || Some(version.load(Ordering::SeqCst)),
+                regions.iter().map(|region| part(region)).collect(),
+            )
+            .await;
+            during.await.unwrap();
+            let titles = answer.map(|actions| {
+                actions
+                    .into_iter()
+                    .map(|action| match action {
+                        CodeActionOrCommand::CodeAction(action) => action.title,
+                        CodeActionOrCommand::Command(command) => command.title,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            match case {
+                "edited" => assert_eq!(titles, Err(()), "{case}"),
+                "re-prepared" => assert_eq!(titles, Ok(regions[1..].to_vec()), "{case}"),
+                // The held ones never current: the first's stay.
+                _ => assert_eq!(titles, Ok(regions[..1].to_vec()), "{case}"),
+            }
+            // One wait for all, however many parts wait.
+            assert!(
+                started.elapsed()
+                    <= crate::lsp::bridge::PREPARE_TIMEOUT + std::time::Duration::from_millis(50),
+                "{case}: waited {:?}",
+                started.elapsed()
+            );
+        }
+    }
 
     /// Under `preferred`, a prepared document's disabled actions (edits the
     /// map refused) do not win over a server ranked below; an unprepared
