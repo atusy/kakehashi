@@ -83,11 +83,8 @@ impl Expansion {
                         if default.is_some() && occurrences.contains_key(&number) {
                             return None;
                         }
-                        if let Some(default) = default
-                            && defaults.insert(number.clone(), default).is_some()
-                        {
-                            // Several defaults for one tabstop.
-                            return None;
+                        if let Some(default) = default {
+                            defaults.insert(number.clone(), default);
                         }
                         number
                     } else {
