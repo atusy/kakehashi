@@ -579,6 +579,13 @@ impl InjectionCoordinator {
     /// servers still hold the text sent before their pair gained a peer:
     /// held documents keep the text sent last, which for them is
     /// unprepared, and a prepared pair never bridges unprepared text.
+    ///
+    /// The closed servers' diagnostics are taken out of the editor as
+    /// [`Self::retract_deselected_docs`] takes them: the region stays live,
+    /// so the merge keeps placing its slots and nothing else drops what the
+    /// editor shows, and the pass may be a prepare resync, which no editor
+    /// event and, for a retry, no collection follows. Detached for the same
+    /// reason: the caller holds the document's edit lock.
     pub(crate) async fn close_unprepared_held(&self, uri: &Url, held: &[(&str, &str)]) {
         if held.is_empty() {
             return;
@@ -586,9 +593,18 @@ impl InjectionCoordinator {
         // Only the closed servers' slots: another server may hold the same
         // region prepared, its diagnostics valid.
         let closed = self.bridge.close_unprepared_held_docs(uri, held).await;
-        if !closed.is_empty() {
-            self.diagnostics.evict_region_servers(uri, &closed);
+        if closed.is_empty() {
+            return;
         }
+        let evicted = self.diagnostics.evict_region_servers(uri, &closed);
+        let publisher = self.publisher.clone();
+        let host = uri.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            if !shutdown.is_cancelled() {
+                publisher.publish_retraction(&host, evicted).await;
+            }
+        });
     }
 
     /// Process injected languages: resolve injection data, optionally forward didChange,
@@ -2926,6 +2942,75 @@ mod tests {
         let servers = &slots[&DiagnosticSource::Region(region.to_string())];
         assert!(!servers.contains_key("as-is"), "{servers:?}");
         assert!(servers.contains_key("prepared"), "{servers:?}");
+    }
+
+    /// Closing a held region's unprepared document tells the editor its
+    /// server's diagnostics are gone: the pass may be a prepare resync, which
+    /// no editor event or collection follows, and the region stays live, so
+    /// its other slots still merge and nothing else drops what was shown.
+    #[tokio::test]
+    async fn closing_an_unprepared_held_document_asks_the_editor_to_pull_again() {
+        use crate::lsp::bridge::ConnectionKey;
+        use crate::lsp::bridge::VirtualDocumentUri;
+        use crate::lsp::diagnostic_cache::DiagnosticSource;
+        use std::sync::Arc;
+        use tower_lsp_server::ls_types::{
+            ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        };
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let host = url::Url::parse("file:///test/held-closed-tells-editor.md").unwrap();
+        let region = "01JPMQ8ZYYQA1W3AVPW4JDRZFS";
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            region,
+        );
+        server.bridge.insert_ready_test_connection("as-is").await;
+        let key = ConnectionKey::for_server("as-is");
+        server
+            .bridge
+            .register_opened_document_for_test(&host, &virtual_uri, &key)
+            .await;
+        server
+            .bridge
+            .record_sent_as_is_for_test(&virtual_uri, &key, "x");
+        server.diagnostics.record(
+            &host,
+            DiagnosticSource::Region(region.to_string()),
+            "as-is".to_string(),
+            None,
+            vec![tower_lsp_server::ls_types::Diagnostic::default()],
+        );
+        server
+            .injection_coordinator()
+            .close_unprepared_held(&host, &[("lua", region)])
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.diagnostics.metrics_snapshot().refreshes_requested == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the editor must be asked to pull the host again");
     }
 
     /// The lifecycle pass holds a region its peer answered unusably as
