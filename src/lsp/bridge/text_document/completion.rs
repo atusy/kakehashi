@@ -406,11 +406,7 @@ fn transform_prepared_completion_item(
     // expansion stands in for it, and it is put back as it came.
     let mut insert_text_sent: Option<Option<String>> = None;
     if snippet {
-        let inserted = match &item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
-            None => item.insert_text.as_ref().unwrap_or(&item.label),
-        };
+        let inserted = inserted_text(item);
         if inserted.contains(['$', '\\']) {
             // One breaking a line or holding a tab is refused too: snippet
             // engines rewrite both whatever the item asks (see
@@ -510,24 +506,18 @@ fn transform_prepared_completion_item(
     // A multi-line edit already regained the indentation the peer removed:
     // a client adjusting it to the line's indentation as well would indent
     // it twice, inserting other text than was checked.
-    if let Some(text_edit) = &item.text_edit {
-        let new_text = match text_edit {
-            CompletionTextEdit::Edit(edit) => &edit.new_text,
-            CompletionTextEdit::InsertAndReplace(edit) => &edit.new_text,
-        };
-        if new_text.contains(['\n', '\r']) {
-            match insert_mode {
-                ClientInsertMode::AsIsSettable => {
-                    item.insert_text_mode = Some(InsertTextMode::AS_IS);
-                }
-                ClientInsertMode::AdjustsIndentation => return false,
-                // The client's default inserts as is; an item asking it to
-                // adjust instead (honored if the client supports that
-                // override) is cleared back to the default.
-                ClientInsertMode::AsIs => {
-                    if item.insert_text_mode == Some(InsertTextMode::ADJUST_INDENTATION) {
-                        item.insert_text_mode = None;
-                    }
+    if item.text_edit.is_some() && inserted_text(item).contains(['\n', '\r']) {
+        match insert_mode {
+            ClientInsertMode::AsIsSettable => {
+                item.insert_text_mode = Some(InsertTextMode::AS_IS);
+            }
+            ClientInsertMode::AdjustsIndentation => return false,
+            // The client's default inserts as is; an item asking it to
+            // adjust instead (honored if the client supports that
+            // override) is cleared back to the default.
+            ClientInsertMode::AsIs => {
+                if item.insert_text_mode == Some(InsertTextMode::ADJUST_INDENTATION) {
+                    item.insert_text_mode = None;
                 }
             }
         }
@@ -620,12 +610,7 @@ fn transform_prepared_completion_item(
     // text holding a tabstop).
     if let Some(expansion) = expanded {
         let plain = !expansion.has_tabstop();
-        let mapped = match &mut item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => Some(&mut edit.new_text),
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(&mut edit.new_text),
-            None => None,
-        };
-        if let Some(mapped) = mapped
+        if let Some(mapped) = inserted_text_mut(item)
             && !plain
         {
             let Some(snippet) = expansion.carry(mapped) else {
@@ -653,16 +638,35 @@ fn transform_prepared_completion_item(
     if item.kind == Some(tower_lsp_server::ls_types::CompletionItemKind::SNIPPET)
         && item.insert_text_format != Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
     {
-        let sent = match &item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
-            None => item.insert_text.as_ref().unwrap_or(&item.label),
-        };
+        let sent = inserted_text(item);
         if sent.contains(['\n', '\r', '\t']) || super::snippet::reads_as_snippet(sent) {
             return false;
         }
     }
     true
+}
+
+/// The text a client inserts for `item`: its edit's (both ranges of an
+/// insert/replace edit share it), else its insertText, else its label.
+pub(super) fn inserted_text(item: &CompletionItem) -> &str {
+    use tower_lsp_server::ls_types::CompletionTextEdit;
+    match &item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
+        None => item.insert_text.as_deref().unwrap_or(&item.label),
+    }
+}
+
+/// The text of `item`'s edit, to rewrite in place (both ranges of an
+/// insert/replace edit share it); `None` for an item without one, whose
+/// insertText or label the caller handles.
+pub(super) fn inserted_text_mut(item: &mut CompletionItem) -> Option<&mut String> {
+    use tower_lsp_server::ls_types::CompletionTextEdit;
+    match &mut item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => Some(&mut edit.new_text),
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(&mut edit.new_text),
+        None => None,
+    }
 }
 
 /// Translate both ranges of a prepared document's insert/replace completion
@@ -1454,17 +1458,6 @@ mod tests {
         );
     }
 
-    /// The text a client inserts for an item on a prepared document, from
-    /// its edit or (without one) its insertText or label.
-    fn sent_text(completed: &CompletionItem) -> &str {
-        use tower_lsp_server::ls_types::CompletionTextEdit;
-        match &completed.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
-            None => completed.insert_text.as_ref().unwrap_or(&completed.label),
-        }
-    }
-
     #[rstest]
     #[case::tabstop("x$0", true, None)]
     #[case::placeholder("${1:x}", true, None)]
@@ -1514,7 +1507,7 @@ mod tests {
             // nothing into it. Text without a tabstop goes out as the plain
             // text it stands for, which every client inserts as is.
             assert_eq!(
-                sent_text(&transformed),
+                inserted_text(&transformed),
                 plain.unwrap_or(snippet),
                 "{completed}"
             );
@@ -1596,7 +1589,7 @@ mod tests {
         }
         let mut literal = edit_of("{\n}");
         assert!(transform(&mut literal, ClientInsertMode::AsIsSettable));
-        assert_eq!(sent_text(&literal), "{\n  }");
+        assert_eq!(inserted_text(&literal), "{\n  }");
         assert_eq!(
             literal.insert_text_format,
             Some(InsertTextFormat::PLAIN_TEXT)
@@ -1647,7 +1640,7 @@ mod tests {
         }
         let mut literal = item(json!({"label": "f", "insertTextFormat": 2, "insertText": "f()"}));
         assert!(transform(&mut literal, ClientInsertMode::AsIs));
-        assert_eq!(sent_text(&literal), "\tf()");
+        assert_eq!(inserted_text(&literal), "\tf()");
     }
 
     /// A snippet expanding to nothing but spaces is refused: the user types
@@ -1684,7 +1677,11 @@ mod tests {
                 Some(Position::new(11, 0)),
                 ClientInsertMode::default(),
             );
-            assert_eq!(kept.then(|| sent_text(&transformed)), sent, "{completed}");
+            assert_eq!(
+                kept.then(|| inserted_text(&transformed)),
+                sent,
+                "{completed}"
+            );
         }
     }
 
