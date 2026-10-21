@@ -102,6 +102,7 @@ holds or a request is built on. The second axis is **revocation**:
 - A revoked map translates nothing more, for any path that reads it.
 - A map whose input was taken after the failure is not revoked, whether it
   is for a newer text or for the same text asked again.
+
 An answer is read only while both hold: its epoch is current, and its map
 is not revoked.
 
