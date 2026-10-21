@@ -102,11 +102,11 @@ impl LanguageServerPool {
                 build_completion_request(virtual_uri, host_position, &offset, request_id)
             },
             |response, ctx| {
-                completion_response_to_host(
+                transform_completion_response_to_host(
                     response,
-                    ctx,
+                    ctx.offset,
                     region_end,
-                    host_position,
+                    Some(host_position),
                     origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
@@ -124,36 +124,6 @@ impl LanguageServerPool {
         )
         .await
     }
-}
-
-/// [`transform_completion_response_to_host`] for a response as the executor
-/// hands it over. Whether the host moved under a prepared request's map is
-/// not read here: the virt layer reads it once, as the final answer is
-/// chosen (`Sourced::still_current`), dropping its items then (an empty
-/// incomplete list when the answer asked to re-query). Refused here, the
-/// reply would count as no answer, and a server ranked below it whose reply
-/// came once the host settled would win, against the configured order.
-/// Mapped through a map the host moved under, the items are only ever
-/// discarded by that check: the map is the one the server's text was
-/// prepared under.
-fn completion_response_to_host(
-    response: serde_json::Value,
-    ctx: &super::super::pool::BridgeResponseContext<'_>,
-    region_end: Position,
-    request_host_position: Position,
-    server_resolves: bool,
-    envelope_ctx: &EnvelopeContext<'_>,
-    insert_mode: ClientInsertMode,
-) -> Option<CompletionList> {
-    transform_completion_response_to_host(
-        response,
-        ctx.offset,
-        region_end,
-        Some(request_host_position),
-        server_resolves,
-        envelope_ctx,
-        insert_mode,
-    )
 }
 
 /// Build a JSON-RPC completion request for a downstream language server.
@@ -1921,15 +1891,15 @@ mod tests {
         };
         pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared);
         let reply = |label: &str| {
-            let ctx = pool.response_context_for_test(&host_lsp, (&host, "lua", region), &offset);
-            completion_response_to_host(
+            let ctx = pool.response_context_for_test(&host_lsp, &offset);
+            transform_completion_response_to_host(
                 json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": label, "textEdit": {
                     "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
                     "newText": label
                 }}]}),
-                &ctx,
+                ctx.offset,
                 Position::new(11, 0),
-                Position::new(10, 3),
+                Some(Position::new(10, 3)),
                 false,
                 &EnvelopeContext {
                     server_name: label,

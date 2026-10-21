@@ -18,7 +18,6 @@ mod crash_recovery;
 mod document_tracker;
 mod dynamic_capability_registry;
 mod execute;
-pub(crate) use execute::BridgeResponseContext;
 mod handshake;
 mod liveness_timeout;
 mod message_sender;

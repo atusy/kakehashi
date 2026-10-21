@@ -266,9 +266,11 @@ impl LanguageServerPool {
                 )
             },
             |response, ctx| {
-                inlay_hint_response_to_host(
+                transform_inlay_hint_response_to_host_and_envelope(
                     response,
-                    ctx,
+                    &ctx.virtual_uri_string,
+                    ctx.host_uri_lsp,
+                    ctx.offset,
                     region_end,
                     &InlayHintEnvelopeContext {
                         server_name,
@@ -782,29 +784,6 @@ fn build_inlay_hint_request(
         },
     };
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/inlayHint", params)
-}
-
-/// [`transform_inlay_hint_response_to_host_and_envelope`] for a response as
-/// the executor hands it over. Whether the host moved under a prepared
-/// request's map is read once, as the final answer is chosen
-/// (`Sourced::still_current`, which strips the hints' edits then), not per
-/// reply.
-fn inlay_hint_response_to_host(
-    response: serde_json::Value,
-    ctx: &super::super::pool::BridgeResponseContext<'_>,
-    region_end: Position,
-    envelope_ctx: &InlayHintEnvelopeContext<'_>,
-    server_resolves: bool,
-) -> Option<Vec<InlayHint>> {
-    transform_inlay_hint_response_to_host_and_envelope(
-        response,
-        &ctx.virtual_uri_string,
-        ctx.host_uri_lsp,
-        ctx.offset,
-        region_end,
-        envelope_ctx,
-        server_resolves,
-    )
 }
 
 /// Translate inlay-hint response items from virtual to host coordinates:
