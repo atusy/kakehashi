@@ -1430,6 +1430,35 @@ mod tests {
         );
     }
 
+    /// The text a client inserts: an edit's (either form), else the
+    /// insertText (empty included), else the label; the mutable form
+    /// reaches an edit's text only.
+    #[test]
+    fn an_items_inserted_text_is_its_edits_then_its_insert_text_then_its_label() {
+        let range =
+            json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+        let mut edit = item(json!({"label": "l", "insertText": "i",
+            "textEdit": {"range": range, "newText": "e"}}));
+        assert_eq!(inserted_text(&edit), "e");
+        assert_eq!(
+            inserted_text_mut(&mut edit).map(|text| text.as_str()),
+            Some("e")
+        );
+        let mut insert_replace = item(json!({"label": "l", "insertText": "i",
+            "textEdit": {"insert": range, "replace": range, "newText": "r"}}));
+        assert_eq!(inserted_text(&insert_replace), "r");
+        assert_eq!(
+            inserted_text_mut(&mut insert_replace).map(|text| text.as_str()),
+            Some("r")
+        );
+        let mut empty_insert_text = item(json!({"label": "l", "insertText": ""}));
+        assert_eq!(inserted_text(&empty_insert_text), "");
+        assert_eq!(inserted_text_mut(&mut empty_insert_text), None);
+        let mut label = item(json!({"label": "l"}));
+        assert_eq!(inserted_text(&label), "l");
+        assert_eq!(inserted_text_mut(&mut label), None);
+    }
+
     #[rstest]
     #[case::tabstop("x$0", true, None)]
     #[case::placeholder("${1:x}", true, None)]
