@@ -706,14 +706,21 @@ impl InjectionCoordinator {
                 replay_held_save,
             )
             .await;
-        // Its holds and texts published for the revision it looked at (see
-        // `LanguageServerPool::note_host_settled`). Only a forwarding pass
-        // records every sendable region's text, before sending any: one
-        // whose sends were not all queued still settled the store (what a
-        // connection holds is checked as each request is queued), while one
-        // that could not look leaves it to its retry.
-        if forward_did_change
-            && pass.looked
+        // Any pass that looked published its holds for the revision it read
+        // before its first await (see `LanguageServerPool::note_host_settled`),
+        // and a forwarding one records each sendable region's text before
+        // sending any; one whose sends were not all queued settled as well
+        // (what a connection holds is checked as each request is queued). A
+        // pass that did not forward leaves texts recorded for an older
+        // revision in place: a prepared answer is kept only on the very
+        // text and coordinates it was built on, read with the host's content
+        // version pinned, so such a text can only drop an answer, never place
+        // one elsewhere. Settling there matters where no forwarding pass
+        // follows: an edit made while the host had no tree to look at (its
+        // parser installing) is settled by the pass that looks once the tree
+        // lands. A pass that could not look leaves it to its retry, or to the
+        // pass of the parse that gives the host a tree.
+        if pass.looked
             && let Some(revision) = pass.revision
         {
             self.bridge.pool().note_host_settled(
@@ -1900,6 +1907,69 @@ mod tests {
                 .map(|injection| injection.content)
                 .collect();
         assert_eq!(sent, ["  a", "a"]);
+    }
+
+    /// An edit noted while the host had no tree to look at (its parser
+    /// still installing, say) is settled by the pass that looks once a
+    /// tree lands, forwarding or not: that pass published the holds for
+    /// the revision it read, so prepared answers are no longer refused as
+    /// pending until some later edit.
+    #[tokio::test]
+    async fn a_pass_that_looks_settles_an_edit_made_while_the_host_had_no_tree() {
+        let pool = std::sync::Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                std::sync::Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(std::sync::Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///tree-less-edit.rs").unwrap();
+        let text = "fn main() {}";
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        pool.open_host_incarnation(&uri, incarnation).await;
+        // The edit, noted as it was applied, leaving no current tree.
+        server
+            .documents
+            .apply_edit(&uri, "fn main() { 1 }".into(), &[]);
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        pool.note_host_edited(&uri, incarnation, content_version);
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let still_current = || pool.host_text_still_current(&uri, "lua", "region", &map);
+        assert!(!still_current(), "pending");
+        // Its forwarding pass, with no tree to look at, settles nothing.
+        server
+            .injection_coordinator()
+            .process_injections(&uri, true)
+            .await;
+        assert!(!still_current(), "still pending");
+        // A tree in place (the parser installed), a non-forwarding pass
+        // (the install's) looks.
+        server.parse_coordinator().reparse_latest(&uri, None).await;
+        server
+            .injection_coordinator()
+            .process_injections(&uri, false)
+            .await;
+        assert!(still_current(), "settled by the pass that looked");
     }
 
     #[rstest::rstest]

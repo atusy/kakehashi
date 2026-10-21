@@ -3502,8 +3502,9 @@ impl LanguageServerPool {
         }
     }
 
-    /// Note that the lifecycle pass finished publishing `host_uri`'s holds
-    /// and texts for `content_version` (see [`Self::note_host_edited`]).
+    /// Note that a lifecycle pass that looked finished publishing
+    /// `host_uri`'s holds for `content_version`, and, forwarding, its
+    /// regions' texts (see [`Self::note_host_edited`]).
     pub(crate) fn note_host_settled(&self, host_uri: &Url, incarnation: u64, content_version: u64) {
         if !self.prepares() {
             return;
