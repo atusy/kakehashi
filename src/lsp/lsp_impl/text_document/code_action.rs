@@ -78,6 +78,14 @@ fn actions_answer(actions: &[CodeActionOrCommand], prepared: bool) -> bool {
     })
 }
 
+/// Whether a layer's `parts` answer a cross-layer `preferred` walk (see
+/// [`actions_answer`]): a prepared part only by an enabled action.
+fn parts_answer(parts: &ActionParts) -> bool {
+    parts
+        .iter()
+        .any(|(actions, source)| actions_answer(actions, source.is_some()))
+}
+
 /// The actions of `parts` judged kept, in order: `Err` when judging emptied
 /// the answer (none left of a stale region's actions). An answer that came
 /// empty stays the empty answer it was (a concatenated walk's `[]`).
@@ -204,11 +212,7 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                |parts: &ActionParts| {
-                    parts
-                        .iter()
-                        .any(|(actions, source)| actions_answer(actions, source.is_some()))
-                },
+                parts_answer,
                 |mut parts: ActionParts, next| {
                     parts.extend(next);
                     parts
@@ -1007,13 +1011,16 @@ mod tests {
     /// one's answer counts whatever it holds, as before.
     #[test]
     fn only_enabled_actions_answer_for_a_prepared_document() {
-        let disabled = CodeActionOrCommand::CodeAction(CodeAction {
-            title: "refused".into(),
-            disabled: Some(tower_lsp_server::ls_types::CodeActionDisabled {
-                reason: "cannot map".into(),
-            }),
-            ..Default::default()
-        });
+        let disabled_action = || {
+            CodeActionOrCommand::CodeAction(CodeAction {
+                title: "refused".into(),
+                disabled: Some(tower_lsp_server::ls_types::CodeActionDisabled {
+                    reason: "cannot map".into(),
+                }),
+                ..Default::default()
+            })
+        };
+        let disabled = disabled_action();
         let enabled = CodeActionOrCommand::CodeAction(CodeAction {
             title: "fix".into(),
             ..Default::default()
@@ -1022,6 +1029,18 @@ mod tests {
         assert!(actions_answer(std::slice::from_ref(&disabled), false));
         assert!(actions_answer(&[disabled, enabled], true));
         assert!(!actions_answer(&[], false));
+        // Across layers, by each part's source.
+        let source = || Some(crate::lsp::lsp_impl::bridge_context::Sourced::unprepared(()));
+        assert!(!parts_answer(&vec![(vec![disabled_action()], source())]));
+        assert!(parts_answer(&vec![(vec![disabled_action()], None)]));
+        assert!(parts_answer(&vec![
+            (vec![disabled_action()], source()),
+            (vec![], None),
+            (
+                vec![CodeActionOrCommand::CodeAction(CodeAction::default())],
+                source()
+            ),
+        ]));
     }
 
     /// The final check drops only a stale prepared region's actions; an

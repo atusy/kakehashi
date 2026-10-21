@@ -1442,6 +1442,29 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                // Holding `REFUSE`: one action whose edit reaches past the
+                // document's end, which no map takes.
+                if documents
+                    .get(&uri)
+                    .is_some_and(|text| text.contains("REFUSE"))
+                {
+                    respond(
+                        &mut writer,
+                        id,
+                        json!([{
+                            "title": "echo-refused",
+                            "kind": "quickfix",
+                            "edit": { "changes": { uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 99, "character": 0 },
+                                    "end": { "line": 99, "character": 0 }
+                                },
+                                "newText": "x"
+                            }] } }
+                        }]),
+                    );
+                    continue;
+                }
                 let width = documents
                     .get(&uri)
                     .and_then(|text| text.lines().next())

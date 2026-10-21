@@ -73,6 +73,9 @@ struct Setup {
     /// Have the echo mock ask to apply its save edit only once it has read
     /// the document's next change.
     apply_edit_after_change: bool,
+    /// Also bridge lua to a `code-action` mock, ranked below the echo mock
+    /// for code actions under `preferred`.
+    second_code_action: bool,
 }
 
 impl Default for Setup {
@@ -94,6 +97,7 @@ impl Default for Setup {
             rename_after_release: false,
             code_action_after_release: false,
             apply_edit_after_change: false,
+            second_code_action: false,
         }
     }
 }
@@ -116,6 +120,10 @@ impl Setup {
         if self.second_on_type {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/onTypeFormatting"] =
                 json!({ "priorities": ["echo", "second"] });
+        }
+        if self.second_code_action {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/codeAction"] =
+                json!({ "strategy": "preferred", "priorities": ["echo", "second"] });
         }
         if self.concatenated {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
@@ -195,6 +203,12 @@ impl Setup {
         if self.second_on_type {
             servers["second"] = json!({
                 "cmd": [mock_bin(), "on-type"],
+                "languages": ["lua"]
+            });
+        }
+        if self.second_code_action {
+            servers["second"] = json!({
+                "cmd": [mock_bin(), "code-action"],
                 "languages": ["lua"]
             });
         }
@@ -1132,6 +1146,41 @@ fn code_actions_map_back_through_the_prepared_document() {
             "resolves: {resolves}"
         );
     }
+}
+
+#[test]
+fn a_prepared_answer_of_refused_actions_does_not_win_a_preferred_walk() {
+    // The echo mock, ranked first, answers one action whose edit the map
+    // refuses: disabled for this editor, it is no answer, and the server
+    // ranked below is asked, its action offered.
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "codeAction": { "disabledSupport": true } } }),
+        second_code_action: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action-refused.md";
+    let text = "# t\n\n```lua\n  local x = 1 -- REFUSE\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+    let titles: Vec<String> = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"))
+        .iter()
+        .filter_map(|action| action["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        titles
+            .iter()
+            .any(|title| title.starts_with("Replace with fixed")),
+        "{response}"
+    );
+    assert!(
+        !titles.iter().any(|title| title.starts_with("echo-refused")),
+        "{response}"
+    );
 }
 
 #[test]
