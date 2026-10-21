@@ -198,20 +198,14 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
 /// which the client highlights and fills the new name in from) or edits
 /// through in place (linked ranges typed into together). `false`, with
 /// `range` left as it came, when on a prepared document it would cover
-/// other host text than it covers there (see
-/// [`PreparedMap::range_reads_alike`]).
+/// other host text than it covers there: text V lacks (see
+/// [`PreparedMap::map_ranges_alike`]), or a line prefix the host has and V
+/// leaves out (a blockquote's `> ` past a line break it reaches across).
 pub(crate) fn translate_editable_virtual_range_to_host(
     range: &mut Range,
     offset: &RegionOffset,
 ) -> bool {
-    if offset
-        .prepared()
-        .is_some_and(|prepared| !prepared.range_reads_alike(*range))
-    {
-        return false;
-    }
-    translate_virtual_range_to_host(range, offset);
-    true
+    translate_editable_virtual_ranges_to_host(std::slice::from_mut(range), offset)
 }
 
 /// [`translate_editable_virtual_range_to_host`] for several ranges, all
@@ -231,12 +225,26 @@ pub(crate) fn translate_editable_virtual_ranges_to_host(
     let Some(mapped) = prepared.map_ranges_alike(ranges) else {
         return false;
     };
+    if mapped
+        .iter()
+        .any(|range| crosses_a_line_prefix(*range, offset))
+    {
+        return false;
+    }
     for (range, mut mapped) in ranges.iter_mut().zip(mapped) {
         translate_unprepared_virtual_position_to_host(&mut mapped.start, offset);
         translate_unprepared_virtual_position_to_host(&mut mapped.end, offset);
         *range = mapped;
     }
     true
+}
+
+/// Whether a V range reaches past a line break onto a line the host opens
+/// with a prefix V leaves out (a blockquote's `> `): in the host it covers
+/// that prefix too, text the server never saw.
+fn crosses_a_line_prefix(range: Range, offset: &RegionOffset) -> bool {
+    (range.start.line.saturating_add(1)..=range.end.line)
+        .any(|line| offset.column_for_line(line) > 0)
 }
 
 /// Translate, in place, a set of edits a downstream server made to one

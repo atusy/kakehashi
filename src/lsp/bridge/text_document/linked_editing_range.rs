@@ -311,6 +311,71 @@ mod tests {
         );
     }
 
+    /// A prepared blockquoted document: each host line opens with `> `,
+    /// which the virtual document leaves out.
+    fn prepared_blockquote_offset(virtual_text: &str) -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let answer =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": []}]}))
+                .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let lines = virtual_text.lines().count();
+        let mut columns = vec![2; lines];
+        columns.push(0);
+        RegionOffset::with_per_line_offsets(5, columns).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn a_prepared_linked_range_across_a_quoted_line_break_maps_to_none() {
+        let offset = prepared_blockquote_offset("foo\nbar\nfoo\nbar\n");
+        let response = |ranges: serde_json::Value| json!({"jsonrpc": "2.0", "id": 1, "result": {"ranges": ranges}});
+        // In the host each would cover `foo\n> bar`: typing into it would
+        // delete the next line's `> `.
+        assert!(
+            transform_linked_editing_range_response_to_host(
+                response(json!([
+                    {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 3}},
+                    {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 3}}
+                ])),
+                &offset,
+            )
+            .is_none()
+        );
+        // Ending at the next line's start still takes in its `> `.
+        assert!(
+            transform_linked_editing_range_response_to_host(
+                response(json!([
+                    {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+                    {"start": {"line": 2, "character": 0}, "end": {"line": 3, "character": 0}}
+                ])),
+                &offset,
+            )
+            .is_none()
+        );
+        // Within their lines they map, after each line's `> `.
+        let linked = transform_linked_editing_range_response_to_host(
+            response(json!([
+                {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 3}}
+            ])),
+            &offset,
+        )
+        .expect("within their lines");
+        assert_eq!(
+            (linked.ranges[0].start, linked.ranges[0].end),
+            (Position::new(5, 2), Position::new(5, 5))
+        );
+        assert_eq!(
+            (linked.ranges[1].start, linked.ranges[1].end),
+            (Position::new(7, 2), Position::new(7, 5))
+        );
+    }
+
     /// Many linked ranges on one long line of a prepared document convert
     /// all at once, not one conversion each.
     #[test]
