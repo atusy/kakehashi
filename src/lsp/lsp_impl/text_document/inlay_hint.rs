@@ -420,6 +420,22 @@ mod tests {
         .unwrap()
     }
 
+    /// A list item's fence with blank rows: the envelope minted from the live
+    /// offset resolves against it after a round trip through the client.
+    #[test]
+    fn inlay_hint_resolve_admits_a_list_item_fence_with_blank_rows() {
+        let live =
+            crate::lsp::bridge::RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
+        let mut json = serde_json::to_value(envelope()).unwrap();
+        json["offset"] =
+            serde_json::to_value(crate::lsp::bridge::EnvelopeOffset::from(&live)).unwrap();
+        let envelope: InlayHintEnvelope = serde_json::from_value(json).unwrap();
+
+        assert!(inlay_hint_region_is_resolvable(
+            &envelope, &live, true, "lua"
+        ));
+    }
+
     #[test]
     fn inlay_hint_resolve_rejects_non_contiguous_region() {
         let envelope = envelope();

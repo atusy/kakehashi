@@ -18,6 +18,8 @@ mod ranges;
 /// Maximum recursion depth for nested injections to prevent stack overflow.
 pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
 
+#[cfg(test)]
+pub(crate) use content::{LinePrefix, protected_blank_rows};
 pub(crate) use content::{
     NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, parse_with_deadline,
     parse_with_deadline_cancellable, parse_with_ranges,

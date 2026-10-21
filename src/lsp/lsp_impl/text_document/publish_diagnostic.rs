@@ -261,6 +261,8 @@ mod tests {
                 injection_language: "python".to_string(),
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
+                protected_blank_rows: Vec::new(),
+                container_blank_rows: Vec::new(),
                 contiguous: true,
             },
             region_end: None,

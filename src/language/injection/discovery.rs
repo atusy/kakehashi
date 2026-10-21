@@ -7,7 +7,9 @@ use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingI
 use ulid::Ulid;
 use url::Url;
 
-use super::content::{compute_line_column_offsets, extract_clean_content};
+use super::content::{
+    LinePrefix, compute_line_prefixes, container_blank_rows, extract_clean_content,
+};
 use super::language::extract_injection_language;
 use super::offset::InjectionOffset;
 use super::ranges::{
@@ -261,16 +263,74 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
     start..end
 }
 
-/// Compute clean virtual content and per-line column offsets for an injection region.
+/// Classify each line prefix of a region by the host parse: a prefix is a
+/// container continuation only when it is exactly the `block_continuation`
+/// that tree-sitter-md parses at the start of that line. For the region's
+/// first line, that is the node right before the content node; for later
+/// lines, it is the content node's excluded children. Only tree-sitter-md
+/// emits that node kind, so no other host has one, and the check needs no
+/// language name (an older parser reports none). Every other non-empty
+/// prefix is other text. The children are walked once, in the order the
+/// gaps arrive.
+fn markdown_container_prefixes<'a>(
+    content_node: &Node<'a>,
+    text: &'a str,
+) -> impl FnMut(Option<usize>, usize) -> LinePrefix + 'a {
+    let bytes = text.as_bytes();
+    let starts_line = move |at: usize| at == 0 || matches!(bytes.get(at - 1), Some(b'\n' | b'\r'));
+    let first_line = content_node
+        .prev_sibling()
+        .filter(|node| node.kind() == "block_continuation" && starts_line(node.start_byte()))
+        .map(|node| node.byte_range());
+    let mut cursor = content_node.walk();
+    let children: Vec<std::ops::Range<usize>> = content_node
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "block_continuation")
+        .map(|node| node.byte_range())
+        .collect();
+    let mut next = 0;
+    move |line_start, gap| {
+        let span = match line_start {
+            None => {
+                if starts_line(gap) {
+                    return LinePrefix::Whitespace(0);
+                }
+                match &first_line {
+                    Some(range) if range.end == gap => range.clone(),
+                    _ => return LinePrefix::Other,
+                }
+            }
+            Some(start) if start == gap => return LinePrefix::Whitespace(0),
+            Some(start) => {
+                while children.get(next).is_some_and(|range| range.start < start) {
+                    next += 1;
+                }
+                match children.get(next) {
+                    Some(range) if range.start == start && range.end == gap => range.clone(),
+                    _ => return LinePrefix::Other,
+                }
+            }
+        };
+        LinePrefix::continuation(clamped_slice(text, span))
+    }
+}
+
+/// A region's virtual content, per-line column offsets, protected blank
+/// rows and container blank rows, as [`extract_virtual_content_and_offsets`]
+/// computes them.
+type ExtractedContent = (String, Vec<u32>, Vec<u32>, Vec<u32>);
+
+/// Compute clean virtual content, per-line column offsets and protected
+/// blank rows for an injection region.
 ///
 /// This combines `compute_included_ranges`, `extract_clean_content`, and
-/// `compute_line_column_offsets` into a single call, avoiding duplication
+/// `compute_line_prefixes` into a single call, avoiding duplication
 /// across resolve methods.
 fn extract_virtual_content_and_offsets(
     region: &InjectionRegionInfo,
     cacheable: &CacheableInjectionRegion,
     text: &str,
-) -> Option<(String, Vec<u32>)> {
+) -> Option<ExtractedContent> {
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
@@ -295,13 +355,68 @@ fn extract_virtual_content_and_offsets(
         cacheable.byte_range.clone(),
         included_ranges.as_deref(),
     );
-    let line_column_offsets = compute_line_column_offsets(
+    let (line_column_offsets, line_prefixes) = compute_line_prefixes(
         text,
         cacheable.byte_range.clone(),
         cacheable.start_column,
         included_ranges.as_deref(),
+        markdown_container_prefixes(&region.content_node, text),
     );
-    Some((virtual_content, line_column_offsets))
+    let opener_width = list_fence_content_column(&region.content_node, text);
+    let (protected_blank_rows, container_blank_rows) = container_blank_rows(
+        &line_column_offsets,
+        &line_prefixes,
+        &virtual_content,
+        opener_width,
+    );
+    Some((
+        virtual_content,
+        line_column_offsets,
+        protected_blank_rows,
+        container_blank_rows,
+    ))
+}
+
+/// The content column of the list item a fenced code block opens in, as
+/// tree-sitter-md parses the opening line: the width of the whitespace
+/// `block_continuation` right before the block (a fence on a later line of
+/// the item), or of the `list_marker_*` right before it, its following
+/// whitespace included (a fence on the item's own line), measured from the
+/// line start with tabs reaching the next multiple of 4. A fence holding
+/// only blank rows has that indentation on no row of its own. 0 when the
+/// block opens in no list item at a line start (a blockquote's marker, a
+/// plain fence). O(1): one parent and one sibling.
+fn list_fence_content_column(content_node: &Node<'_>, text: &str) -> u32 {
+    let Some(block) = content_node
+        .parent()
+        .filter(|node| node.kind() == "fenced_code_block")
+    else {
+        return 0;
+    };
+    let Some(before) = block.prev_sibling().filter(|node| {
+        (node.kind() == "block_continuation" || node.kind().starts_with("list_marker_"))
+            && node.end_byte() == block.start_byte()
+    }) else {
+        return 0;
+    };
+    let start = before.start_byte();
+    if !(start == 0 || matches!(text.as_bytes().get(start - 1), Some(b'\n' | b'\r'))) {
+        return 0;
+    }
+    let span = clamped_slice(text, before.byte_range());
+    let mut width = 0u32;
+    for byte in span.bytes() {
+        match byte {
+            b'\t' => width = (width / 4).saturating_add(1).saturating_mul(4),
+            b' ' => width = width.saturating_add(1),
+            // A marker's own characters are one column each; a
+            // continuation holding anything but whitespace (a `>`) is no
+            // list item's indentation.
+            _ if before.kind() != "block_continuation" => width = width.saturating_add(1),
+            _ => return 0,
+        }
+    }
+    width
 }
 
 impl CacheableInjectionRegion {
@@ -945,6 +1060,14 @@ pub(crate) struct ResolvedInjection {
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
+    /// The virtual lines that are blank rows of a markdown container block
+    /// (see [`protected_blank_rows`]); empty for most regions, and for a
+    /// multi-capture combined region.
+    pub protected_blank_rows: Vec<u32>,
+    /// The blank rows of markdown container blocks whose prefix is only
+    /// whitespace, protected or not (see `container_blank_rows`): the
+    /// concatenated pipeline's common prefix skips them.
+    pub container_blank_rows: Vec<u32>,
     /// Whether `virtual_content` maps through the ordinary single-region path.
     /// For a multi-capture combined document this is `false` whenever the union
     /// of included ranges leaves uncovered host bytes, including inter-capture
@@ -1130,7 +1253,7 @@ impl InjectionResolver {
         let region_id_str = region_id.to_string();
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text, lone_crs);
-        let (virtual_content, line_column_offsets) =
+        let (virtual_content, line_column_offsets, protected_blank_rows, container_blank_rows) =
             extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
@@ -1139,6 +1262,8 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            protected_blank_rows,
+            container_blank_rows,
             contiguous: true,
         })
     }
@@ -1181,7 +1306,7 @@ impl InjectionResolver {
         if regions.len() == 1 {
             let first = regions[0];
             let first_cacheable = cacheable[0];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, protected_blank_rows, container_blank_rows) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1192,6 +1317,8 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                protected_blank_rows,
+                container_blank_rows,
                 contiguous: true,
             });
         }
@@ -1222,7 +1349,7 @@ impl InjectionResolver {
             let index = active_indices[0];
             let first = regions[index];
             let first_cacheable = cacheable[index];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, protected_blank_rows, container_blank_rows) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1233,6 +1360,8 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                protected_blank_rows,
+                container_blank_rows,
                 contiguous: true,
             });
         }
@@ -1289,6 +1418,8 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            protected_blank_rows: Vec::new(),
+            container_blank_rows: Vec::new(),
             contiguous,
         })
     }
@@ -1498,8 +1629,12 @@ impl InjectionResolver {
             };
             let region = &regions[index];
             if let Some(cacheable) = prebuilt {
-                let Some((virtual_content, line_column_offsets)) =
-                    extract_virtual_content_and_offsets(region, &cacheable[index], text)
+                let Some((
+                    virtual_content,
+                    line_column_offsets,
+                    protected_blank_rows,
+                    container_blank_rows,
+                )) = extract_virtual_content_and_offsets(region, &cacheable[index], text)
                 else {
                     continue;
                 };
@@ -1510,6 +1645,8 @@ impl InjectionResolver {
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                    protected_blank_rows,
+                    container_blank_rows,
                     contiguous: true,
                 });
             } else {

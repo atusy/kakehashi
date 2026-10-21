@@ -487,6 +487,14 @@ pub(crate) struct EnvelopeOffset {
     /// `None` for non-blockquote injections (backwards-compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_column_offsets: Option<Vec<u32>>,
+    /// The virtual lines that discovery marked as protected blank rows of a
+    /// list item's fence (recording no prefix, or whitespace short of the
+    /// item's indentation; see
+    /// `language::injection::content::container_blank_rows`), carried so a
+    /// resolve judges edits as the original response was. Empty for most
+    /// regions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protected_blank_rows: Vec<u32>,
 }
 
 impl From<&RegionOffset> for EnvelopeOffset {
@@ -495,6 +503,7 @@ impl From<&RegionOffset> for EnvelopeOffset {
             line: o.line(),
             column: o.column_for_line(0),
             line_column_offsets: Some(o.columns().to_vec()),
+            protected_blank_rows: o.protected_blank_row_list(),
         }
     }
 }
@@ -502,7 +511,9 @@ impl From<&RegionOffset> for EnvelopeOffset {
 impl From<&EnvelopeOffset> for RegionOffset {
     fn from(o: &EnvelopeOffset) -> Self {
         match &o.line_column_offsets {
-            Some(columns) => Self::with_per_line_offsets(o.line, columns.clone()),
+            Some(columns) => {
+                Self::with_protected_blank_rows(o.line, columns.clone(), &o.protected_blank_rows)
+            }
             None => Self::new(o.line, o.column),
         }
     }
@@ -607,6 +618,7 @@ pub(super) fn envelope_host_item(
             line: 0,
             column: 0,
             line_column_offsets: None,
+            protected_blank_rows: Vec::new(),
         },
         region_end: None,
         host_layer: true,
@@ -1275,7 +1287,8 @@ mod tests {
             EnvelopeOffset {
                 line: 3,
                 column: 4,
-                line_column_offsets: Some(vec![4])
+                line_column_offsets: Some(vec![4]),
+                protected_blank_rows: Vec::new(),
             }
         );
 
@@ -1622,12 +1635,28 @@ mod tests {
         assert_eq!(offset.line_column_offsets, None);
     }
 
+    /// A list item's fence marks its blank rows from the region's text; an
+    /// envelope carries them through the client, so the offset rebuilt at
+    /// resolve equals the live one and the resolve is not taken as stale.
+    #[test]
+    fn envelope_offset_round_trips_the_protected_blank_rows() {
+        let live = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
+        assert_eq!(live.protected_blank_row_list(), vec![1, 2]);
+
+        let json = serde_json::to_value(EnvelopeOffset::from(&live)).unwrap();
+        assert_eq!(json["protected_blank_rows"], json!([1, 2]));
+        let echoed: EnvelopeOffset = serde_json::from_value(json).unwrap();
+
+        assert_eq!(RegionOffset::from(&echoed), live);
+    }
+
     #[test]
     fn envelope_offset_round_trips_with_line_column_offsets() {
         let offset = EnvelopeOffset {
             line: 5,
             column: 2,
             line_column_offsets: Some(vec![2, 2, 2]),
+            protected_blank_rows: Vec::new(),
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         let deserialized: EnvelopeOffset =
@@ -1642,6 +1671,7 @@ mod tests {
             line: 5,
             column: 0,
             line_column_offsets: None,
+            protected_blank_rows: Vec::new(),
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         assert!(json.get("line_column_offsets").is_none());
@@ -1716,6 +1746,38 @@ mod tests {
             list.items[0].additional_text_edits.is_none(),
             "an unsafe member drops the whole additionalTextEdits array \
              (halves of one operation must not apply separately)"
+        );
+    }
+
+    #[test]
+    fn transform_drops_an_import_at_a_blank_row_of_a_list_item_fence() {
+        // A list item's fence ("- item\n\n  ```py\n  a = 1\n\n\n  ```\n"):
+        // its blank rows record no prefix, so an import inserted at one lands
+        // at host column 0 and ends the list item. The additional edits drop;
+        // the item and its own edit stay.
+        let offset = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
+        let region_end = Position::new(6, 0);
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "item",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 4 },
+                                           "end": { "line": 0, "character": 5 } },
+                                "newText": "2" },
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 1, "character": 0 },
+                                   "end": { "line": 1, "character": 0 } },
+                        "newText": "import x\n" }
+                  ] }
+            ]
+        });
+
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
+
+        assert_eq!(list.items.len(), 1);
+        assert!(
+            list.items[0].additional_text_edits.is_none(),
+            "the import would end the list item"
         );
     }
 
