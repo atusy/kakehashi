@@ -215,7 +215,7 @@ impl Kakehashi {
                 &ctx.document,
                 hints,
                 self.bridge.node_tracker(),
-                Some(revision.content_version),
+                Some(revision),
             )
         }))
     }

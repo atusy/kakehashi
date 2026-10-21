@@ -335,7 +335,8 @@ pub(crate) struct Sourced<T> {
 
 /// The region and request map a prepared answer was transformed through,
 /// and the host lifetime the region was tracked under as it was (`None`:
-/// not tracked even then).
+/// not tracked even then, or tracked under another lifetime than the
+/// request's content version was read under).
 struct PreparedSource {
     host_uri: Url,
     language: String,
@@ -343,7 +344,8 @@ struct PreparedSource {
     map: std::sync::Arc<crate::lsp::bridge::PreparedMap>,
     incarnation: Option<u64>,
     /// The host's content version read before the request's text was:
-    /// never newer than the text the answer was made on.
+    /// never newer than the text the answer was made on, under the lifetime
+    /// in `incarnation` (`None` there when it was read under another).
     content_version: Option<u64>,
 }
 
@@ -398,13 +400,13 @@ impl<T> Sourced<T> {
 
     /// The virt layer's answer for `ctx`'s region: through its map, when
     /// the region is prepared, with the lifetime `tracker` tracks it under
-    /// and the host's `content_version` read before the request's text (see
-    /// [`Kakehashi::prepared_request_content_version`]).
+    /// and the host's `revision` read before the request's text (see
+    /// [`Kakehashi::prepared_request_revision`]).
     pub(crate) fn from_region(
         ctx: &DocumentRequestContext,
         value: T,
         tracker: &crate::language::NodeTracker,
-        content_version: Option<u64>,
+        revision: Option<crate::lsp::bridge::HostRevision>,
     ) -> Self {
         Self {
             value,
@@ -413,12 +415,18 @@ impl<T> Sourced<T> {
                 language: ctx.resolved.injection_language.clone(),
                 region_id: ctx.resolved.region.region_id.clone(),
                 map: std::sync::Arc::clone(map),
+                // Tracked under another lifetime than the revision was read
+                // under (the host reopened while the text was resolved), the
+                // version read stamps no text the answer was made on.
                 incarnation: tracked_region_incarnation(
                     tracker,
                     &ctx.uri,
                     &ctx.resolved.region.region_id,
-                ),
-                content_version,
+                )
+                .filter(|&incarnation| {
+                    revision.is_some_and(|revision| revision.incarnation == incarnation)
+                }),
+                content_version: revision.map(|revision| revision.content_version),
             }),
         }
     }
@@ -447,7 +455,8 @@ impl<T> Sourced<T> {
     /// host coordinates its edits were translated to. And the region must
     /// be live —
     /// still tracked under the lifetime it was tracked under as the answer
-    /// was made, which the host's store is open for (not deleted,
+    /// was made, the one the request's content version was read under and
+    /// the host's store is open for (not deleted,
     /// invalidated, nor its host closed or reopened) — and its recorded text
     /// still the request's (`LanguageServerPool::host_text_still_current`).
     /// Read where an answer is chosen, and nowhere per reply: a reply refused
@@ -486,15 +495,24 @@ impl<T> Sourced<T> {
 }
 
 impl Kakehashi {
-    /// The host's content version, read before a virt layer resolves the
-    /// request's text, for its prepared answer's final check (see
-    /// [`Sourced::still_current`]). Read only by a pool that prepares:
-    /// unprepared answers pay no lookup.
-    pub(crate) fn prepared_request_content_version(&self, lsp_uri: &Uri) -> Option<u64> {
+    /// The host's lifetime and content version, read together before a virt
+    /// layer resolves the request's text, for its prepared answer's final
+    /// check (see [`Sourced::still_current`]). Read only by a pool that
+    /// prepares: unprepared answers pay no lookup.
+    pub(crate) fn prepared_request_revision(
+        &self,
+        lsp_uri: &Uri,
+    ) -> Option<crate::lsp::bridge::HostRevision> {
         if !self.bridge.pool().prepares() {
             return None;
         }
-        self.host_content_version(lsp_uri)
+        let uri = uri_to_url(lsp_uri).ok()?;
+        self.documents
+            .get(&uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            })
     }
 
     /// Whether `sourced`'s edits, made for `lsp_uri`, still land where they
@@ -2601,6 +2619,70 @@ mod tests {
             !answer.still_current(&pool, &tracker, || Some(0)),
             "reopened"
         );
+    }
+
+    /// The host's revision read before the request's text belongs to the
+    /// lifetime it was read under: when the host closed and reopened while
+    /// the request resolved its text, the reopened document's content
+    /// version can come back to the number read, and the region is tracked
+    /// under the new lifetime, yet the edits were made against a text the
+    /// read revision never stamped. Stale.
+    #[tokio::test]
+    async fn an_answer_whose_revision_predates_a_reopen_is_stale_when_chosen() {
+        use crate::lsp::bridge::{HostRevision, VirtualLayout, apply_prepare_result};
+        let prepared = apply_prepare_result("a\n", &VirtualLayout::single("a\n"), None).unwrap();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/reopened-mid-request.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 2);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 2)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 2).await;
+        pool.record_latest_prepared_for_test(&host, 2, "lua", &region, &prepared);
+        let ctx = DocumentRequestContext {
+            prepared: Some(std::sync::Arc::clone(&prepared.map)),
+            uri: host.clone(),
+            resolved: crate::language::injection::ResolvedInjection {
+                region: crate::language::injection::CacheableInjectionRegion {
+                    language: "lua".to_string(),
+                    byte_range: 0..2,
+                    line_range: 0..1,
+                    start_column: 0,
+                    region_id: region.clone(),
+                    content_hash: 0,
+                },
+                injection_language: "lua".to_string(),
+                virtual_content: "a\n".to_string(),
+                line_column_offsets: vec![0],
+                contiguous: true,
+                gaps: Default::default(),
+            },
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let answer_read_under = |incarnation| {
+            Sourced::from_region(
+                &ctx,
+                (),
+                &tracker,
+                Some(HostRevision {
+                    incarnation,
+                    content_version: 3,
+                }),
+            )
+        };
+        assert!(
+            answer_read_under(2).still_current(&pool, &tracker, || Some(3)),
+            "read under the lifetime it resolved in"
+        );
+        assert!(!answer_read_under(1).still_current(&pool, &tracker, || Some(3)));
     }
 
     /// A Kakehashi over a preparing pool whose markdown lua documents have

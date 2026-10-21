@@ -194,7 +194,7 @@ impl Kakehashi {
         requery: &std::sync::atomic::AtomicBool,
     ) -> Result<Option<Sourced<CompletionResponse>>> {
         // Before the text is read: see `Sourced::from_region`.
-        let content_version = self.prepared_request_content_version(lsp_uri);
+        let revision = self.prepared_request_revision(lsp_uri);
         // Use shared preamble to resolve injection context with ALL matching servers
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
@@ -270,7 +270,7 @@ impl Kakehashi {
                 &ctx.document,
                 response,
                 self.bridge.node_tracker(),
-                content_version,
+                revision,
             )
         }))
     }

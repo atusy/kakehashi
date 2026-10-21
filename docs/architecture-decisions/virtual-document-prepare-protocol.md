@@ -281,8 +281,10 @@ The answer is checked against:
   translated to, though the region's text and map stay the same) —
   dropped, when the final answer is chosen;
 - the region is no longer live (no longer tracked under the host
-  lifetime it was tracked under as the answer was made: deleted,
-  invalidated by an edit over it, its host closed or reopened) — dropped;
+  lifetime the request's content version was read under, as it was when
+  the answer was made: deleted, invalidated by an edit over it, its host
+  closed or reopened, before or after the request's text was read) —
+  dropped;
 - the host's last edit has not been settled yet (its parse or lifecycle
   pass still running, so the recorded text may predate it), or the
   host's newer text waits for its prepare answer — dropped;
