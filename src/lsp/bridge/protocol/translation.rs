@@ -214,6 +214,31 @@ pub(crate) fn translate_editable_virtual_range_to_host(
     true
 }
 
+/// [`translate_editable_virtual_range_to_host`] for several ranges, all
+/// or none (linked ranges, typed into together): `false`, with `ranges`
+/// left as they came, when any is refused. Through a prepared map their
+/// ends are converted all at once (see [`PreparedMap::map_ranges_alike`]).
+pub(crate) fn translate_editable_virtual_ranges_to_host(
+    ranges: &mut [Range],
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for range in ranges.iter_mut() {
+            translate_virtual_range_to_host(range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = prepared.map_ranges_alike(ranges) else {
+        return false;
+    };
+    for (range, mut mapped) in ranges.iter_mut().zip(mapped) {
+        translate_unprepared_virtual_position_to_host(&mut mapped.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut mapped.end, offset);
+        *range = mapped;
+    }
+    true
+}
+
 /// Translate, in place, a set of edits a downstream server made to one
 /// virtual document into host coordinates, as `mode` reads them; `false` —
 /// the caller drops the set or its carrier — when the set is refused, with

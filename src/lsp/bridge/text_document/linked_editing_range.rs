@@ -16,7 +16,7 @@ use tower_lsp_server::ls_types::{LinkedEditingRanges, Position, TextDocumentPosi
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_editable_virtual_range_to_host;
+use super::super::protocol::translate_editable_virtual_ranges_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
     response_has_jsonrpc_error,
@@ -125,10 +125,7 @@ fn transform_linked_editing_range_response_to_host(
     // a prepared document each must cover in the host exactly the text it
     // covers there, or the answer is none (one range typed into elsewhere
     // than the server meant would desynchronize the others).
-    let alike = linked
-        .ranges
-        .iter_mut()
-        .all(|range| translate_editable_virtual_range_to_host(range, offset));
+    let alike = translate_editable_virtual_ranges_to_host(&mut linked.ranges, offset);
     if !alike {
         log::debug!(
             target: "kakehashi::bridge",
@@ -311,6 +308,43 @@ mod tests {
                 &offset,
             )
             .is_none()
+        );
+    }
+
+    /// Many linked ranges on one long line of a prepared document convert
+    /// all at once, not one conversion each.
+    #[test]
+    fn many_linked_ranges_on_a_prepared_line_convert_at_once() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let count = 1_000u32;
+        let virtual_text = format!("  {}\n", vec!["\u{3042}a"; count as usize].join(" "));
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &VirtualLayout::single(&virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(5, 0).with_prepared(prepared.map);
+        let ranges: Vec<serde_json::Value> = (0..count)
+            .map(|at| {
+                json!({"start": {"line": 0, "character": at * 3 + 1}, "end": {"line": 0, "character": at * 3 + 2}})
+            })
+            .collect();
+        crate::lsp::bridge::protocol::CONVERSIONS.with(|conversions| conversions.set(0));
+        let linked = transform_linked_editing_range_response_to_host(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"ranges": ranges}}),
+            &offset,
+        )
+        .expect("all alike");
+        assert_eq!(linked.ranges.len(), count as usize);
+        assert_eq!(linked.ranges[1].start, Position::new(5, 6));
+        assert_eq!(
+            crate::lsp::bridge::protocol::CONVERSIONS.with(|conversions| conversions.get()),
+            0
         );
     }
 }
