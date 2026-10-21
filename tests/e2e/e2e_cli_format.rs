@@ -658,6 +658,75 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_of_a_same_range_alternative_left_out() {
+    // Two alternatives inject the same span: lua, found first, formats it;
+    // `peerlang`, whose peer fails, comes after. The later one sends no
+    // formatting request, as its span is already taken, so none failed:
+    // the run formats the span and exits 0.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("injections.scm"),
+        r#"
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+
+(fenced_code_block
+  (code_fence_content) @injection.content
+  (#set! injection.language "peerlang"))
+"#,
+    )
+    .expect("write injection query");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown]
+queries = [{{ path = "injections.scm", kind = "injections" }}]
+
+[languages.markdown.bridge.peerlang.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["peerlang"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua", "peerlang"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an alternative left out for a span already taken must not count \
+         its peer's failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        "# Test\n\n```lua\nPRINT('FAIL')\n```\n",
+        "the first alternative must format the span"
+    );
+}
+
+#[test]
 fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
     // The same region, prepared by its peer, is no failure: the run
     // exits 0.
