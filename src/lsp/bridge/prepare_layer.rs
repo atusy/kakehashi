@@ -442,6 +442,43 @@ impl super::BridgeCoordinator {
         )
     }
 
+    /// How each of `host_uri`'s cached region push slots places (see
+    /// [`Self::place_held`]), through the text of its region as resolved in
+    /// `regions` now: as is when every push does (see
+    /// [`Self::places_pushes_as_is`], read once, here), and nowhere for a
+    /// region no longer resolved.
+    pub(crate) fn push_placement<'a>(
+        &'a self,
+        host_uri: &'a Url,
+        regions: &'a [crate::language::injection::ResolvedInjection],
+    ) -> impl Fn(&str, &crate::lsp::diagnostic_cache::SlotEntry) -> super::Presentation + 'a {
+        // The language and virtual text of each region, needed only once
+        // anything was prepared.
+        let regions: Option<
+            std::collections::HashMap<&str, &crate::language::injection::ResolvedInjection>,
+        > = (!self.places_pushes_as_is()).then(|| {
+            regions
+                .iter()
+                .map(|region| (region.region.region_id.as_str(), region))
+                .collect()
+        });
+        move |region_id, slot| {
+            let Some(regions) = &regions else {
+                return super::Presentation::AsIs;
+            };
+            match regions.get(region_id) {
+                Some(region) => self.place_held(
+                    host_uri,
+                    &region.injection_language,
+                    region_id,
+                    &region.virtual_content,
+                    slot.held.as_ref(),
+                ),
+                None => super::Presentation::Unavailable,
+            }
+        }
+    }
+
     /// Whether every cached push places as is (see [`Self::place_held`]),
     /// so the per-slot placement can be skipped: the rule's shortcut (see
     /// `DocumentTracker::held_texts_matter`) for every region at once — no
