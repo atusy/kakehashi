@@ -479,7 +479,7 @@ fn content_deletions(
     edges: DocumentEdges,
 ) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
     let segment_lines = LineMap::new(segment_text.to_string());
-    let mut deletions = Vec::with_capacity(changes.len());
+    let mut ranges = Vec::with_capacity(changes.len());
     for change in changes {
         if !change.new_text.is_empty() {
             return Err("content changes may only delete text");
@@ -496,6 +496,28 @@ fn content_deletions(
         if start == end {
             continue;
         }
+        ranges.push(start..end);
+    }
+    ranges.sort_by_key(|range| range.start);
+    if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err("content changes overlap");
+    }
+    // Deletions that touch within one line are one: a peer may split a
+    // line's indentation across edits, each but the first then starting
+    // past the line's start. Never across a line break, which would join a
+    // deleted blank line to the next line's indentation into no whole line.
+    let within_line = |range: &Range<usize>| !segment_text[range.clone()].contains(['\n', '\r']);
+    let mut joined: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match joined.last_mut() {
+            Some(last) if last.end == range.start && within_line(last) && within_line(&range) => {
+                last.end = range.end;
+            }
+            _ => joined.push(range),
+        }
+    }
+    let mut deletions = Vec::with_capacity(joined.len());
+    for Range { start, end } in joined {
         let deleted = &segment_text[start..end];
         let absolute = segment_start + start;
         let at_line_start = is_line_start(virtual_text, absolute);
@@ -524,13 +546,6 @@ fn content_deletions(
             return Err("content changes may only delete whole blank lines");
         };
         deletions.push((absolute..segment_start + end, kind));
-    }
-    deletions.sort_by_key(|(range, _)| range.start);
-    if deletions
-        .windows(2)
-        .any(|pair| pair[0].0.end > pair[1].0.start)
-    {
-        return Err("content changes overlap");
     }
     // Whole lines go only from the document's edges, where the host's
     // string syntax drops them (the line break after a Nix `''`, the blank
@@ -2002,6 +2017,91 @@ mod tests {
         )
         .map(|prepared| prepared.text);
         assert_eq!(prepared, Ok("  a\n".to_string()));
+    }
+
+    /// A line's indentation deleted in pieces, in any order, is deleted as
+    /// one: the text is V with those bytes gone, and the map is the one the
+    /// whole deletion gives. Never joined across a line break, so a deleted
+    /// blank line and the next line's indentation still go apart.
+    #[test]
+    fn indentation_deleted_in_pieces_is_deleted_as_one() {
+        let change = |start: (u32, u32), end: (u32, u32)| {
+            json!({"range": {
+                "start": {"line": start.0, "character": start.1},
+                "end": {"line": end.0, "character": end.1}
+            }, "newText": ""})
+        };
+        let prepare = |virtual_text: &str, changes: Vec<serde_json::Value>| {
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                result(json!({"segments": [{"type": "content", "changes": changes}]})),
+            )
+        };
+        // (V, the pieces, the whole deletions, the bytes of V they delete)
+        let cases: [(&str, Vec<_>, Vec<_>, std::ops::Range<usize>); 4] = [
+            (
+                "  a",
+                vec![change((0, 0), (0, 1)), change((0, 1), (0, 2))],
+                vec![change((0, 0), (0, 2))],
+                0..2,
+            ),
+            (
+                "  a",
+                vec![change((0, 1), (0, 2)), change((0, 0), (0, 1))],
+                vec![change((0, 0), (0, 2))],
+                0..2,
+            ),
+            (
+                "  a\n\n\t\t",
+                vec![
+                    change((1, 0), (2, 0)),
+                    change((2, 0), (2, 1)),
+                    change((2, 1), (2, 2)),
+                ],
+                vec![change((1, 0), (2, 0)), change((2, 0), (2, 2))],
+                4..7,
+            ),
+            (
+                "\n  a",
+                vec![change((0, 0), (1, 0)), change((1, 0), (1, 2))],
+                vec![change((0, 0), (1, 0)), change((1, 0), (1, 2))],
+                0..3,
+            ),
+        ];
+        for (virtual_text, pieces, whole, deleted) in cases {
+            let split = prepare(virtual_text, pieces).expect(virtual_text);
+            let joined = prepare(virtual_text, whole).expect(virtual_text);
+            let mut expected = virtual_text.to_string();
+            expected.replace_range(deleted, "");
+            assert_eq!(split.text, expected, "{virtual_text:?}");
+            assert_eq!(split.text, joined.text, "{virtual_text:?}");
+            for line in 0..4 {
+                for character in 0..4 {
+                    for bias in [Bias::Start, Bias::End] {
+                        let at = pos(line, character);
+                        assert_eq!(
+                            split.map.to_virtual(at, bias),
+                            joined.map.to_virtual(at, bias),
+                            "{virtual_text:?} {at:?}"
+                        );
+                        assert_eq!(
+                            split.map.to_prepared(at, bias),
+                            joined.map.to_prepared(at, bias),
+                            "{virtual_text:?} {at:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Overlapping pieces are still refused.
+        assert_eq!(
+            prepare("  a", vec![change((0, 0), (0, 2)), change((0, 1), (0, 2))]),
+            Err(PrepareError::InvalidChange {
+                index: 0,
+                reason: "content changes overlap"
+            })
+        );
     }
 
     #[test]
