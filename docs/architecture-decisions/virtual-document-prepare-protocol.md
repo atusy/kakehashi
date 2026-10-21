@@ -507,11 +507,11 @@ concatenated; under a cross-layer `preferred` a virt answer already
 moved or stale as the layers' race decides is no answer of its layer, and
 the race falls through to the host layer's, while one chosen and then
 dropped — settling as the race decided, or moved since — leaves none
-until asked again), and linked
-editing ranges answer nothing. Under a cross-layer `preferred`, a rename's,
+until asked again), and prepareRename and linked editing ranges answer
+nothing. Under a cross-layer `preferred`, a rename's,
 prepareRename's or linked editing ranges' virt answer already moved or
 stale as the race decides is likewise no answer of its layer: the host
-layer's wins. Code actions and linked editing ranges
+layer's wins. Code actions, prepareRename and linked editing ranges
 wait, as formatting does (below), while the host's last edit settles or a
 region's hold clears: an editor may ask them once right after an edit
 elsewhere (Neovim asks code actions once per keypress), and an answer
@@ -585,8 +585,8 @@ host has and P never showed. Completion answers dropped this way come back
 as an empty incomplete list, which the client asks again for, and inlay
 hints stay shown with only their edits stripped: the answer for the latest
 text still arrives, the cost availability (an answer within a keystroke's
-parse and prepare round-trip), never a misplaced edit; code actions and
-linked editing ranges likewise, though they first wait for the host's last
+parse and prepare round-trip), never a misplaced edit; code actions,
+prepareRename and linked editing ranges likewise, though they first wait for the host's last
 edit to settle (see above). Color presentations are asked once per picker
 interaction, and the formatting methods and renames once per action: they
 wait for the host to settle instead, as the final check described above
