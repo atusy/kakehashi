@@ -31,7 +31,7 @@ use super::super::protocol::{
     translate_virtual_main_and_additional_edits_to_host, translate_virtual_range_to_host,
 };
 use super::keep_additional_edits_if_safe;
-use super::snippet::Expansion;
+use super::snippet::{Expansion, SnippetStandIn};
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
@@ -398,13 +398,10 @@ fn transform_prepared_completion_item(
     // snippet's expansion, every tabstop at its default, kept only when
     // every client expands it alike. The expansion stands in for the
     // snippet through every check below, and the snippet goes out with the
-    // indentation its expansion regained before it (`expanded`). (An
+    // indentation its expansion regained before it (`stand_in`). (An
     // expansion holds no variable, so none is left to expand into lines at
     // the insertion point, as the unprepared path has to check.)
-    let mut expanded: Option<Expansion> = None;
-    // An item without an edit is inserted as its insertText (or label): the
-    // expansion stands in for it, and it is put back as it came.
-    let mut insert_text_sent: Option<Option<String>> = None;
+    let mut stand_in: Option<SnippetStandIn> = None;
     if snippet {
         let inserted = inserted_text(item);
         if inserted.contains(['$', '\\']) {
@@ -421,15 +418,7 @@ fn transform_prepared_completion_item(
             if expansion.text().chars().all(|c| c == ' ') {
                 return false;
             }
-            let text = expansion.text().to_string();
-            match &mut item.text_edit {
-                Some(CompletionTextEdit::Edit(edit)) => edit.new_text = text,
-                Some(CompletionTextEdit::InsertAndReplace(edit)) => edit.new_text = text,
-                None => {
-                    insert_text_sent = Some(item.insert_text.replace(text));
-                }
-            }
-            expanded = Some(expansion);
+            stand_in = Some(SnippetStandIn::install(item, expansion));
         } else {
             // Literal text means the same as plain text, which a client's
             // snippet engine cannot re-indent once more on insertion.
@@ -601,29 +590,12 @@ fn transform_prepared_completion_item(
             "completion: dropped an item's additionalTextEdits ({dropped}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
         );
     }
-    // The snippet goes out where its expansion was checked, expanding to
-    // the text checked: the indentation the map wrote before the expansion
-    // written before the snippet, or the item refused.
-    // One without a tabstop is the text its escapes stand for: it goes out
-    // as that plain text, as checked. Sent as a snippet, a client may take
-    // it as plain text, backslashes and all (mini.completion expands only
-    // text holding a tabstop).
-    if let Some(expansion) = expanded {
-        let plain = !expansion.has_tabstop();
-        if let Some(mapped) = inserted_text_mut(item)
-            && !plain
-        {
-            let Some(snippet) = expansion.carry(mapped) else {
-                return false;
-            };
-            *mapped = snippet;
-        }
-        if plain {
-            item.insert_text_format =
-                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
-        } else if let Some(sent) = insert_text_sent {
-            item.insert_text = sent;
-        }
+    // The snippet goes out where its expansion was checked, or the item is
+    // refused (see `SnippetStandIn::restore`).
+    if let Some(stand_in) = stand_in
+        && !stand_in.restore(item)
+    {
+        return false;
     }
     // A snippet item inserting its label says so: a client may otherwise
     // insert its filterText (mini.completion does), not the text checked.
