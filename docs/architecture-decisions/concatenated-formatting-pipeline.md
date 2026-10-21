@@ -161,7 +161,9 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    line holds text, by all of its lines but the synthetic one after the final
    line break. A blank line's prefix is not the region's: a list item's fence
    may leave its blank lines unindented and a blockquote leaves a blank line's
-   `>` without its space, so blank lines are left out of the LCP. This is exact
+   `>` without its space, so blank lines are left out of the LCP. The first
+   output line follows the first line's own host prefix, so when that line was
+   blank, text on it takes the rest of the common prefix. This is exact
    for the usual uniform-prefix injection (single-level indentation, or a
    uniform `> `) and is a documented limitation for the rare region whose
    per-line prefixes genuinely differ across a line-count change. On **empty**

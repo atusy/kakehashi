@@ -1760,7 +1760,9 @@ fn pipeline_region_text(
 ///   fence may leave them unindented (no prefix) and a blockquote leaves its
 ///   marker without the space (`>`). So the LCP is taken over the rows
 ///   holding text ([`region_common_prefix`]), and output text that lands on a
-///   blank row takes the LCP when the row's own prefix falls short of it.
+///   blank row takes the LCP when the row's own prefix falls short of it. On
+///   the first row, whose own prefix precedes the replacement range, that
+///   means the rest of the LCP, whatever the line count.
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
@@ -1770,11 +1772,6 @@ fn reapply_host_line_prefixes(
     host_line_prefixes: &[String],
 ) -> String {
     let lines = split_lsp_lines(final_text);
-    if lines.len() <= 1 {
-        // Single-line output sits entirely after the first line's host prefix.
-        return final_text.to_string();
-    }
-
     let line_count_preserved = lines.len() == host_line_prefixes.len();
     let blank_rows: Vec<bool> = split_lsp_lines(original_virtual)
         .iter()
@@ -1783,6 +1780,23 @@ fn reapply_host_line_prefixes(
     // The caller sizes the prefixes by the same text's LSP lines.
     debug_assert_eq!(blank_rows.len(), host_line_prefixes.len());
     let lcp = region_common_prefix(host_line_prefixes, &blank_rows);
+
+    // The first output line sits after the first row's own host prefix, so
+    // text on a blank first row takes only the rest of the region's.
+    let first_line_rest = match (
+        host_line_prefixes.first(),
+        blank_rows.first(),
+        lines.first(),
+    ) {
+        (Some(own), Some(true), Some(&(line, _))) if !line.is_empty() => {
+            lcp.strip_prefix(own.as_str()).unwrap_or("")
+        }
+        _ => "",
+    };
+    if lines.len() <= 1 && first_line_rest.is_empty() {
+        // Single-line output sits entirely after the first line's host prefix.
+        return final_text.to_string();
+    }
 
     // Reserve for the prefixes being prepended too (slight over-reserve when
     // empty lines get a trimmed prefix or rows keep their own prefix), so the
@@ -1794,11 +1808,13 @@ fn reapply_host_line_prefixes(
             .map(|prefix| prefix.len().max(lcp.len()))
             .sum()
     } else {
-        (lines.len() - 1) * lcp.len()
+        lines.len().saturating_sub(1) * lcp.len()
     };
-    let mut out = String::with_capacity(final_text.len() + added_len);
+    let mut out = String::with_capacity(final_text.len() + first_line_rest.len() + added_len);
     for (i, &(line, line_end)) in lines.iter().enumerate() {
-        if i > 0 {
+        if i == 0 {
+            out.push_str(first_line_rest);
+        } else {
             let line_is_empty = line.is_empty();
             let prefix = if line_count_preserved {
                 let own = host_line_prefixes[i].as_str();
@@ -2965,6 +2981,44 @@ mod tests {
         );
 
         assert_eq!(text.as_deref(), Some("def f():\n      pass\n\n  x\n"));
+    }
+
+    #[test]
+    fn pipeline_indents_text_it_puts_on_a_list_fence_leading_blank_row() {
+        // The replacement starts after the first row's own prefix, which a
+        // blank first row leaves empty: the first output line needs the rest
+        // of the item's indentation, or it ends the list item.
+        let text = pipeline_region_text(
+            "\na\nb\n",
+            "a\nb\n",
+            &RegionOffset::with_per_line_offsets(3, vec![0, 2, 2, 0]),
+            &[
+                String::new(),
+                "  ".to_string(),
+                "  ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some("  a\n  b\n"));
+    }
+
+    #[test]
+    fn pipeline_spaces_text_it_puts_on_a_blockquoted_fence_leading_blank_row() {
+        // The first row's `>` is already in the host; only its space is not.
+        let text = pipeline_region_text(
+            "\na\nb\n",
+            "a\nb\n",
+            &RegionOffset::with_per_line_offsets(3, vec![1, 2, 2, 0]),
+            &[
+                ">".to_string(),
+                "> ".to_string(),
+                "> ".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(text.as_deref(), Some(" a\n> b\n"));
     }
 
     #[test]
