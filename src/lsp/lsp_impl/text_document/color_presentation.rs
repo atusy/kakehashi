@@ -58,8 +58,8 @@ impl Kakehashi {
         // interaction, not on every keystroke).
         passed_over
             .resolve(race, pool, tracker, current_version, || {
-                // Read only once an answer was kept aside, which only a pool
-                // that prepares keeps.
+                // Read only once a prepared answer was kept aside or
+                // dropped, which only a pool that prepares has.
                 revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision
             })
             .await
@@ -225,12 +225,16 @@ impl ColorAnswer {
     }
 
     /// [`Self::still_current`], the prepared part judged once the host's
-    /// last edit settles (see `bridge_context::sources_verdict`).
+    /// last edit settles (see `bridge_context::sources_verdict`). Dropped,
+    /// the parts left (the host layer's, under `concatenated`) were read
+    /// for the text the request read: they answer only while the host is
+    /// still that text (`unchanged`).
     async fn settled_presentations(
         self,
         pool: &crate::lsp::bridge::LanguageServerPool,
         tracker: &crate::language::NodeTracker,
         current_version: impl Fn() -> Option<u64>,
+        unchanged: impl Fn() -> bool,
     ) -> Vec<ColorPresentation> {
         let keeps = match &self.prepared {
             Some((source, _)) => {
@@ -240,7 +244,11 @@ impl ColorAnswer {
             }
             None => true,
         };
-        self.still_current(|_| keeps)
+        let presentations = self.still_current(|_| keeps);
+        if !keeps && !presentations.is_empty() && !unchanged() {
+            return Vec::new();
+        }
+        presentations
     }
 
     /// The presentations, the prepared part kept only while its edits still
@@ -321,7 +329,7 @@ impl PassedOver {
         unchanged: impl Fn() -> bool,
     ) -> Result<Vec<ColorPresentation>> {
         let mut race = std::pin::pin!(race);
-        let mut settled = std::pin::pin!(self.settled(pool, tracker, &current_version));
+        let mut settled = std::pin::pin!(self.settled(pool, tracker, &current_version, &unchanged));
         let chosen = tokio::select! {
             chosen = &mut race => {
                 let cancelled = matches!(
@@ -346,7 +354,7 @@ impl PassedOver {
         match chosen? {
             Some(_) if self.has_kept() && !unchanged() => Ok(Vec::new()),
             Some(answer) => Ok(answer
-                .settled_presentations(pool, tracker, &current_version)
+                .settled_presentations(pool, tracker, &current_version, &unchanged)
                 .await),
             None => Ok(Vec::new()),
         }
@@ -366,6 +374,7 @@ impl PassedOver {
         pool: &crate::lsp::bridge::LanguageServerPool,
         tracker: &crate::language::NodeTracker,
         current_version: impl Fn() -> Option<u64>,
+        unchanged: impl Fn() -> bool,
     ) -> Vec<ColorPresentation> {
         self.kept_aside.notified().await;
         let kept = self
@@ -375,7 +384,7 @@ impl PassedOver {
             .clone();
         match kept {
             Some(kept) => {
-                kept.settled_presentations(pool, tracker, current_version)
+                kept.settled_presentations(pool, tracker, current_version, unchanged)
                     .await
             }
             None => Vec::new(),
@@ -505,7 +514,7 @@ mod tests {
         }
         assert_eq!(
             answer
-                .settled_presentations(&pool, &tracker, || Some(1))
+                .settled_presentations(&pool, &tracker, || Some(1), || true)
                 .await,
             vec![presentation]
         );
@@ -629,6 +638,72 @@ mod tests {
                 ),
                 _ => {}
             }
+        }
+    }
+
+    /// Under `concatenated`, a prepared part dropped as the host's last
+    /// edit settles leaves the host layer's part, read for the text the
+    /// request read: it answers only while the host is still that text.
+    #[tokio::test(start_paused = true)]
+    async fn a_merged_host_part_outlives_a_dropped_prepared_part_only_on_unchanged_text() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        let prepare = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let presentation = |label: &str| ColorPresentation {
+            label: label.to_string(),
+            text_edit: None,
+            additional_text_edits: None,
+        };
+        for unchanged in [true, false] {
+            let prepared = prepare("  red\n");
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            let host = url::Url::parse("file:///test/color-merged.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "css", &region, &prepared);
+            pool.note_host_edited(&host, 1, 1);
+            {
+                let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let other = prepare("  blue\n");
+                    pool.record_latest_prepared_for_test(&host, 1, "css", &region, &other);
+                    pool.note_host_settled(&host, 1, 1);
+                });
+            }
+            let merged = ColorAnswer::unprepared(vec![presentation("host")]).combine(
+                ColorAnswer::from_layer(Sourced::prepared_for_test(
+                    vec![presentation("virt")],
+                    &host,
+                    "css",
+                    &region,
+                    &prepared.map,
+                    1,
+                    1,
+                )),
+            );
+            let labels = merged
+                .settled_presentations(&pool, &tracker, || Some(1), || unchanged)
+                .await
+                .into_iter()
+                .map(|presentation| presentation.label)
+                .collect::<Vec<_>>();
+            let expected: &[&str] = if unchanged { &["host"] } else { &[] };
+            assert_eq!(labels, expected, "unchanged: {unchanged}");
         }
     }
 

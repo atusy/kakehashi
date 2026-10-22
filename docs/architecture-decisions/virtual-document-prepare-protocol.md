@@ -372,7 +372,8 @@ still running), a stale incomplete completion list still asking to
 re-query; they read it once more as they return the answer, with no await
 since the race decided. Under `concatenated`, color presentations read it
 once, after every layer answered: a stale prepared part is dropped from
-the merged answer, the host layer's part kept. Inlay hints read it only
+the merged answer, the host layer's part kept while the host is still the
+text the request read. Inlay hints read it only
 once the answer is chosen: a stale answer's hints stay shown without
 their edits, which keeps more than the host layer's answer would give.
 The answer is checked against:
