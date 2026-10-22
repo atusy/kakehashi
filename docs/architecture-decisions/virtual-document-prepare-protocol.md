@@ -422,7 +422,14 @@ never settles is dropped when the wait ends. The warning says which.
 Dropped (moved, stale or unsettled), the whole answer is dropped (the host's own formatter's edits and
 those of regions still current too) and the request is counted failed, so
 `kakehashi format` exits 2 and writes nothing (range and on-type
-formatting, which no one-shot run makes, answer nothing). A reply its map
+formatting, which no one-shot run makes, answer nothing). Under the
+`preferred` strategy, a formatting answer dropped as stale or unsettled
+gives way to the host layer's answer when that layer is in the race
+(waited for if still running) and the host is still the text the request
+read (not edited, nor closed and reopened): read for that text, it lost
+only to the answer dropped, so it answers and the request is not counted
+failed. Dropped as moved, nothing stands in: the host layer's edits were
+read for the text the host moved from too. A reply its map
 refuses counts as that server failing, as any failed reply does:
 `kakehashi format` exits 2 when no other server formats the region.
 On-type formatting is the exception: an answer refused, or dropped at the
