@@ -5359,6 +5359,7 @@ mod reopen_order_tests {
                     injection_regions: None,
                     regions: None,
                     layer_trees: Arc::new(std::sync::OnceLock::new()),
+                    awaiting_reparse: false,
                 }
             )));
         }
@@ -5931,6 +5932,7 @@ mod reopen_order_tests {
                     injection_regions: None,
                     regions: None,
                     layer_trees: Arc::new(std::sync::OnceLock::new()),
+                    awaiting_reparse: false,
                 }))
             );
             hosts.push(host);

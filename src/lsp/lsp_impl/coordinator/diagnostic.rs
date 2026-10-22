@@ -718,6 +718,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }),
         );
         assert!(installed.current && installed.published);
@@ -765,6 +766,7 @@ mod tests {
                         injection_regions: None,
                         regions: None,
                         layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                        awaiting_reparse: false,
                     }),
                 )
                 .current
