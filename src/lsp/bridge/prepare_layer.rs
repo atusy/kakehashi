@@ -657,8 +657,8 @@ impl super::BridgeCoordinator {
     /// `injections` (the regions sent now), settling what an earlier save of
     /// that version left them owed — but for regions whose save some
     /// connection was refused (their answer revoked or superseded there
-    /// since it was looked up): they still miss a save of this version, and
-    /// stay owed for the resync to forward.
+    /// since it was looked up): they miss a save of this version, and are
+    /// owed it for the resync the newer answer (or the failure) brings.
     pub(crate) async fn forward_did_save(
         &self,
         host_uri: &Url,
@@ -676,9 +676,11 @@ impl super::BridgeCoordinator {
             content_version,
             injections
                 .iter()
-                .map(|injection| injection.region_id.as_str())
-                .filter(|region_id| !refused.iter().any(|refused| refused == region_id)),
+                .map(|injection| injection.region_id.as_str()),
         );
+        if !refused.is_empty() {
+            self.hold_save(host_uri, incarnation, content_version, refused);
+        }
     }
 
     /// Take the save `host_uri`'s held regions missed, if any.
@@ -1230,18 +1232,19 @@ mod tests {
 
     /// A save forwarded with an answer superseded on a connection since it
     /// was looked up (a request opened the region with a newer answer for
-    /// the same input) is refused there: the region still misses a save of
-    /// that version and stays owed. Forwarded with the answer the connection
-    /// holds, it is sent and settles the debt.
+    /// the same input) is refused there: the region misses a save of that
+    /// version and is owed it, whether or not an earlier save already was.
+    /// Forwarded with the answer the connection holds, it is sent and
+    /// settles any debt.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_save_refused_for_a_superseded_answer_stays_owed() {
+    async fn a_save_refused_for_a_superseded_answer_is_owed() {
         use super::super::coordinator::BridgeInjection;
         use super::super::pool::{ConnectionKey, SentText, test_helpers};
         use super::super::protocol::{
             Revocation, VirtualDocumentUri, VirtualLayout, apply_prepare_result_at,
         };
-        for superseded in [true, false] {
+        for (superseded, owed_before) in [(true, true), (true, false), (false, true)] {
             let dir = tempfile::tempdir().unwrap();
             let wire = dir.path().join("wire");
             let pool = Arc::new(LanguageServerPool::preparing());
@@ -1284,8 +1287,10 @@ mod tests {
                     map: Some(&newer),
                 },
             );
-            // An earlier save of this version missed the region.
-            coordinator.hold_save(&host, 1, 2, [region_id.clone()]);
+            if owed_before {
+                // An earlier save of this version missed the region.
+                coordinator.hold_save(&host, 1, 2, [region_id.clone()]);
+            }
             let (content, map) = if superseded {
                 ("print(1)", saved)
             } else {
@@ -1306,8 +1311,13 @@ mod tests {
             let owed = coordinator.take_held_save(&host);
             if superseded {
                 assert_eq!(
-                    owed.map(|held| held.region_ids.into_iter().collect::<Vec<_>>()),
-                    Some(vec![region_id])
+                    owed.map(|held| (
+                        held.incarnation,
+                        held.content_version,
+                        held.region_ids.into_iter().collect::<Vec<_>>()
+                    )),
+                    Some((1, 2, vec![region_id])),
+                    "owed before: {owed_before}"
                 );
             } else {
                 assert_eq!(owed, None);
