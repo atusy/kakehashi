@@ -366,7 +366,8 @@ impl Kakehashi {
             // formats: one that would not, being unplanned or its span taken,
             // sends no request, so its peer is not waited for and no failure
             // of it is counted. One closed or unprepared takes no span, and
-            // one unprepared counts only if no later alternative formats it.
+            // one unprepared counts unless a later alternative answers for
+            // the span (an empty answer, already formatted, included).
             let gate = match self
                 .method_gate(uri, language_name, resolved, "textDocument/formatting")
                 .await
@@ -378,6 +379,7 @@ impl Kakehashi {
             if spans.admit(span, gate).is_none() {
                 continue;
             }
+            let owed = spans.owes(span);
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
@@ -469,6 +471,7 @@ impl Kakehashi {
                         host_line_prefixes,
                         region_cancel_rx,
                         request_error_sink,
+                        owed,
                     )
                     .await
                 } else {
@@ -479,15 +482,17 @@ impl Kakehashi {
                         region_cancel_rx,
                         request_error_sink,
                         region_cp_tokens,
+                        owed,
                     )
                     .await
                 }
             });
         }
 
-        // A span no alternative could format for want of its prepared text
-        // is left unformatted: a failed request (`kakehashi format` exits 2),
-        // as `diagnose` counts it.
+        // A span no alternative could be asked to format for want of its
+        // prepared text is left unformatted: a failed request (`kakehashi
+        // format` exits 2), as `diagnose` counts it. One a later alternative
+        // took counts in that alternative's task, if it gets no answer.
         count_request_errors(&cancel_state.request_error_sink, spans.unprepared());
 
         // One teardown guard for the whole request, held across the edit
@@ -880,7 +885,14 @@ impl SpanReservations {
         Some(ctx)
     }
 
-    /// How many spans no alternative formats for want of prepared text.
+    /// Whether an earlier alternative for `span` could not be prepared:
+    /// the one that takes it then answers for it, or the span counts as
+    /// left unformatted.
+    pub(super) fn owes(&self, span: (usize, usize)) -> bool {
+        self.unprepared.contains(&span)
+    }
+
+    /// How many spans no alternative takes for want of prepared text.
     pub(super) fn unprepared(&self) -> usize {
         self.unprepared.difference(&self.reserved).count()
     }
@@ -902,6 +914,9 @@ async fn dispatch_preferred_formatting(
     region_cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
     client_progress_tokens: Option<std::collections::HashMap<String, NumberOrString>>,
+    // An earlier same-span alternative could not be prepared (see
+    // `SpanReservations::owes`): one failure, unless a server answers.
+    owed: bool,
 ) -> Option<Vec<TextEdit>> {
     let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
         let options = options.clone();
@@ -961,6 +976,9 @@ async fn dispatch_preferred_formatting(
     // non-winners merely returned empty); `Done`/`Cancelled` count nothing
     // (#503).
     count_no_winner_errors(&result, &request_error_sink);
+    if owed && matches!(result, FanInResult::NoResult { .. }) {
+        count_request_errors(&request_error_sink, 1);
+    }
     match result {
         FanInResult::Done(edits) => edits,
         FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
@@ -1014,6 +1032,7 @@ async fn dispatch_preferred_formatting(
 /// the bridge reader (ADR Decision point 7; `is_scratch_publish_diagnostics`
 /// in `src/lsp/bridge/actor/reader.rs`), so the scratch documents this run
 /// opens can never surface speculative diagnostics to the editor.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_concatenated_formatting(
     region_ctx: &DocumentRequestContext,
     pool: Arc<crate::lsp::bridge::LanguageServerPool>,
@@ -1027,7 +1046,15 @@ async fn dispatch_concatenated_formatting(
     host_line_prefixes: Vec<String>,
     cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
+    // An earlier same-span alternative could not be prepared (see
+    // `SpanReservations::owes`): one failure, unless a step answers.
+    owed: bool,
 ) -> Option<Vec<TextEdit>> {
+    // Whether any step answered, an empty answer (already formatted)
+    // included: the pipeline's text alone does not tell that from no step
+    // answering.
+    let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owed_sink = request_error_sink.clone();
     let offset = RegionOffset::with_per_line_offsets(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
@@ -1037,7 +1064,12 @@ async fn dispatch_concatenated_formatting(
     // `original_virtual`, so it can be moved into the pipeline below without a
     // second clone. An unresolvable end position means we emit no edit (bounded
     // -range safety) — so bail before doing any downstream work.
-    let replacement_range = region_replacement_range(&original_virtual, &offset)?;
+    let Some(replacement_range) = region_replacement_range(&original_virtual, &offset) else {
+        if owed {
+            count_request_errors(&owed_sink, 1);
+        }
+        return None;
+    };
     let injection_language = region_ctx.resolved.injection_language.clone();
     let region_id = region_ctx.resolved.region.region_id.clone();
     let uri = region_ctx.uri.clone();
@@ -1113,6 +1145,7 @@ async fn dispatch_concatenated_formatting(
     let pipeline_fut = run_sequential_format_pipeline(original_virtual, &server_names, {
         let pool = Arc::clone(&pool);
         let open_scratch = Arc::clone(&open_scratch);
+        let answered = Arc::clone(&answered);
         move |server_name, current_text| {
             let pool = Arc::clone(&pool);
             let options = options.clone();
@@ -1126,6 +1159,7 @@ async fn dispatch_concatenated_formatting(
             let host_uri_lsp = host_uri_lsp.clone();
             let open_scratch = Arc::clone(&open_scratch);
             let request_error_sink = request_error_sink.clone();
+            let answered = Arc::clone(&answered);
             async move {
                 // No config for this server name: skip-and-continue, handing the
                 // unchanged text back to the pipeline (ADR Decision point 6).
@@ -1409,6 +1443,9 @@ async fn dispatch_concatenated_formatting(
                 // removed, leaking it. The scratch doc stays tracked in
                 // `open_scratch` (registered above) for the guard to close.
 
+                if result.is_some() {
+                    answered.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Hand the (unchanged) virtual text back to the pipeline along
                 // with the result so the pipeline can move it forward without a
                 // per-step clone.
@@ -1445,6 +1482,9 @@ async fn dispatch_concatenated_formatting(
     // Scratch cleanup is handled entirely by `_scratch_guard`'s Drop below.
     if cancelled {
         return None;
+    }
+    if owed && !answered.load(std::sync::atomic::Ordering::Relaxed) {
+        count_request_errors(&owed_sink, 1);
     }
 
     let final_text = pipeline_region_text(
@@ -2134,6 +2174,14 @@ mod tests {
         // unformatted.
         assert_eq!(spans.admit::<&str, ()>((5, 9), Err(())), None);
         assert_eq!(spans.unprepared(), 1);
+        // The alternative taking a span after an unprepared one answers
+        // for it; one taking it first owes nothing.
+        assert!(spans.owes((0, 4)));
+        assert_eq!(spans.admit::<_, ()>((5, 9), Ok(Some("lua"))), Some("lua"));
+        assert!(spans.owes((5, 9)));
+        assert_eq!(spans.unprepared(), 0);
+        assert_eq!(spans.admit::<_, ()>((10, 14), Ok(Some("lua"))), Some("lua"));
+        assert!(!spans.owes((10, 14)));
     }
 
     #[test]

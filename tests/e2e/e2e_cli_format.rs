@@ -795,6 +795,142 @@ languages = ["lua", "peerlang"]
     );
 }
 
+/// `peerlang`, found first, has a failing peer, so it takes no span; lua,
+/// after it, is served as `lua_config` (TOML) says. Runs `kakehashi format`
+/// on the workspace and returns its output with the workspace.
+fn format_after_a_failed_prepare_alternative(
+    markdown: &str,
+    lua_config: &str,
+) -> (std::process::Output, tempfile::TempDir) {
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("injections.scm"),
+        r#"
+(fenced_code_block
+  (code_fence_content) @injection.content
+  (#set! injection.language "peerlang"))
+
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+"#,
+    )
+    .expect("write injection query");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown]
+queries = [{{ path = "injections.scm", kind = "injections" }}]
+
+[languages.markdown.bridge.peerlang.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["peerlang"]
+
+[languageServers.mock-peerlang]
+cmd = ['{bin}', 'upper']
+languages = ["peerlang"]
+
+{lua_config}
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter"),
+            lua_config = lua_config.replace("{bin}", env!("CARGO_BIN_EXE_mock-lsp-formatter")),
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    (output, ws)
+}
+
+#[test]
+fn e2e_format_counts_a_failed_prepare_peer_whose_span_a_later_alternative_takes_but_never_formats()
+{
+    // lua takes the span, but its only server formats nothing (it
+    // advertises no formatting): no alternative answered for the span the
+    // failing peer left, so it is left unformatted, and the run exits 2.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languageServers.mock-definition]
+cmd = ['{bin}', 'definition']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a span no alternative answered for must count its peer's failure; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_counts_a_failed_prepare_peer_whose_span_a_later_pipeline_takes_but_never_formats() {
+    // The same under the concatenated pipeline: its only step advertises
+    // no formatting, so no step answers, and the run exits 2.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-definition"]
+
+[languageServers.mock-definition]
+cmd = ['{bin}', 'definition']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a span no pipeline step answered for must count its peer's \
+         failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_whose_span_a_later_pipeline_finds_formatted() {
+    // The pipeline's step answers, but the span is already formatted, so
+    // it changes nothing: an answer all the same, and the run exits 0.
+    let markdown = "# Test\n\n```lua\nPRINT('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-upper"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an already formatted span is answered; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
 #[test]
 fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
     // The same region, prepared by its peer, is no failure: the run
