@@ -2911,3 +2911,28 @@ fn a_closing_indent_after_content_left_alone_is_no_indent_to_regain() {
         .unwrap();
     assert_eq!(apply_to(virtual_text, &[inserted]), "a\nz\n  ");
 }
+
+#[test]
+fn many_edits_on_one_long_line_look_at_it_in_linear_work() {
+    // Each edit asks whether the rest of its line is blank; asked by
+    // scanning to the line's end, edits on one long line cost edits ×
+    // line length.
+    // Text, and text followed by a long run of spaces.
+    for body in ["ab".repeat(4_000), format!("a{}", " ".repeat(7_999))] {
+        let virtual_text = format!("  {body}\n");
+        let map = dedent_by_two(&virtual_text);
+        let edits: Vec<_> = (0..4_000u32)
+            .map(|column| edit((0, 2 * column + 1), (0, 2 * column + 1), "x"))
+            .collect();
+        let blank_scanned = || super::super::tests::BLANK_SCANNED.with(std::cell::Cell::get);
+        let before = blank_scanned();
+        let mapped = map.map_edits(&edits, EditMode::Extent).unwrap();
+        let scanned = blank_scanned() - before;
+        assert_eq!(mapped.len(), edits.len());
+        assert!(
+            scanned <= 2 * virtual_text.len(),
+            "{scanned} bytes scanned for a {}-byte line",
+            virtual_text.len()
+        );
+    }
+}

@@ -441,7 +441,11 @@ impl PreparedMap {
             starts_virtual_line: is_line_start(virtual_text, virtual_start),
             starts_prepared_line_or_after_gap: is_line_start(prepared, old.start) || after_gap,
             ends_virtual_line: is_line_end(virtual_text, virtual_start),
-            virtual_rest_blank: rest_of_line_blank(virtual_text, virtual_start),
+            // Read only where `first_indent` does: a whitespace-only rest
+            // of a long line is not scanned again for every edit on it.
+            virtual_rest_blank: whole_lines
+                && is_line_start(virtual_text, virtual_start)
+                && rest_of_line_blank(virtual_text, virtual_start),
             text_breaks_line: new_text.contains(['\n', '\r']),
             tail,
             text_joins_line: new_text.is_empty() || begins_line(following),
