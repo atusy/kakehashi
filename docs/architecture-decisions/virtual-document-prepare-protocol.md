@@ -428,8 +428,8 @@ formatting, which no one-shot run makes, answer nothing). Under the
 gives way to the host layer's answer when that layer is in the race
 (waited for if still running) and the host is still the text the request
 read (not edited, nor closed and reopened): read for that text, it lost
-only to the answer dropped, so it answers and the request is not counted
-failed. Dropped as moved, nothing stands in: the host layer's edits were
+only to the answer dropped, so it answers (an empty answer, already
+formatted, too) and the request is not counted failed. Dropped as moved, nothing stands in: the host layer's edits were
 read for the text the host moved from too. Color presentations hold the
 same rule for an answer the race passed over while it settled: the host
 layer's answer stands in for it, dropped as it settles, only while the
