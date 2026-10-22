@@ -327,8 +327,10 @@ pub(crate) struct DocumentTracker {
     /// connection computed may be in a prepared text's, which no record says
     /// any more. Written under `document_fingerprints`'s lock, as a prepared
     /// text is recorded (a take-back keeps it: conservative), read under it
-    /// too (that lock first). Dropped with the connection, and with its host.
-    /// Keyed by virtual URI, with the host URI each belongs to.
+    /// too (that lock first). Kept past a purge of the connection's records
+    /// (see `purge_connection`), and dropped only as its host closes (see
+    /// [`Self::forget_prepared_history`]), regions closed before it
+    /// included. Keyed by virtual URI, with the host URI each belongs to.
     prepared_history: std::sync::Mutex<HashMap<ConnectionKey, HashMap<String, String>>>,
     /// Tracks which virtual documents were opened for each host document.
     ///
