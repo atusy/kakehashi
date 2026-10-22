@@ -812,18 +812,23 @@ impl DocumentTracker {
                 .document_fingerprints
                 .lock()
                 .recover_poison("DocumentTracker::document_fingerprints");
-            if let Some(held) = fingerprints
+            let held = fingerprints
                 .get_mut(connection_key)
-                .and_then(|docs| docs.get_mut(&uri_string))
-                .filter(|held| held.fingerprint == fp)
+                .and_then(|docs| docs.get_mut(&uri_string));
+            // An answer taken before the one held for the same input (a
+            // stale pass, repair or save carrying it), whatever its text, is
+            // neither held nor sent: the input's answer never moves
+            // backwards. The record stays.
+            if held
+                .as_ref()
+                .is_some_and(|held| PreparedMap::taken_before(content.map, held.map.as_ref()))
             {
+                return None;
+            }
+            if let Some(held) = held.filter(|held| held.fingerprint == fp) {
                 // A map revoked since its text was admitted (across an
-                // await), or an answer taken before the one held (a stale
-                // pass or repair carrying it), is held through no path: the
-                // record stays.
-                if content.map.is_some_and(|map| map.revoked())
-                    || PreparedMap::taken_before(content.map, held.map.as_ref())
-                {
+                // await) is held through no path: the record stays.
+                if content.map.is_some_and(|map| map.revoked()) {
                     return None;
                 }
                 // Another answer, however alike in coordinates (the same text
