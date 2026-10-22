@@ -271,6 +271,15 @@ impl Kakehashi {
         let prepare_answers_then = self.bridge.prepare_host_answers(&uri);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
+            // Every region's prepare attempt started before any is waited
+            // for: the waits in the loop below then share attempts already
+            // running, the pull waiting about the slowest, not one after
+            // another.
+            crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+                &self.bridge,
+                language_name,
+                virt_regions.iter().map(|resolved| (&uri, resolved)),
+            );
             for resolved in virt_regions.iter() {
                 let mut configs = self.bridge_configs_for_injection_language(
                     language_name,
@@ -337,8 +346,8 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                // The lifecycle pass has started every region's attempt
-                // already: waiting for each in turn costs the slowest one.
+                // Its attempt already running (see above): waiting for each
+                // in turn costs the slowest one.
                 let region_ctx =
                     match crate::lsp::lsp_impl::bridge_context::prepare_request_context(
                         &self.bridge,
