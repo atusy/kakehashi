@@ -48,6 +48,15 @@ impl Kakehashi {
             if !self.host_incarnation_is_current(&uri, envelope.incarnation) {
                 return Ok(params);
             }
+            // An item minted from a prepared document never resolves (see
+            // `completion_geometry_matches`). It is refused here, before a
+            // connection, a parse wait or the edit lock, which a client
+            // resolving on every selection move would otherwise pay each
+            // time; the item goes back with its envelope kept, as every later
+            // refusal returns it.
+            if envelope.offset.prepared {
+                return Ok(params);
+            }
         }
         let unresolved = envelope.as_ref().map(|_| params.clone());
         let settings = self.settings_manager.load_settings();

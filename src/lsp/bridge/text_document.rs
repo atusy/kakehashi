@@ -64,3 +64,31 @@ pub(crate) use type_hierarchy::{
     TypeHierarchyDocumentRevision, TypeHierarchyEnvelope, envelope_host_type_hierarchy_items,
     extract_type_hierarchy_envelope, parse_type_hierarchy_items,
 };
+
+/// Drop an item's additional edits whole unless they were `kept` with its
+/// main edit and every one is safe in the injection region
+/// (`text_edit_safe_in_region`). ALL-OR-NOTHING: the array can carry paired
+/// halves of one operation (a deletion plus a reinsertion), so stripping
+/// only the unsafe member could apply half and lose content. The item is
+/// kept: its main edit still applies, though possibly semantically
+/// incomplete (e.g. without its auto-import) — availability over fidelity,
+/// never corruption. `Some(count)` of the edits dropped, for the caller to
+/// log.
+fn keep_additional_edits_if_safe(
+    additional: &mut Option<Vec<tower_lsp_server::ls_types::TextEdit>>,
+    kept: bool,
+    offset: &super::protocol::RegionOffset,
+    region_end: tower_lsp_server::ls_types::Position,
+) -> Option<usize> {
+    let edits = additional.as_ref()?;
+    if kept
+        && edits
+            .iter()
+            .all(|edit| super::protocol::text_edit_safe_in_region(edit, offset, region_end))
+    {
+        return None;
+    }
+    let dropped = edits.len();
+    *additional = None;
+    Some(dropped)
+}

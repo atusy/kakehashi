@@ -32,8 +32,9 @@ coordinate bookkeeping itself. The peer is any language server that
 advertises the request; tsudoi-language-server is the intended one, since
 its handlers are user code.
 
-Edits are not mapped back through a prepared document: methods whose
-answers are edits are not available on one (see Coordinates).
+Edits a downstream server makes to a prepared document are mapped back
+through the same map (see Edits); methods whose edits are not mapped that
+way are not available on one (see Coordinates).
 
 ### Configuration and Discovery
 
@@ -188,18 +189,173 @@ request is not made at all at a host position with no corresponding
 position in P, such as one strictly inside a gap or on a deleted edge line,
 since the server would answer it for another place.
 
-No edit is mapped back through a prepared document. The methods closed to
-a non-contiguous combined document — codeAction, colorPresentation,
-completion, formatting, inlayHint, linkedEditingRange, onTypeFormatting,
-prepareRename, rangeFormatting, rename — are closed to a prepared one too,
-as is an inbound `workspace/applyEdit` computed for a prepared text, but
-for inlay hints: they stay available on a contiguous prepared document
-(they are display), with each hint's `textEdits` dropped.
+The methods closed to a non-contiguous combined document — codeAction,
+colorPresentation, completion, formatting, inlayHint, linkedEditingRange,
+onTypeFormatting, prepareRename, rangeFormatting, rename — are closed to a
+prepared one too, as is an inbound `workspace/applyEdit` computed for a
+prepared text, but for completion, inlay hints and color presentations:
+they stay available on a contiguous prepared document, their edits mapped
+as Edits describes.
 A `*/resolve` envelope minted from a prepared document never resolves,
 nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
 `typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
 not carried.
+
+### Edits
+
+An edit a server makes to P maps onto V keeping its extent: its range maps
+as positions do, except that a change starting at a line start that
+replaces, clears or deletes whole lines, or opens with a line break, also
+covers the indentation the peer removed from that line, and a change ending
+at a line start keeps that line's own removed indentation (the change takes
+it along and gives it back). Every line the edit's text begins regains the
+indentation the peer removed from the segment it lands in, provided every
+indentation the peer removed from the segment's content lines is the same
+(lines it left alone do not count, nor do whitespace-only lines, but in a
+segment holding nothing else); otherwise an edit creating a line of text
+that would regain it there is refused, since no single indentation is right
+(a blank line needs none, and the existing line an edit ends before keeps its
+own). A segment that says nothing of its
+indentation (no indentation removed, and no block of text opening a line
+of its own: the rest of a line after an interpolation, blank lines)
+regains the segment's before it. The document's deleted indentation-only
+last line (the indentation before a closing `''`) counts only in a segment
+of whitespace alone, with no other indentation removed and no closing
+lines deleted with it: a created line never takes host layout's
+indentation over the content's (nixfmt's shallower closing indent), nor
+any beside content left at column 0. Lines inserted at that last line's
+start are content lines: they go before its indentation, which the text
+after their last line break, if any, joins.
+
+A set of edits the client applies together (a hint's `textEdits`, a
+completion item's or color presentation's main edit with its
+`additionalTextEdits`) is mapped one by one and checked as a whole on the
+edited V. It is refused, and dropped like any unsafe set, when:
+
+- an edit is reversed, or reaches a line past P's last; edits overlap in
+  P or once mapped; or edits touch
+  (one ending where another starts, or two inserting at one place) at a
+  line start, or with a line break or no text on the side where they meet:
+  how each regains a removed indent, or where a CR and an LF meet, depends
+  on the other's text — but for lines inserted at a line start before an
+  edit starting there with text (an import above the line a completion
+  rewrites), which keep to their own lines, provided the host has a line
+  start there too and both map to the same place;
+- an edge of a mapped edit falls between a CR and an LF of V, where no LSP
+  position is;
+- an edit reaches into a gap's text (or, for a gap the peer emptied,
+  spans its position);
+- host text starting a line in V — a gap such as the fences between two
+  combined blocks, or the document's deleted closing lines — would no
+  longer start one;
+- a line break P hides — a deleted edge line's, or a replaced gap's — would
+  fuse with one beside it into a single CRLF;
+- a CR and an LF would meet at an edit's edge in one document but not in
+  the other (a CR inserted before an LF P shows right after a gap it
+  emptied: one line break in P, two in V).
+
+No edit in P reaches into the deleted edge lines or the closing indent
+deleted with them: P has no position inside them.
+
+An answer's edits are mapped only while they would land where the server
+meant them. This is read where an answer is chosen, not as each reply
+arrives: the servers' fan-in or the layer race can hold an answer while
+the host moves, and a reply refused on arrival would count as no answer,
+so a server ranked below it whose reply came once the host settled (with
+the region's content unchanged, after an edit to another fence or a hold
+clearing) would win against the configured order. A reply is mapped
+through its request's map whatever happened since. Completion, and color
+presentations under the `preferred` strategy, read it as the layer race
+decides on the injected layer's answer: a stale one is no answer of that
+layer, and the race falls through to the host layer's (waited for if
+still running), a stale incomplete completion list still asking to
+re-query; they read it once more as they return the answer, with no await
+since the race decided. Under `concatenated`, color presentations read it
+once, after every layer answered: a stale prepared part is dropped from
+the merged answer, the host layer's part kept. Inlay hints read it only
+once the answer is chosen: a stale answer's hints stay shown without
+their edits, which keeps more than the host layer's answer would give.
+The answer is checked against:
+
+- the host was edited since the request's text was read (anywhere: an
+  edit above the region moves the host coordinates its edits were
+  translated to, though the region's text and map stay the same) —
+  dropped, when the final answer is chosen;
+- the region is no longer live (no longer tracked under the host
+  lifetime the request's content version was read under, as it was when
+  the answer was made: deleted, invalidated by an edit over it, its host
+  closed or reopened, before or after the request's text was read) —
+  dropped;
+- the host's last edit has not been settled yet (its parse or lifecycle
+  pass still running, so the recorded text may predate it), or the
+  host's newer text waits for its prepare answer — dropped;
+- the peer failed the request's input (see Failure; a reply arriving
+  after that is refused whole, and one the failure lands under keeps no
+  edit) — dropped;
+- live, and nothing recorded for the region yet (opened, no pass has
+  recorded its text) — kept;
+- recorded with the request's very text in the very same coordinates —
+  kept;
+- anything else recorded (typed on, re-indented, or, with the host
+  unedited, sent as is or answered anew after an epoch move, or the
+  region rerouted to another language) — dropped.
+
+Dropped, completion answers nothing (an empty incomplete list when it
+asked to re-query), color presentations answer nothing, and inlay hints
+stay shown without their edits.
+
+Unlike on an unprepared document, an answer overtaken by typing is
+dropped, not kept stale. How an edit maps back depends on the whole text
+— which lines are blank, what an inserted line joins, which indentation
+a created line regains — so no text but the request's is known to place
+it as the server meant, and a stale edit could land in indentation the
+host has and P never showed. Clients ask again on every keystroke, so the
+answer for the latest text still arrives and is kept: the cost is
+availability (an answer within a keystroke's parse and prepare
+round-trip), never a misplaced edit.
+
+A color presentation without a `textEdit` replaces the request range with
+its label; on a prepared document that edit is made explicit and mapped
+like any other. A request range reaching into a gap stands for host text no
+presentation may replace (with the gap emptied, its prepared range is even
+empty, and an edit there would only insert beside it), and one right after
+an emptied gap reaches the server where the gap's start does, an edit there
+mapping back before the gap: for either, no presentation is returned.
+Additional edits refused with the main edit are dropped, the main edit kept
+as it maps alone.
+
+Completion keeps to what the client inserts where it asked:
+
+- A caret inside indentation or blank lines the peer removed (or from
+  where the deleted closing lines start) gets no completion: the server
+  sees it elsewhere, and its items would edit away from it.
+- An item's edit must contain the caret once mapped (a caret right after a
+  gap the peer emptied reaches the server where the gap's start does); an
+  insert/replace edit maps through both ranges, which must start at the
+  same position as sent, map the shared text alike and keep their shared
+  start.
+- A snippet is kept only when it is literal text: what a client expands
+  tabstops, placeholders, variables or escapes to is not the text checked.
+  Kept, it is sent as plain text, which no snippet engine re-indents.
+- An item without a `textEdit` is inserted at the caret, outside the map:
+  it is dropped when its text breaks a line; where the same text as an
+  edit at the caret regains an indent (a blank line among dedented ones,
+  or one the peer emptied of other whitespace, which that edit replaces
+  on the caret's line), it goes out as that edit, its additional edits
+  checked with it; inserted at the caret as is, it drops them, having no
+  main edit to be checked with.
+- A mapped multi-line edit already regained the removed indentation: the
+  item asks a client that supports it to insert as is, and is dropped for
+  one that always adjusts indentation.
+- An incomplete list without items (the server's own, or one whose every
+  item did not map back) is no result: it would win over another server's
+  items. Its ask to re-query still stands when the server ranks above the
+  layer's winning server, since the next keystroke may move the caret to
+  where its items map: the winning list is marked incomplete. With no
+  items in the layer, the host layer's answer is marked incomplete when it
+  came after the injected layer finished, and nothing at all answers an
+  empty incomplete list.
 
 ### Failure
 
@@ -406,9 +562,11 @@ a hook per kind of change.
 - With experimental features on, a language's first document waits for its
   servers' handshakes to learn whether any prepares it, even when none
   does.
-- Edit-producing methods (completion, code actions, rename, formatting and
-  the others listed in Coordinates) and inbound `workspace/applyEdit` are
-  not available on prepared documents; inlay hints lose their edits.
+- Edit-producing methods other than completion, inlay hints and color
+  presentations (code actions, rename, formatting and the others listed in
+  Coordinates) and inbound `workspace/applyEdit` are not available on
+  prepared documents; completion items there are snippets only as literal
+  text, and are not resolved.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than

@@ -5,6 +5,10 @@
 //! label fallback at the request position) is unsafe for the injection region —
 //! escape it, break per-line `> ` prefixes, or merge content into the closing
 //! fence — if applied verbatim (see `transform_completion_item`).
+//! On a prepared document the items' edits map back through its map,
+//! re-indented; a literal snippet goes out as plain text, and an item without
+//! an edit is made an explicit one where its text at the caret regains an
+//! indent, or dropped where it would map off the caret.
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -19,11 +23,13 @@ use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    response_has_jsonrpc_error, text_edit_safe_in_region,
+    EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    build_position_based_request, host_position_in_removed_indent, response_has_jsonrpc_error,
+    text_edit_safe_in_region, translate_virtual_main_and_additional_edits_to_host,
+    translate_virtual_range_to_host,
 };
+use super::keep_additional_edits_if_safe;
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
@@ -50,6 +56,15 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Option<CompletionList>> {
+        // Inside indentation or blank lines the prepare peer removed, the
+        // server sees the caret elsewhere (the line's content, the
+        // document's start, the content's end): its items would replace text
+        // away from the caret the client asked at, which LSP requires an
+        // edit's range to contain, and one without an edit would be inserted
+        // there outside any mapping.
+        if host_position_in_removed_indent(host_position, &offset) {
+            return Ok(None);
+        }
         let host_incarnation = self.current_host_incarnation(host_uri);
         let handle = self
             .get_or_create_virtual_connection(
@@ -67,6 +82,12 @@ impl LanguageServerPool {
         // does: a dynamic `resolveProvider` registration can land between
         // send and reply, and the envelope decision should see it.
         let origin = std::sync::Arc::clone(&handle);
+        // Read only for a prepared document, the only one it bears on.
+        let insert_mode = if offset.prepared().is_some() {
+            ClientInsertMode::from_capabilities(self.client_capabilities_ref())
+        } else {
+            ClientInsertMode::default()
+        };
         self.execute_position_bridge_request_with_handle(
             handle,
             host_uri,
@@ -86,7 +107,7 @@ impl LanguageServerPool {
                     response,
                     ctx.offset,
                     region_end,
-                    Some(host_position.line),
+                    Some(host_position),
                     origin.has_capability("completionItem/resolve"),
                     &EnvelopeContext {
                         server_name,
@@ -98,6 +119,7 @@ impl LanguageServerPool {
                         region_end: Some(region_end),
                         host_layer: false,
                     },
+                    insert_mode,
                 )
             },
         )
@@ -133,9 +155,10 @@ fn transform_completion_response_to_host(
     mut response: serde_json::Value,
     offset: &RegionOffset,
     region_end: Position,
-    request_host_line: Option<u32>,
+    request_host_position: Option<Position>,
     server_resolves: bool,
     envelope_ctx: &EnvelopeContext<'_>,
+    insert_mode: ClientInsertMode,
 ) -> Option<CompletionList> {
     if response_has_jsonrpc_error(&response, "textDocument/completion") {
         return None;
@@ -168,7 +191,8 @@ fn transform_completion_response_to_host(
     // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
-        if !transform_completion_item(item, offset, region_end, request_host_line) {
+        if !transform_completion_item(item, offset, region_end, request_host_position, insert_mode)
+        {
             return false;
         }
         if should_envelope(item.data.as_ref(), server_resolves) {
@@ -180,7 +204,7 @@ fn transform_completion_response_to_host(
     if dropped > 0 {
         log::warn!(
             target: "kakehashi::bridge",
-            "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence)"
+            "completion: dropped {dropped} item(s) whose primary insertion/edit is unsafe for the injection region (escapes it, breaks line prefixes, splits the host line, or merges content into the closing fence) or does not map back through its prepared document"
         );
     }
 
@@ -190,17 +214,54 @@ fn transform_completion_response_to_host(
 /// Transform textEdit range in a single completion item to host coordinates.
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
-/// additionalTextEdits if present.
+/// additionalTextEdits if present. On a prepared document the edits go
+/// through its map (`translate_virtual_main_and_additional_edits_to_host`),
+/// their text re-indented, and the item may be given `insertTextMode: asIs`
+/// (see `ClientInsertMode`). A literal snippet there is sent as plain text,
+/// and an item without an edit is probed as an edit at the caret: made that
+/// explicit edit when its text regains an indent, dropped when it maps off
+/// the caret.
 ///
 /// Returns `false` when the item's primary insertion — its text edit, or the
 /// insertText/label fallback applied at the request position — is unsafe for the
 /// injection region — escapes it, corrupts per-line `> ` prefixes, or merges
 /// content into the closing fence — if applied verbatim; the caller must
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
+/// On a prepared document also when its edit does not map back (or its
+/// insert and replace ranges map its text apart), a mapped range no longer
+/// contains the caret, its snippet is no literal text, its text without an
+/// edit breaks a line, or its multi-line edit would reach a client that
+/// always adjusts indentation.
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
 pub(super) fn transform_completion_item(
+    item: &mut CompletionItem,
+    offset: &RegionOffset,
+    region_end: Position,
+    request_host_position: Option<Position>,
+    insert_mode: ClientInsertMode,
+) -> bool {
+    if offset.prepared().is_some() {
+        transform_prepared_completion_item(
+            item,
+            offset,
+            region_end,
+            request_host_position,
+            insert_mode,
+        )
+    } else {
+        transform_unprepared_completion_item(
+            item,
+            offset,
+            region_end,
+            request_host_position.map(|position| position.line),
+        )
+    }
+}
+
+/// [`transform_completion_item`] on a document as is.
+fn transform_unprepared_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,
     region_end: Position,
@@ -313,6 +374,309 @@ pub(super) fn transform_completion_item(
         }
     }
     true
+}
+
+/// [`transform_completion_item`] on a prepared document.
+fn transform_prepared_completion_item(
+    item: &mut CompletionItem,
+    offset: &RegionOffset,
+    region_end: Position,
+    request_host_position: Option<Position>,
+    insert_mode: ClientInsertMode,
+) -> bool {
+    use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextMode, TextEdit};
+    // The text the map checks must be the text the client inserts: a
+    // snippet is kept only when it is literal text, with no tabstop,
+    // placeholder, variable or escape for the client to expand. (So no
+    // snippet variable is left to expand into lines at the insertion point,
+    // as the unprepared path has to check.)
+    if item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET) {
+        let inserted = match &item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
+            None => item.insert_text.as_ref().unwrap_or(&item.label),
+        };
+        if inserted.contains(['$', '\\']) {
+            return false;
+        }
+        // Literal text means the same as plain text, which a client's
+        // snippet engine cannot re-indent once more on insertion.
+        item.insert_text_format = Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
+    }
+    // LSP requires an item's edit ranges to contain the requested position.
+    // Out of a prepared document a range can map past it: the server saw the
+    // caret where the prepared text has no position of its own (an emptied
+    // gap's edge, say), and an edit anchored there maps to the far side of
+    // what the peer removed.
+    let contains_request = |range: &tower_lsp_server::ls_types::Range| {
+        request_host_position
+            .is_none_or(|position| range.start <= position && position <= range.end)
+    };
+    // Transform text_edit if present, and the additional edits with it, as
+    // the one set the client applies, through each range it may apply the
+    // primary with.
+    let additional = item.additional_text_edits.as_mut();
+    let mut additional_kept = match &mut item.text_edit {
+        None => translate_virtual_main_and_additional_edits_to_host(
+            &mut [],
+            additional,
+            offset,
+            EditMode::Extent,
+        )
+        .unwrap_or(false),
+        Some(CompletionTextEdit::Edit(edit)) => {
+            let Some(kept) = translate_virtual_main_and_additional_edits_to_host(
+                std::slice::from_mut(edit),
+                additional,
+                offset,
+                EditMode::Extent,
+            ) else {
+                return false;
+            };
+            kept
+        }
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => {
+            let Some(kept) = translate_insert_replace_edit_to_host(edit, additional, offset) else {
+                return false;
+            };
+            kept
+        }
+    };
+    if let Some(ref mut text_edit) = item.text_edit {
+        match text_edit {
+            CompletionTextEdit::Edit(edit) => {
+                if !contains_request(&edit.range)
+                    || !text_edit_safe_in_region(edit, offset, region_end)
+                {
+                    return false;
+                }
+            }
+            CompletionTextEdit::InsertAndReplace(edit) => {
+                if !contains_request(&edit.insert) || !contains_request(&edit.replace) {
+                    return false;
+                }
+                // Check both ranges through one probe edit, moving new_text in
+                // and out instead of cloning it per range.
+                let mut probe = TextEdit {
+                    range: edit.insert,
+                    new_text: std::mem::take(&mut edit.new_text),
+                };
+                let insert_ok = text_edit_safe_in_region(&probe, offset, region_end);
+                probe.range = edit.replace;
+                let replace_ok = text_edit_safe_in_region(&probe, offset, region_end);
+                edit.new_text = probe.new_text;
+                // Check BOTH client-selectable ranges: with unequal starts,
+                // the minimum line could be unprefixed while the other range
+                // starts on a prefixed line.
+                if !insert_ok || !replace_ok {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // A multi-line edit already regained the indentation the peer removed:
+    // a client adjusting it to the line's indentation as well would indent
+    // it twice, inserting other text than was checked.
+    if let Some(text_edit) = &item.text_edit {
+        let new_text = match text_edit {
+            CompletionTextEdit::Edit(edit) => &edit.new_text,
+            CompletionTextEdit::InsertAndReplace(edit) => &edit.new_text,
+        };
+        if new_text.contains(['\n', '\r']) {
+            match insert_mode {
+                ClientInsertMode::AsIsSettable => {
+                    item.insert_text_mode = Some(InsertTextMode::AS_IS);
+                }
+                ClientInsertMode::AdjustsIndentation => return false,
+                // The client's default inserts as is; an item asking it to
+                // adjust instead (honored if the client supports that
+                // override) is cleared back to the default.
+                ClientInsertMode::AsIs => {
+                    if item.insert_text_mode == Some(InsertTextMode::ADJUST_INDENTATION) {
+                        item.insert_text_mode = None;
+                    }
+                }
+            }
+        }
+    }
+
+    // No textEdit: the client inserts insertText (or the label) at the
+    // completion position instead, verbatim: a multi-line insertion lands
+    // without the indentation the prepare peer removed (explicit edits regain
+    // it through the edit seam instead), so the newline itself is the reject
+    // signal, as in any prefixed region.
+    if item.text_edit.is_none() {
+        let effective = item.insert_text.as_deref().unwrap_or(&item.label);
+        if effective.contains('\n') || effective.contains('\r') {
+            return false;
+        }
+        // On a prepared document the client inserts the text at the caret
+        // as is. Where the same text as an edit at the caret regains an
+        // indent (a blank line among dedented ones, where no word prefix is
+        // the client's to replace), or replaces whitespace there with the
+        // content's indent (a blank line the peer emptied of other
+        // whitespace), the item goes out as that edit, as an item with one
+        // would; one mapping off the caret's line or the caret is refused.
+        if let Some(caret) = request_host_position
+            && !effective.is_empty()
+        {
+            let mut at = caret;
+            super::super::protocol::translate_host_position_to_virtual(&mut at, offset);
+            let mut probe = [TextEdit {
+                range: tower_lsp_server::ls_types::Range::new(at, at),
+                new_text: effective.to_string(),
+            }];
+            // The edit may replace whitespace around the caret on its line
+            // (a blank line the peer emptied, whose whitespace the content's
+            // indent replaces); it must stay on that line and contain the
+            // caret, as LSP requires of an item's edit. The additional edits
+            // map with it as the one set the client applies, should it go
+            // out as that edit.
+            let Some(additional_kept_with_probe) =
+                translate_virtual_main_and_additional_edits_to_host(
+                    &mut probe,
+                    item.additional_text_edits.as_mut(),
+                    offset,
+                    EditMode::Extent,
+                )
+            else {
+                return false;
+            };
+            let range = probe[0].range;
+            if range.start.line != caret.line
+                || range.end.line != caret.line
+                || caret < range.start
+                || range.end < caret
+            {
+                return false;
+            }
+            if probe[0].new_text != effective
+                || range != tower_lsp_server::ls_types::Range::new(caret, caret)
+            {
+                // Written here, it answers to the region's checks as any
+                // edit does (a caret on the closing fence's line, say).
+                if !text_edit_safe_in_region(&probe[0], offset, region_end) {
+                    return false;
+                }
+                let [edit] = probe;
+                item.text_edit = Some(CompletionTextEdit::Edit(edit));
+                additional_kept = additional_kept_with_probe;
+            }
+        }
+    }
+
+    // An item without a textEdit has no primary to check its additional
+    // edits with (the client inserts at the caret, over a range it picks):
+    // they are dropped, unless the item goes out as the edit the caret probe
+    // made, with which they were checked.
+    if let Some(dropped) = keep_additional_edits_if_safe(
+        &mut item.additional_text_edits,
+        additional_kept,
+        offset,
+        region_end,
+    ) {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "completion: dropped an item's additionalTextEdits ({dropped}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
+        );
+    }
+    true
+}
+
+/// Translate both ranges of a prepared document's insert/replace completion
+/// edit in place, with the item's additional edits (see
+/// `translate_virtual_main_and_additional_edits_to_host`, whose answer this
+/// is). Each range goes through the edit seam with the shared `newText`,
+/// which must map to the same text for either choice the client makes.
+fn translate_insert_replace_edit_to_host(
+    edit: &mut tower_lsp_server::ls_types::InsertReplaceEdit,
+    additional: Option<&mut Vec<tower_lsp_server::ls_types::TextEdit>>,
+    offset: &RegionOffset,
+) -> Option<bool> {
+    use tower_lsp_server::ls_types::TextEdit;
+    // LSP has both ranges start at the same position. Sent apart, no
+    // realignment below would send a range that was checked.
+    if edit.insert.start != edit.replace.start {
+        return None;
+    }
+    let new_text = std::mem::take(&mut edit.new_text);
+    let mut mains = [
+        TextEdit {
+            range: edit.insert,
+            new_text: new_text.clone(),
+        },
+        TextEdit {
+            range: edit.replace,
+            new_text,
+        },
+    ];
+    let kept = translate_virtual_main_and_additional_edits_to_host(
+        &mut mains,
+        additional,
+        offset,
+        EditMode::Extent,
+    );
+    let [insert, replace] = mains;
+    edit.new_text = replace.new_text;
+    let kept = kept?;
+    if insert.new_text != edit.new_text {
+        return None;
+    }
+    edit.insert = insert.range;
+    edit.replace = replace.range;
+    // Mapped, the two ranges must still share their start (LSP), as sent.
+    // Clearing a dedented line's content maps the replace range over the
+    // removed indent, which the (empty) insert range does not cover: start
+    // both after it, as the shared text was re-indented for.
+    if edit.replace.start != edit.insert.start {
+        if edit.replace.start < edit.insert.start && edit.insert.start <= edit.replace.end {
+            edit.replace.start = edit.insert.start;
+        } else {
+            return None;
+        }
+    }
+    Some(kept)
+}
+
+/// How the client inserts a completion's multi-line text (LSP
+/// `insertTextMode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ClientInsertMode {
+    /// As is, by default, with no way to tell it otherwise declared.
+    #[default]
+    AsIs,
+    /// It honors an item's `insertTextMode: asIs`.
+    AsIsSettable,
+    /// It adjusts the indentation by default, and an item cannot tell it not
+    /// to.
+    AdjustsIndentation,
+}
+
+impl ClientInsertMode {
+    /// From the client's completion capabilities.
+    pub(super) fn from_capabilities(
+        caps: Option<&tower_lsp_server::ls_types::ClientCapabilities>,
+    ) -> Self {
+        use tower_lsp_server::ls_types::InsertTextMode;
+        let completion = caps
+            .and_then(|caps| caps.text_document.as_ref())
+            .and_then(|text_document| text_document.completion.as_ref());
+        let settable = completion
+            .and_then(|completion| completion.completion_item.as_ref())
+            .and_then(|item| item.insert_text_mode_support.as_ref())
+            .is_some_and(|support| support.value_set.contains(&InsertTextMode::AS_IS));
+        if settable {
+            Self::AsIsSettable
+        } else if completion
+            .and_then(|completion| completion.insert_text_mode)
+            .is_some_and(|mode| mode == InsertTextMode::ADJUST_INDENTATION)
+        {
+            Self::AdjustsIndentation
+        } else {
+            Self::AsIs
+        }
+    }
 }
 
 /// Whether the host line carries region-adjacent host content an unprefixed
@@ -669,6 +1033,859 @@ mod tests {
     use rstest::rstest;
     use serde_json::json;
 
+    /// A region at host line 10 holding `virtual_text`, dedented by two on
+    /// every line starting with two spaces.
+    fn dedented_offset(virtual_text: &str) -> RegionOffset {
+        RegionOffset::new(10, 0).with_prepared(dedented_map(virtual_text))
+    }
+
+    /// The map of `virtual_text` dedented by two on every line starting
+    /// with two spaces.
+    fn dedented_map(virtual_text: &str) -> std::sync::Arc<crate::lsp::bridge::PreparedMap> {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let changes: Vec<_> = virtual_text
+            .split('\n')
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("  "))
+            .map(|(line, _)| json!({
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}},
+                "newText": ""
+            }))
+            .collect();
+        let result =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": changes}]}))
+                .unwrap();
+        apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap()
+        .map
+    }
+
+    fn item(value: serde_json::Value) -> CompletionItem {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_prepared_edit_maps_back_reindented_with_its_additional_edits() {
+        // `  import os\n  x = o\n`, the server completing `o` on P line 1
+        // and adding an import line above.
+        let offset = dedented_offset("  import os\n  x = o\n");
+        let mut completed = item(json!({
+            "label": "os.path",
+            "textEdit": {
+                "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 5}},
+                "newText": "os.path"
+            },
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 9}, "end": {"line": 0, "character": 9}},
+                "newText": "\nimport os.path"
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(12, 0),
+            Some(Position::new(11, 7)),
+            ClientInsertMode::default(),
+        ));
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &completed.text_edit
+        else {
+            panic!("{completed:?}");
+        };
+        assert_eq!(
+            edit.range,
+            tower_lsp_server::ls_types::Range::new(Position::new(11, 6), Position::new(11, 7))
+        );
+        assert_eq!(
+            completed.additional_text_edits,
+            Some(vec![tower_lsp_server::ls_types::TextEdit {
+                range: tower_lsp_server::ls_types::Range::new(
+                    Position::new(10, 11),
+                    Position::new(10, 11)
+                ),
+                new_text: "\n  import os.path".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn a_prepared_item_without_a_text_edit_drops_its_additional_edits() {
+        // Inserted at the caret over a range the client picks: there is no
+        // primary edit to check the additional edits with. (A region at line
+        // 0, where the edits as sent would be in bounds: only the refusal
+        // drops them.)
+        let offset = RegionOffset::new(0, 0).with_prepared(dedented_map("  a\n  \n  b\n"));
+        let mut completed = item(json!({
+            "label": "x",
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "newText": "y"
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(3, 0),
+            Some(Position::new(1, 2)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(completed.additional_text_edits, None);
+    }
+
+    #[test]
+    fn an_empty_additional_edits_list_is_kept_as_it_came() {
+        // Nothing to check, even with no main edit to check it with.
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x", "additionalTextEdits": []}));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(completed.additional_text_edits, Some(vec![]));
+    }
+
+    #[test]
+    fn a_prepared_item_inserted_at_the_caret_goes_out_as_its_edit_would() {
+        // `    abc\n\n    xyz\n` dedented by four: on the blank line an edit
+        // would regain the indent the client's verbatim insertion lacks.
+        let virtual_text = "    abc\n\n    xyz\n";
+        let map = {
+            use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+            let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 4}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(result),
+            )
+            .unwrap()
+            .map
+        };
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let plain = || item(json!({"label": "foo"}));
+        let mut on_blank = plain();
+        assert!(transform_completion_item(
+            &mut on_blank,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(
+            on_blank.text_edit,
+            Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                tower_lsp_server::ls_types::TextEdit {
+                    range: tower_lsp_server::ls_types::Range::new(
+                        Position::new(11, 0),
+                        Position::new(11, 0)
+                    ),
+                    new_text: "    foo".to_string(),
+                }
+            ))
+        );
+        // After text, the insertion is what the edit would be: as it came.
+        let mut after_text = plain();
+        assert!(transform_completion_item(
+            &mut after_text,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(after_text.text_edit, None);
+    }
+
+    #[test]
+    fn a_caret_edit_written_for_an_item_answers_to_the_region_checks() {
+        // `  a\n` dedented, the caret at column 0 of the closing fence's line
+        // (the region's end): as an edit the item would regain the indent
+        // and push text onto the fence.
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "foo"}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn a_prepared_item_inserting_lines_at_the_caret_is_dropped() {
+        // Without a textEdit the client inserts it as is: its second line
+        // would not regain the removed indent.
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x", "insertText": "if x:\n  y"}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn additional_edits_refused_with_the_primary_are_dropped() {
+        // The additional edit touches the primary right after its line
+        // break: together they are refused; the primary stays as it maps
+        // alone.
+        let offset = dedented_offset("  a\n  b\n");
+        let mut completed = item(json!({
+            "label": "x",
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                "newText": "x\n"
+            },
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 1, "character": 0}},
+                "newText": "y"
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(12, 0),
+            Some(Position::new(10, 2)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(completed.additional_text_edits, None);
+    }
+
+    #[rstest]
+    #[case::as_is_settable(
+        ClientInsertMode::AsIsSettable,
+        true,
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation, false, None)]
+    #[case::as_is(ClientInsertMode::AsIs, true, None)]
+    fn a_prepared_multi_line_edit_is_inserted_as_is(
+        #[case] insert_mode: ClientInsertMode,
+        #[case] kept: bool,
+        #[case] mode: Option<tower_lsp_server::ls_types::InsertTextMode>,
+    ) {
+        // Mapped, its second line regained the removed indent: a client
+        // adjusting it to the line's indent again would double it.
+        let offset = dedented_offset("  foo\n  baz\n");
+        let mut completed = item(json!({
+            "label": "if",
+            "insertTextMode": 2,
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                "newText": "if x:\n  pass"
+            }
+        }));
+        assert_eq!(
+            transform_completion_item(
+                &mut completed,
+                &offset,
+                Position::new(12, 0),
+                Some(Position::new(10, 5)),
+                insert_mode,
+            ),
+            kept
+        );
+        if kept {
+            assert_eq!(completed.insert_text_mode, mode);
+        }
+    }
+
+    /// The prepared-only rules leave an unprepared item as main sends it:
+    /// its edit range need not contain the caret, its multi-line edit keeps
+    /// the insert mode it asked for whatever the client does, and its
+    /// snippet stays a snippet.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    fn prepared_only_rules_leave_an_unprepared_item_alone(#[case] insert_mode: ClientInsertMode) {
+        use tower_lsp_server::ls_types::{InsertTextFormat, InsertTextMode};
+        let offset = RegionOffset::new(10, 0);
+        let mut completed = item(json!({
+            "label": "if",
+            "insertTextMode": 2,
+            "insertTextFormat": 2,
+            "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                "newText": "if ${1:x}:\n  pass"
+            }
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(12, 0),
+            // Past the edit's range.
+            Some(Position::new(11, 2)),
+            insert_mode,
+        ));
+        assert_eq!(
+            completed.insert_text_mode,
+            Some(InsertTextMode::ADJUST_INDENTATION)
+        );
+        assert_eq!(
+            completed.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
+        );
+    }
+
+    #[test]
+    fn the_client_insert_mode_follows_its_capabilities() {
+        let caps = |value: serde_json::Value| -> tower_lsp_server::ls_types::ClientCapabilities {
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(
+            ClientInsertMode::from_capabilities(None),
+            ClientInsertMode::AsIs
+        );
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                json!({"textDocument": {"completion": {
+                    "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+                }}})
+            ))),
+            ClientInsertMode::AsIsSettable
+        );
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                json!({"textDocument": {"completion": {
+                    "insertTextMode": 2
+                }}})
+            ))),
+            ClientInsertMode::AdjustsIndentation
+        );
+        // Support for adjusting only is no way to ask for as is.
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                json!({"textDocument": {"completion": {
+                    "completionItem": {"insertTextModeSupport": {"valueSet": [2]}}
+                }}})
+            ))),
+            ClientInsertMode::AsIs
+        );
+    }
+
+    #[rstest]
+    #[case::tabstop("x$0", false)]
+    #[case::placeholder("${1:x}", false)]
+    #[case::escape("x\\$", false)]
+    #[case::escaped_brace("x\\}", false)]
+    #[case::literal("x", true)]
+    fn a_prepared_snippet_is_kept_only_as_literal_text(#[case] snippet: &str, #[case] kept: bool) {
+        let offset = dedented_offset("  a\n");
+        for completed in [
+            json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+            json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                "newText": snippet
+            }}),
+        ] {
+            assert_eq!(
+                transform_completion_item(
+                    &mut item(completed.clone()),
+                    &offset,
+                    Position::new(11, 0),
+                    Some(Position::new(10, 3)),
+                    ClientInsertMode::default(),
+                ),
+                kept,
+                "{completed}"
+            );
+        }
+        // Kept, it goes out as the plain text it is.
+        let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
+        assert_eq!(
+            transform_completion_item(
+                &mut literal,
+                &offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                ClientInsertMode::default(),
+            ),
+            kept
+        );
+        if kept {
+            assert_eq!(
+                literal.insert_text_format,
+                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT)
+            );
+        }
+        // As is, a snippet is the client's to expand.
+        let mut as_is = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
+        assert!(transform_completion_item(
+            &mut as_is,
+            &RegionOffset::new(10, 0),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(
+            as_is.insert_text_format,
+            Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+        );
+    }
+
+    #[test]
+    fn a_prepared_item_must_contain_the_requested_caret() {
+        use crate::lsp::bridge::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        // `foo${x}bar` at host line 10, the interpolation emptied: `foobar`.
+        let virtual_text = "foo    bar\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..11, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let map = apply_prepare_result(virtual_text, &layout, Some(result))
+            .unwrap()
+            .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let region_end = Position::new(11, 0);
+        // Both carets reach the server at P (0, 3); its insertion there maps
+        // before `${x}`.
+        let completed = || {
+            item(json!({
+                "label": "X",
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                    "newText": "X"
+                }
+            }))
+        };
+        assert!(
+            !transform_completion_item(
+                &mut completed(),
+                &offset,
+                region_end,
+                Some(Position::new(10, 7)),
+                ClientInsertMode::default()
+            ),
+            "the edit lands before the gap, short of the caret after it"
+        );
+        assert!(transform_completion_item(
+            &mut completed(),
+            &offset,
+            region_end,
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default()
+        ));
+    }
+
+    /// `foo${x}bar` at host line 10, the interpolation emptied: `foobar`.
+    fn emptied_gap_offset() -> RegionOffset {
+        use crate::lsp::bridge::protocol::{SegmentKind, VirtualLayout, apply_prepare_result};
+        let virtual_text = "foo    bar\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..3, String::new()),
+                (SegmentKind::Gap, 3..7, "${x}".to_string()),
+                (SegmentKind::Content, 7..11, String::new()),
+            ],
+        );
+        let result = serde_json::from_value(json!({"segments": [
+            {"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}
+        ]}))
+        .unwrap();
+        let map = apply_prepare_result(virtual_text, &layout, Some(result))
+            .unwrap()
+            .map;
+        RegionOffset::new(10, 0).with_prepared(map)
+    }
+
+    #[test]
+    fn insert_replace_ranges_mapped_to_different_starts_are_dropped() {
+        // At the emptied interpolation: the insert range maps before its
+        // host text, the replace range over `bar` after it. Realigned, the
+        // replace range would swallow `${x}`.
+        let mut completed = item(json!({
+            "label": "X",
+            "textEdit": {
+                "insert": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "replace": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 6}},
+                "newText": "X"
+            }
+        }));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn insert_replace_ranges_must_contain_the_caret_once_mapped() {
+        // Both ranges empty at the emptied interpolation map before its host
+        // text, short of a caret after it.
+        let mut completed = item(json!({
+            "label": "X",
+            "textEdit": {
+                "insert": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "replace": {"start": {"line": 0, "character": 3}, "end": {"line": 0, "character": 3}},
+                "newText": "X"
+            }
+        }));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    /// An item without a textEdit is made one only from single-line text:
+    /// multi-line text is dropped before the caret probe, so the edit it is
+    /// given never spans lines, and no client insert mode re-indents it.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    fn an_implicit_item_is_made_an_edit_only_on_one_line(#[case] insert_mode: ClientInsertMode) {
+        // A blank line among dedented ones: the caret there regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        let mut single = item(json!({"label": "foo"}));
+        assert!(transform(&mut single));
+        let Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit)) = &single.text_edit
+        else {
+            panic!("made an edit: {single:?}");
+        };
+        assert_eq!(edit.new_text, "  foo");
+        assert_eq!(single.insert_text_mode, None);
+        let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
+        assert!(!transform(&mut multi));
+    }
+
+    /// A caret on a blank line the peer emptied of a space shorter than
+    /// the content's indent: text typed there regains the content's indent,
+    /// replacing that space. An item without a textEdit goes out as that
+    /// edit, its range on the caret's line and containing the caret; one
+    /// with a textEdit at the caret maps to the same edit; multi-line text
+    /// is dropped as anywhere on a prepared document.
+    #[test]
+    fn an_item_on_an_emptied_blank_line_replaces_its_whitespace() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range, TextEdit};
+        let virtual_text = "  a\n \n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let caret = Position::new(11, 1);
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(caret),
+                ClientInsertMode::default(),
+            )
+        };
+        let expected = Some(CompletionTextEdit::Edit(TextEdit {
+            range: Range::new(Position::new(11, 0), Position::new(11, 1)),
+            new_text: "  z".to_string(),
+        }));
+        let mut implicit = item(json!({"label": "z"}));
+        assert!(transform(&mut implicit));
+        assert_eq!(implicit.text_edit, expected);
+        let mut explicit = item(json!({"label": "z", "textEdit": {
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+            "newText": "z"
+        }}));
+        assert!(transform(&mut explicit));
+        assert_eq!(explicit.text_edit, expected);
+        let mut multi = item(json!({"label": "x", "insertText": "if a:\n  b"}));
+        assert!(!transform(&mut multi));
+    }
+
+    /// An item without a textEdit that goes out as the caret probe's edit
+    /// keeps its additional edits (an auto-import) checked with that edit,
+    /// as for an item with one; left inserted at the caret, it drops them.
+    #[test]
+    fn an_implicit_item_made_an_edit_keeps_its_additional_edits() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range, TextEdit};
+        // A blank line among dedented ones: the probe regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let mut completed = item(json!({
+            "label": "foo",
+            "additionalTextEdits": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "newText": "use x;\n"
+            }]
+        }));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(
+            completed.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range: Range::new(Position::new(11, 0), Position::new(11, 0)),
+                new_text: "  foo".to_string(),
+            }))
+        );
+        assert_eq!(
+            completed.additional_text_edits,
+            // After line 0's indent, regaining it for the line it keeps.
+            Some(vec![TextEdit {
+                range: Range::new(Position::new(10, 2), Position::new(10, 2)),
+                new_text: "use x;\n  ".to_string(),
+            }])
+        );
+    }
+
+    #[test]
+    fn an_implicit_item_whose_caret_edit_maps_off_the_caret_is_dropped() {
+        // The caret right after the emptied interpolation's host text: the
+        // label inserted there as an edit maps before that text, so the
+        // client inserting at the caret would insert other text than checked.
+        let mut completed = item(json!({"label": "q"}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &emptied_gap_offset(),
+            Position::new(11, 0),
+            Some(Position::new(10, 7)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn a_prepared_snippet_label_is_checked_when_it_is_the_text() {
+        let offset = dedented_offset("  a\n");
+        let mut completed = item(json!({"label": "x$1", "insertTextFormat": 2}));
+        assert!(!transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+    }
+
+    #[test]
+    fn prepared_insert_replace_edits_keep_their_shared_start() {
+        // Clearing the whole content of a dedented line (`if x:`): the
+        // replace range covers it, the insert range is empty at its start.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: String::new(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 0),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 5),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(
+                &mut edit,
+                None,
+                &dedented_offset("  if x:\n    y\n")
+            ),
+            Some(true)
+        );
+        assert_eq!(edit.insert.start, edit.replace.start);
+        assert_eq!(
+            edit.replace,
+            tower_lsp_server::ls_types::Range::new(Position::new(10, 2), Position::new(10, 7))
+        );
+    }
+
+    #[test]
+    fn prepared_insert_replace_edits_map_both_ranges_and_reindent() {
+        // `y` sits at P (1, 2): insert at its start, replace the word.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "yes\n  z".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(1, 2),
+                Position::new(1, 2),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(1, 2),
+                Position::new(1, 3),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(
+                &mut edit,
+                None,
+                &dedented_offset("  if x:\n    y\n")
+            ),
+            Some(true)
+        );
+        assert_eq!(edit.insert.start, Position::new(11, 4));
+        assert_eq!(edit.replace.end, Position::new(11, 5));
+        assert_eq!(edit.new_text, "yes\n    z");
+    }
+
+    #[test]
+    fn prepared_insert_replace_ranges_sent_with_unequal_starts_are_refused() {
+        // `ab`, dedented: the replace range starts before the insert range
+        // (against LSP). Moving the mapped replace start up to the insert
+        // start would send a replacement the server never asked for, and
+        // which no check saw.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "x".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 2),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 0),
+                Position::new(0, 2),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(&mut edit, None, &dedented_offset("  ab\n  c\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn insert_replace_ranges_mapping_the_text_apart_are_refused() {
+        // `ab`, dedented: inserted before `b` the line break is followed by
+        // `b`, whose line regains the indent; replacing `b` it ends the
+        // line. The shared text would differ between the client's choices.
+        let mut edit = tower_lsp_server::ls_types::InsertReplaceEdit {
+            new_text: "x\n".to_string(),
+            insert: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 1),
+            ),
+            replace: tower_lsp_server::ls_types::Range::new(
+                Position::new(0, 1),
+                Position::new(0, 2),
+            ),
+        };
+        assert_eq!(
+            translate_insert_replace_edit_to_host(&mut edit, None, &dedented_offset("  ab\n  c\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn unprepared_insert_replace_ranges_stay_as_sent() {
+        // Unequal starts, as a server may send them: only translated.
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range};
+        let mut completed = item(json!({"label": "x", "textEdit": {
+            "insert": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 3}},
+            "replace": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 5}},
+            "newText": "x"
+        }}));
+        assert!(transform_completion_item(
+            &mut completed,
+            &RegionOffset::new(10, 4),
+            Position::new(12, 0),
+            Some(Position::new(10, 6)),
+            ClientInsertMode::default(),
+        ));
+        let Some(CompletionTextEdit::InsertAndReplace(edit)) = completed.text_edit else {
+            panic!("an insert/replace edit");
+        };
+        assert_eq!(
+            edit.insert,
+            Range::new(Position::new(10, 6), Position::new(10, 7))
+        );
+        assert_eq!(
+            edit.replace,
+            Range::new(Position::new(10, 4), Position::new(10, 9))
+        );
+        assert_eq!(edit.new_text, "x");
+    }
+
+    #[test]
+    fn additional_edits_must_map_alike_with_either_range() {
+        // `ab\n` dedented. An additional edit right after `b`: apart from the
+        // insert range (empty before `b`), and meeting the replace range over
+        // `b` mid-line between text — both map it alike.
+        let offset = dedented_offset("  ab\n");
+        let completed = |additional: &str| {
+            item(json!({
+                "label": "bc",
+                "textEdit": {
+                    "insert": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "replace": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 2}},
+                    "newText": "bc"
+                },
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 2}, "end": {"line": 0, "character": 2}},
+                    "newText": additional
+                }]
+            }))
+        };
+        let mut kept = completed("z");
+        assert!(transform_completion_item(
+            &mut kept,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(
+            kept.additional_text_edits,
+            Some(vec![tower_lsp_server::ls_types::TextEdit {
+                range: tower_lsp_server::ls_types::Range::new(
+                    Position::new(10, 4),
+                    Position::new(10, 4)
+                ),
+                new_text: "z".to_string(),
+            }])
+        );
+        // One opening with a line break still maps with the insert range,
+        // but meets the replace range with that break, where the set is
+        // refused: refused with one range, the additional edits are dropped.
+        let mut dropped = completed("\nq");
+        assert!(transform_completion_item(
+            &mut dropped,
+            &offset,
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(dropped.additional_text_edits, None);
+    }
+
     /// An envelope minted from a prepared document never resolves, even
     /// against a live offset equal to its own (the region's pair lost its
     /// peer since): the map it was minted through is not carried. The mark
@@ -713,7 +1930,7 @@ mod tests {
             response,
             offset,
             region_end,
-            request_host_line,
+            request_host_line.map(|line| Position::new(line, 0)),
             server_resolves,
             &EnvelopeContext {
                 server_name: "lua-ls",
@@ -725,7 +1942,114 @@ mod tests {
                 region_end: Some(region_end),
                 host_layer: false,
             },
+            ClientInsertMode::default(),
         )
+    }
+
+    #[test]
+    fn an_incomplete_list_whose_items_all_drop_stays_an_incomplete_list() {
+        // As is, and prepared alike: the virt layer, not this transform,
+        // decides what a prepared document's empty incomplete list counts as.
+        let response = json!({"jsonrpc": "2.0", "id": 1, "result": {
+            "isIncomplete": true,
+            "items": [{"label": "x", "textEdit": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 9, "character": 0}},
+                "newText": "x"
+            }}]
+        }});
+        for offset in [
+            RegionOffset::new(10, 0),
+            RegionOffset::new(10, 0).with_prepared(dedented_map("  a\n")),
+        ] {
+            let list = transform_with_resolve_support(
+                response.clone(),
+                &offset,
+                Position::new(11, 0),
+                Some(10),
+                false,
+            )
+            .expect("a list");
+            assert!(list.is_incomplete && list.items.is_empty(), "{list:?}");
+        }
+    }
+
+    /// The server ranked first keeps its place though its reply came while
+    /// the host had moved (an edit to another fence, its pass not settled
+    /// yet) and the next one's came once it settled with the content
+    /// unchanged: whether the host moved is read once, where the answer is
+    /// chosen, not per reply, where it would hand the region to the next.
+    #[tokio::test]
+    async fn the_server_ranked_first_wins_though_its_reply_came_before_the_host_settled() {
+        use crate::lsp::aggregation::server::priority::PriorityEntry;
+        use crate::lsp::aggregation::server::{FanInResult, TaggedResult, preferred};
+        let map = dedented_map("  a\n");
+        let offset = RegionOffset::new(10, 0).with_prepared(std::sync::Arc::clone(&map));
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/two-fences.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        let prepared = crate::lsp::bridge::protocol::PreparedDocument {
+            text: "a\n".to_string(),
+            map: std::sync::Arc::clone(&map),
+        };
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared);
+        let reply = |label: &str| {
+            let ctx = pool.response_context_for_test(&host_lsp, &offset);
+            transform_completion_response_to_host(
+                json!({"jsonrpc": "2.0", "id": 1, "result": [{"label": label, "textEdit": {
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "newText": label
+                }}]}),
+                ctx.offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                false,
+                &EnvelopeContext {
+                    server_name: label,
+                    injection_language: "lua",
+                    incarnation: Some(1),
+                    host_uri: "file:///test/two-fences.md",
+                    region_id: region,
+                    offset: &offset,
+                    region_end: Some(Position::new(11, 0)),
+                    host_layer: false,
+                },
+                ClientInsertMode::default(),
+            )
+        };
+        // Another fence edited, its pass not settled: the top server replies.
+        pool.note_host_edited(&host, 1, 1);
+        let top = reply("top");
+        // Settled, this region's text unchanged: the next server replies.
+        pool.note_host_settled(&host, 1, 1);
+        let next = reply("next");
+        assert!(next.is_some());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (server_name, value) in [("next", next), ("top", top)] {
+            tasks.spawn(async move {
+                TaggedResult {
+                    server_name: server_name.to_string(),
+                    value: Ok(value),
+                }
+            });
+        }
+        let result = preferred(
+            &mut tasks,
+            |list: &Option<CompletionList>| {
+                list.as_ref().is_some_and(|list| !list.items.is_empty())
+            },
+            &[
+                PriorityEntry::Server("top".to_string()),
+                PriorityEntry::Server("next".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let FanInResult::Done(Some(list)) = result else {
+            panic!("an answer");
+        };
+        assert_eq!(list.items[0].label, "top");
     }
 
     #[test]

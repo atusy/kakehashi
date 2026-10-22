@@ -17,13 +17,19 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
-//! - `echo-document` — advertises `hoverProvider`,
-//!   `documentFormattingProvider`, `documentRangeFormattingProvider`,
-//!   `renameProvider`, `diagnosticProvider`, and full sync with save; hover
+//! - `echo-document` — advertises `hoverProvider`, `completionProvider`,
+//!   `inlayHintProvider`, `colorProvider`, `documentFormattingProvider`,
+//!   `documentRangeFormattingProvider`, `renameProvider`,
+//!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting and range
 //!   formatting uppercase; rename replaces the first line; a pull diagnostic
-//!   spans the first line and carries the full text. Proves what a prepared virtual
+//!   spans the first line and carries the full text; completion inserts
+//!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
+//!   document's first (and offers `echo-plain` with no edit), inlay hints
+//!   answer as in the other modes, and color presentations add one over
+//!   (0, 6)-(0, 7); a document holding `SNIPPETS` gets an incomplete list
+//!   of snippets only instead. Proves what a prepared virtual
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
@@ -355,6 +361,9 @@ fn main() {
                     }),
                     "echo-document" => json!({
                         "hoverProvider": true,
+                        "completionProvider": {},
+                        "inlayHintProvider": true,
+                        "colorProvider": true,
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
                         "renameProvider": true,
@@ -1169,6 +1178,42 @@ fn main() {
                         }])
                     })
                     .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            // A document holding `SNIPPETS` gets an incomplete list of
+            // snippets only, which a prepared document drops whole.
+            "textDocument/completion"
+                if mode == "echo-document"
+                    && message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .is_some_and(|text| text.contains("SNIPPETS")) =>
+            {
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"isIncomplete": true, "items": [
+                        {"label": "s", "insertTextFormat": 2, "insertText": "s$0"}
+                    ]}),
+                );
+            }
+            "textDocument/completion" if mode == "echo-document" => {
+                let position = message["params"]["position"].clone();
+                let result = json!({"isIncomplete": false, "items": [{ "label": "echo-plain" }, {
+                    "label": "echo-edit",
+                    "textEdit": {
+                        "range": { "start": position, "end": position },
+                        "newText": "int(x)\nprint(y)"
+                    },
+                    "additionalTextEdits": [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "-- c\n"
+                    }]
+                }]});
                 respond(&mut writer, id, result);
             }
             // Answers only for documents this server received via `didOpen`,
@@ -2163,10 +2208,24 @@ fn main() {
                         .filter(|uri| documents.contains_key(*uri))
                         .and(range)
                         .map(|range| {
-                            json!([{
+                            let mut presentations = json!([{
                                 "label": label,
                                 "textEdit": { "range": range, "newText": new_text }
-                            }])
+                            }]);
+                            // One the server places itself: (0, 6)-(0, 7).
+                            if mode == "echo-document" {
+                                presentations.as_array_mut().unwrap().push(json!({
+                                    "label": "echo-fixed",
+                                    "textEdit": {
+                                        "range": {
+                                            "start": { "line": 0, "character": 6 },
+                                            "end": { "line": 0, "character": 7 }
+                                        },
+                                        "newText": "#00ff00"
+                                    }
+                                }));
+                            }
+                            presentations
                         })
                         .unwrap_or(Value::Null)
                 };

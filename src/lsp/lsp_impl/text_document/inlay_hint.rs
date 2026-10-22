@@ -27,7 +27,7 @@ use crate::lsp::bridge::{
     extract_inlay_hint_envelope,
 };
 use crate::lsp::current_upstream_id;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/inlayHint";
 
@@ -42,17 +42,27 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let range = params.range;
         let virt = self.inlay_hint_virt_layer(&lsp_uri, range, work_done_token);
-        let host = self.inlay_hint_host_layer(&lsp_uri, raw_params);
-        self.walk_layer_futures(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            |hints: &Vec<InlayHint>| !hints.is_empty(),
-        )
-        .await
+        let host = async {
+            let hints = self.inlay_hint_host_layer(&lsp_uri, raw_params).await?;
+            Ok(hints.map(Sourced::unprepared))
+        };
+        let hints = self
+            .walk_layer_futures(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                |hints: &Sourced<Vec<InlayHint>>| !hints.value.is_empty(),
+            )
+            .await?;
+        // The final answer chosen: its edits checked once more against the
+        // host text, which may have moved while it was held.
+        Ok(hints.map(|hints| {
+            let current = self.sourced_still_current(&hints, &lsp_uri);
+            inlay_hints_still_current(hints.value, current)
+        }))
     }
 
     async fn inlay_hint_host_layer(
@@ -140,7 +150,7 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         client_progress_token: Option<NumberOrString>,
-    ) -> Result<Option<Vec<InlayHint>>> {
+    ) -> Result<Option<Sourced<Vec<InlayHint>>>> {
         // Read before the preamble snapshots the document, so the stamp can
         // only be older than the content the hints were computed on, never
         // newer: an edit landing in between makes every hint of this
@@ -197,9 +207,17 @@ impl Kakehashi {
         )
         .await;
 
-        result
+        let hints = result
             .handle(&self.notifier(), "inlay hint", None, Ok)
-            .await
+            .await?;
+        Ok(hints.map(|hints| {
+            Sourced::from_region(
+                &ctx.document,
+                hints,
+                self.bridge.node_tracker(),
+                Some(revision),
+            )
+        }))
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {
@@ -418,9 +436,40 @@ impl HostInlayHints {
     }
 }
 
+/// The chosen hints once their edits were checked against the host text
+/// (`current`): as they are, or, their edits stale, shown without them, as
+/// a position still is.
+fn inlay_hints_still_current(mut hints: Vec<InlayHint>, current: bool) -> Vec<InlayHint> {
+    if !current {
+        for hint in &mut hints {
+            hint.text_edits = None;
+        }
+    }
+    hints
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_hints_stay_shown_without_their_edits() {
+        let hint: InlayHint = serde_json::from_value(serde_json::json!({
+            "position": {"line": 0, "character": 1},
+            "label": ": x",
+            "textEdits": [{
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                "newText": ": x"
+            }]
+        }))
+        .unwrap();
+        let kept = inlay_hints_still_current(vec![hint.clone()], true);
+        assert!(kept[0].text_edits.is_some());
+        let stale = inlay_hints_still_current(vec![hint.clone()], false);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].text_edits, None);
+        assert_eq!(stale[0].position, hint.position);
+    }
 
     fn envelope() -> InlayHintEnvelope {
         serde_json::from_value(serde_json::json!({

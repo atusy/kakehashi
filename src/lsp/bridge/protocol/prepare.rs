@@ -26,6 +26,10 @@ use crate::text::position::normalize_lone_carriage_returns;
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::{Position, TextEdit};
 
+mod edits;
+
+pub(crate) use edits::EditMode;
+
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
 
@@ -371,6 +375,7 @@ fn build_prepared(
 
     let mut text = String::with_capacity(virtual_text.len());
     let mut runs: Vec<Run> = Vec::new();
+    let mut indents: Vec<SegmentIndent> = Vec::new();
     let last_index = layout.segments.len().saturating_sub(1);
     for (index, (segment, answer)) in layout.segments.iter().zip(result.segments).enumerate() {
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
@@ -388,6 +393,15 @@ fn build_prepared(
                 )
                 .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
+                let mut deleted: Vec<&str> = Vec::new();
+                // Indentation removed from whitespace-only lines: the
+                // content's indent only in a segment with no content line to
+                // say it (a blank line left indented says nothing of it).
+                let mut blank: Vec<&str> = Vec::new();
+                let mut closing: Option<&str> = None;
+                let deletes_closing_lines = deletions
+                    .iter()
+                    .any(|(_, kind)| *kind == RunKind::TrailingLines);
                 for (deletion, kind) in deletions {
                     push_run(
                         &mut runs,
@@ -405,6 +419,26 @@ fn build_prepared(
                         virtual_text,
                         "",
                     );
+                    // The indentation-only last line the peer deleted (the
+                    // indent before a closing `''`, with the closing lines or
+                    // right after content, where nixfmt puts it shallower
+                    // than the content) does not outvote the content's
+                    // dedent: new lines regain the content's, and with content
+                    // left alone, none. Only in a segment with no content at
+                    // all, and no closing lines deleted with it, is it the
+                    // indent new lines regain.
+                    let closing_indent = kind == RunKind::Deleted
+                        && index == last_index
+                        && deletion.end == segment.virtual_range.end;
+                    if closing_indent {
+                        closing = Some(&virtual_text[deletion.clone()]);
+                    } else if kind == RunKind::Deleted {
+                        if rest_of_line_blank(virtual_text, deletion.end) {
+                            blank.push(&virtual_text[deletion.clone()]);
+                        } else {
+                            deleted.push(&virtual_text[deletion.clone()]);
+                        }
+                    }
                     cursor = deletion.end;
                 }
                 push_run(
@@ -415,6 +449,26 @@ fn build_prepared(
                     virtual_text,
                     "",
                 );
+                let whitespace_only = virtual_segment
+                    .chars()
+                    .all(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+                // Content lines set the indent new lines regain; with none,
+                // the blank lines' removed indentation, then the closing one.
+                if deleted.is_empty() && whitespace_only {
+                    deleted = blank;
+                }
+                if deleted.is_empty()
+                    && !deletes_closing_lines
+                    && whitespace_only
+                    && let Some(closing) = closing
+                {
+                    deleted.push(closing);
+                }
+                indents.push(SegmentIndent::from_deletions(
+                    virtual_text,
+                    segment.virtual_range.clone(),
+                    &deleted,
+                ));
             }
             (SegmentKind::Gap, WireSegmentResult::Gap { content }) => {
                 let replacement = content.as_deref().unwrap_or(virtual_segment);
@@ -434,6 +488,14 @@ fn build_prepared(
     if check_line_breaks && fuses_a_line_break(&text, &runs, virtual_text) {
         return Err(PrepareError::FusedLineBreak);
     }
+    // A segment that says nothing of its indentation (no indent removed,
+    // and no block of text of its own: the rest of a line after an
+    // interpolation, blank lines) is indented as the content before it.
+    for index in 1..indents.len() {
+        if !indents[index].evidence {
+            indents[index].uniform = indents[index - 1].uniform.clone();
+        }
+    }
 
     // Even an answer that changed nothing yields a map: the map is how every
     // later path knows the document went through the peer (and must wait
@@ -450,6 +512,7 @@ fn build_prepared(
         virtual_lines: LineMap::new(virtual_text.to_string()),
         prepared_lines: LineMap::new(text.clone()),
         runs,
+        indents,
         fingerprint,
         built: taken,
         #[cfg(test)]
@@ -680,6 +743,51 @@ struct Run {
     virtual_: Range<usize>,
 }
 
+/// The indentation a content segment lost, which lines an edit to P creates
+/// there regain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentIndent {
+    virtual_range: Range<usize>,
+    /// `Some(indent)` when every deletion in the segment removed the same
+    /// text (a dedent); `None` when they differ, so a new line of text has no
+    /// single right indentation (a blank one needs none). Indentation removed from whitespace-only lines
+    /// counts only in a segment of whitespace alone (a blank line says
+    /// nothing of the content's indent), and the document's deleted
+    /// indentation-only last line (the closing indent) only there with no
+    /// other deletion and no closing lines deleted with it. A
+    /// segment without `evidence` takes the previous segment's instead.
+    uniform: Option<String>,
+    /// Whether the segment says anything of its indentation: an indent
+    /// removed, or text in a segment that opens a line of its own.
+    evidence: bool,
+}
+
+impl SegmentIndent {
+    fn from_deletions(virtual_text: &str, virtual_range: Range<usize>, deleted: &[&str]) -> Self {
+        // A line of text the peer left alone says nothing of the indent new
+        // lines regain, as within one segment; but a segment that opens a
+        // line of its own (a block after a fence) and holds text is a block
+        // the peer left unindented, not the rest of the line before it.
+        let evidence = !deleted.is_empty()
+            || (is_line_start(virtual_text, virtual_range.start)
+                && !virtual_text[virtual_range.clone()]
+                    .trim_matches([' ', '\t', '\n', '\r'])
+                    .is_empty());
+        let uniform = match deleted.split_first() {
+            None => Some(String::new()),
+            Some((first, rest)) => rest
+                .iter()
+                .all(|other| other == first)
+                .then(|| (*first).to_string()),
+        };
+        Self {
+            virtual_range,
+            uniform,
+            evidence,
+        }
+    }
+}
+
 /// Coordinates between a prepared document (P) and its virtual document (V).
 ///
 /// Equality compares a fingerprint of both texts and the runs between them:
@@ -690,6 +798,9 @@ pub(crate) struct PreparedMap {
     virtual_lines: LineMap,
     prepared_lines: LineMap,
     runs: Vec<Run>,
+    /// One per content segment, in order; derived from the runs, so not
+    /// part of the fingerprint.
+    indents: Vec<SegmentIndent>,
     fingerprint: u64,
     /// Where the input its answer came from was taken in the presentation
     /// order (see [`apply_prepare_result_at`]); not part of its equality.
@@ -782,6 +893,12 @@ impl PreparedMap {
     /// answer.
     pub(crate) fn set_revocation(&mut self, revocation: std::sync::Arc<Revocation>) {
         self.revocation = Some(revocation);
+    }
+
+    /// The indentation the peer removed right at P offset `prepared` (a
+    /// deleted run P shows nothing of), if any.
+    fn removed_indent_at(&self, prepared: usize) -> Option<&Run> {
+        empty_run(&self.runs, prepared, |kind| kind == RunKind::Deleted)
     }
 
     /// Whether `a` and `b` translate alike: built from the same texts with
@@ -912,16 +1029,38 @@ impl PreparedMap {
             .take_while(move |run| run.virtual_.start <= offset)
     }
 
+    /// Whether a V position sits within indentation or blank lines the peer
+    /// removed: P has no position there, and one at the line's content (or
+    /// the content's end) stands in for it, starts included.
+    pub(crate) fn virtual_position_in_removed_indent(&self, position: Position) -> bool {
+        let offset = self.virtual_lines.offset_clamped(position);
+        self.offset_in_removed_lines(offset)
+            || self.runs_at_virtual(offset).any(|run| {
+                run.kind == RunKind::Deleted
+                    && run.virtual_.start <= offset
+                    && offset < run.virtual_.end
+            })
+    }
+
+    /// Whether the V range reaches inside a gap's host text (an empty range:
+    /// whether it sits strictly inside one).
+    pub(crate) fn virtual_range_in_gap(&self, range: tower_lsp_server::ls_types::Range) -> bool {
+        self.virtual_range_reaches_into_gap(
+            self.virtual_lines.offset_clamped(range.start),
+            self.virtual_lines.offset_clamped(range.end),
+        )
+    }
+
     /// Whether a V position sits strictly inside a gap: host-owned text no
     /// downstream position stands for.
     pub(crate) fn virtual_position_in_gap(&self, position: Position) -> bool {
         let offset = self.virtual_lines.offset_clamped(position);
-        self.virtual_range_touches_gap(offset, offset)
+        self.virtual_range_reaches_into_gap(offset, offset)
     }
 
     /// Whether the V range `start..end` reaches inside a gap's V text (an
     /// empty range: whether it sits strictly inside one).
-    fn virtual_range_touches_gap(&self, start: usize, end: usize) -> bool {
+    fn virtual_range_reaches_into_gap(&self, start: usize, end: usize) -> bool {
         let first = self.runs.partition_point(|run| run.virtual_.end <= start);
         self.runs[first..]
             .iter()
@@ -965,6 +1104,21 @@ impl Side {
 /// after the lines deleted from the document's start, and P's end, whatever
 /// the bias, before those deleted from its end.
 fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
+    map_offset_stopping(runs, offset, bias, from, |kind| {
+        matches!(kind, RunKind::Gap | RunKind::Deleted)
+    })
+}
+
+/// [`map_offset`], with a [`Bias::End`] offset from P stopping before the
+/// empty runs of the kinds `stops_before` accepts that sit there (and before
+/// the document's deleted closing lines, whatever it accepts).
+fn map_offset_stopping(
+    runs: &[Run],
+    offset: usize,
+    bias: Bias,
+    from: Side,
+    stops_before: impl Fn(RunKind) -> bool,
+) -> usize {
     // P's end, where the document's deleted closing lines were: the
     // content ends there in V too, before them.
     if matches!(from, Side::Prepared)
@@ -977,9 +1131,7 @@ fn map_offset(runs: &[Run], offset: usize, bias: Bias, from: Side) -> usize {
     // range covers none of that host text.
     if bias == Bias::End
         && matches!(from, Side::Prepared)
-        && let Some(run) = empty_run(runs, offset, |kind| {
-            matches!(kind, RunKind::Gap | RunKind::Deleted)
-        })
+        && let Some(run) = empty_run(runs, offset, stops_before)
     {
         return run.virtual_.start;
     }
@@ -1246,9 +1398,26 @@ fn is_line_start(text: &str, offset: usize) -> bool {
     offset == 0 || matches!(text.as_bytes().get(offset - 1), Some(b'\n' | b'\r'))
 }
 
+/// Whether the rest of `text`'s line from `offset` holds nothing but spaces
+/// and tabs (or nothing).
+fn rest_of_line_blank(text: &str, offset: usize) -> bool {
+    let rest = text[offset..]
+        .split(['\n', '\r'])
+        .next()
+        .unwrap_or_default();
+    #[cfg(test)]
+    tests::BLANK_SCANNED.with(|scanned| scanned.set(scanned.get() + rest.len()));
+    rest.chars().all(|c| matches!(c, ' ' | '\t'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Bytes `rest_of_line_blank` examined on this thread.
+        pub(super) static BLANK_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     /// An answer whose prepared text would join a lone CR and a following
     /// LF into one CRLF — one line fewer than the virtual document keeps,

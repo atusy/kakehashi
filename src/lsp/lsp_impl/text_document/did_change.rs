@@ -108,6 +108,19 @@ impl Kakehashi {
         // scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
         self.documents.apply_edit(&uri, text, &edits);
+        // Before any await: a prepared answer arriving from now on is judged
+        // against a host text its regions' latest texts may not describe yet.
+        // Gated first: a pool preparing nothing keeps nothing, and typing
+        // there pays no document lookup for it.
+        if self.bridge.pool().prepares()
+            && let Some(document) = self.documents.get(&uri)
+        {
+            self.bridge.pool().note_host_edited(
+                &uri,
+                document.incarnation(),
+                document.content_version(),
+            );
+        }
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.

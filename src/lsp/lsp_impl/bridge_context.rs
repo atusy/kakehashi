@@ -74,11 +74,20 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
+/// Whether an edit method stays open to a contiguous prepared document: its
+/// edits are mapped back through the prepared map
+/// (`translate_virtual_text_edits_to_host`).
+fn method_maps_prepared_edits(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/colorPresentation" | "textDocument/completion" | "textDocument/inlayHint"
+    )
+}
+
 /// Whether `method` is closed to a region: one that is not contiguous, or
 /// whose document is prepared (`prepared`), cannot take the edits the method
-/// answers with — no edit is mapped back through a prepared document. Inlay
-/// hints stay open to a contiguous prepared document (they are display; their
-/// edits are dropped instead).
+/// answers with — but for the methods whose edits are mapped back through a
+/// prepared document ([`method_maps_prepared_edits`]).
 pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
     method_closed_to_with(resolved, method, || prepared)
 }
@@ -91,7 +100,7 @@ fn method_closed_to_with(
     prepared: impl FnOnce() -> bool,
 ) -> bool {
     method_requires_contiguous_injection(method)
-        && (!resolved.contiguous || (method != "textDocument/inlayHint" && prepared()))
+        && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
 }
 
 /// [`prepare_request_context`] for a `method` request: `None` when the
@@ -313,6 +322,214 @@ impl UpstreamRegistrySweepGuard {
 impl Drop for UpstreamRegistrySweepGuard {
     fn drop(&mut self) {
         self.pool.unregister_all_for_upstream_id(self.id.as_ref());
+    }
+}
+
+/// A layer's answer, with the prepared region its edits were mapped
+/// through, if any: what the final answer is checked against once, as it
+/// is chosen (see [`Self::still_current`]).
+pub(crate) struct Sourced<T> {
+    pub(crate) value: T,
+    prepared: Option<PreparedSource>,
+}
+
+/// The region and request map a prepared answer was transformed through,
+/// and the host lifetime the region was tracked under as it was (`None`:
+/// not tracked even then, or tracked under another lifetime than the
+/// request's content version was read under).
+struct PreparedSource {
+    host_uri: Url,
+    language: String,
+    region_id: String,
+    map: std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+    incarnation: Option<u64>,
+    /// The host's content version read before the request's text was:
+    /// never newer than the text the answer was made on, under the lifetime
+    /// in `incarnation` (`None` there when it was read under another).
+    content_version: Option<u64>,
+}
+
+/// The host lifetime `region_id` of `host_uri` is tracked under now, if it
+/// is tracked at all: a region deleted, invalidated by an edit, or of a
+/// closed host is not.
+fn tracked_region_incarnation(
+    tracker: &crate::language::NodeTracker,
+    host_uri: &Url,
+    region_id: &str,
+) -> Option<u64> {
+    let ulid = region_id.parse::<ulid::Ulid>().ok()?;
+    tracker
+        .lookup_position(host_uri, &ulid)
+        .map(|(_, _, _, incarnation)| incarnation)
+}
+
+impl<T> Sourced<T> {
+    /// An answer read through no prepared map (the host layer's, or an
+    /// unprepared region's).
+    pub(crate) fn unprepared(value: T) -> Self {
+        Self {
+            value,
+            prepared: None,
+        }
+    }
+
+    /// An answer mapped through `map`, for `region_id` (under `language`)
+    /// of `host_uri`.
+    #[cfg(test)]
+    pub(crate) fn prepared_for_test(
+        value: T,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        map: &std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+        incarnation: u64,
+        content_version: u64,
+    ) -> Self {
+        Self {
+            value,
+            prepared: Some(PreparedSource {
+                host_uri: host_uri.clone(),
+                language: language.to_string(),
+                region_id: region_id.to_string(),
+                map: std::sync::Arc::clone(map),
+                incarnation: Some(incarnation),
+                content_version: Some(content_version),
+            }),
+        }
+    }
+
+    /// The virt layer's answer for `ctx`'s region: through its map, when
+    /// the region is prepared, with the lifetime `tracker` tracks it under
+    /// and the host's `revision` read before the request's text (see
+    /// [`Kakehashi::prepared_request_revision`]).
+    pub(crate) fn from_region(
+        ctx: &DocumentRequestContext,
+        value: T,
+        tracker: &crate::language::NodeTracker,
+        revision: Option<crate::lsp::bridge::HostRevision>,
+    ) -> Self {
+        Self {
+            value,
+            prepared: ctx.prepared.as_ref().map(|map| PreparedSource {
+                host_uri: ctx.uri.clone(),
+                language: ctx.resolved.injection_language.clone(),
+                region_id: ctx.resolved.region.region_id.clone(),
+                map: std::sync::Arc::clone(map),
+                // Tracked under another lifetime than the revision was read
+                // under (the host reopened while the text was resolved), the
+                // version read stamps no text the answer was made on.
+                incarnation: tracked_region_incarnation(
+                    tracker,
+                    &ctx.uri,
+                    &ctx.resolved.region.region_id,
+                )
+                .filter(|&incarnation| {
+                    revision.is_some_and(|revision| revision.incarnation == incarnation)
+                }),
+                content_version: revision.map(|revision| revision.content_version),
+            }),
+        }
+    }
+
+    /// The value apart from where it came from: for an answer combined with
+    /// others, the source checked for its part alone.
+    pub(crate) fn into_parts(self) -> (T, Sourced<()>) {
+        (
+            self.value,
+            Sourced {
+                value: (),
+                prepared: self.prepared,
+            },
+        )
+    }
+
+    /// Whether the answer was mapped through a prepared map.
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.prepared.is_some()
+    }
+
+    /// Whether the edits mapped into the answer still land where they were
+    /// mapped: always so without a map. Otherwise the host must not have
+    /// been edited since the request's text was read (`current_version`,
+    /// read only then): an edit anywhere, above the region too, moves the
+    /// host coordinates its edits were translated to. And the region must
+    /// be live —
+    /// still tracked under the lifetime it was tracked under as the answer
+    /// was made, the one the request's content version was read under and
+    /// the host's store is open for (not deleted,
+    /// invalidated, nor its host closed or reopened) — and its recorded text
+    /// still the request's (`LanguageServerPool::host_text_still_current`).
+    /// Read where an answer is chosen, and nowhere per reply: a reply refused
+    /// as it arrived would count as no answer, and a server ranked below it
+    /// replying once the host settled (the region's content unchanged) would
+    /// win. Completion, and color presentations under `preferred`, read it
+    /// as the layer race decides on the injected layer's answer, so a stale
+    /// one falls through to the host layer's, and again as they return the
+    /// answer, after the last await. Color presentations under
+    /// `concatenated` read it once, after every layer answered, dropping only
+    /// a stale prepared part; inlay hints once the answer is chosen, a stale
+    /// answer's hints staying shown without their edits.
+    pub(crate) fn still_current(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+        current_version: impl FnOnce() -> Option<u64>,
+    ) -> bool {
+        self.prepared.as_ref().is_none_or(|source| {
+            source
+                .content_version
+                .is_some_and(|version| current_version() == Some(version))
+                && source.incarnation.is_some_and(|incarnation| {
+                    tracked_region_incarnation(tracker, &source.host_uri, &source.region_id)
+                        == Some(incarnation)
+                        && pool.current_host_incarnation(&source.host_uri) == Some(incarnation)
+                })
+                && pool.host_text_still_current(
+                    &source.host_uri,
+                    &source.language,
+                    &source.region_id,
+                    &source.map,
+                )
+        })
+    }
+}
+
+impl Kakehashi {
+    /// The host's lifetime and content version, read together before a virt
+    /// layer resolves the request's text, for its prepared answer's final
+    /// check (see [`Sourced::still_current`]). Read only by a pool that
+    /// prepares: unprepared answers pay no lookup.
+    pub(crate) fn prepared_request_revision(
+        &self,
+        lsp_uri: &Uri,
+    ) -> Option<crate::lsp::bridge::HostRevision> {
+        if !self.bridge.pool().prepares() {
+            return None;
+        }
+        let uri = uri_to_url(lsp_uri).ok()?;
+        self.documents
+            .get(&uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            })
+    }
+
+    /// Whether `sourced`'s edits, made for `lsp_uri`, still land where they
+    /// were mapped (see [`Sourced::still_current`]), read against the host
+    /// as it is now.
+    pub(crate) fn sourced_still_current<T>(&self, sourced: &Sourced<T>, lsp_uri: &Uri) -> bool {
+        sourced.still_current(self.bridge.pool(), self.bridge.node_tracker(), || {
+            self.host_content_version(lsp_uri)
+        })
+    }
+
+    /// The host's current content version.
+    pub(crate) fn host_content_version(&self, lsp_uri: &Uri) -> Option<u64> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        self.documents
+            .get(&uri)
+            .map(|document| document.content_version())
     }
 }
 
@@ -1881,22 +2098,54 @@ impl Kakehashi {
         native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
         is_nonempty: impl Fn(&R) -> bool,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
-        let Ok(uri) = uri_to_url(lsp_uri) else {
-            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
-            return Ok(None);
-        };
-        let Some(host_language) = self.document_language(&uri) else {
-            return Ok(None);
-        };
-        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
-        self.run_layer_race(race_layers_preferred(
-            &layer_cfg.priorities,
+        self.walk_layer_futures_in_order(
+            lsp_uri,
+            layer_method,
+            request_method,
             virt,
             host,
             native,
             is_nonempty,
-        ))
+        )
         .await
+        .0
+    }
+
+    /// [`Self::walk_layer_futures`], also handing back the layer order the
+    /// walk raced in (empty when it did not run), read from the same
+    /// settings snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn walk_layer_futures_in_order<R>(
+        &self,
+        lsp_uri: &Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        virt: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        host: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        native: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
+        is_nonempty: impl Fn(&R) -> bool,
+    ) -> (
+        tower_lsp_server::jsonrpc::Result<Option<R>>,
+        Vec<LayerSource>,
+    ) {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return (Ok(None), Vec::new());
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return (Ok(None), Vec::new());
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        let result = self
+            .run_layer_race(race_layers_preferred(
+                &layer_cfg.priorities,
+                virt,
+                host,
+                native,
+                is_nonempty,
+            ))
+            .await;
+        (result, layer_cfg.priorities)
     }
 
     /// Run a pre-built layer race under a walk-wide cancel subscription, then
@@ -2221,6 +2470,221 @@ mod tests {
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
 
+    /// A transformed answer a fan-in or the layer race held while the host
+    /// was re-indented (the same prepared text under a new map) is stale
+    /// when the final answer is chosen, though it was current as its reply
+    /// was transformed.
+    #[tokio::test]
+    async fn an_answer_held_while_the_host_moved_is_stale_when_chosen() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let strip = |text: &str, columns: u32| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0},
+                              "end": {"line": 0, "character": columns}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let before = strip("  red\n", 2);
+        let after = strip("    red\n", 4);
+        assert_eq!(before.text, after.text);
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/held-reindent.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 1).await;
+        let held = Sourced::prepared_for_test((), &host, "lua", &region, &before.map, 1, 0);
+        // Open, no pass recorded its text yet: live, kept.
+        assert!(held.still_current(&pool, &tracker, || Some(0)));
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &before);
+        assert!(
+            held.still_current(&pool, &tracker, || Some(0)),
+            "current as its reply was transformed"
+        );
+        pool.note_host_edited(&host, 1, 1);
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &after);
+        pool.note_host_settled(&host, 1, 1);
+        // Dropped by the store alone (the same host version read)...
+        assert!(!held.still_current(&pool, &tracker, || Some(0)));
+        // ...as by the version the edit moved the host to.
+        assert!(!held.still_current(&pool, &tracker, || Some(1)));
+        // An answer through no map reads nothing.
+        assert!(Sourced::unprepared(()).still_current(&pool, &tracker, || Some(0)));
+    }
+
+    /// An edit above the region moves the host coordinates its answer's
+    /// edits were translated to, though the region stays live with the
+    /// same text and map: dropped, as after any host edit.
+    #[tokio::test]
+    async fn an_answer_whose_host_moved_above_the_region_is_stale_when_chosen() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let original_host = "intro\n```lua\n  red\n```\n";
+        let virtual_text = "  red\n";
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0},
+                          "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let host = Url::parse("file:///test/shifted-region.md").unwrap();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        pool.open_host_incarnation(&host, 1).await;
+        let start = original_host.find(virtual_text).unwrap();
+        let region = tracker
+            .get_or_create_for_incarnation(&host, start, start + virtual_text.len(), "block", 1)
+            .unwrap();
+        let region_id = region.to_string();
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region_id, &prepared);
+        let sourced = Sourced::prepared_for_test((), &host, "lua", &region_id, &prepared.map, 1, 0);
+        assert!(sourced.still_current(&pool, &tracker, || Some(0)));
+        // A line inserted above: the region survives, shifted, its text and
+        // map recorded again unchanged.
+        let invalidated = tracker.apply_input_edits(
+            &host,
+            &[crate::language::node_tracker::EditInfo::new(0, 0, 1)],
+        );
+        assert!(!invalidated.contains(&region));
+        pool.note_host_edited(&host, 1, 1);
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region_id, &prepared);
+        pool.note_host_settled(&host, 1, 1);
+        assert!(pool.host_text_still_current(&host, "lua", &region_id, &prepared.map));
+        assert!(!sourced.still_current(&pool, &tracker, || Some(1)));
+    }
+
+    /// A region forgotten after its request was made is no place for the
+    /// answer's edits, however the store reads: rerouted to another
+    /// language, invalidated or deleted, or its host closed or reopened.
+    #[tokio::test]
+    async fn an_answer_for_a_region_forgotten_since_is_stale_when_chosen() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let prepared = apply_prepare_result("a\n", &VirtualLayout::single("a\n"), None).unwrap();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/forgotten.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 1)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+        let answer = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 0);
+        assert!(answer.still_current(&pool, &tracker, || Some(0)));
+        // Rerouted: the region's text recorded under another language only.
+        pool.clear_invalidated_virtual_contents(&host, &[region.parse().unwrap()]);
+        assert!(
+            answer.still_current(&pool, &tracker, || Some(0)),
+            "open, not recorded"
+        );
+        pool.record_latest_prepared_for_test(&host, 1, "python", &region, &prepared);
+        assert!(!answer.still_current(&pool, &tracker, || Some(0)));
+        pool.clear_invalidated_virtual_contents(&host, &[region.parse().unwrap()]);
+        // Invalidated by an edit over it (or deleted): no longer tracked.
+        let invalidated = tracker.apply_input_edits(
+            &host,
+            &[crate::language::node_tracker::EditInfo::new(0, 2, 0)],
+        );
+        assert!(invalidated.iter().any(|ulid| ulid.to_string() == region));
+        assert!(!answer.still_current(&pool, &tracker, || Some(0)));
+        // Its host reopened: the region tracked anew under another lifetime.
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 1)
+            .unwrap()
+            .to_string();
+        let answer = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 0);
+        assert!(answer.still_current(&pool, &tracker, || Some(0)));
+        pool.close_host_incarnation(&host, 1).await;
+        assert!(!answer.still_current(&pool, &tracker, || Some(0)), "closed");
+        pool.open_host_incarnation(&host, 2).await;
+        assert!(
+            !answer.still_current(&pool, &tracker, || Some(0)),
+            "reopened"
+        );
+    }
+
+    /// The host's revision read before the request's text belongs to the
+    /// lifetime it was read under: when the host closed and reopened while
+    /// the request resolved its text, the reopened document's content
+    /// version can come back to the number read, and the region is tracked
+    /// under the new lifetime, yet the edits were made against a text the
+    /// read revision never stamped. Stale.
+    #[tokio::test]
+    async fn an_answer_whose_revision_predates_a_reopen_is_stale_when_chosen() {
+        use crate::lsp::bridge::{HostRevision, VirtualLayout, apply_prepare_result};
+        let prepared = apply_prepare_result("a\n", &VirtualLayout::single("a\n"), None).unwrap();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = Url::parse("file:///test/reopened-mid-request.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 2);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 2, "block", 2)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 2).await;
+        pool.record_latest_prepared_for_test(&host, 2, "lua", &region, &prepared);
+        let ctx = DocumentRequestContext {
+            prepared: Some(std::sync::Arc::clone(&prepared.map)),
+            uri: host.clone(),
+            resolved: crate::language::injection::ResolvedInjection {
+                region: crate::language::injection::CacheableInjectionRegion {
+                    language: "lua".to_string(),
+                    byte_range: 0..2,
+                    line_range: 0..1,
+                    start_column: 0,
+                    region_id: region.clone(),
+                    content_hash: 0,
+                },
+                injection_language: "lua".to_string(),
+                virtual_content: "a\n".to_string(),
+                line_column_offsets: vec![0],
+                contiguous: true,
+                gaps: Default::default(),
+            },
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let answer_read_under = |incarnation| {
+            Sourced::from_region(
+                &ctx,
+                (),
+                &tracker,
+                Some(HostRevision {
+                    incarnation,
+                    content_version: 3,
+                }),
+            )
+        };
+        assert!(
+            answer_read_under(2).still_current(&pool, &tracker, || Some(3)),
+            "read under the lifetime it resolved in"
+        );
+        assert!(!answer_read_under(1).still_current(&pool, &tracker, || Some(3)));
+    }
+
     /// A Kakehashi over a preparing pool whose markdown lua documents have
     /// one candidate, and a region of it no lifecycle pass looked up.
     fn kakehashi_with_an_unlooked_region() -> (
@@ -2323,7 +2787,7 @@ mod tests {
 
     /// An edit method on a region the lifecycle pass has not looked up yet
     /// is closed once its answer is in, unless the document goes as is;
-    /// inlay hints stay open (their edits are dropped instead).
+    /// inlay hints and completion stay open (their edits are mapped back).
     #[tokio::test]
     async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
@@ -2352,12 +2816,14 @@ mod tests {
         let for_method =
             |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
         assert!(for_method("textDocument/rename").await.is_none());
-        assert!(for_method("textDocument/completion").await.is_none());
-        let hint = for_method("textDocument/inlayHint")
-            .await
-            .expect("hints stay open");
-        assert!(hint.prepared.is_some());
-        assert_eq!(hint.resolved.virtual_content, "a");
+        assert!(for_method("textDocument/codeAction").await.is_none());
+        for method in ["textDocument/inlayHint", "textDocument/completion"] {
+            let open = for_method(method)
+                .await
+                .unwrap_or_else(|| panic!("{method} stays open"));
+            assert!(open.prepared.is_some());
+            assert_eq!(open.resolved.virtual_content, "a");
+        }
     }
 
     /// A region the lifecycle pass holds on an unusable answer is not
@@ -2448,7 +2914,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_document_is_closed_to_edit_methods_but_not_inlay_hints() {
+    fn a_prepared_document_is_closed_to_edit_methods_but_those_mapping_their_edits() {
         let mut resolved = crate::language::injection::ResolvedInjection {
             region: crate::language::injection::CacheableInjectionRegion {
                 language: "lua".to_string(),
@@ -2466,7 +2932,6 @@ mod tests {
         };
         for method in [
             "textDocument/rename",
-            "textDocument/completion",
             "textDocument/codeAction",
             "textDocument/prepareRename",
             "textDocument/formatting",
@@ -2476,10 +2941,49 @@ mod tests {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
             assert!(method_closed_to(&resolved, method, true), "{method}");
         }
-        assert!(!method_closed_to(&resolved, "textDocument/inlayHint", true));
+        for method in [
+            "textDocument/inlayHint",
+            "textDocument/colorPresentation",
+            "textDocument/completion",
+        ] {
+            assert!(!method_closed_to(&resolved, method, true), "{method}");
+        }
         assert!(!method_closed_to(&resolved, "textDocument/hover", true));
         resolved.contiguous = false;
         assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
+    }
+
+    /// The carriers mapping edits back through a prepared map open on
+    /// contiguous regions only: a noncontiguous one, whose map has gaps
+    /// (where `map_edits`' indentation is not yet exact), never reaches it,
+    /// prepared or not.
+    #[test]
+    fn edit_carriers_mapping_prepared_edits_stay_closed_to_noncontiguous_regions() {
+        let resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: String::new(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![],
+            contiguous: false,
+            gaps: Default::default(),
+        };
+        for method in [
+            "textDocument/completion",
+            "textDocument/inlayHint",
+            "textDocument/colorPresentation",
+        ] {
+            assert!(method_maps_prepared_edits(method), "{method}");
+            for prepared in [false, true] {
+                assert!(method_closed_to(&resolved, method, prepared), "{method}");
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,7 +11,11 @@ pub(crate) use dispatch::{
     effective_priorities_from, mint_region_progress_source,
 };
 pub(crate) use fan_in::FanInResult;
+#[cfg(test)]
+pub(crate) use fan_in::preferred::preferred;
 pub(crate) use fan_out::FanOutTask;
+#[cfg(test)]
+pub(crate) use fan_out::TaggedResult;
 pub(crate) use host_dispatch::{
     HostFanOutTask, dispatch_host_concatenated, dispatch_host_preferred,
 };

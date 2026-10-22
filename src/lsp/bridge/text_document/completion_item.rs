@@ -31,10 +31,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
 };
-use super::completion::{
-    EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
-    transform_completion_item,
-};
+use super::completion::{KakehashiEnvelope, strip_envelope, transform_completion_item};
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{
@@ -319,7 +316,16 @@ impl LanguageServerPool {
             .await
         {
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                // No prepared region gets this far (its items never resolve:
+                // `Kakehashi::completion_resolve_region`), so the client's insert mode,
+                // which only a prepared edit consults, does not matter.
+                if transform_completion_item(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    super::completion::ClientInsertMode::default(),
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.
@@ -596,21 +602,26 @@ fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &Reg
 /// The resolved item may have its own `data` (from the downstream's resolve
 /// response). We wrap it again so that future resolves can still be routed.
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
-    let ctx = EnvelopeContext {
-        server_name: &envelope.origin,
-        injection_language: &envelope.injection_language,
+    // The offset as a fresh mint writes it, keeping the prepared mark (see
+    // `EnvelopeOffset::rewritten`), as every carrier re-envelopes. The layer
+    // is kept too: a host-layer item resolved once must still take the host
+    // path on the client's NEXT resolve of it.
+    let offset = envelope.offset.rewritten();
+    // Field by field: `..envelope.clone()` would clone `inner`, the
+    // server's whole data payload, only to drop it.
+    let rebuilt = KakehashiEnvelope {
+        origin: envelope.origin.clone(),
+        injection_language: envelope.injection_language.clone(),
         incarnation: envelope.incarnation,
-        host_uri: &envelope.host_uri,
-        region_id: &envelope.region_id,
-        offset: &RegionOffset::from(&envelope.offset),
-        region_end: envelope
-            .region_end
-            .map(|(line, character)| Position { line, character }),
-        // Preserve the layer: a host-layer item that has been resolved once
-        // must still take the host path on the client's NEXT resolve of it.
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        inner: None,
+        offset,
+        region_end: envelope.region_end,
         host_layer: envelope.host_layer,
     };
-    envelope_item_data(item, &ctx);
+    let inner = item.data.take();
+    item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
 }
 
 #[cfg(test)]
@@ -640,6 +651,30 @@ mod tests {
             region_end: Some((9, 0)),
             host_layer: false,
         }
+    }
+
+    #[test]
+    fn a_refused_resolve_keeps_the_prepared_mark() {
+        let mut envelope = test_envelope();
+        envelope.offset.prepared = true;
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &envelope);
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(back.offset.prepared);
+        // As is, the envelope is written as before.
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &test_envelope());
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(!back.offset.prepared);
+        assert_eq!(back.offset.line_column_offsets, Some(vec![0]));
     }
 
     #[cfg(unix)]
