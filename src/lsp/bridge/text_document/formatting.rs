@@ -2,10 +2,12 @@
 //! `TextEdit` range from virtual coordinates back to the host document, applying
 //! the injection's [`RegionOffset`] (including per-line column for the first line).
 //!
-//! [`transform_formatting_response_to_host`] is `pub(super)` so
+//! [`formatting_answer_to_host`] (over
+//! [`transform_formatting_response_to_host`]) is `pub(super)` so
 //! [`super::range_formatting`], which shares the same virtual→host hazards,
 //! can reuse it; [`super::on_type_formatting`] uses
-//! [`transform_on_type_formatting_response_to_host`].
+//! [`on_type_formatting_answer_to_host`] (over
+//! [`transform_on_type_formatting_response_to_host`]).
 //!
 //! # Known limitation: formatting in prefixed regions can drop WHOLE responses
 //!
@@ -40,8 +42,8 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::pool::{BridgeResponseContext, LanguageServerPool, UpstreamId};
+use super::super::protocol::{FormattingRefusal, translate_virtual_formatting_edits_to_host};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
     response_has_jsonrpc_error, text_edit_safe_in_region,
@@ -105,13 +107,7 @@ impl LanguageServerPool {
             // malformed payloads to `Err` (request failure) — only the
             // no-capability early return above yields `Ok(None)`.
             |response, ctx| {
-                transform_formatting_response_to_host(
-                    response,
-                    ctx.offset,
-                    virtual_content,
-                    region_end,
-                )
-                .map(Some)
+                formatting_answer_to_host(response, ctx, virtual_content, region_end).map(Some)
             },
             downstream_id_probe,
         )
@@ -524,6 +520,110 @@ fn build_formatting_request(
     JsonRpcRequest::new(request_id.as_i64(), "textDocument/formatting", params)
 }
 
+/// A formatting or range formatting answer arriving in `ctx`, in host
+/// coordinates: [`transform_formatting_response_to_host`] through
+/// `ctx.offset`.
+///
+/// Whether the host moved under a prepared answer since its request is not
+/// read here: the formatting fan-outs check every prepared region once, as
+/// the final answer is chosen (`Sourced::still_current`), which drops the
+/// answer whole. Refused here instead, the reply would count as its server
+/// failing, and the preferred fan-in would fall through to a server ranked
+/// below it whose reply came once the host settled, against the configured
+/// order. An answer mapped through a map the host moved under is only ever
+/// discarded: the map is the one the server's text was prepared under, so
+/// mapping through it is well defined. Until that check, only the
+/// concatenated pipeline's later layers read the result: the host's own
+/// formatter is sent the text with these edits applied, a coherent text
+/// of the same snapshot, and its answer is discarded with the rest when
+/// the check fails.
+pub(super) fn formatting_answer_to_host(
+    response: serde_json::Value,
+    ctx: &BridgeResponseContext<'_>,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Vec<TextEdit>> {
+    transform_formatting_response_to_host(response, ctx.offset, virtual_content, region_end)
+        .map_err(|error| placed(error, ctx))
+}
+
+/// A formatting answer the prepared map refused, why, and (once the
+/// caller that knows the document says) where: the error the transforms
+/// fail with. The fan-in logs it once for the reply, with the server, and
+/// counts it as that server failing.
+#[derive(Debug)]
+pub(crate) struct PreparedAnswerRefused {
+    pub(crate) reason: FormattingRefusal,
+    /// The host document and the region's virtual document.
+    pub(crate) place: Option<String>,
+}
+
+impl std::fmt::Display for PreparedAnswerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.place {
+            Some(place) => write!(
+                f,
+                "formatting response for {place} refused: {}",
+                self.reason
+            ),
+            None => write!(f, "formatting response refused: {}", self.reason),
+        }
+    }
+}
+
+impl std::error::Error for PreparedAnswerRefused {}
+
+/// The reason a prepared map refused an answer, if that is why `error`
+/// was raised.
+fn refusal(error: &io::Error) -> Option<FormattingRefusal> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>())
+        .map(|refused| refused.reason)
+}
+
+/// `error`, a refusal named with the host document and the region.
+fn placed(error: io::Error, ctx: &BridgeResponseContext<'_>) -> io::Error {
+    match refusal(&error) {
+        Some(reason) => io::Error::other(PreparedAnswerRefused {
+            reason,
+            place: Some(format!(
+                "{} (region {})",
+                ctx.host_uri_lsp.as_str(),
+                ctx.virtual_uri_string
+            )),
+        }),
+        None => error,
+    }
+}
+
+/// [`formatting_answer_to_host`] for an on-type formatting answer (see
+/// [`transform_on_type_formatting_response_to_host`]). One the prepared
+/// map refuses is no answer (`None`), logged at debug, as one the host
+/// moved under is: on-type answers come on trigger keystrokes, and a
+/// failure there would warn the user on every one. No answer, not an empty
+/// one: an empty answer says nothing needs formatting and wins the fan-in,
+/// while no answer leaves it to the servers ranked below.
+pub(super) fn on_type_formatting_answer_to_host(
+    response: serde_json::Value,
+    ctx: &BridgeResponseContext<'_>,
+    virtual_content: &str,
+    region_end: Position,
+) -> io::Result<Option<Vec<TextEdit>>> {
+    match transform_on_type_formatting_response_to_host(
+        response,
+        ctx.offset,
+        virtual_content,
+        region_end,
+    ) {
+        Err(error) if refusal(&error).is_some() => {
+            log::debug!(target: "kakehashi::bridge", "{}", placed(error, ctx));
+            Ok(None)
+        }
+        result => result.map(Some),
+    }
+}
+
 /// Translate each `TextEdit` from virtual to host coordinates via `offset`.
 ///
 /// LSP returns `TextEdit[] | null`. A `null` result from a server that handled
@@ -650,10 +750,34 @@ fn transform_formatting_style_response(
 
     if keep_edges {
         edits = keep_edge_layout(edits, virtual_content, offset);
+    } else if offset
+        .prepared()
+        .is_some_and(|prepared| prepared.drops_the_break_before_the_closing(&edits))
+    {
+        // An on-type answer keeps no edges: one dropping P's final line
+        // break would edit the closing the peer deleted after it.
+        return Err(io::Error::other(PreparedAnswerRefused {
+            reason: FormattingRefusal::Shape,
+            place: None,
+        }));
     }
 
-    for edit in &mut edits {
-        translate_virtual_range_to_host(&mut edit.range, offset);
+    // On a prepared document the server formatted P (`virtual_content`),
+    // whose edges the layout kept above. Its answer maps back through the
+    // map, which restores the indentation the peer removed and keeps the
+    // host text P does not show (the deleted edge lines). An answer the map
+    // refuses counts as its server failing (the fan-in falls through to the
+    // next server, and the CLI reports a region none formats), unlike the
+    // unsafe answers dropped below: the server did its job, and the region
+    // is left unformatted only because its result cannot be placed. An
+    // unprepared document's edits translate as ranges, never refused.
+    // Logged by the caller, which knows the document (see
+    // `PreparedAnswerRefused`).
+    if let Err(reason) = translate_virtual_formatting_edits_to_host(&mut edits, offset) {
+        return Err(io::Error::other(PreparedAnswerRefused {
+            reason,
+            place: None,
+        }));
     }
 
     // Clamp positions past the end of the last content line into the region:
@@ -2015,5 +2139,556 @@ mod tests {
             edits.is_empty(),
             "edits starting more than one line past EOF must still be dropped"
         );
+    }
+
+    /// `virtual_content` prepared by a peer answering `changes` to its one
+    /// content segment, at host line 0, column `column`.
+    fn prepared_offset(
+        virtual_content: &str,
+        column: u32,
+        changes: serde_json::Value,
+    ) -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let result =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": changes}]}))
+                .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        RegionOffset::new(0, column).with_prepared(prepared.map)
+    }
+
+    /// A Nix `''` string's JSON, its content dedented by the peer.
+    const NIX_JSON_HOST: &str = "x = ''\n    {\"a\":1}\n  '';\n";
+    const NIX_JSON: &str = "\n    {\"a\":1}\n  ";
+
+    fn nix_json_offset() -> RegionOffset {
+        prepared_offset(
+            NIX_JSON,
+            6,
+            json!([{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}]),
+        )
+    }
+
+    #[test]
+    fn a_prepared_region_maps_a_whole_document_answer_back_reindented() {
+        // jsonls drops the line break after `''` and the closing indent of
+        // the prepared text it formatted; both are the region's edges.
+        let offset = nix_json_offset();
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "\n{\"a\":1}\n  ");
+        let host = format_host(
+            NIX_JSON_HOST,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 2 } },
+                "newText": "{\n  \"a\": 1\n}"
+            }]),
+        );
+        assert_eq!(host, "x = ''\n    {\n      \"a\": 1\n    }\n  '';\n");
+    }
+
+    #[test]
+    fn joining_a_nix_strings_last_line_maps() {
+        // The closing `'';` follows the last content line on the same host
+        // line: P has no final line break, and the answer joins that line.
+        let host = "x = ''\n  foo(\n    a)'';\n";
+        let virtual_content = "\n  foo(\n    a)";
+        let offset = prepared_offset(
+            virtual_content,
+            6,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "foo(\n  a)");
+        let formatted = format_host(
+            host,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 4 } },
+                "newText": "foo(a)\n"
+            }]),
+        );
+        assert_eq!(formatted, "x = ''\n  foo(a)'';\n");
+    }
+
+    #[rstest]
+    // The closing indent the peer removed after the last line.
+    #[case::closing_indent("  a\n  ", 2, "a")]
+    // nixfmt's: content deeper than the closing indent.
+    #[case::nixfmt("    a\n  ", 4, "a\nb")]
+    // The final break kept, text written after it (on the closing).
+    #[case::text_after_the_break("    a\n  ", 4, "a\nfoo")]
+    fn an_on_type_answer_dropping_the_final_break_keeps_the_closing(
+        #[case] virtual_content: &str,
+        #[case] dedent: u32,
+        #[case] answer: &str,
+    ) {
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": dedent}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "a\n");
+        let response = |answer: &str| {
+            json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": answer
+            }]})
+        };
+        // Refused as to its shape, not edited into the closing the peer
+        // deleted.
+        let error = transform_on_type_formatting_response_to_host(
+            response(answer),
+            &offset,
+            &prepared,
+            region_host_end(&prepared, &offset),
+        )
+        .unwrap_err();
+        assert_eq!(refusal(&error), Some(FormattingRefusal::Shape));
+        // The same answer ending with its line break maps, the closing kept.
+        let kept = transform_on_type_formatting_response_to_host(
+            response(&format!("{answer}\n")),
+            &offset,
+            &prepared,
+            region_host_end(&prepared, &offset),
+        )
+        .unwrap();
+        let host = crate::text::edit::apply_text_edits(virtual_content, &kept);
+        assert!(host.ends_with("\n  "), "{host:?}");
+    }
+
+    #[test]
+    fn whole_line_stretches_from_blank_lines_map_back_through_the_transform() {
+        // Formatting answers whose stretches start on, or run across,
+        // whitespace lines the peer emptied or kept.
+        {
+            // A line rewritten past a whitespace line the peer emptied (` `):
+            // `end` is a line of the content.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  x\\n \\n  c\\n  then\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 1, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 0}}, \"newText\": \"x\\nend\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "  x\n  end\n",
+                "m17"
+            );
+        }
+        {
+            // The same with the whitespace line kept (`   `).
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  x\\n   \\n  c\\n  then\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 0}}, \"newText\": \"x\\nend\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "  x\n  end\n",
+                "m8"
+            );
+        }
+        {
+            // A whole answer ending a line short of P's end, the closing kept.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\" \\tdef f(x):\\r\\n\\t\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"end\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                " \tend\r\n\t",
+                "n1"
+            );
+        }
+        {
+            // Lines reordered across CRLF and emptied whitespace lines; those
+            // blank lines read as rewritten empty (their whitespace, which
+            // the peer removed, is not told apart by the answer).
+            let virtual_content: &str = &serde_json::from_str::<String>("\"\\tcall(\\ud835\\udcb3, '\\u00e9')\\r\\n \\n\\t \\r\\n\\t\\n\\treturn x\\r\\n\\treturn x\\r\\n\\t \\n\\t    }\\r\\n\\t    let y = f x;\\r\\n\\t\\r\\n\"").unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 1, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 4, \"character\": 0}, \"end\": {\"line\": 4, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 5, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 6, \"character\": 0}, \"end\": {\"line\": 6, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 0}, \"end\": {\"line\": 7, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 0}, \"end\": {\"line\": 8, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 9, \"character\": 0}, \"end\": {\"line\": 9, \"character\": 1}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 8}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 0, \"character\": 9}, \"end\": {\"line\": 0, \"character\": 13}}, \"newText\": \" }\"}, {\"range\": {\"start\": {\"line\": 4, \"character\": 8}, \"end\": {\"line\": 4, \"character\": 8}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 5, \"character\": 8}, \"end\": {\"line\": 5, \"character\": 8}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 0}, \"end\": {\"line\": 7, \"character\": 3}}, \"newText\": \"call(\\ud835\\udcb3,\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 4}, \"end\": {\"line\": 7, \"character\": 5}}, \"newText\": \"'\\u00e9')\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 2}, \"end\": {\"line\": 8, \"character\": 4}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 15}, \"end\": {\"line\": 8, \"character\": 15}}, \"newText\": \"ss\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 16}, \"end\": {\"line\": 9, \"character\": 0}}, \"newText\": \"\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "\t  }\r\n\n\r\n\n\treturn xss\r\n\treturn xss\r\n\n\tcall(\u{1D4B3}, '\u{e9}')\r\n\t  let y = f xss;\r\n",
+                "t1"
+            );
+        }
+        {
+            // A whole-line stretch from a kept whitespace line into a dedented
+            // line rewritten: the rewritten line keeps the content's indent.
+            let virtual_content: &str =
+                &serde_json::from_str::<String>("\"  a = 1\\n \\n    foo(\\n    f('a')\\n\"")
+                    .unwrap();
+            let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 2}}, \"newText\": \"\"}]").unwrap());
+            let prepared = offset.prepared().unwrap().prepared_text().to_string();
+            let edits: serde_json::Value = serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 4, \"character\": 0}}, \"newText\": \"    a = 1\\na = 1,\\n\"}]").unwrap();
+            let response = json!({ "jsonrpc": "2.0", "id": 1, "result": edits });
+            let got = transform_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            );
+            assert_eq!(
+                got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
+                    .unwrap(),
+                "      a = 1\n  a = 1,\n",
+                "r4t1"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_after_a_removed_blank_line_keeps_the_contents_indent() {
+        // A list item's Python fence: its blank lines carry the item's
+        // indent, which the peer removes with the rest. Black removes one
+        // of two blank lines and rewrites the line after them: that line
+        // is the one it was, not text written on the blank line removed.
+        let virtual_content = "  if a:\n      b = 1\n  \n  \n      c = 'y'\n      d = c\n";
+        let changes: Vec<_> = (0..6)
+            .map(|line| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""}))
+            .collect();
+        let offset = prepared_offset(virtual_content, 0, json!(changes));
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "if a:\n    b = 1\n\n\n    c = 'y'\n    d = c\n");
+        let host = format_host(
+            virtual_content,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 6, "character": 0 } },
+                "newText": "if a:\n    b = 1\n\n    c = \"y\"\n    d = c\n"
+            }]),
+        );
+        assert_eq!(
+            host,
+            "  if a:\n      b = 1\n  \n      c = \"y\"\n      d = c\n"
+        );
+    }
+
+    #[test]
+    fn a_prepared_answer_ending_past_the_last_line_maps_to_the_region_end() {
+        // A whole-document answer ending at `(lineCount, 0)`, the line past
+        // P's last: the transform clamps it to P's end, and the lines it
+        // breaks regain the removed indent.
+        let virtual_content = "  a; b\n";
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "a; b\n");
+        let host = format_host(
+            virtual_content,
+            offset,
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+                "newText": "a;\nb\n"
+            }]),
+        );
+        assert_eq!(host, "  a;\n  b\n");
+    }
+
+    #[test]
+    fn a_prepared_answer_the_map_refuses_counts_as_its_server_failing() {
+        // Lines dedented by two and by four: a new line has no one indent.
+        let virtual_content = "  a\n    b\n";
+        let offset = prepared_offset(
+            virtual_content,
+            0,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+            ]),
+        );
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
+            "newText": "a\nb\nc\n"
+        }]});
+        let region_end = region_host_end("a\nb\n", &offset);
+        let error = transform_formatting_response_to_host(response, &offset, "a\nb\n", region_end)
+            .unwrap_err();
+        // Carrying why, for the caller that knows the document to log.
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<PreparedAnswerRefused>()),
+            Some(PreparedAnswerRefused {
+                reason: FormattingRefusal::Shape,
+                place: None
+            })
+        ));
+    }
+
+    #[test]
+    fn a_prepared_region_keeps_its_indentation_only_last_line() {
+        // The indentation-only last line is deleted with the peer's dedent:
+        // an edit taking the line before it along ends after it, where the
+        // region does.
+        let host = "x = ''\n  foo\n  '';\n";
+        let virtual_content = "\n  foo\n  ";
+        let offset = prepared_offset(
+            virtual_content,
+            6,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        assert_eq!(prepared, "foo\n");
+        let formatted = format_host(
+            host,
+            offset.clone(),
+            &prepared,
+            json!([{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": "bar\n"
+            }]),
+        );
+        assert_eq!(formatted, "x = ''\n  bar\n  '';\n");
+        // Joining the closing onto the last line (an on-type answer keeps
+        // no edges, so the final line break it drops is the closing's):
+        // refused, the closing the peer deleted left as it is.
+        let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+            "range": { "start": { "line": 0, "character": 3 }, "end": { "line": 1, "character": 0 } },
+            "newText": ""
+        }]});
+        assert!(
+            transform_on_type_formatting_response_to_host(
+                response,
+                &offset,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+            .is_err()
+        );
+    }
+
+    /// The server ranked first keeps its place though its reply came while
+    /// the host had moved (an edit to another fence, its pass not settled
+    /// yet) and the next one's came once it settled with the content
+    /// unchanged: whether the host moved is read once, where the answer is
+    /// chosen, not per reply, where a refused reply would count as that
+    /// server failing and hand the region to the next.
+    #[tokio::test]
+    async fn the_server_ranked_first_wins_though_its_reply_came_before_the_host_settled() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::aggregation::server::priority::PriorityEntry;
+        use crate::lsp::aggregation::server::{FanInResult, TaggedResult, preferred};
+        let virtual_content = "  a\n  b\n";
+        let result = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared_document = apply_prepare_result(
+            virtual_content,
+            &VirtualLayout::single(virtual_content),
+            Some(result),
+        )
+        .unwrap();
+        let offset =
+            RegionOffset::new(0, 0).with_prepared(std::sync::Arc::clone(&prepared_document.map));
+        let prepared = prepared_document.text.clone();
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/two-fences.md").unwrap();
+        let host_lsp = crate::lsp::lsp_impl::url_to_uri(&host).unwrap();
+        let region = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared_document);
+        let reply = |first_line: &str| {
+            let ctx = pool.response_context_for_test(&host_lsp, &offset);
+            formatting_answer_to_host(
+                json!({"jsonrpc": "2.0", "id": 1, "result": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 0}},
+                    "newText": format!("{first_line}\nb\n")
+                }]}),
+                &ctx,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+        };
+        // Another fence edited, its pass not settled: the top server replies.
+        pool.note_host_edited(&host, 1, 1);
+        let top = reply("top");
+        // Settled, this region's text unchanged: the next server replies.
+        pool.note_host_settled(&host, 1, 1);
+        let next = reply("next");
+        assert!(!next.as_ref().unwrap().is_empty());
+        let mut tasks = tokio::task::JoinSet::new();
+        for (server_name, value) in [("next", next), ("top", top)] {
+            tasks.spawn(async move {
+                TaggedResult {
+                    server_name: server_name.to_string(),
+                    value,
+                }
+            });
+        }
+        let result = preferred(
+            &mut tasks,
+            |edits: &Vec<TextEdit>| !edits.is_empty(),
+            &[
+                PriorityEntry::Server("top".to_string()),
+                PriorityEntry::Server("next".to_string()),
+            ],
+            None,
+        )
+        .await;
+        let FanInResult::Done(edits) = result else {
+            panic!("an answer");
+        };
+        assert_eq!(
+            crate::text::edit::apply_text_edits(virtual_content, &edits),
+            "  top\n  b\n"
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_names_where_and_why_once() {
+        // Text rewritten past any likeness, in a region of 20,000
+        // characters: the diff runs out of work.
+        let mut seed = 7u64;
+        let mut text = |length: usize| -> String {
+            (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    char::from(b'a' + (seed >> 60) as u8 % 4)
+                })
+                .collect()
+        };
+        let (old, new) = (text(20_000), text(20_000));
+        let virtual_content = format!("  {old}\n");
+        let offset = prepared_offset(
+            &virtual_content,
+            0,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]),
+        );
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///refused.md".parse().unwrap();
+        let ctx = BridgeResponseContext {
+            virtual_uri_string: "file:///region.lua".to_string(),
+            host_uri_lsp: &host_uri,
+            offset: &offset,
+        };
+        let response = || {
+            json!({ "jsonrpc": "2.0", "id": 1, "result": [{
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": format!("{new}\n")
+            }]})
+        };
+        let end = region_host_end(&prepared, &offset);
+        // Formatting: an error the fan-in logs once, with where and why.
+        let error = formatting_answer_to_host(response(), &ctx, &prepared, end).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("file:///refused.md"), "{message}");
+        assert!(message.contains("file:///region.lua"), "{message}");
+        assert!(message.contains("ran out of work"), "{message}");
+        // On type: no answer (not an empty one, which would win the
+        // fan-in), not a failure warned on every keystroke.
+        assert_eq!(
+            on_type_formatting_answer_to_host(response(), &ctx, &prepared, end).unwrap(),
+            None
+        );
+    }
+
+    /// [`on_type_formatting_answer_to_host`], no answer read as none.
+    fn on_type_answer(
+        response: serde_json::Value,
+        ctx: &BridgeResponseContext<'_>,
+        virtual_content: &str,
+        region_end: Position,
+    ) -> io::Result<Vec<TextEdit>> {
+        on_type_formatting_answer_to_host(response, ctx, virtual_content, region_end)
+            .map(Option::unwrap_or_default)
+    }
+
+    #[rstest]
+    #[case::formatting(formatting_answer_to_host)]
+    #[case::on_type_formatting(on_type_answer)]
+    fn a_prepared_answer_maps_through_its_context(
+        #[case] answer_to_host: fn(
+            serde_json::Value,
+            &BridgeResponseContext<'_>,
+            &str,
+            Position,
+        ) -> io::Result<Vec<TextEdit>>,
+    ) {
+        let offset = nix_json_offset();
+        let prepared = offset.prepared().unwrap().prepared_text().to_string();
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.nix".parse().unwrap();
+        let answer = || {
+            let ctx = BridgeResponseContext {
+                virtual_uri_string: String::new(),
+                host_uri_lsp: &host_uri,
+                offset: &offset,
+            };
+            let response = json!({ "jsonrpc": "2.0", "id": 42, "result": [{
+                "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "newText": " "
+            }]});
+            answer_to_host(
+                response,
+                &ctx,
+                &prepared,
+                region_host_end(&prepared, &offset),
+            )
+        };
+        // Mapped through the context's prepared map: the inserted space
+        // lands after the line's removed indent, regained.
+        let edits = answer().expect("mapped");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start.line, 1);
     }
 }

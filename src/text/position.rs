@@ -56,6 +56,15 @@ pub(crate) fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
     Cow::Owned(unsafe { String::from_utf8_unchecked(normalized) })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Characters [`positions_to_bytes_clamped`] stepped over.
+    pub(crate) static STEPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Positions converted one at a time (see
+    /// [`PositionMapper::position_to_byte_clamped`]).
+    pub(crate) static ONE_AT_A_TIME: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// [`PositionMapper::position_to_byte_clamped`] for many positions in one
 /// pass over `text`, floored to char boundaries: one position at a time
 /// scans its line's UTF-16 columns each time, quadratic on a long line.
@@ -79,6 +88,8 @@ pub(crate) fn positions_to_bytes_clamped(text: &str, positions: &[Position]) -> 
                     break;
                 }
                 chars.next();
+                #[cfg(test)]
+                STEPPED.with(|stepped| stepped.set(stepped.get() + 1));
                 if ch == '\r' && chars.peek().is_some_and(|&(_, next)| next == '\n') {
                     chars.next();
                 }
@@ -93,6 +104,8 @@ pub(crate) fn positions_to_bytes_clamped(text: &str, positions: &[Position]) -> 
                 break;
             }
             chars.next();
+            #[cfg(test)]
+            STEPPED.with(|stepped| stepped.set(stepped.get() + 1));
             column += width;
             byte = at + ch.len_utf8();
         }
@@ -136,6 +149,8 @@ impl PositionMapper<'_> {
     /// the largest in-bounds offset on a line is its end-of-content, which is
     /// `<= line(l).end()`, so the `min` never alters it.
     pub fn position_to_byte_clamped(&self, position: Position) -> usize {
+        #[cfg(test)]
+        ONE_AT_A_TIME.with(|count| count.set(count.get() + 1));
         match self.line_index.line(position.line) {
             // Line exists: take the mapped offset but clamp it to the line's
             // end so an over-long character can't spill past this line.

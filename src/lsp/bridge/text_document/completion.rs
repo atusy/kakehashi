@@ -24,10 +24,9 @@ use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::{
-    EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
-    build_position_based_request, host_position_in_removed_indent, response_has_jsonrpc_error,
-    text_edit_safe_in_region, translate_virtual_main_and_additional_edits_to_host,
-    translate_virtual_range_to_host,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
+    host_position_in_removed_indent, response_has_jsonrpc_error, text_edit_safe_in_region,
+    translate_virtual_main_and_additional_edits_to_host, translate_virtual_range_to_host,
 };
 use super::keep_additional_edits_if_safe;
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
@@ -417,19 +416,13 @@ fn transform_prepared_completion_item(
     // primary with.
     let additional = item.additional_text_edits.as_mut();
     let mut additional_kept = match &mut item.text_edit {
-        None => translate_virtual_main_and_additional_edits_to_host(
-            &mut [],
-            additional,
-            offset,
-            EditMode::Extent,
-        )
-        .unwrap_or(false),
+        None => translate_virtual_main_and_additional_edits_to_host(&mut [], additional, offset)
+            .unwrap_or(false),
         Some(CompletionTextEdit::Edit(edit)) => {
             let Some(kept) = translate_virtual_main_and_additional_edits_to_host(
                 std::slice::from_mut(edit),
                 additional,
                 offset,
-                EditMode::Extent,
             ) else {
                 return false;
             };
@@ -523,10 +516,10 @@ fn transform_prepared_completion_item(
         {
             let mut at = caret;
             super::super::protocol::translate_host_position_to_virtual(&mut at, offset);
-            let mut probe = [TextEdit {
+            let mut probe = TextEdit {
                 range: tower_lsp_server::ls_types::Range::new(at, at),
                 new_text: effective.to_string(),
-            }];
+            };
             // The edit may replace whitespace around the caret on its line
             // (a blank line the peer emptied, whose whitespace the content's
             // indent replaces); it must stay on that line and contain the
@@ -535,15 +528,14 @@ fn transform_prepared_completion_item(
             // out as that edit.
             let Some(additional_kept_with_probe) =
                 translate_virtual_main_and_additional_edits_to_host(
-                    &mut probe,
+                    std::slice::from_mut(&mut probe),
                     item.additional_text_edits.as_mut(),
                     offset,
-                    EditMode::Extent,
                 )
             else {
                 return false;
             };
-            let range = probe[0].range;
+            let range = probe.range;
             if range.start.line != caret.line
                 || range.end.line != caret.line
                 || caret < range.start
@@ -551,16 +543,15 @@ fn transform_prepared_completion_item(
             {
                 return false;
             }
-            if probe[0].new_text != effective
+            if probe.new_text != effective
                 || range != tower_lsp_server::ls_types::Range::new(caret, caret)
             {
                 // Written here, it answers to the region's checks as any
                 // edit does (a caret on the closing fence's line, say).
-                if !text_edit_safe_in_region(&probe[0], offset, region_end) {
+                if !text_edit_safe_in_region(&probe, offset, region_end) {
                     return false;
                 }
-                let [edit] = probe;
-                item.text_edit = Some(CompletionTextEdit::Edit(edit));
+                item.text_edit = Some(CompletionTextEdit::Edit(probe));
                 additional_kept = additional_kept_with_probe;
             }
         }
@@ -611,12 +602,7 @@ fn translate_insert_replace_edit_to_host(
             new_text,
         },
     ];
-    let kept = translate_virtual_main_and_additional_edits_to_host(
-        &mut mains,
-        additional,
-        offset,
-        EditMode::Extent,
-    );
+    let kept = translate_virtual_main_and_additional_edits_to_host(&mut mains, additional, offset);
     let [insert, replace] = mains;
     edit.new_text = replace.new_text;
     let kept = kept?;

@@ -81,18 +81,23 @@ pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
+pub(crate) use protocol::PREPARE_TIMEOUT;
 #[cfg(test)]
 pub(crate) use protocol::PreparedDocument;
 pub(crate) use protocol::PreparedMap;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
+#[cfg(test)]
+pub(crate) use protocol::Revocation;
 pub(crate) use protocol::VirtualDocumentUri;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::host_position_within_region_bounds;
+pub(crate) use protocol::host_range_selects_nothing;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
 pub(crate) use protocol::transform_workspace_edit_to_host;
+pub(crate) use protocol::translate_virtual_formatting_edits_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;

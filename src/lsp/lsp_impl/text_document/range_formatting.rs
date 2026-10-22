@@ -32,11 +32,13 @@ use crate::lsp::aggregation::server::{
     dispatch_preferred, dispatch_preferred_with_tokens, mint_region_progress_source,
 };
 use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
-use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, parse_host_verbatim};
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, Sourced};
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
-use super::formatting::{RegionFormatPlan, finalize_formatting_edits, plan_region_format};
+use super::formatting::{
+    RegionEdits, RegionFormatPlan, finalize_formatting_edits, plan_region_format,
+};
 
 impl Kakehashi {
     pub(crate) async fn range_formatting_impl(
@@ -66,6 +68,9 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
+        // Before the text is read (by either layer): see
+        // `Sourced::from_region`.
+        let revision = self.prepared_request_revision(&lsp_uri);
         let virt = async {
             let lsp_uri = params.text_document.uri;
             let options = params.options;
@@ -161,7 +166,7 @@ impl Kakehashi {
             let mapper = PositionMapper::new(snapshot.text());
             let request_bytes = clamp_request_to_document(&mapper, host_range);
 
-            let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
+            let mut outer_join_set: JoinSet<Option<RegionEdits>> = JoinSet::new();
 
             // Shared client progress: a range-formatting request fans out over
             // several injection regions (one `dispatch_preferred` each), so they
@@ -177,14 +182,34 @@ impl Kakehashi {
             });
             let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-            let mut seen_edit_ranges = std::collections::HashSet::new();
-            for resolved in all_regions.iter() {
-                // Non-contiguous combined injections contain masked host-only
-                // gaps. Even a covering range may fall back to full formatting,
-                // whose single replacement would overwrite those real gaps.
-                if !resolved.contiguous {
-                    continue;
-                }
+            // The regions the request overlaps, each with the request clipped
+            // to it. Non-contiguous combined injections contain masked
+            // host-only gaps. Even a covering range may fall back to full
+            // formatting, whose single replacement would overwrite those real
+            // gaps.
+            let eligible: Vec<_> = all_regions
+                .iter()
+                .filter(|resolved| {
+                    !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                        resolved,
+                        "textDocument/rangeFormatting",
+                        false,
+                    )
+                })
+                .filter_map(|resolved| {
+                    clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
+                        .map(|clipped| (resolved, clipped))
+                })
+                .collect();
+            // Every overlapped region's prepare attempt started before any
+            // is waited for (see `formatting`).
+            crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+                &self.bridge,
+                &language_name,
+                eligible.iter().map(|(resolved, _)| (&uri, *resolved)),
+            );
+            let mut spans = super::formatting::SpanReservations::default();
+            for (resolved, clipped) in eligible {
                 // A covering request (its byte span encloses the whole region)
                 // prefers full formatting; a partial request range-formats the
                 // clipped span. Either way we compute the clipped+content-clamped
@@ -195,11 +220,6 @@ impl Kakehashi {
                 let is_covering =
                     request_covers_region(&request_bytes, &resolved.region.byte_range);
 
-                let Some(clipped) =
-                    clip_request_to_region(&request_bytes, &resolved.region.byte_range, &mapper)
-                else {
-                    continue;
-                };
                 // The byte-range clip can still leave an endpoint inside a stripped
                 // per-line prefix (e.g. blockquoted code's `> `); pull both
                 // endpoints onto the actual injected content. A partial selection
@@ -260,38 +280,15 @@ impl Kakehashi {
                     }
                     RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
                 }
-                // Preserve discovery priority among executable same-range
-                // alternatives. Unconfigured/disabled layers deliberately do
-                // not reserve the span, allowing the first configured layer to
-                // format it while preventing overlapping edits from later ones.
+                // Discovery priority among executable same-range alternatives
+                // (see `SpanReservations`).
                 let span = (
                     resolved.region.byte_range.start,
                     resolved.region.byte_range.end,
                 );
-                if seen_edit_ranges.contains(&span) {
+                if spans.is_reserved(span) {
                     continue;
                 }
-                // A formatter's edits to a prepared document are not mapped
-                // back through its map: closed as a non-contiguous one is.
-                // Asked only of a region that formats: one outside the range,
-                // unplanned, or its span taken sends no request, so its peer
-                // is not waited for. One closed or left unformatted because
-                // its peer failed (`Unprepared`) takes no span, and is not
-                // counted as `formatting` counts it: no one-shot run range-
-                // formats, so no failure count reads it.
-                if self
-                    .method_gate(
-                        &uri,
-                        &language_name,
-                        resolved,
-                        "textDocument/rangeFormatting",
-                    )
-                    .await
-                    != crate::lsp::lsp_impl::bridge_context::MethodGate::Open
-                {
-                    continue;
-                }
-                seen_edit_ranges.insert(span);
                 let region_ctx = DocumentRequestContext {
                     prepared: None,
                     uri: uri.clone(),
@@ -304,6 +301,42 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                // The document as its servers see it, the method closed to it
+                // as its shape says (see `formatting`). One left unformatted
+                // because its peer failed is not counted as `formatting`
+                // counts it: no one-shot run range-formats, so no failure
+                // count reads it.
+                let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
+                    &self.bridge,
+                    &language_name,
+                    region_ctx,
+                    "textDocument/rangeFormatting",
+                )
+                .await;
+                let Some(region_ctx) = spans.admit(span, region_ctx) else {
+                    continue;
+                };
+                // A selection of only what the peer removed (indentation, a
+                // blank edge line) is empty in the prepared text: skipped as
+                // one in a host prefix is, its span kept, for this
+                // alternative found nothing selected there.
+                if let Some(map) = &region_ctx.prepared
+                    && crate::lsp::bridge::host_range_selects_nothing(
+                        clipped_host_range,
+                        &crate::lsp::bridge::RegionOffset::with_per_line_offsets(
+                            region_ctx.resolved.region.line_range.start,
+                            region_ctx.resolved.line_column_offsets.clone(),
+                        )
+                        .with_prepared(Arc::clone(map)),
+                    )
+                {
+                    continue;
+                }
+                // Counted toward the final check only once its task returns edits
+                // (see `finalize_formatting_edits`).
+                let source = region_ctx.prepared.is_some().then(|| {
+                    Sourced::from_region(&region_ctx, (), self.bridge.node_tracker(), revision)
+                });
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).
@@ -319,93 +352,97 @@ impl Kakehashi {
                 let region_cancel_rx = cancel_state.derive_receiver();
 
                 outer_join_set.spawn(async move {
-                    let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
-                        let options = options.clone();
-                        async move {
-                            // The covering path may issue BOTH a formatting and
-                            // a rangeFormatting request; capture the per-task
-                            // client-progress token once and hand it to whichever
-                            // call actually goes on the wire.
-                            let cp_token = t.client_progress_token;
-                            // Covering request: prefer full formatting, but fall
-                            // back to rangeFormatting over the whole region when
-                            // the server has no `documentFormattingProvider`
-                            // (`Ok(None)`) — otherwise a range-only server would
-                            // format nothing. Errors propagate (no fallback);
-                            // `Ok(Some(_))` (incl. an empty edit list) is an
-                            // authoritative result.
-                            if is_covering {
-                                match t
-                                    .pool
-                                    .send_formatting_request(
+                    let edits = async move {
+                        let send = move |t: crate::lsp::aggregation::server::FanOutTask| {
+                            let options = options.clone();
+                            async move {
+                                // The covering path may issue BOTH a formatting and
+                                // a rangeFormatting request; capture the per-task
+                                // client-progress token once and hand it to whichever
+                                // call actually goes on the wire.
+                                let cp_token = t.client_progress_token;
+                                // Covering request: prefer full formatting, but fall
+                                // back to rangeFormatting over the whole region when
+                                // the server has no `documentFormattingProvider`
+                                // (`Ok(None)`) — otherwise a range-only server would
+                                // format nothing. Errors propagate (no fallback);
+                                // `Ok(Some(_))` (incl. an empty edit list) is an
+                                // authoritative result.
+                                if is_covering {
+                                    match t
+                                        .pool
+                                        .send_formatting_request(
+                                            &t.server_name,
+                                            &t.server_config,
+                                            &t.uri,
+                                            &t.injection_language,
+                                            &t.region_id,
+                                            t.offset.clone(),
+                                            &t.virtual_content,
+                                            options.clone(),
+                                            t.upstream_id.clone(),
+                                            cp_token.clone(),
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        Ok(None) => {} // fall through to rangeFormatting
+                                        other => return other,
+                                    }
+                                }
+                                t.pool
+                                    .send_range_formatting_request(
                                         &t.server_name,
                                         &t.server_config,
                                         &t.uri,
                                         &t.injection_language,
                                         &t.region_id,
-                                        t.offset.clone(),
+                                        t.offset,
                                         &t.virtual_content,
-                                        options.clone(),
-                                        t.upstream_id.clone(),
-                                        cp_token.clone(),
+                                        clipped_host_range,
+                                        options,
+                                        t.upstream_id,
+                                        cp_token,
                                         None,
                                     )
                                     .await
-                                {
-                                    Ok(None) => {} // fall through to rangeFormatting
-                                    other => return other,
-                                }
                             }
-                            t.pool
-                                .send_range_formatting_request(
-                                    &t.server_name,
-                                    &t.server_config,
-                                    &t.uri,
-                                    &t.injection_language,
-                                    &t.region_id,
-                                    t.offset,
-                                    &t.virtual_content,
-                                    clipped_host_range,
-                                    options,
-                                    t.upstream_id,
-                                    cp_token,
-                                    None,
+                        };
+                        // Same semantics as full formatting: `Some(vec![])` is an
+                        // authoritative "no edits needed" (e.g., the range is already
+                        // perfectly formatted) — keep it and stop. `None` means "no
+                        // response" and falls through to lower-priority servers.
+                        let is_nonempty = |opt: &Option<Vec<TextEdit>>| opt.is_some();
+                        let result = match region_cp_tokens {
+                            Some(tokens) => {
+                                dispatch_preferred_with_tokens(
+                                    &region_ctx,
+                                    pool.clone(),
+                                    send,
+                                    is_nonempty,
+                                    region_cancel_rx,
+                                    tokens,
                                 )
                                 .await
+                            }
+                            None => {
+                                dispatch_preferred(
+                                    &region_ctx,
+                                    pool.clone(),
+                                    send,
+                                    is_nonempty,
+                                    region_cancel_rx,
+                                )
+                                .await
+                            }
+                        };
+                        match result {
+                            FanInResult::Done(edits) => edits,
+                            FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                         }
-                    };
-                    // Same semantics as full formatting: `Some(vec![])` is an
-                    // authoritative "no edits needed" (e.g., the range is already
-                    // perfectly formatted) — keep it and stop. `None` means "no
-                    // response" and falls through to lower-priority servers.
-                    let is_nonempty = |opt: &Option<Vec<TextEdit>>| opt.is_some();
-                    let result = match region_cp_tokens {
-                        Some(tokens) => {
-                            dispatch_preferred_with_tokens(
-                                &region_ctx,
-                                pool.clone(),
-                                send,
-                                is_nonempty,
-                                region_cancel_rx,
-                                tokens,
-                            )
-                            .await
-                        }
-                        None => {
-                            dispatch_preferred(
-                                &region_ctx,
-                                pool.clone(),
-                                send,
-                                is_nonempty,
-                                region_cancel_rx,
-                            )
-                            .await
-                        }
-                    };
-                    match result {
-                        FanInResult::Done(edits) => edits,
-                        FanInResult::NoResult { .. } | FanInResult::Cancelled => None,
                     }
+                    .await;
+                    edits.map(|edits| (edits, source))
                 });
             }
 
@@ -428,16 +465,34 @@ impl Kakehashi {
         // formatting is the partial-document counterpart of full formatting
         // and shares its layer order and aggregation key. request_method is
         // what goes on the wire to host-capable servers.
-        self.walk_layers(
-            &lsp_uri,
-            "textDocument/formatting",
-            "textDocument/rangeFormatting",
-            raw_params,
-            virt,
-            parse_host_verbatim::<Vec<TextEdit>>,
-            |edits: &Vec<TextEdit>| !edits.is_empty(),
-        )
-        .await
+        //
+        // The final answer is chosen as whole formatting's is: a prepared one
+        // dropped as stale or unsettled gives way to the host layer's while
+        // the host is unedited. Nothing is counted: no one-shot run
+        // range-formats.
+        let (edits, refused) = self
+            .walk_formatting_layers(
+                &lsp_uri,
+                "textDocument/formatting",
+                "textDocument/rangeFormatting",
+                raw_params,
+                virt,
+                revision,
+            )
+            .await?;
+        if let Some(verdict) = refused {
+            log::warn!(
+                target: "kakehashi::formatting",
+                "range formatting result for {} dropped: {verdict}{}",
+                lsp_uri.as_str(),
+                if edits.is_some() {
+                    "; the host layer's answer stands in"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(edits.filter(|edits| !edits.is_empty()))
     }
 }
 

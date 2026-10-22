@@ -18,6 +18,7 @@ mod crash_recovery;
 mod document_tracker;
 mod dynamic_capability_registry;
 mod execute;
+pub(crate) use execute::BridgeResponseContext;
 mod handshake;
 mod liveness_timeout;
 mod message_sender;
@@ -3483,6 +3484,21 @@ impl LanguageServerPool {
                 regions.key().as_str() != language && regions.value().contains_key(region_id)
             }),
         }
+    }
+
+    /// Whether something may still change whether an answer made on
+    /// `region_id` of `host_uri` is current while the host's content
+    /// version stays put: the host's last edit not settled yet (its pass
+    /// may still record the region's text anew), or the region held for its
+    /// prepare answer. Read only; with neither, what
+    /// [`Self::host_text_still_current`] says holds until the host is
+    /// edited again. A host this pool keeps nothing for is settled.
+    pub(crate) fn host_settling(&self, host_uri: &Url, language: &str, region_id: &str) -> bool {
+        let Some(host) = self.latest_virtual_contents.get(host_uri) else {
+            return false;
+        };
+        host.settled.load(Ordering::Acquire) < host.edited.load(Ordering::Acquire)
+            || self.host_withholds(host_uri, &host, language, region_id)
     }
 
     /// Note that `host_uri`'s text was edited to `content_version`: from

@@ -10,6 +10,11 @@
 //! order end-to-end:
 //!
 //! - `upper` — advertises `documentFormattingProvider`; uppercases the text.
+//!   (In the modes answering `textDocument/formatting` and
+//!   `textDocument/rangeFormatting` with a whole-document edit, formatting a
+//!   text holding `OVERLAP` is answered with two overlapping edits: an
+//!   answer no document takes; so is on-type formatting in `echo-document`
+//!   mode.)
 //! - `append` — advertises `documentFormattingProvider`; appends a
 //!   `-- mock-marker` line (lowercase, so a later `upper` step would be
 //!   detectable).
@@ -22,8 +27,8 @@
 //!   `documentRangeFormattingProvider`, `renameProvider`,
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
-//!   the hovered line in its own coordinates; formatting and range
-//!   formatting uppercase; rename replaces the first line; a pull diagnostic
+//!   the hovered line in its own coordinates; formatting, range and on-type
+//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -45,6 +50,15 @@
 //!   replaced by `MOCK_PREPARE_PLACEHOLDER` (default `--`). A document whose
 //!   content holds `FAIL` gets an error; one holding `SLOW` is answered
 //!   after two seconds.
+//! - `slow-empty` — advertises formatting, range and on-type (`;`)
+//!   formatting, and answers each with no edits after a second and a half:
+//!   a slow host layer for a test to edit the host while it runs.
+//! - `empty-on-release` — `slow-empty`, but each formatting answer waits
+//!   for the file `MOCK_RELEASE_FILE` names to exist instead of a delay: a
+//!   barrier a test lifts once it has edited the host while a request runs
+//!   (or, unlifted, a minute later).
+//!   (A `didChange` cannot be the barrier: the upstream forwards the host's
+//!   edit to this server only after its in-flight request is answered.)
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -346,6 +360,12 @@ fn main() {
                         "documentRangeFormattingProvider": true,
                         "textDocumentSync": 1
                     }),
+                    "slow-empty" | "empty-on-release" => json!({
+                        "documentFormattingProvider": true,
+                        "documentRangeFormattingProvider": true,
+                        "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
+                        "textDocumentSync": 1
+                    }),
                     "definition" => json!({
                         "definitionProvider": true,
                         "hoverProvider": true,
@@ -366,6 +386,7 @@ fn main() {
                         "colorProvider": true,
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
+                        "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
                         "renameProvider": true,
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
@@ -2193,6 +2214,19 @@ fn main() {
                     record_mock_event(&mode, "request", &message);
                     std::thread::sleep(std::time::Duration::from_secs(3));
                 }
+                // With `MOCK_COLOR_AFTER_RELEASE` set, answered only once
+                // the file `MOCK_RELEASE_FILE` names exists (or a minute
+                // later): a barrier a test lifts after editing the host.
+                if std::env::var_os("MOCK_COLOR_AFTER_RELEASE").is_some()
+                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+                {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                    while !std::path::Path::new(&release).exists()
+                        && std::time::Instant::now() < until
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 let range = message.pointer("/params/range").cloned();
                 let result = if mode == "document-color-empty-presentation" {
                     json!([])
@@ -2713,6 +2747,29 @@ fn main() {
                     respond(&mut writer, id, result);
                 }
             }
+            "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
+                if mode == "slow-empty" =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                respond(&mut writer, id, json!([]));
+            }
+            "textDocument/formatting"
+            | "textDocument/rangeFormatting"
+            | "textDocument/onTypeFormatting"
+                if mode == "empty-on-release" =>
+            {
+                let release = std::env::var("MOCK_RELEASE_FILE").expect("MOCK_RELEASE_FILE");
+                // Bounded: a test failing before it releases must not leave
+                // this server spinning forever.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while !std::path::Path::new(&release).exists() && std::time::Instant::now() < until
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                respond(&mut writer, id, json!([]));
+            }
             "textDocument/onTypeFormatting" => {
                 // Answer with the whole-document transformation REGARDLESS of
                 // the typed character: the bridge is supposed to filter
@@ -2724,7 +2781,19 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|uri| documents.get(uri))
-                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
+                    .map(|text| {
+                        // In `echo-document` mode, a text holding `OVERLAP`
+                        // is answered with two overlapping edits, as
+                        // formatting is: an answer no document takes.
+                        if mode == "echo-document" && text.contains("OVERLAP") {
+                            json!([
+                                { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }, "newText": "a" },
+                                { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "newText": "b" }
+                            ])
+                        } else {
+                            whole_document_edit(text, &mode, options.as_ref())
+                        }
+                    })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
@@ -2748,7 +2817,17 @@ fn main() {
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .and_then(|uri| documents.get(uri))
-                    .map(|text| whole_document_edit(text, &mode, options.as_ref()))
+                    .map(|text| {
+                        // Two edits overlapping: an answer no document takes.
+                        if text.contains("OVERLAP") {
+                            json!([
+                                { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } }, "newText": "a" },
+                                { "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 3 } }, "newText": "b" }
+                            ])
+                        } else {
+                            whole_document_edit(text, &mode, options.as_ref())
+                        }
+                    })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
             }
@@ -2852,6 +2931,8 @@ fn whole_document_edit(text: &str, mode: &str, options: Option<&Value>) -> Value
                 .unwrap_or_else(|| "missing".to_string());
             format!("-- tabSize={tab_size} insertSpaces={insert_spaces}\n")
         }
+        // Uppercased, each `; ` breaking the line (statements one per line).
+        "echo-document" => text.to_uppercase().replace("; ", "\n"),
         // "upper" and "range-upper"
         _ => text.to_uppercase(),
     };

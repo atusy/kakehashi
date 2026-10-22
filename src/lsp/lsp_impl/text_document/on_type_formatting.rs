@@ -13,7 +13,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
-use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
+use crate::lsp::lsp_impl::bridge_context::Sourced;
 
 const METHOD: &str = "textDocument/onTypeFormatting";
 
@@ -26,18 +26,47 @@ impl Kakehashi {
         let lsp_uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let virt =
-            self.on_type_formatting_virt_layer(&lsp_uri, position, &params.ch, params.options);
-        self.walk_layers(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            raw_params,
-            virt,
-            parse_host_verbatim::<Vec<TextEdit>>,
-            |edits: &Vec<TextEdit>| !edits.is_empty(),
-        )
-        .await
+        // Before the text is read (by either layer): see
+        // `Sourced::from_region`.
+        let revision = self.prepared_request_revision(&lsp_uri);
+        let virt = async {
+            Ok(self
+                .on_type_formatting_virt_layer(
+                    &lsp_uri,
+                    position,
+                    &params.ch,
+                    params.options,
+                    revision,
+                )
+                .await?
+                .map(|sourced| {
+                    let (edits, source) = sourced.into_parts();
+                    (edits, vec![source])
+                }))
+        };
+        // The final answer is chosen as whole formatting's is: its edits
+        // checked once more against the host text, which may have moved
+        // while it was held, once the host's last edit settled, and a
+        // prepared one dropped as stale or unsettled gives way to the host
+        // layer's while the host is unedited. Dropped with nothing standing
+        // in, it is no answer, logged at debug only: trigger keystrokes would
+        // warn each time.
+        let (edits, refused) = self
+            .walk_formatting_layers(&lsp_uri, METHOD, METHOD, raw_params, virt, revision)
+            .await?;
+        if let Some(verdict) = refused {
+            log::debug!(
+                target: "kakehashi::formatting",
+                "on-type formatting result for {} dropped: {verdict}{}",
+                lsp_uri.as_str(),
+                if edits.is_some() {
+                    "; the host layer's answer stands in"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(edits.filter(|edits| !edits.is_empty()))
     }
 
     /// Virt layer: bridge the injection region under the typed character.
@@ -47,7 +76,9 @@ impl Kakehashi {
         position: Position,
         ch: &str,
         options: FormattingOptions,
-    ) -> Result<Option<Vec<TextEdit>>> {
+        // Read before the text is: see `Sourced::from_region`.
+        revision: Option<crate::lsp::bridge::HostRevision>,
+    ) -> Result<Option<Sourced<Vec<TextEdit>>>> {
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -92,8 +123,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result
+        let edits = result
             .handle(&self.notifier(), "onTypeFormatting", None, Ok)
-            .await
+            .await?;
+        Ok(edits.map(|edits| {
+            Sourced::from_region(&ctx.document, edits, self.bridge.node_tracker(), revision)
+        }))
     }
 }

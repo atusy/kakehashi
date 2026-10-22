@@ -54,7 +54,9 @@ use crate::lsp::bridge::{
     ClientProgressAggregator, ClientProgressDeregisterGuard, RegionOffset, ResolvedServerConfig,
     UpstreamId, VirtualDocumentUri, translate_virtual_range_to_host,
 };
-use crate::lsp::lsp_impl::bridge_context::DocumentRequestContext;
+use crate::lsp::lsp_impl::bridge_context::{
+    DocumentRequestContext, Sourced, Verdict, sources_verdict,
+};
 use crate::lsp::lsp_impl::text_document::{
     RequestErrorSink, count_no_winner_errors, count_request_errors,
 };
@@ -109,6 +111,8 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
+        // Before the text is read: see `Sourced::from_region`.
+        let revision = self.prepared_request_revision(&lsp_uri);
         let snapshot = match self.documents.get(&uri) {
             None => {
                 log::debug!("formatting: No document found for {}", uri);
@@ -160,16 +164,44 @@ impl Kakehashi {
                     &upstream_request_id,
                     &cancel_state,
                     work_done_token.clone(),
+                    revision,
                 );
-                let host = self.host_format_edits(&lsp_uri, &original, &options, &cancel_state);
-                crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
+                let host = async {
+                    let edits = self
+                        .host_format_edits(&lsp_uri, &original, &options, &cancel_state)
+                        .await?;
+                    Ok(edits.map(|edits| (edits, Vec::new())))
+                };
+                let (edits, refused) = race_formatting_layers(
                     &layer_cfg.priorities,
                     virt,
                     host,
-                    std::future::ready(Ok(None)),
-                    |edits: &Vec<TextEdit>| !edits.is_empty(),
+                    self.bridge.pool(),
+                    self.bridge.node_tracker(),
+                    || self.host_content_version(&lsp_uri),
+                    // Read only by a pool that prepares, the one that refuses.
+                    || revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision,
                 )
-                .await?
+                .await?;
+                if let Some(verdict) = refused {
+                    log::warn!(
+                        target: "kakehashi::formatting",
+                        "formatting result for {} dropped: {verdict}{}",
+                        lsp_uri.as_str(),
+                        if edits.is_some() {
+                            "; the host layer's answer stands in"
+                        } else {
+                            ""
+                        }
+                    );
+                    // Answered all the same: the request did not fail.
+                    if edits.is_none() {
+                        count_request_errors(&cancel_state.request_error_sink, 1);
+                    }
+                }
+                // An empty stand-in answers as the race answers when no
+                // layer has edits.
+                edits.filter(|edits| !edits.is_empty())
             }
             AggregationStrategy::Concatenated => {
                 // Sequential cross-layer pipeline (cross-layer-aggregation
@@ -183,6 +215,9 @@ impl Kakehashi {
                 let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(&original);
                 let mut producers = 0usize;
                 let mut sole_edits: Option<Vec<TextEdit>> = None;
+                // The prepared regions virt edits were mapped through: the
+                // result builds on them, checked once it is final.
+                let mut virt_sources = Vec::new();
                 for layer in &layer_cfg.priorities {
                     let edits = match layer {
                         LayerSource::Virt => {
@@ -203,8 +238,13 @@ impl Kakehashi {
                                 &upstream_request_id,
                                 &cancel_state,
                                 work_done_token.clone(),
+                                revision,
                             )
                             .await?
+                            .map(|(edits, sources)| {
+                                virt_sources = sources;
+                                edits
+                            })
                         }
                         LayerSource::Host => {
                             self.host_format_edits(&lsp_uri, &current, &options, &cancel_state)
@@ -221,6 +261,19 @@ impl Kakehashi {
                         producers += 1;
                         sole_edits = Some(edits);
                     }
+                }
+                // The final answer: the virt edits it builds on checked once
+                // more against the host text, which may have moved while later
+                // layers ran.
+                if !self
+                    .formatting_sources_current(
+                        &lsp_uri,
+                        &virt_sources,
+                        &cancel_state.request_error_sink,
+                    )
+                    .await
+                {
+                    return Ok(None);
                 }
                 match producers {
                     0 => None,
@@ -253,7 +306,8 @@ impl Kakehashi {
         upstream_request_id: &Option<UpstreamId>,
         cancel_state: &FormattingCancelState<'_>,
         client_progress_token: Option<NumberOrString>,
-    ) -> Result<Option<Vec<TextEdit>>> {
+        revision: Option<crate::lsp::bridge::HostRevision>,
+    ) -> Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>> {
         let Some(injection_query) = self.language.injection_query(language_name) else {
             return Ok(None);
         };
@@ -281,7 +335,7 @@ impl Kakehashi {
         let pool = self.bridge.pool_arc();
 
         // Outer JoinSet: one task per injection region, all in parallel
-        let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();
+        let mut outer_join_set: JoinSet<Option<RegionEdits>> = JoinSet::new();
 
         // Shared host-text position mapper for prefix extraction, built at
         // most once per request: constructing it is O(document size), so
@@ -304,14 +358,29 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
+        // Non-contiguous combined injections contain masked host-only gaps.
+        // A formatter returns a contiguous whole-document replacement, which
+        // would replace those real host gaps as well and corrupt the document.
+        let eligible: Vec<_> = all_regions
+            .iter()
+            .filter(|resolved| {
+                !crate::lsp::lsp_impl::bridge_context::method_closed_to(
+                    resolved,
+                    "textDocument/formatting",
+                    false,
+                )
+            })
+            .collect();
+        // Every region's prepare attempt started before any is waited for:
+        // the waits in the loop below then share attempts already running,
+        // the request waiting about the slowest, not one after another.
+        crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+            &self.bridge,
+            language_name,
+            eligible.iter().map(|resolved| (uri, *resolved)),
+        );
         let mut spans = SpanReservations::default();
-        for resolved in all_regions.iter() {
-            // Non-contiguous combined injections contain masked host-only gaps.
-            // A formatter returns a contiguous whole-document replacement, which
-            // would replace those real host gaps as well and corrupt the document.
-            if !resolved.contiguous {
-                continue;
-            }
+        for resolved in eligible {
             let configs = self
                 .bridge_configs_for_injection_language(language_name, &resolved.injection_language);
             if configs.is_empty() {
@@ -349,11 +418,6 @@ impl Kakehashi {
                 }
                 RegionFormatPlan::Concatenated(_) | RegionFormatPlan::Preferred => {}
             }
-            // Same-range query alternatives are tried in discovery priority
-            // order, but an unconfigured or explicitly disabled language is
-            // not a winner. Reserve the span only after planning so the first
-            // executable alternative formats it; later executable layers are
-            // suppressed to keep emitted edits non-overlapping.
             let span = (
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
@@ -361,26 +425,6 @@ impl Kakehashi {
             if spans.is_reserved(span) {
                 continue;
             }
-            // A formatter's edits to a prepared document are not mapped back
-            // through its map: closed as a non-contiguous one is. Asked only
-            // of a region that formats: one that would not, being unplanned or
-            // its span taken, sends no request, so its peer is not waited for
-            // and no failure of it is counted. One closed or unprepared takes
-            // no span, and one unprepared counts unless a later alternative
-            // answers for the span (an empty answer, already formatted,
-            // included).
-            let gate = match self
-                .method_gate(uri, language_name, resolved, "textDocument/formatting")
-                .await
-            {
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => Ok(Some(())),
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => Ok(None),
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => Err(()),
-            };
-            if spans.admit(span, gate).is_none() {
-                continue;
-            }
-            let owed = spans.owes(span);
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
@@ -393,6 +437,30 @@ impl Kakehashi {
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
             };
+            // The document as its servers see it: prepared when its peer
+            // prepares it, waiting for the answer (every region's attempt
+            // started above, so waiting for each in turn costs about the
+            // slowest one), and the method closed to it as the answer's
+            // shape says (a prepared one stays open, its edits mapped back
+            // through its map).
+            let region_ctx = crate::lsp::lsp_impl::bridge_context::prepare_request_context_for(
+                &self.bridge,
+                language_name,
+                region_ctx,
+                "textDocument/formatting",
+            )
+            .await;
+            let Some(region_ctx) = spans.admit(span, region_ctx) else {
+                continue;
+            };
+            // One unprepared before it counts unless this one answers for
+            // the span (an empty answer, already formatted, included).
+            let owed = spans.owes(span);
+            // Counted toward the final check only once its task returns edits
+            // (see `finalize_formatting_edits`).
+            let source = region_ctx.prepared.is_some().then(|| {
+                Sourced::from_region(&region_ctx, (), self.bridge.node_tracker(), revision)
+            });
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -426,7 +494,17 @@ impl Kakehashi {
                     // the host snapshot is at hand: the pipeline's whole-region
                     // replacement must re-apply them to its multi-line output
                     // (Decision point 4, `reapply_host_line_prefixes`).
-                    let virtual_line_count = lsp_line_count(&region_ctx.resolved.virtual_content);
+                    // The prefixes are per host line: counted over the virtual
+                    // document, which a prepared one may have more lines of
+                    // than its prepared text (edge blank lines deleted).
+                    let virtual_line_count = lsp_line_count(
+                        region_ctx
+                            .prepared
+                            .as_deref()
+                            .map_or(&region_ctx.resolved.virtual_content, |map| {
+                                map.virtual_text()
+                            }),
+                    );
                     let mapper = host_mapper
                         .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
                     let host_line_prefixes = extract_host_line_prefixes(
@@ -463,30 +541,34 @@ impl Kakehashi {
             let request_error_sink = cancel_state.request_error_sink.clone();
 
             outer_join_set.spawn(async move {
-                if let Some((servers, host_line_prefixes)) = pipeline {
-                    dispatch_concatenated_formatting(
-                        &region_ctx,
-                        pool.clone(),
-                        options,
-                        servers,
-                        host_line_prefixes,
-                        region_cancel_rx,
-                        request_error_sink,
-                        owed,
-                    )
-                    .await
-                } else {
-                    dispatch_preferred_formatting(
-                        &region_ctx,
-                        pool.clone(),
-                        options,
-                        region_cancel_rx,
-                        request_error_sink,
-                        region_cp_tokens,
-                        owed,
-                    )
-                    .await
+                let edits = async move {
+                    if let Some((servers, host_line_prefixes)) = pipeline {
+                        dispatch_concatenated_formatting(
+                            &region_ctx,
+                            pool.clone(),
+                            options,
+                            servers,
+                            host_line_prefixes,
+                            region_cancel_rx,
+                            request_error_sink,
+                            owed,
+                        )
+                        .await
+                    } else {
+                        dispatch_preferred_formatting(
+                            &region_ctx,
+                            pool.clone(),
+                            options,
+                            region_cancel_rx,
+                            request_error_sink,
+                            region_cp_tokens,
+                            owed,
+                        )
+                        .await
+                    }
                 }
+                .await;
+                edits.map(|edits| (edits, source))
             });
         }
 
@@ -509,6 +591,93 @@ impl Kakehashi {
         // sibling's live cancel registrations. `formatting_impl_with_error_sink`
         // sweeps once after the whole strategy dispatch.
         finalize_formatting_edits(outer_join_set, cancel_state.token.clone()).await
+    }
+
+    /// Race a partial formatting method's layers (`preferred`, as
+    /// [`Self::walk_layers`] does: the host layer forwards `raw_params`
+    /// verbatim), and choose the final answer as whole formatting does
+    /// (see [`race_formatting_layers`]). `revision` is the host's, read
+    /// before the request's text was. The walk's cancel subscription and
+    /// registry sweep cover the choice too, as the host layer may still be
+    /// running when its answer stands in.
+    pub(super) async fn walk_formatting_layers(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        layer_method: &'static str,
+        request_method: &'static str,
+        raw_params: serde_json::Value,
+        virt: impl std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
+        revision: Option<crate::lsp::bridge::HostRevision>,
+    ) -> Result<(Option<Vec<TextEdit>>, Option<Verdict>)> {
+        let Ok(uri) = uri_to_url(lsp_uri) else {
+            log::warn!("Invalid URI in {}: {}", request_method, lsp_uri.as_str());
+            return Ok((None, None));
+        };
+        let Some(host_language) = self.document_language(&uri) else {
+            return Ok((None, None));
+        };
+        let layer_cfg = self.resolve_layer_config(&host_language, layer_method);
+        let host = async {
+            match self.resolve_host_bridge_context(lsp_uri, layer_method) {
+                Some(ctx) => Ok(self
+                    .host_layer_value_with_ctx(&ctx, request_method, raw_params)
+                    .await?
+                    .and_then(crate::lsp::lsp_impl::bridge_context::parse_host_verbatim)
+                    .map(|edits| (edits, Vec::new()))),
+                None => Ok(None),
+            }
+        };
+        let answer = self
+            .run_layer_race(async {
+                race_formatting_layers(
+                    &layer_cfg.priorities,
+                    virt,
+                    host,
+                    self.bridge.pool(),
+                    self.bridge.node_tracker(),
+                    || self.host_content_version(lsp_uri),
+                    // Read only by a pool that prepares, the one that refuses.
+                    || revision.is_some() && self.prepared_request_revision(lsp_uri) == revision,
+                )
+                .await
+                .map(Some)
+            })
+            .await?;
+        Ok(answer.unwrap_or((None, None)))
+    }
+
+    /// Whether every prepared region a formatting answer was mapped
+    /// through is still the host's text (see [`Sourced::still_current`]).
+    /// One that is not fails the request — counted in `failure_sink`, for
+    /// the CLI to exit non-zero — and the caller drops the whole answer,
+    /// the host layer's edits and those of regions still current too: the
+    /// host moved under the answer, and an edit read for a region no longer
+    /// as it was would land elsewhere.
+    ///
+    /// The host's last edit may not be settled yet, or a region held for
+    /// its prepare answer, though its text is the request's: the answer is
+    /// judged once that clears (see
+    /// [`settled_verdict`](crate::lsp::lsp_impl::bridge_context::settled_verdict)),
+    /// not dropped. A formatting request comes once per action, unlike
+    /// completion's on every keystroke, so an answer dropped for that is
+    /// never asked again.
+    pub(super) async fn formatting_sources_current(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        sources: &[Sourced<()>],
+        failure_sink: &RequestErrorSink,
+    ) -> bool {
+        let verdict = self.settled_verdict_of(lsp_uri, sources.iter()).await;
+        if verdict.keeps() {
+            return true;
+        }
+        log::warn!(
+            target: "kakehashi::formatting",
+            "formatting result for {} dropped: {verdict}",
+            lsp_uri.as_str()
+        );
+        count_request_errors(failure_sink, 1);
+        false
     }
 
     /// Format the host document itself (the **host** layer,
@@ -624,6 +793,92 @@ impl Kakehashi {
             FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
+}
+
+/// The formatting layers' `preferred` race (virt and host; native has
+/// no contributor) and its final answer (see
+/// [`preferred_formatting_answer`]): the highest-priority answer with
+/// edits wins, and once a prepared one is dropped, the host layer's
+/// stands in where it may. Returns the edits and the verdict that
+/// dropped the chosen answer, if one did.
+pub(super) async fn race_formatting_layers(
+    priorities: &[LayerSource],
+    virt: impl std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
+    host: impl std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    unchanged: impl Fn() -> bool,
+) -> Result<(Option<Vec<TextEdit>>, Option<Verdict>)> {
+    // Shared: the race drops it once a higher layer's answer wins, but that
+    // answer may yet be dropped, and this one stand in.
+    let host = futures::FutureExt::shared(host);
+    let answer = crate::lsp::lsp_impl::bridge_context::race_layers_preferred(
+        priorities,
+        virt,
+        host.clone(),
+        std::future::ready(Ok(None)),
+        |(edits, _): &(Vec<TextEdit>, Vec<Sourced<()>>)| !edits.is_empty(),
+    )
+    .await?;
+    // The final answer chosen: its prepared regions' edits checked once
+    // more against the host text, which may have moved while it was held.
+    Ok(preferred_formatting_answer(
+        answer,
+        pool,
+        tracker,
+        current_version,
+        priorities.contains(&LayerSource::Host).then_some(host),
+        unchanged,
+    )
+    .await)
+}
+
+/// A formatting answer as `preferred` returns it, chosen by the layers'
+/// race: its prepared regions' edits judged once more against the host
+/// text (see [`sources_verdict`]). Returns the edits, and the verdict that
+/// refused the chosen answer, if one did.
+///
+/// Refused with the host unedited (stale, or not settled in time), the
+/// chosen answer gives way to the host layer's (`host`, when the host
+/// layer is in the race, awaited if still running): read for the same
+/// host text, it lost only to the answer refused. Only while the host is
+/// still the text the request read (`unchanged`, read once that answer is
+/// in): neither edited nor closed and reopened, though a reopen may bring
+/// back the same content version. Refused as moved, nothing stands in:
+/// the host layer's edits were read for the text the host moved from too.
+/// An empty host answer (already formatted) stands in too: the edits are
+/// then `Some(vec![])`, an answer, not a failure.
+pub(super) async fn preferred_formatting_answer<H>(
+    answer: Option<(Vec<TextEdit>, Vec<Sourced<()>>)>,
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    host: Option<H>,
+    unchanged: impl Fn() -> bool,
+) -> (Option<Vec<TextEdit>>, Option<Verdict>)
+where
+    H: std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
+{
+    let Some((edits, sources)) = answer else {
+        return (None, None);
+    };
+    let verdict = sources_verdict(pool, tracker, &current_version, sources.iter()).await;
+    if verdict.keeps() {
+        return (Some(edits), None);
+    }
+    // Only a prepared answer is ever refused, so the host layer's is
+    // another answer than the one refused.
+    let stand_in = match host {
+        Some(host) if verdict != Verdict::Moved => host
+            .await
+            .ok()
+            .flatten()
+            .map(|(edits, _)| edits)
+            .filter(|_| unchanged()),
+        _ => None,
+    };
+    (stand_in, Some(verdict))
 }
 
 /// Select one deterministic edit-producing layer for each host byte range.
@@ -1060,7 +1315,15 @@ async fn dispatch_concatenated_formatting(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
     );
+    // A prepared document's servers format its prepared text (the context's
+    // virtual content): the result goes back through its map (see
+    // `prepared_pipeline_edits`).
+    let offset = match &region_ctx.prepared {
+        Some(map) => offset.with_prepared(Arc::clone(map)),
+        None => offset,
+    };
     let original_virtual = region_ctx.resolved.virtual_content.clone();
+    let prepared_failure_sink = request_error_sink.clone();
     // Precompute the host replacement range now, while we still hold
     // `original_virtual`, so it can be moved into the pipeline below without a
     // second clone. An unresolvable end position means we emit no edit (bounded
@@ -1488,9 +1751,20 @@ async fn dispatch_concatenated_formatting(
         count_request_errors(&owed_sink, 1);
     }
 
+    let final_text = final_text?;
+    if offset.prepared().is_some() {
+        return prepared_pipeline_edits(
+            &region_ctx.resolved.virtual_content,
+            &final_text,
+            &offset,
+            &host_line_prefixes,
+            &region_ctx.uri,
+            &prepared_failure_sink,
+        );
+    }
     let final_text = pipeline_region_text(
         &region_ctx.resolved.virtual_content,
-        &final_text?,
+        &final_text,
         &offset,
         &host_line_prefixes,
     )?;
@@ -1797,6 +2071,76 @@ fn extract_host_line_prefixes(
         .collect()
 }
 
+/// The edits a concatenated pipeline's result over a prepared document makes
+/// to the host: the result keeps the prepared text's edge layout, then goes
+/// back through the prepared map as one formatting answer, which restores
+/// the indentation the peer removed and keeps the host text it hid. Host
+/// line prefixes are not re-applied on this path: a prefixed region fails
+/// closed, as does a result the map refuses; both count as request errors.
+/// `None` also when the result changes nothing.
+fn prepared_pipeline_edits(
+    prepared: &str,
+    final_text: &str,
+    offset: &RegionOffset,
+    host_line_prefixes: &[String],
+    uri: &url::Url,
+    failure_sink: &RequestErrorSink,
+) -> Option<Vec<TextEdit>> {
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
+    let restored = crate::text::edge_layout::restore_edge_layout(
+        prepared,
+        final_text,
+        opens_after_a_delimiter,
+    );
+    if restored == prepared {
+        return None;
+    }
+    let prefixed = host_line_prefixes
+        .iter()
+        .skip(usize::from(opens_after_a_delimiter))
+        .any(|prefix| !prefix.is_empty());
+    if prefixed {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} dropped: host line prefixes are not re-applied to a prepared virtual document",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+        return None;
+    }
+    let end = crate::text::PositionMapper::new(prepared).byte_to_position(prepared.len())?;
+    let mut edits = vec![TextEdit {
+        range: Range::new(Position::new(0, 0), end),
+        new_text: restored,
+    }];
+    if let Err(reason) =
+        crate::lsp::bridge::translate_virtual_formatting_edits_to_host(&mut edits, offset)
+    {
+        log::warn!(
+            target: "kakehashi::formatting",
+            "concatenated formatting result for {} dropped: {reason}",
+            uri
+        );
+        count_request_errors(failure_sink, 1);
+        return None;
+    }
+    Some(edits)
+}
+
+/// Whether a region opens mid-line, after a delimiter on its first line (a
+/// Nix `''`): its leading line break is then layout, and its first line has
+/// no line prefix (the host text before it is the delimiter's line). One
+/// column offset is also the shape of a blockquoted or list-item fence
+/// ending at EOF, which opens at a line start behind its prefix; a line
+/// prefix is made of container markers and indentation only, a delimiter's
+/// line is not.
+fn opens_after_a_delimiter(offset: &RegionOffset, host_line_prefixes: &[String]) -> bool {
+    offset.opens_mid_line()
+        && host_line_prefixes
+            .first()
+            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())))
+}
+
 /// The host text replacing the region after the concatenated pipeline
 /// formatted `original_virtual` into `final_text`, or `None` when the region
 /// is left as it was.
@@ -1806,16 +2150,7 @@ fn pipeline_region_text(
     offset: &RegionOffset,
     host_line_prefixes: &[String],
 ) -> Option<String> {
-    // A region opening mid-line, after a delimiter on its first line (a Nix
-    // `''`), has its leading line break as layout and no line prefix: the
-    // host text before it is the delimiter's line. One column offset is also
-    // the shape of a blockquoted or list-item fence ending at EOF, which
-    // opens at a line start behind its prefix; a line prefix is made of
-    // container markers and indentation only, a delimiter's line is not.
-    let opens_after_a_delimiter = offset.opens_mid_line()
-        && host_line_prefixes
-            .first()
-            .is_some_and(|text| text.chars().any(|c| !(c == '>' || c.is_whitespace())));
+    let opens_after_a_delimiter = opens_after_a_delimiter(offset, host_line_prefixes);
     // Each step keeps the edge layout of its own text, but formats with a zero
     // offset, which reads as a region opening at a line start: only the
     // region tells whether its leading line break is layout.
@@ -2098,11 +2433,16 @@ impl Kakehashi {
     }
 }
 
+/// A region's formatting edits, and the prepared region they were mapped
+/// through, if any.
+pub(super) type RegionEdits = (Vec<TextEdit>, Option<Sourced<()>>);
+
 /// Collect per-region `JoinSet` results, sort the concatenated edits, and
 /// shape into the LSP-spec response (`None` when there are no edits).
 ///
 /// Both formatting handlers funnel their per-region futures into a single
-/// `JoinSet<Option<Vec<TextEdit>>>` and need to:
+/// `JoinSet<Option<RegionEdits>>` (each region's edits and the prepared
+/// region they were mapped through) and need to:
 ///
 /// 1. Cancel-aware collect every region's edits (regions whose dispatcher
 ///    cancelled or returned no result contribute nothing).
@@ -2111,33 +2451,239 @@ impl Kakehashi {
 /// 3. Map `vec![]` to `Ok(None)` per the LSP convention that empty edit
 ///    lists are equivalent to no response.
 pub(super) async fn finalize_formatting_edits(
-    outer_join_set: JoinSet<Option<Vec<TextEdit>>>,
+    outer_join_set: JoinSet<Option<RegionEdits>>,
     cancel_token: Option<CancellationToken>,
-) -> Result<Option<Vec<TextEdit>>> {
-    let all_edits = collect_region_results_with_cancel(
+) -> Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>> {
+    // A region's prepared source is checked as the final answer is chosen
+    // only when its edits are in the answer: one whose formatter answered
+    // nothing cannot move the answer, nor hold it up.
+    let collected = collect_region_results_with_cancel(
         outer_join_set,
         cancel_token.map(cancel_rx_from_token),
-        |acc, opt: Option<Vec<TextEdit>>| {
-            if let Some(items) = opt {
-                acc.extend(items);
+        |acc: &mut Vec<RegionEdits>, opt| {
+            if let Some((items, source)) = opt
+                && !items.is_empty()
+            {
+                acc.push((items, source));
             }
         },
     )
-    .await;
-
-    let mut all_edits = all_edits?;
+    .await?;
+    let mut all_edits = Vec::new();
+    let mut sources = Vec::new();
+    for (items, source) in collected {
+        all_edits.extend(items);
+        sources.extend(source);
+    }
     sort_edits_by_start_position(&mut all_edits);
-    Ok(if all_edits.is_empty() {
-        None
-    } else {
-        Some(all_edits)
-    })
+    Ok((!all_edits.is_empty()).then_some((all_edits, sources)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
+
+    /// A prepared answer the race chose, dropped as stale with the host
+    /// unedited: the host layer's answer, read for the same host text,
+    /// stands in for it. Moved, nothing does: the host's edits were read
+    /// for the text it moved from too. Nor once the host reopened, nor
+    /// without a host layer in the race.
+    /// A prepared answer, current, recorded for its region of a host at
+    /// content version 1; revoking `Revocation` makes it stale.
+    async fn prepared_stand_in_source() -> (
+        Arc<crate::lsp::bridge::LanguageServerPool>,
+        crate::language::NodeTracker,
+        Sourced<()>,
+        Arc<crate::lsp::bridge::Revocation>,
+    ) {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let mut prepared =
+            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                .unwrap();
+        let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+        Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        pool.prepare_failures_for_test();
+        let host = url::Url::parse("file:///test/stand-in.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+            .unwrap()
+            .to_string();
+        pool.open_host_incarnation(&host, 1).await;
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+        pool.note_host_edited(&host, 1, 1);
+        pool.note_host_settled(&host, 1, 1);
+        let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
+        (pool, tracker, source, revocation)
+    }
+
+    /// The race of the formatting layers gives way to the host layer's
+    /// answer once the prepared one that won it is dropped, though the
+    /// host layer was still running when it lost: whole, range and
+    /// on-type formatting choose their answer alike.
+    #[tokio::test]
+    async fn the_formatting_race_waits_for_a_host_answer_standing_in() {
+        let edit = |text: &str| TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: text.to_string(),
+        };
+        let (pool, tracker, source, revocation) = prepared_stand_in_source().await;
+        revocation.revoke(u64::MAX);
+        let (host_tx, host_rx) = tokio::sync::oneshot::channel::<()>();
+        let virt = async {
+            // The host layer is still running once this answer wins.
+            let _ = host_tx.send(());
+            Ok(Some((vec![edit("virt")], vec![source])))
+        };
+        let host = async {
+            let _ = host_rx.await;
+            tokio::task::yield_now().await;
+            Ok(Some((vec![edit("host")], Vec::new())))
+        };
+        let answer = race_formatting_layers(
+            &[LayerSource::Virt, LayerSource::Host],
+            virt,
+            host,
+            &pool,
+            &tracker,
+            || Some(1),
+            || true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, (Some(vec![edit("host")]), Some(Verdict::Stale)));
+    }
+
+    #[tokio::test]
+    async fn a_host_answer_stands_in_for_a_stale_prepared_one() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let edit = |text: &str| TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: text.to_string(),
+        };
+        for case in [
+            "current",
+            "stale",
+            "stale, host already formatted",
+            "stale, no host answer",
+            "stale, no host layer",
+            "stale, reopened",
+            "moved",
+        ] {
+            let (pool, tracker, source, revocation) = prepared_stand_in_source().await;
+            let version = AtomicU64::new(1);
+            match case {
+                "moved" => version.store(2, Ordering::SeqCst),
+                "current" => {}
+                _ => revocation.revoke(u64::MAX),
+            }
+            let host_edits = match case {
+                "stale, host already formatted" => Some(Vec::new()),
+                "stale, no host answer" => None,
+                _ => Some(vec![edit("host")]),
+            };
+            let host_layer = (case != "stale, no host layer")
+                .then_some(async move { Ok(host_edits.map(|edits| (edits, Vec::new()))) });
+            let (edits, refused) = preferred_formatting_answer(
+                Some((vec![edit("virt")], vec![source])),
+                &pool,
+                &tracker,
+                || Some(version.load(Ordering::SeqCst)),
+                host_layer,
+                || case != "stale, reopened",
+            )
+            .await;
+            let (expected, verdict) = match case {
+                "current" => (Some(vec![edit("virt")]), None),
+                "stale" => (Some(vec![edit("host")]), Some(Verdict::Stale)),
+                // An answer all the same: nothing to change.
+                "stale, host already formatted" => (Some(Vec::new()), Some(Verdict::Stale)),
+                "stale, no host answer" | "stale, no host layer" | "stale, reopened" => {
+                    (None, Some(Verdict::Stale))
+                }
+                _ => (None, Some(Verdict::Moved)),
+            };
+            assert_eq!(edits, expected, "{case}");
+            assert_eq!(refused, verdict, "{case}");
+        }
+    }
+
+    /// A prepared region whose formatter answered nothing is not judged
+    /// with the answer: only the regions whose edits it carries are.
+    #[tokio::test]
+    async fn only_regions_whose_edits_the_answer_carries_are_judged() {
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "red",
+            &crate::lsp::bridge::VirtualLayout::single("red"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let host = url::Url::parse("file:///test/sources.md").unwrap();
+        let source = || {
+            Some(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host,
+                    "lua",
+                    "region",
+                    &map,
+                    1,
+                    0,
+                ),
+            )
+        };
+        let edit = TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            new_text: "x".to_string(),
+        };
+        let mut tasks = JoinSet::new();
+        let (with_edits, without) = ((vec![edit.clone()], None), (Vec::new(), source()));
+        tasks.spawn(async move { Some(with_edits) });
+        tasks.spawn(async move { Some(without) });
+        let (edits, sources) = finalize_formatting_edits(tasks, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edits, vec![edit.clone()]);
+        assert!(sources.is_empty());
+        let mut tasks = JoinSet::new();
+        let carried = (vec![edit], source());
+        tasks.spawn(async move { Some(carried) });
+        let (_, sources) = finalize_formatting_edits(tasks, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_host_settles_once_its_last_edit_settles() {
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/settling.md").unwrap();
+        assert!(
+            !pool.host_settling(&host, "lua", "r"),
+            "nothing kept: settled"
+        );
+        pool.open_host_incarnation(&host, 1).await;
+        assert!(!pool.host_settling(&host, "lua", "r"));
+        pool.note_host_edited(&host, 1, 1);
+        assert!(pool.host_settling(&host, "lua", "r"), "edited, not settled");
+        pool.note_host_settled(&host, 1, 1);
+        assert!(!pool.host_settling(&host, "lua", "r"));
+    }
 
     fn resolved_region(
         language: &str,
@@ -2158,6 +2704,147 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         }
+    }
+
+    /// `virtual_text` at host line 0, column 0, every line starting with
+    /// two spaces dedented by them: the offset, and the prepared text.
+    fn prepared_region(virtual_text: &str, removed: &[u32]) -> (RegionOffset, String) {
+        prepared_region_at(virtual_text, removed, 0)
+    }
+
+    /// [`prepared_region`] opening at host column `column` of line 0.
+    fn prepared_region_at(
+        virtual_text: &str,
+        removed: &[u32],
+        column: u32,
+    ) -> (RegionOffset, String) {
+        let changes: Vec<_> = removed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &width)| width > 0)
+            .map(|(line, &width)| serde_json::json!({
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": width}},
+                "newText": ""
+            }))
+            .collect();
+        let result = serde_json::from_value(
+            serde_json::json!({"segments": [{"type": "content", "changes": changes}]}),
+        )
+        .unwrap();
+        let prepared = crate::lsp::bridge::apply_prepare_result(
+            virtual_text,
+            &crate::lsp::bridge::VirtualLayout::single(virtual_text),
+            Some(result),
+        )
+        .unwrap();
+        (
+            RegionOffset::new(0, column).with_prepared(prepared.map),
+            prepared.text,
+        )
+    }
+
+    fn sink() -> RequestErrorSink {
+        Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    fn failures(sink: &RequestErrorSink) -> usize {
+        sink.as_ref()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_prepared_pipeline_result_maps_back_reindented() {
+        let virtual_text = "  a; b\n";
+        let (offset, prepared) = prepared_region(virtual_text, &[2]);
+        assert_eq!(prepared, "a; b\n");
+        let uri = url::Url::parse("file:///doc.md").unwrap();
+        let failures_sink = sink();
+        let edits =
+            prepared_pipeline_edits(&prepared, "a\nb\n", &offset, &[], &uri, &failures_sink)
+                .unwrap();
+        assert_eq!(
+            crate::text::edit::apply_text_edits(virtual_text, &edits),
+            "  a\n  b\n"
+        );
+        assert_eq!(failures(&failures_sink), 0);
+        // A result changing nothing is no edit and no failure.
+        assert_eq!(
+            prepared_pipeline_edits(&prepared, &prepared, &offset, &[], &uri, &failures_sink),
+            None
+        );
+        assert_eq!(failures(&failures_sink), 0);
+    }
+
+    #[test]
+    fn a_prepared_pipeline_result_keeps_a_delimiters_line_break_as_layout() {
+        // A Nix `''` string's JSON, dedented by the peer: the pipeline's
+        // result drops the line break after the delimiter and the closing
+        // indent, both the region's layout, which come back.
+        let host = "x = ''\n    {\"a\":1}\n  '';\n";
+        let virtual_text = "\n    {\"a\":1}\n  ";
+        let (offset, prepared) = prepared_region_at(virtual_text, &[0, 4], 6);
+        assert_eq!(prepared, "\n{\"a\":1}\n  ");
+        let uri = url::Url::parse("file:///doc.nix").unwrap();
+        let prefixes = ["x = ''".to_string(), String::new(), String::new()];
+        let edits = prepared_pipeline_edits(
+            &prepared,
+            "{\n  \"a\": 1\n}",
+            &offset,
+            &prefixes,
+            &uri,
+            &sink(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "x = ''\n    {\n      \"a\": 1\n    }\n  '';\n"
+        );
+    }
+
+    #[test]
+    fn a_prepared_pipeline_result_the_host_cannot_take_fails_the_request() {
+        let uri = url::Url::parse("file:///doc.md").unwrap();
+        // Prefixed lines: prefixes are not re-applied on this path.
+        let (offset, prepared) = prepared_region("  a\n  b\n", &[2, 2]);
+        let failures_sink = sink();
+        let prefixes = ["".to_string(), "> ".to_string()];
+        assert_eq!(
+            prepared_pipeline_edits(
+                &prepared,
+                "A\nB\n",
+                &offset,
+                &prefixes,
+                &uri,
+                &failures_sink
+            ),
+            None
+        );
+        assert_eq!(failures(&failures_sink), 1);
+        // A line created where the removed indents differ: refused.
+        let (offset, prepared) = prepared_region("  a\n    b\n", &[2, 4]);
+        assert_eq!(
+            prepared_pipeline_edits(&prepared, "a\nb\nc\n", &offset, &[], &uri, &failures_sink),
+            None
+        );
+        assert_eq!(failures(&failures_sink), 2);
+        // A region opening mid-line after a blockquote marker: the marker
+        // is the first line's prefix, not a delimiter whose line break is
+        // layout, so it counts as a prefix too.
+        let (offset, prepared) = prepared_region_at("  a; b\n", &[2], 2);
+        let prefixes = ["> ".to_string(), String::new()];
+        assert_eq!(
+            prepared_pipeline_edits(
+                &prepared,
+                "a\nb\n",
+                &offset,
+                &prefixes,
+                &uri,
+                &failures_sink
+            ),
+            None
+        );
+        assert_eq!(failures(&failures_sink), 3);
     }
 
     #[test]

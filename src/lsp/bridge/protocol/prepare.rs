@@ -28,7 +28,7 @@ use tower_lsp_server::ls_types::{Position, TextEdit};
 
 mod edits;
 
-pub(crate) use edits::EditMode;
+pub(crate) use edits::{EditMode, FormattingRefusal};
 
 /// The request kakehashi sends to the configured prepare peer.
 pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
@@ -969,6 +969,12 @@ impl PreparedMap {
         &self.virtual_lines.text
     }
 
+    /// The prepared text this map was built for.
+    #[cfg(test)]
+    pub(crate) fn prepared_text(&self) -> &str {
+        &self.prepared_lines.text
+    }
+
     /// Translate a position in P to V.
     pub(crate) fn to_virtual(&self, position: Position, bias: Bias) -> Position {
         let offset = self.prepared_lines.offset_clamped(position);
@@ -1235,6 +1241,8 @@ impl LineMap {
     /// Byte offset of `position`, clamped to its line's content (a column
     /// past the end) or to the document end (a line past the end).
     fn offset_clamped(&self, position: Position) -> usize {
+        #[cfg(test)]
+        CONVERSIONS.with(|conversions| conversions.set(conversions.get() + 1));
         let Some(line_range) = self.index.0.line(position.line) else {
             return self.text.len();
         };
@@ -1278,7 +1286,111 @@ impl LineMap {
         line_start + content.len()
     }
 
+    /// The byte offsets of `positions`, each as [`Self::offset_clamped`]
+    /// gives it, in one forward pass over each line they name: a line's
+    /// first position scans it from its start, and each later one on it
+    /// from the one before. Converting positions one by one rescans a
+    /// line's earlier non-ASCII characters for each, quadratic in the
+    /// positions on one long line.
+    fn offsets_clamped(&self, positions: &[Position]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..positions.len()).collect();
+        order.sort_by_key(|&index| (positions[index].line, positions[index].character));
+        let mut offsets = vec![0; positions.len()];
+        // The line scanned so far: its number, its content's end, and the
+        // byte and UTF-16 column reached on it.
+        let mut at: Option<(u32, usize, usize, u32)> = None;
+        for index in order {
+            let position = positions[index];
+            let (byte, column, content_end) = match at {
+                Some((line, content_end, byte, column)) if line == position.line => {
+                    (byte, column, content_end)
+                }
+                _ => {
+                    let Some(line_range) = self.index.0.line(position.line) else {
+                        offsets[index] = self.text.len();
+                        continue;
+                    };
+                    (line_range.start().into(), 0, self.content_end(line_range))
+                }
+            };
+            #[cfg(test)]
+            let from = byte;
+            let (mut byte, mut column) = (byte, column);
+            for character in self.text[byte..content_end].chars() {
+                if column >= position.character {
+                    break;
+                }
+                column += character.len_utf16() as u32;
+                byte += character.len_utf8();
+            }
+            #[cfg(test)]
+            SCANNED.with(|scanned| scanned.set(scanned.get() + byte - from));
+            at = Some((position.line, content_end, byte, column));
+            offsets[index] = byte;
+        }
+        offsets
+    }
+
+    /// The positions of `offsets`, each as [`Self::position`] gives it, in
+    /// one forward pass over each line they fall on (see
+    /// [`Self::offsets_clamped`]), each line found in a number of lookups
+    /// logarithmic in how far it lies past the line before.
+    fn positions(&self, offsets: &[usize]) -> Vec<Position> {
+        let mut order: Vec<usize> = (0..offsets.len()).collect();
+        order.sort_by_key(|&index| offsets[index]);
+        let mut positions = vec![Position::new(0, 0); offsets.len()];
+        // The line reached so far, and the byte and UTF-16 column reached on
+        // it. An offset's line is found from the one reached by doubling the
+        // stride while that line still starts at or before the offset, then
+        // halving it back: a few lookups however far it lies (looking a line
+        // up by offset in the index checks every non-ASCII character on it,
+        // as converting an offset does).
+        let start = |line: u32| -> Option<usize> {
+            #[cfg(test)]
+            LINE_LOOKUPS.with(|lookups| lookups.set(lookups.get() + 1));
+            self.index.0.line(line).map(|range| range.start().into())
+        };
+        let (mut line, mut byte, mut column) = (0u32, 0usize, 0u32);
+        for index in order {
+            let offset = self
+                .text
+                .floor_char_boundary(offsets[index].min(self.text.len()));
+            let reaches = |line: u32| start(line).is_some_and(|start| start <= offset);
+            if line.checked_add(1).is_some_and(reaches) {
+                let mut stride = 1u32;
+                while line
+                    .checked_add(stride.saturating_mul(2))
+                    .is_some_and(reaches)
+                {
+                    stride = stride.saturating_mul(2);
+                }
+                let (mut low, mut high) =
+                    (line + stride, line.saturating_add(stride.saturating_mul(2)));
+                while low + 1 < high {
+                    let middle = low + (high - low) / 2;
+                    if reaches(middle) {
+                        low = middle;
+                    } else {
+                        high = middle;
+                    }
+                }
+                (line, byte, column) = (low, start(low).unwrap_or(offset), 0);
+            }
+            column += self.text[byte..offset]
+                .chars()
+                .map(|character| character.len_utf16() as u32)
+                .sum::<u32>();
+            #[cfg(test)]
+            SCANNED.with(|scanned| scanned.set(scanned.get() + offset - byte));
+            byte = offset;
+            positions[index] = Position::new(line, column);
+        }
+        positions
+    }
+
     fn position(&self, offset: usize) -> Position {
+        #[cfg(test)]
+        CONVERSIONS.with(|conversions| conversions.set(conversions.get() + 1));
         let offset = self.text.floor_char_boundary(offset.min(self.text.len()));
         let Some(line_col) = u32::try_from(offset)
             .ok()
@@ -1293,6 +1405,16 @@ impl LineMap {
                 Position::new(wide.line, wide.col)
             })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Positions or offsets converted one by one (see `LineMap::position`).
+    static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes the batch conversions scanned (see `LineMap::positions`).
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Lines `LineMap::positions` looked up to find its offsets' lines.
+    static LINE_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `LineIndex` is a pure function of the text, so two indexes over equal text
@@ -1821,6 +1943,74 @@ mod tests {
             "no such line"
         );
         assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
+
+    #[test]
+    fn positions_far_into_a_text_look_their_lines_up() {
+        // One offset near the end of 100,000 lines (an edit a completion
+        // or a hint maps): its line is found in a few lookups, not by
+        // stepping through every line before it.
+        let text = "x\n".repeat(100_000);
+        let lines = LineMap::new(text.clone());
+        LINE_LOOKUPS.with(|lookups| lookups.set(0));
+        let offset = text.len() - 3;
+        assert_eq!(lines.positions(&[offset]), vec![lines.position(offset)]);
+        let lookups = LINE_LOOKUPS.with(|lookups| lookups.get());
+        assert!(lookups <= 64, "{lookups}");
+    }
+
+    #[test]
+    fn conversions_in_one_pass_agree_with_one_at_a_time() {
+        let pieces = [
+            "a",
+            " ",
+            "\u{e9}",
+            "\u{1F600}",
+            "\u{3042}",
+            "\n",
+            "\r",
+            "\r\n",
+        ];
+        let mut seed: u64 = 7;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        for _ in 0..300 {
+            let text: String = (0..next(30)).map(|_| pieces[next(pieces.len())]).collect();
+            let lines = LineMap::new(text.clone());
+            let offsets: Vec<usize> = (0..next(20)).map(|_| next(text.len() + 3)).collect();
+            let one_at_a_time: Vec<Position> = offsets
+                .iter()
+                .map(|&offset| lines.position(offset))
+                .collect();
+            assert_eq!(
+                lines.positions(&offsets),
+                one_at_a_time,
+                "{text:?} {offsets:?}"
+            );
+            let positions: Vec<Position> = (0..next(20))
+                .map(|_| {
+                    let character = if next(8) == 0 {
+                        u32::MAX
+                    } else {
+                        next(12) as u32
+                    };
+                    Position::new(next(8) as u32, character)
+                })
+                .collect();
+            let one_at_a_time: Vec<usize> = positions
+                .iter()
+                .map(|&position| lines.offset_clamped(position))
+                .collect();
+            assert_eq!(
+                lines.offsets_clamped(&positions),
+                one_at_a_time,
+                "{text:?} {positions:?}"
+            );
+        }
     }
 
     #[test]

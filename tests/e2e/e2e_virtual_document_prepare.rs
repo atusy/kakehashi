@@ -46,6 +46,24 @@ struct Setup {
     wire_log: bool,
     /// `KAKEHASHI_EXPERIMENTAL`, which the prepare layer requires.
     experimental: bool,
+    /// Bridge markdown itself to a `slow-empty` host server and give the
+    /// formatting methods' layers this strategy, the host layer ranked as
+    /// it says: `preferred` ranks host first, `concatenated` runs virt then
+    /// host.
+    slow_host: Option<&'static str>,
+    /// Format markdown's lua documents with the concatenated pipeline (the
+    /// echo mock its one step).
+    concatenated: bool,
+    /// The mock mode of the `slow_host` server: `slow-empty`, or
+    /// `empty-on-release` to answer only once the test creates `release`
+    /// in its directory.
+    host_mode: &'static str,
+    /// Also bridge lua to an `on-type` mock, ranked below the echo mock for
+    /// on-type formatting.
+    second_on_type: bool,
+    /// Have the echo mock answer color presentations only once the test
+    /// creates `release` in its directory.
+    color_after_release: bool,
 }
 
 impl Default for Setup {
@@ -59,6 +77,11 @@ impl Default for Setup {
             prepare_priorities: json!(["peer"]),
             wire_log: false,
             experimental: true,
+            slow_host: None,
+            concatenated: false,
+            host_mode: "slow-empty",
+            second_on_type: false,
+            color_after_release: false,
         }
     }
 }
@@ -78,6 +101,26 @@ impl Setup {
         if self.unprepared_python {
             markdown["bridge"]["python"] = json!({});
         }
+        if self.second_on_type {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/onTypeFormatting"] =
+                json!({ "priorities": ["echo", "second"] });
+        }
+        if self.concatenated {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
+                json!({ "strategy": "concatenated", "priorities": ["echo"] });
+        }
+        if let Some(strategy) = self.slow_host {
+            markdown["bridge"]["_self"] = json!({ "enabled": true });
+            let priorities = if strategy == "preferred" {
+                json!(["host", "virt"])
+            } else {
+                json!(["virt", "host"])
+            };
+            markdown["layers"] = json!({ "aggregation": {
+                "textDocument/formatting": { "strategy": strategy, "priorities": priorities },
+                "textDocument/onTypeFormatting": { "strategy": strategy, "priorities": priorities }
+            } });
+        }
         if self.combined {
             let query_path = dir.path().join("combined-injections.scm");
             std::fs::write(&query_path, COMBINED_QUERY).expect("write combined query");
@@ -93,7 +136,17 @@ impl Setup {
                 "KAKEHASHI_EXPERIMENTAL",
                 if self.experimental { "true" } else { "false" },
             )
-            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder);
+            .env("MOCK_PREPARE_PLACEHOLDER", self.placeholder)
+            .env(
+                "MOCK_RELEASE_FILE",
+                dir.path()
+                    .join("release")
+                    .to_str()
+                    .expect("UTF-8 release path"),
+            );
+        if self.color_after_release {
+            builder = builder.env("MOCK_COLOR_AFTER_RELEASE", "1");
+        }
         if self.wire_log {
             builder = builder.env(
                 "MOCK_LSP_WIRE_LOG",
@@ -104,6 +157,32 @@ impl Setup {
             );
         }
         let mut client = builder.build();
+        let mut servers = json!({
+            "peer": {
+                "cmd": [mock_bin(), "prepare-peer"],
+                "languages": ["lua"]
+            },
+            "echo": {
+                "cmd": [mock_bin(), self.echo],
+                "languages": if self.unprepared_python {
+                    json!(["lua", "python"])
+                } else {
+                    json!(["lua"])
+                }
+            }
+        });
+        if self.second_on_type {
+            servers["second"] = json!({
+                "cmd": [mock_bin(), "on-type"],
+                "languages": ["lua"]
+            });
+        }
+        if self.slow_host.is_some() {
+            servers["slowhost"] = json!({
+                "cmd": [mock_bin(), self.host_mode],
+                "languages": ["markdown"]
+            });
+        }
         client.send_request(
             "initialize",
             json!({
@@ -112,20 +191,7 @@ impl Setup {
                 "capabilities": self.capabilities,
                 "workspaceFolders": null,
                 "initializationOptions": {
-                    "languageServers": {
-                        "peer": {
-                            "cmd": [mock_bin(), "prepare-peer"],
-                            "languages": ["lua"]
-                        },
-                        "echo": {
-                            "cmd": [mock_bin(), self.echo],
-                            "languages": if self.unprepared_python {
-                                json!(["lua", "python"])
-                            } else {
-                                json!(["lua"])
-                            }
-                        }
-                    },
+                    "languageServers": servers,
                     "languages": { "markdown": markdown }
                 }
             }),
@@ -390,20 +456,50 @@ fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
     );
 }
 
+/// Apply LSP `TextEdit`s to `text`, fixtures being ASCII (a UTF-16 column
+/// is a byte), end-first.
+fn apply_edits(text: &str, edits: &[Value]) -> String {
+    let offset = |position: &Value| -> usize {
+        let line = position["line"].as_u64().unwrap() as usize;
+        let character = position["character"].as_u64().unwrap() as usize;
+        let start: usize = text.split_inclusive('\n').take(line).map(str::len).sum();
+        let content = text.split_inclusive('\n').nth(line).unwrap_or("");
+        assert!(
+            character <= content.trim_end_matches('\n').len(),
+            "column {character} past line {line}"
+        );
+        start + character
+    };
+    let mut spans: Vec<(usize, usize, String)> = edits
+        .iter()
+        .map(|edit| {
+            (
+                offset(&edit["range"]["start"]),
+                offset(&edit["range"]["end"]),
+                edit["newText"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    spans.sort_by_key(|&(start, end, _)| std::cmp::Reverse((start, end)));
+    let mut text = text.to_string();
+    for (start, end, new_text) in spans {
+        text.replace_range(start..end, &new_text);
+    }
+    text
+}
+
 #[test]
-fn formatting_is_not_offered_on_a_prepared_document() {
+fn formatting_on_a_prepared_document_maps_back_reindented() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // The echo mock would uppercase the document; a formatter's edits to a
-    // prepared one are not mapped back through its map. Refused up front,
-    // not by a wait for a text the server never holds (which would take the
-    // 5 s budget).
+    // The echo mock formats the prepared (dedented) text, uppercasing it
+    // and breaking the line: the line it creates regains the indentation
+    // the peer removed.
     for method in ["textDocument/formatting", "textDocument/rangeFormatting"] {
-        let started = Instant::now();
         let response = client.send_request(
             method,
             json!({
@@ -415,48 +511,442 @@ fn formatting_is_not_offered_on_a_prepared_document() {
                 "options": { "tabSize": 2, "insertSpaces": true }
             }),
         );
-        assert!(response.get("error").is_none(), "{method}: {response}");
-        let edits = response["result"].as_array().cloned().unwrap_or_default();
-        assert!(edits.is_empty(), "{method}: {response}");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "{method} took {elapsed:?}"
+        let edits = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{method}: {response}"));
+        assert_eq!(
+            apply_edits(text, &edits),
+            "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+            "{method}: {response}"
         );
     }
 }
 
 #[test]
-fn formatting_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+fn on_type_formatting_on_a_prepared_document_maps_back_reindented() {
     let (mut client, _dir) = Setup::default().start();
-    let uri = "file:///prepare/format-early.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let uri = "file:///prepare/on-type.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
     open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
 
-    // At once, and again while a hover may be sending the prepared text
-    // before the lifecycle pass looked the region up: each waits for the
-    // answer, and is refused up front rather than by waiting out the
-    // budget for a text its server never holds.
-    for attempt in 0..10 {
-        let started = Instant::now();
+    // `;` typed after `1`: the echo mock answers for the whole prepared
+    // text, its line broken; the new line regains the removed indent.
+    let response = client.send_request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 14 },
+            "ch": ";",
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        "{response}"
+    );
+}
+
+#[test]
+fn an_on_type_answer_its_map_refuses_leaves_the_request_to_the_next_server() {
+    let (mut client, _dir) = Setup {
+        second_on_type: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/on-type-refused.md";
+    let text = "# t\n\n```lua\n  local x = 1; -- OVERLAP\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // The echo mock, ranked first, answers with overlapping edits: its map
+    // refuses them, which is no answer, so the `on-type` mock ranked below
+    // answers instead (uppercasing), its edits mapped back reindented. No
+    // answer (null) only while that server starts; the first answer given
+    // is checked as it comes (an empty list would be the refusal winning).
+    let mut edits = None;
+    for _ in 0..100 {
         let response = client.send_request(
-            "textDocument/formatting",
+            "textDocument/onTypeFormatting",
             json!({
                 "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 14 },
+                "ch": ";",
                 "options": { "tabSize": 2, "insertSpaces": true }
             }),
         );
         assert!(response.get("error").is_none(), "{response}");
-        let edits = response["result"].as_array().cloned().unwrap_or_default();
-        assert!(edits.is_empty(), "{response}");
-        // The first may wait for the peer to start and answer.
-        let elapsed = started.elapsed();
-        assert!(
-            attempt == 0 || elapsed < Duration::from_millis(2500),
-            "formatting took {elapsed:?}"
-        );
-        let _ = hover(&mut client, uri, 3, 4);
+        if !response["result"].is_null() {
+            edits = response["result"].as_array().cloned();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    let edits = edits.expect("an on-type answer");
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1; -- OVERLAP\n```\n"
+    );
+}
+
+#[test]
+fn on_type_formatting_with_the_caret_in_a_removed_indent_is_answered() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/on-type-indent.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // The caret inside the indent the peer removed has no place of its own
+    // in the prepared text: it is sent as its line's start there, and the
+    // answer maps back as from anywhere else.
+    let response = client.send_request(
+        "textDocument/onTypeFormatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 1 },
+            "ch": ";",
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        "{response}"
+    );
+}
+
+#[test]
+fn a_selection_of_only_what_the_peer_removed_is_not_range_formatted() {
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let wire = dir.path().join("wire.log");
+    let sent = || {
+        std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("textDocument/rangeFormatting\t"))
+            .count()
+    };
+    // Each selection on its own document: (text, selection, reaches the
+    // server). One holding nothing the prepared text has (the removed
+    // indent, or a removed blank line) is empty there: no request, as for a
+    // selection only in a host prefix. One holding a character of the code
+    // is sent.
+    let one_line = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    let blank_first = "# t\n\n```lua\n\n  local x = 1; local y = 2\n```\n";
+    for (index, (text, (start, end), reaches)) in [
+        (one_line, ((3, 0), (3, 2)), false),
+        (one_line, ((3, 1), (3, 2)), false),
+        (blank_first, ((3, 0), (4, 0)), false),
+        (one_line, ((3, 0), (3, 3)), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let uri = format!("file:///prepare/range-removed-{index}.md");
+        let code_line = if text == blank_first { 4 } else { 3 };
+        open(&mut client, &uri, text);
+        hover_with_retry(&mut client, &uri, code_line, 4);
+        let before = sent();
+        let response = client.send_request(
+            "textDocument/rangeFormatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": start.0, "character": start.1 },
+                    "end": { "line": end.0, "character": end.1 }
+                },
+                "options": { "tabSize": 2, "insertSpaces": true }
+            }),
+        );
+        assert!(response.get("error").is_none(), "{index}: {response}");
+        assert_eq!(sent() - before, usize::from(reaches), "{index}: {response}");
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            apply_edits(text, &edits) != text,
+            reaches,
+            "{index}: {response}"
+        );
+    }
+}
+
+#[test]
+fn the_concatenated_pipeline_formats_a_prepared_document() {
+    let (mut client, _dir) = Setup {
+        concatenated: true,
+        ..Setup::default()
+    }
+    .start();
+    // The second fence's leading blank line is deleted by the peer: the
+    // host keeps it.
+    for (index, text, formatted) in [
+        (
+            0,
+            "# t\n\n```lua\n  local x = 1; local y = 2\n```\n",
+            "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        ),
+        (
+            1,
+            "# t\n\n```lua\n\n  local x = 1; local y = 2\n```\n",
+            "# t\n\n```lua\n\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        ),
+    ] {
+        let uri = format!("file:///prepare/pipeline-{index}.md");
+        open(&mut client, &uri, text);
+        hover_with_retry(&mut client, &uri, 3 + index, 4);
+        let response = client.send_request(
+            "textDocument/formatting",
+            formatting_params("textDocument/formatting", &uri),
+        );
+        let edits = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{response}"));
+        assert_eq!(apply_edits(text, &edits), formatted, "{response}");
+    }
+}
+
+/// The params of `method` over the whole of `uri`, typed at host (3, 14)
+/// for on-type formatting.
+fn formatting_params(method: &str, uri: &str) -> Value {
+    let mut params = json!({
+        "textDocument": { "uri": uri },
+        "options": { "tabSize": 2, "insertSpaces": true }
+    });
+    match method {
+        "textDocument/rangeFormatting" => {
+            params["range"] = json!({
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            });
+        }
+        "textDocument/onTypeFormatting" => {
+            params["position"] = json!({ "line": 3, "character": 14 });
+            params["ch"] = json!(";");
+        }
+        _ => {}
+    }
+    params
+}
+
+/// A formatting answer mapped through a prepared document is checked once
+/// more as the final answer is chosen: while the host layer still ran, the
+/// host was edited, and the whole answer is dropped, without an error.
+/// Without the edit, the same request answers with the virt edits.
+#[test]
+fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    for (strategy, method) in [
+        ("preferred", "textDocument/formatting"),
+        ("preferred", "textDocument/rangeFormatting"),
+        ("preferred", "textDocument/onTypeFormatting"),
+        ("concatenated", "textDocument/formatting"),
+    ] {
+        let (mut client, _dir) = Setup {
+            slow_host: Some(strategy),
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/stale.md";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+
+        let response = client.send_request(method, formatting_params(method, uri));
+        let edits = response["result"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !edits.is_empty(),
+            "{strategy} {method}, unedited: {response}"
+        );
+        drop(client);
+
+        // Now a host layer answering only when released. Edit the host
+        // (outside the region) once the host layer's request is out, and
+        // release it once the edit is in. The request read the host's
+        // version as it started, before either layer was sent: whether the
+        // virt layer's answer came before the edit or after the release,
+        // it is made for the text before the edit, and the answer chosen
+        // after the host layer's is checked against the edited host.
+        let (mut client, dir) = Setup {
+            slow_host: Some(strategy),
+            host_mode: "empty-on-release",
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let id = client.send_request_async(method, formatting_params(method, uri));
+        let wire = dir.path().join("wire.log");
+        let host_request = format!("{method}\t{uri}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == host_request)
+        {
+            assert!(
+                Instant::now() < until,
+                "{strategy} {method}: host request not sent: {}",
+                std::fs::read_to_string(&wire).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+        // A request after the edit is answered once the edit is in.
+        hover(&mut client, uri, 0, 0);
+        std::fs::write(dir.path().join("release"), "").expect("release the host layer");
+        let response = client.receive_response_for_id_public(id);
+        assert!(
+            response.get("error").is_none(),
+            "{strategy} {method}: {response}"
+        );
+        // Dropped whole: no answer at all, not an empty list some layer
+        // gave.
+        assert!(
+            response["result"].is_null(),
+            "{strategy} {method}, edited: {response}"
+        );
+    }
+}
+
+#[test]
+fn a_color_presentation_the_host_moved_under_is_dropped() {
+    // The echo mock answers the picker only once released. The host is
+    // edited (outside the region) while the request is out: its
+    // presentation, made for the text before the edit, is dropped.
+    let (mut client, dir) = Setup {
+        color_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/color-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+        "range": {
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 9 }
+        }
+    });
+    // Unedited, the presentations map back.
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.send_request("textDocument/colorPresentation", request.clone());
+    assert!(!result_items(&response).is_empty(), "{response}");
+    std::fs::remove_file(dir.path().join("release")).expect("hold again");
+
+    let id = client.send_request_async("textDocument/colorPresentation", request);
+    let wire = dir.path().join("wire.log");
+    let sent = || {
+        std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with("textDocument/colorPresentation\t"))
+            .count()
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while sent() < 2 {
+        assert!(Instant::now() < until, "color request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(result_items(&response).is_empty(), "{response}");
+}
+
+#[test]
+fn a_formatting_request_cancelled_while_it_waits_ends_at_once() {
+    // The host layer answers only once released; the request waits on it,
+    // as it may wait on the host settling before its answer is judged, all
+    // in the request's own handler. `$/cancelRequest` ends that handler
+    // wherever it waits: the response is the cancelled error, at once.
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    for method in [
+        "textDocument/formatting",
+        "textDocument/rangeFormatting",
+        "textDocument/onTypeFormatting",
+    ] {
+        let (mut client, dir) = Setup {
+            slow_host: Some("preferred"),
+            host_mode: "empty-on-release",
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/cancelled.md";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let id = client.send_request_async(method, formatting_params(method, uri));
+        let wire = dir.path().join("wire.log");
+        let host_request = format!("{method}\t{uri}");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line == host_request)
+        {
+            assert!(Instant::now() < until, "{method}: host request not sent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let cancelled = Instant::now();
+        client.send_notification("$/cancelRequest", json!({ "id": id }));
+        let response = client.receive_response_for_id_public(id);
+        assert_eq!(response["error"]["code"], -32800, "{method}: {response}");
+        assert!(
+            cancelled.elapsed() < Duration::from_secs(5),
+            "{method}: {:?}",
+            cancelled.elapsed()
+        );
+        std::fs::write(dir.path().join("release"), "").expect("release the host layer");
+    }
+}
+
+#[test]
+fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/format-early.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+
+    // At once: the answer is not in yet. The request waits for it and
+    // formats the prepared text, its edits mapped back: the line the
+    // formatter breaks off regains the indent (unprepared, it would not).
+    let response = client.send_request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let edits = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  LOCAL X = 1\n  LOCAL Y = 2\n```\n",
+        "{response}"
+    );
 }
 
 #[test]
@@ -673,6 +1163,41 @@ fn range_formatting_does_not_wait_for_regions_outside_its_range() {
 }
 
 #[test]
+fn without_experimental_features_formatting_answers_as_unprepared() {
+    // With experimental features off, the formatting methods answer as on
+    // any unprepared document: the edits' ranges translated, their text as
+    // the server wrote it
+    // (the line the formatter breaks off regains no indent).
+    let (mut client, _dir) = Setup {
+        experimental: false,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/flag-off-format.md";
+    let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    for method in [
+        "textDocument/formatting",
+        "textDocument/rangeFormatting",
+        "textDocument/onTypeFormatting",
+    ] {
+        let response = client.send_request(method, formatting_params(method, uri));
+        assert_eq!(
+            response["result"],
+            json!([{
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 4, "character": 0 }
+                },
+                "newText": "  LOCAL X = 1\nLOCAL Y = 2\n"
+            }]),
+            "{method}"
+        );
+    }
+}
+
+#[test]
 fn without_experimental_features_nothing_is_prepared() {
     // The peer advertises the request and is configured to prepare lua, but
     // with experimental features off it is never asked: the document goes
@@ -697,7 +1222,8 @@ fn without_experimental_features_nothing_is_prepared() {
         }),
     );
     assert!(!response["result"].is_null(), "{response}");
-    // Edits translate as ranges only, as on main: no text re-indented.
+    // Edits translate as ranges only, as with preparation off: no text
+    // re-indented.
     let response = client.send_request(
         "textDocument/completion",
         json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 4 } }),

@@ -14,6 +14,26 @@ impl PreparedMap {
     }
 }
 
+/// A property's runner over `cases` cases, from a fixed seed: a run is
+/// repeatable, and a failure it finds found again. `PROPTEST_RNG_SEED` picks
+/// another seed, and `KAKEHASHI_PROPTEST_RANDOM` set a random one.
+fn property_runner(cases: u32) -> proptest::test_runner::TestRunner {
+    use proptest::test_runner::{Config, RngSeed, TestRunner};
+    let rng_seed = if std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_some() {
+        RngSeed::Random
+    } else if std::env::var_os("PROPTEST_RNG_SEED").is_some() {
+        Config::default().rng_seed
+    } else {
+        RngSeed::Fixed(0x6b61_6b65)
+    };
+    TestRunner::new(Config {
+        cases,
+        failure_persistence: None,
+        rng_seed,
+        ..Config::default()
+    })
+}
+
 fn result(value: serde_json::Value) -> Option<PrepareResult> {
     serde_json::from_value(value).unwrap()
 }
@@ -32,7 +52,7 @@ fn edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
 /// `text` with `edits` applied (a column past a line's end meaning its end).
 pub(super) fn apply_to(text: &str, edits: &[TextEdit]) -> String {
     let lines = LineMap::new(text.to_string());
-    let (ranges, order) = sorted_extents(&lines, edits).expect("edits apply");
+    let (ranges, order) = sorted_extents(&lines, edits, true).expect("edits apply");
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     for index in order {
@@ -1072,7 +1092,7 @@ mod properties {
     use super::super::super::{Run, is_line_start, splits_crlf};
     use super::*;
     use proptest::prelude::*;
-    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+    use proptest::test_runner::TestCaseError;
     use std::cell::Cell;
 
     /// One line of a generated virtual document.
@@ -1445,11 +1465,7 @@ mod properties {
 
     #[test]
     fn mapped_edits_keep_host_text_and_the_servers_content() {
-        let mut runner = TestRunner::new(Config {
-            cases: 4000,
-            failure_persistence: None,
-            ..Config::default()
-        });
+        let mut runner = property_runner(4000);
         let (answered, mapped_sets) = (Cell::new(0), Cell::new(0));
         let strategy = (
             prop::collection::vec(line_spec(), 1..7),
@@ -1505,11 +1521,7 @@ mod properties {
     fn edits_to_a_uniformly_dedented_document_map_back_reindented() {
         // A document whose every non-empty line the peer dedented by one
         // indent: any edit set maps back to its result on P re-indented.
-        let mut runner = TestRunner::new(Config {
-            cases: 3000,
-            failure_persistence: None,
-            ..Config::default()
-        });
+        let mut runner = property_runner(3000);
         let mapped_sets = Cell::new(0);
         let strategy = (
             prop::collection::vec((1..BODIES.len(), any::<bool>(), 0..3usize), 1..6),
@@ -1808,7 +1820,7 @@ fn a_cr_before_a_gap_shown_opening_with_its_lf_is_the_servers_to_join() {
 mod exact_reference {
     use super::*;
     use proptest::prelude::*;
-    use proptest::test_runner::{Config, TestCaseError, TestRunner};
+    use proptest::test_runner::TestCaseError;
     use std::cell::Cell;
 
     /// One line of a generated document.
@@ -2134,12 +2146,10 @@ mod exact_reference {
 
     #[test]
     fn mapped_edits_give_exactly_the_reference_host_text() {
-        let mut runner = TestRunner::new(Config {
+        let mut runner = property_runner(
             // Most generated documents bear gaps, skipped below.
-            cases: 12000,
-            failure_persistence: None,
-            ..Config::default()
-        });
+            12000,
+        );
         let (mapped_sets, refused_by_reference) = (Cell::new(0), Cell::new(0));
         let strategy = (
             prop::collection::vec(line(), 1..6),
@@ -2934,5 +2944,2514 @@ fn many_edits_on_one_long_line_look_at_it_in_linear_work() {
             "{scanned} bytes scanned for a {}-byte line",
             virtual_text.len()
         );
+    }
+}
+
+#[test]
+fn an_edit_keeping_its_extent_over_whole_blank_lines_is_placed_as_it_says() {
+    // Text replacing whole lines from a blank line: an edit keeping its
+    // extent takes the indent its own rules give (formatting answers alone
+    // read such text as a line of the content in the blank line's place).
+    let changes = |removed: &[usize]| -> serde_json::Value {
+        removed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &width)| width > 0)
+            .map(|(line, &width)| {
+                json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": width}}, "newText": ""})
+            })
+            .collect()
+    };
+    let map = prepare("\t \n\n    \t\n", changes(&[1, 0, 4]));
+    assert_eq!(
+        map.map_one_with_extent(&edit((0, 0), (2, 1), "\u{1D11E}")),
+        Some(edit((0, 0), (2, 5), "\t\u{1D11E}"))
+    );
+    let map = prepare("    \r\na\n x\n      \n x\r\n", changes(&[3, 0, 0, 4, 1]));
+    assert_eq!(
+        map.map_one_with_extent(&edit((3, 0), (5, 1), "x")),
+        Some(edit((3, 0), (5, 0), "    x"))
+    );
+}
+
+mod formatting {
+    use super::*;
+
+    /// V formatted through `map` by a formatter answering `edits` to P, the
+    /// diff given `budget` steps of work; `None` when the map refuses the
+    /// answer.
+    fn formatted(
+        map: &PreparedMap,
+        virtual_text: &str,
+        edits: &[TextEdit],
+        budget: usize,
+    ) -> Option<String> {
+        let mapped = map.map_formatting(edits, budget).ok()?;
+        Some(apply_to(virtual_text, &mapped))
+    }
+
+    /// [`formatted`] with work enough; with none, an answer changing
+    /// anything is refused.
+    fn formatted_either_way(
+        map: &PreparedMap,
+        virtual_text: &str,
+        edits: &[TextEdit],
+    ) -> Option<String> {
+        let precise = formatted(map, virtual_text, edits, usize::MAX);
+        let coarse = formatted(map, virtual_text, edits, 0);
+        if precise.as_deref() != Some(virtual_text) {
+            assert_eq!(coarse, None, "a diff out of work is refused");
+        }
+        precise
+    }
+
+    #[test]
+    fn a_whitespace_line_the_peer_kept_shorter_than_the_indent_keeps_it() {
+        // A whitespace-only line the peer kept, shorter than the indent.
+        let virtual_text = "    if x:\n \n";
+        let map = prepare(
+            virtual_text,
+            json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""}]),
+        );
+        let answer = [edit((0, 0), (2, 0), "    if x:\n    \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("        if x:\n    \n")
+        );
+    }
+
+    /// `virtual_text` with the indent `removed` (`""` for none) deleted
+    /// from each line.
+    fn dedent_lines(virtual_text: &str, removed: &[usize]) -> PreparedMap {
+        let changes: Vec<_> = removed
+            .iter()
+            .enumerate()
+            .filter(|&(_, &width)| width > 0)
+            .map(|(line, &width)| {
+                json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": width}}, "newText": ""})
+            })
+            .collect();
+        prepare(virtual_text, json!(changes))
+    }
+
+    #[test]
+    fn a_line_inserted_before_a_kept_whitespace_line_takes_the_content_indent() {
+        // The kept ` ` is a line of its own, not the start of the new one.
+        let virtual_text = "  if x:\n \n";
+        let map = dedent_lines(virtual_text, &[2]);
+        let answer = [edit((0, 0), (2, 0), "if x:\n  w\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  if x:\n    w\n \n")
+        );
+    }
+
+    #[test]
+    fn text_where_blank_lines_were_takes_the_contents_indent_or_is_refused() {
+        // An empty line had nothing to remove: text written where it was
+        // is the content's, indented as it is. Text where the kept ` ` was
+        // (typed after its whitespace or not) is refused: typed on it or
+        // written in its place, a whole-text answer does not tell.
+        let virtual_text = "  a\n\n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\ny\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  y\n  b\n")
+        );
+        let virtual_text = "  a\n \n\n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), "a\n x\ny\nb\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+    }
+
+    #[rstest::rstest]
+    // Seeds of a provenance oracle: text typed right after a kept
+    // whitespace line's whitespace, a line inserted in its place as well.
+    #[case("  1,\r   \r  \r ", &[2, 0, 2, 1], "1,\r\n   }\r\n")]
+    #[case("\t\t)\n\t\t\n", &[2, 0], ")\r\n\t\t}\r\n")]
+    #[case("    f(a,b,c)\t\r    \t\n", &[4, 0], "f(a,b,c)\r    \t}\n")]
+    fn text_typed_after_a_kept_whitespace_line_is_refused(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split(['\n', '\r']).count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+    }
+
+    #[test]
+    fn lines_repeating_a_lines_start_are_each_indented() {
+        // `x` begins two written lines: whichever the diff keeps as the
+        // old one, every line written gains the indent, none twice.
+        let virtual_text = "  x\n  y\n";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "xa\nq\nxb\ny\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  xa\n  q\n  xb\n  y\n")
+        );
+    }
+
+    /// Minified JSON of at least `bytes`, and the same pretty-printed, two
+    /// spaces a level: they differ only in whitespace.
+    fn json_pair(bytes: usize) -> (String, String) {
+        let mut items = Vec::new();
+        let mut length = 0;
+        while length < bytes {
+            let index = items.len();
+            let item = format!(
+                "{{\"key{index}\":[{index},{},\"v{index}\"],\"n\":{{\"x\":{index}}}}}",
+                index * 7
+            );
+            length += item.len() + 1;
+            items.push(item);
+        }
+        let minified = format!("[{}]", items.join(","));
+        let value: serde_json::Value = serde_json::from_str(&minified).unwrap();
+        (minified, serde_json::to_string_pretty(&value).unwrap())
+    }
+
+    /// A one-line JSON document in an indented block, and an answer
+    /// pretty-printing it: V, its map, the answer, and V formatted.
+    fn pretty_printed(bytes: usize) -> (String, PreparedMap, [TextEdit; 1], String) {
+        let (minified, pretty) = json_pair(bytes);
+        let virtual_text = format!("  {minified}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 0), (1, 0), &format!("{pretty}\n"))];
+        let expected = pretty.lines().map(|line| format!("  {line}\n")).collect();
+        (virtual_text, map, answer, expected)
+    }
+
+    #[test]
+    fn a_large_pretty_printed_answer_maps() {
+        // Some 25 KB rewritten into thousands of lines: every character
+        // other than whitespace is kept, so pairing those first finds them
+        // along one diagonal, and only the whitespace between them is
+        // diffed.
+        let (virtual_text, map, answer, expected) = pretty_printed(25_000);
+        assert!(virtual_text.len() > 25_000);
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .ok()
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn whitespace_rewritten_costs_work_linear_in_the_texts() {
+        let (virtual_text, map, answer, expected) = pretty_printed(25_000);
+        let budget = 4 * (virtual_text.len() + expected.len());
+        assert_eq!(
+            formatted(&map, &virtual_text, &answer, budget),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn the_work_an_answer_takes_decides_it_alike_every_time() {
+        // No clock: the least budget mapping an answer maps it on every
+        // run, and one step less refuses it on every run.
+        let (_, map, answer, _) = pretty_printed(2_000);
+        let maps = |budget| map.map_formatting(&answer, budget).ok();
+        let (mut refusing, mut mapping) = (0, FORMATTING_DIFF_BUDGET);
+        let mapped = maps(mapping);
+        assert!(mapped.is_some());
+        assert_eq!(maps(refusing), None);
+        while mapping - refusing > 1 {
+            let between = refusing + (mapping - refusing) / 2;
+            if maps(between).is_some() {
+                mapping = between;
+            } else {
+                refusing = between;
+            }
+        }
+        for _ in 0..5 {
+            assert_eq!(maps(refusing), None);
+            assert_eq!(maps(mapping), mapped);
+        }
+    }
+
+    #[rstest::rstest]
+    // A kept whitespace line deleted, the next line rewritten.
+    #[case::kept("  a\n \n  b\n", &[2, 0, 2], "a\nB\n", "  a\n  B\n")]
+    // A whitespace line the peer cleared, deleted the same way.
+    #[case::cleared("  a\n   \n  b\n", &[2, 3, 2], "a\nB\n", "  a\n  B\n")]
+    // And with two lines made one beside it.
+    #[case::merged("  a\n \n  b\n  c\n", &[2, 0, 2, 2], "a\nB C\n", "  a\n  B C\n")]
+    // A line split, its second half joined onto the next line across a
+    // blank line the answer removed, a cleared one: in its place.
+    #[case::rejoined_cleared(
+        "    ={x}y  =\n    \t=\n          \n    \te {\n",
+        &[4, 4, 10, 4],
+        "= { x\n\t} y = =\n\te {\n",
+        "    = { x\n    \t} y = =\n    \te {\n"
+    )]
+    fn text_is_never_written_on_a_whitespace_line_the_answer_removed(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+        #[case] expected: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split_inclusive('\n').count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn text_typed_after_a_kept_whitespace_line_beside_lines_moved_is_refused() {
+        // `1a1` moved after `2a2` lands beside the kept ` `, and ` w3`
+        // starts with its whitespace: more lines than blank lines there,
+        // whether ` w3` was typed on it or written in its place no answer
+        // tells.
+        let virtual_text = "0a0\n  1a1\n  2a2\n \n";
+        let map = dedent_lines(virtual_text, &[0, 2, 2, 0]);
+        let answer = [edit((0, 0), (4, 0), "0a0\n2a2\n1a1\n w3\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+    }
+
+    #[test]
+    fn alike_lines_with_the_same_indent_stay_mapped() {
+        // Alike lines with the same indent stay mapped.
+        let virtual_text = "  }\n  a\n  }\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2]);
+        let answer = [edit((0, 0), (3, 0), "}\nb\n}\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  }\n  b\n  }\n")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::cleared("  a\n   \n  b\n", &[2, 2, 2], "a\nc\n\nb\n", "  a\n  c\n\n  b\n")]
+    #[case::comment(
+        "  a = 1\n      \n  b = 2\n",
+        &[2, 2, 2],
+        "a = 1\n# x\n\nb = 2\n",
+        "  a = 1\n  # x\n\n  b = 2\n"
+    )]
+    #[case::sorted(
+        "  import c\n  import b\n  import a\n      \n  y = 1\n",
+        &[2, 2, 2, 2, 2],
+        "import a\nimport b\nimport c\n\ny = 1\n",
+        "  import a\n  import b\n  import c\n\n  y = 1\n"
+    )]
+    fn a_line_written_before_a_dedented_whitespace_line_the_answer_clears_maps(
+        #[case] virtual_text: &str,
+        #[case] removed: &[usize],
+        #[case] answer: &str,
+        #[case] expected: &str,
+    ) {
+        let map = dedent_lines(virtual_text, removed);
+        let lines = map.prepared_lines.text.split('\n').count() as u32;
+        let answer = [edit((0, 0), (lines, 0), answer)];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[rstest::rstest]
+    // The closing indent the peer removed with the last line.
+    #[case::closing_indent("  a\n  ", json!([
+        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+    ]), "a")]
+    #[case::nixfmt("    a\n  ", json!([
+        {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 4}}, "newText": ""},
+        {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+    ]), "a\nb")]
+    fn an_answer_dropping_ps_final_line_break_before_a_deleted_closing_is_told(
+        #[case] virtual_text: &str,
+        #[case] changes: serde_json::Value,
+        #[case] answer: &str,
+    ) {
+        // Formatting answers keep P's edges, restored before mapping; an
+        // on-type answer does not: one dropping P's final line break would
+        // edit the closing the peer deleted (taking its indent off, or
+        // writing a line on it), which the on-type transform refuses.
+        let map = prepare(virtual_text, changes);
+        assert_eq!(map.prepared_lines.text, "a\n");
+        let answer = [edit((0, 0), (1, 0), answer)];
+        assert!(map.drops_the_break_before_the_closing(&answer));
+        // Keeping the break, it does not.
+        let kept = [edit((0, 0), (1, 0), "b\n")];
+        assert!(!map.drops_the_break_before_the_closing(&kept));
+    }
+
+    #[test]
+    fn text_where_a_kept_whitespace_line_was_is_refused() {
+        // A line split, its second half joined onto the next across a kept
+        // `  \t` the answer replaced: written on it (no indent) or in its
+        // place (the content's), no answer tells. Refused, not guessed.
+        let virtual_text = "  )  } =  (y\n  \t)  \n  \t\n  ,  in\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), ") } =\n\t( y )\n, in\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Typed right after the kept whitespace too: a whole-text answer
+        // does not tell that from a line written in the kept line's place.
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\n x\nb\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::quotes(|index: usize| format!("x = 'a{index}'"), |index: usize| format!("x = \"a{index}\""))]
+    #[case::call(
+        |index: usize| format!("foo('a{index}', \"b\")"),
+        |index: usize| format!("foo(\"a{index}\", \"b\");")
+    )]
+    #[case::object(
+        |index: usize| format!("\"k{index}\":[1,2,{{'a':'b'}}],"),
+        |index: usize| format!("\"k{index}\": [1, 2, {{\"a\": \"b\"}}],")
+    )]
+    fn every_line_rewritten_in_place_maps_in_linear_work(
+        #[case] old_line: fn(usize) -> String,
+        #[case] new_line: fn(usize) -> String,
+    ) {
+        // No line alike to another but for whitespace, every one changed:
+        // lines alike in their letters and digits pair in order, each
+        // diffed on its own, however many there are. One line split in
+        // two in the middle leaves the lines on either side paired.
+        let count = 20_000;
+        let indented = |line: String| format!("  {line}\n");
+        let virtual_text: String = (0..count).map(old_line).map(indented).collect();
+        let map = dedent_lines(&virtual_text, &vec![2; count]);
+        let split = count / 2;
+        let formatted: String = (0..count)
+            .map(|index| {
+                let line = new_line(index);
+                if index == split {
+                    let (head, tail) = line.split_at(line.len() / 2);
+                    format!("{head}\n{tail}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        let answer = [edit((0, 0), (count as u32, 0), &formatted)];
+        let expected: String = formatted
+            .lines()
+            .map(|line| indented(line.to_string()))
+            .collect();
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::lf("  a\n  b", "  a b")]
+    #[case::crlf("  a\r\n  b", "  a b")]
+    fn joining_the_last_line_with_no_line_break_maps(
+        #[case] virtual_text: &str,
+        #[case] expected: &str,
+    ) {
+        // The line joined away ends the document with no line break: its
+        // removal goes with the join, not apart from it.
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (1, 1), "a b")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn every_line_rewritten_and_empty_lines_removed_maps_in_linear_work() {
+        // An empty line after every tenth, all of them removed, every line
+        // of text rewritten: the lines still pair in order.
+        let count = 20_000;
+        let virtual_text: String = (0..count)
+            .map(|index| {
+                let line = format!("  \"k{index}\":[1,2,{{'a':'b'}}],\n");
+                if index % 10 == 9 {
+                    format!("{line}\n")
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let removed: Vec<usize> = virtual_text
+            .lines()
+            .map(|line| if line.is_empty() { 0 } else { 2 })
+            .collect();
+        let map = dedent_lines(&virtual_text, &removed);
+        let formatted: String = (0..count)
+            .map(|index| format!("\"k{index}\": [1, 2, {{\"a\": \"b\"}}],\n"))
+            .collect();
+        let answer = [edit((0, 0), (removed.len() as u32, 0), &formatted)];
+        let expected: String = formatted
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect();
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
+    #[test]
+    fn blank_lines_removed_whole_go_where_the_answer_leaves_them() {
+        // `   ` dedented to ` ` between two lines of the content.
+        let virtual_text = "  a\n   \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2]);
+        // `a` rewritten and the blank line gone: the blank line goes
+        // whole, before what follows, not into `xxxa`.
+        let answer = [edit((0, 0), (3, 0), "xxxa\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  xxxa\n  b\n")
+        );
+        // Everything rewritten as one line: the blank line goes with the
+        // rest, none of it left behind.
+        let answer = [edit((0, 0), (3, 0), "x\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  x\n")
+        );
+        // Two lines where the blank line was, neither starting with its
+        // whitespace: lines of the content, the blank line gone.
+        let answer = [edit((0, 0), (3, 0), "a\n     x\ny\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n       x\n  y\n  b\n")
+        );
+    }
+
+    #[test]
+    fn lines_found_more_than_once_pair_only_once_the_rest_is_placed() {
+        // Nothing dedented: `}` twice in P, the answer joining and
+        // respacing around them. `e let y` is `e  let  y` respaced, given
+        // no indent of another line's.
+        let virtual_text = "}\n      \n  }  \n e  let  y z( \"s\"";
+        let map = dedent_lines(virtual_text, &[0, 0, 0, 0]);
+        let answer = [edit(
+            (0, 0),
+            (4, 0),
+            "} in import\n    }\ne let y\n    z ( \"s\"",
+        )];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("} in import\n    }\ne let y\n    z ( \"s\"")
+        );
+        // `}` twice and `import e` once in P, `import e` twice in the
+        // answer: the dedented whitespace line emptied is emptied.
+        let virtual_text = "    }\n    import e\n    )in)\n      \n    }\n";
+        let map = dedent_lines(virtual_text, &[4, 4, 4, 4, 4]);
+        let answer = [edit((0, 0), (5, 0), "import e\n}\nimport e\n\n  }\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    import e\n    }\n    import e\n\n      }\n")
+        );
+        // Copies on an evenly dedented region: once the lines found once are
+        // placed, copies found as many times on each side pair in order,
+        // and those found more often on one side do not; each answer below
+        // maps to the one text every reading of it writes.
+        let cases: [(&str, &[usize], &str, &str); 3] = [
+            // `x` twice, one rewritten and one written over the kept ` `.
+            ("x\nx\n \n", &[0, 0, 0], "xx\nx\nx\n", "xx\nx\nx\n"),
+            // `}` twice, reindented and copied, `x` beside the kept ` `.
+            (
+                "  }\n  }\n \n",
+                &[2, 2, 0],
+                " }\n}\n}\nx\n",
+                "   }\n  }\n  }\n  x\n",
+            ),
+            // `\t}` twice, one rewritten, the kept ` ` removed.
+            (" \n\t}\n\t}\n", &[0, 0, 0], "}x\n}\n", "}x\n}\n"),
+        ];
+        for (virtual_text, removed, answer, expected) in cases {
+            let map = dedent_lines(virtual_text, removed);
+            let answer = [edit((0, 0), (4, 0), answer)];
+            assert_eq!(
+                formatted_either_way(&map, virtual_text, &answer).as_deref(),
+                Some(expected),
+                "{virtual_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_in_a_kept_whitespace_lines_place_is_refused_but_more_lines_there_are_the_contents() {
+        // `     ` kept, rewritten line for line as `      c`: typed on it,
+        // or a line in its place, no answer tells.
+        let virtual_text = "  a\n     \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\n      c\nb\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // With two lines there for the one blank line, neither starting
+        // with exactly its whitespace, the blank line went and both are
+        // lines of the content.
+        let answer = [edit((0, 0), (3, 0), "a\n      c\nd\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n        c\n  d\n  b\n")
+        );
+    }
+
+    #[test]
+    fn answers_on_a_peer_dedenting_unevenly_are_refused() {
+        // A line of the content the peer left alone, or dedented otherwise
+        // than the rest: which line of a whole answer is which old one,
+        // and so which indent each regains, only a pairing reads, and a
+        // reading can cross copies or move a line off its own indent. Each
+        // shape below is one a pairing once mapped, some to the wrong text.
+        let cases: [(&str, &[usize], u32, &str); 22] = [
+            // A line left alone deleted, the next reindented.
+            ("0b c0\n  1a1\n", &[0, 2], 2, " 1a1\n"),
+            // A blank line written after the content, a line left alone.
+            ("    0x\n\n2x\n", &[4, 0, 0], 3, "0x\n  w\n\n2x\n\n"),
+            // A line break turned CRLF above a line left alone.
+            ("x\n  q\n  b\n", &[0, 0, 2], 3, "x\r\nq\nb\n"),
+            // A line left alone beside a kept whitespace line removed.
+            (
+                "    y\n  a=f('q')\n      \n",
+                &[4, 0, 4],
+                3,
+                "y\n  }\n  a=f(\"q\")\n",
+            ),
+            // A line left alone swapped with one of the content, also
+            // reindented; two lines left alone swapped.
+            ("  }\nk\n  }\n", &[2, 0, 2], 3, "}\n}\nk\n"),
+            ("  }\nk\n  }\n", &[2, 0, 2], 3, "}\n}\n k\n"),
+            ("a\nb\n  c\n", &[0, 0, 2], 3, "b\na\nc\n"),
+            // Copies reindented so one reads as the other did.
+            (
+                "  x\n    foo(\n    foo(\n",
+                &[2, 0, 2],
+                3,
+                "x\n        foo(\n    foo(\n",
+            ),
+            // Copies, one given punctuation and the other an indent.
+            (
+                "  x\na = 1\n  y\n    a = 1\n",
+                &[2, 0, 2, 2],
+                4,
+                "x\na = 1,\ny\n    a = 1\n",
+            ),
+            (
+                "  x\n\ta = 1\n  y\n  \t\ta = 1\n",
+                &[2, 0, 2, 2],
+                4,
+                "x\n  a = 1,\ny\n    a = 1\n",
+            ),
+            // Copies of a line left alone written more or fewer times.
+            (
+                "\t\ta\rlet s = \"é\";\r\t\tlet s = \"é\"; \r\t\t)\r\t\tpass  \r",
+                &[2, 0, 2, 2, 2],
+                5,
+                "let s = \"é\"; \r\n)\r\npass  \r\n",
+            ),
+            ("    a\n }\n    b\n", &[4, 0, 4], 3, "a\n }\n }\nb\n"),
+            (
+                "\t\ta\nlet s;\n\t\tlet s;\n\t\tb\n",
+                &[2, 0, 2, 2],
+                4,
+                "let s;\nb\n",
+            ),
+            ("  f(a)\ny\ny\n  f(a)\n", &[2, 0, 0, 2], 5, "y\nf(a)\ny\n"),
+            ("}\n  x\n   \n", &[0, 2, 2], 4, "x\nx\n\n"),
+            // Lines alike but for whitespace, each left as it was.
+            (
+                "    x='a'\n    }\n  }\n    y='b'\n",
+                &[4, 4, 0, 4],
+                4,
+                "x = \"a\"\n}\n  }\ny = \"b\"\n",
+            ),
+            // Lines joined, deleted or rewritten beside a line left alone.
+            (" \n    1a1\n2a2\n", &[0, 2, 0], 3, "  1a1 2a2\n"),
+            ("  0a0\r\n\t1b c1\r\n", &[2, 0], 2, "1b c1\r\n"),
+            ("a\n  ab\n", &[0, 2], 2, "ab\n"),
+            ("a\n  \tb\n", &[0, 2], 2, "  b\n"),
+            ("0a0\n  1a1\n", &[0, 2], 2, "0a0\r\n"),
+            (
+                "0if x:0\n    1if x:1\n    2if x:2\n",
+                &[0, 4, 4],
+                3,
+                "1if x:1 2if x:2\n",
+            ),
+        ];
+        for (virtual_text, removed, lines, answer) in cases {
+            let map = dedent_lines(virtual_text, removed);
+            let answer = [edit((0, 0), (lines, 0), answer)];
+            assert_eq!(
+                map.map_formatting_answer(&answer),
+                Err(FormattingRefusal::Shape),
+                "{virtual_text:?}"
+            );
+        }
+        // Indents removed that differ (no uniform one), even with every
+        // line kept in place.
+        let virtual_text = "  a\n    b\n";
+        let map = dedent_lines(virtual_text, &[2, 4]);
+        assert_eq!(
+            map.map_formatting_answer(&[edit((0, 0), (2, 0), "A\nb\n")]),
+            Err(FormattingRefusal::Shape)
+        );
+        // An answer changing nothing is no edit; whitespace lines left alone,
+        // and a line starting with a gap's text, do not count.
+        assert_eq!(
+            map.map_formatting_answer(&[edit((0, 0), (2, 0), "a\nb\n")]),
+            Ok(Vec::new())
+        );
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &[edit((0, 0), (3, 0), "a\n\nB\n")])
+                .as_deref(),
+            Some("  a\n\n  B\n")
+        );
+        let virtual_text = "  a\n     c\n  b\n";
+        let dedent = |line: u32| json!({"range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}}, "newText": ""});
+        let prepared = prepare_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..4, String::new()),
+                (SegmentKind::Gap, 4..8, "${x}".to_string()),
+                (SegmentKind::Content, 8..15, String::new()),
+            ],
+            json!({"segments": [
+                {"type": "content", "changes": [dedent(0)]},
+                {"type": "gap", "content": "None"},
+                {"type": "content", "changes": [dedent(1)]}
+            ]}),
+        );
+        let map = std::sync::Arc::try_unwrap(prepared.map).unwrap();
+        assert_eq!(map.prepared_lines.text, "a\nNone c\nb\n");
+        assert_eq!(
+            formatted_either_way(
+                &map,
+                virtual_text,
+                &[edit((0, 0), (3, 0), "a\nNone c\nB\n")]
+            )
+            .as_deref(),
+            Some("  a\n     c\n  B\n")
+        );
+    }
+
+    #[test]
+    fn the_allowance_per_byte_counts_both_texts() {
+        // Every line rewritten, a whitespace line after each: the blank
+        // line table is quadratic in them, so 1,100 such lines need more
+        // than the base budget and fifteen steps a byte, and no more than
+        // sixteen, counted over P and the edited P alike.
+        let count = 1_100;
+        let virtual_text: String = (0..count).map(|line| format!("  a{line}\n  \n")).collect();
+        let formatted: String = (0..count).map(|line| format!("b{line}\n\n")).collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (2 * count as u32, 0), &formatted)];
+        assert!(map.map_formatting_answer(&answer).is_ok());
+        assert_eq!(
+            map.map_formatting_within(
+                &answer,
+                FORMATTING_DIFF_BUDGET,
+                15,
+                Some(FORMATTING_DIFF_BUDGET_CAP)
+            ),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn pairing_lines_alike_in_letters_and_digits_costs_work() {
+        // Every line's punctuation rewritten: only their letters and digits
+        // pair them, and that pairing is charged, a step a line and one for
+        // every 64 bytes compared. 474 steps take the answer, 473 do not.
+        let virtual_text: String = (0..10).map(|line| format!("  f{line}('a')\n")).collect();
+        let formatted: String = (0..10).map(|line| format!("f{line}(\"a\");\n")).collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (10, 0), &formatted)];
+        assert!(map.map_formatting(&answer, 474).is_ok());
+        assert_eq!(
+            map.map_formatting(&answer, 473),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn non_ascii_text_in_many_stretches_maps_back_exactly() {
+        // `["あ","é",...]` respaced after each comma: a stretch after every
+        // comma of one line, each mapped back to UTF-16 columns.
+        let virtual_text = "  [\"\u{3042}\",\"\u{e9}\",\"\u{1F600}\"]\n";
+        let map = dedent_by_two(virtual_text);
+        let answer = [edit(
+            (0, 0),
+            (1, 0),
+            "[\"\u{3042}\", \"\u{e9}\", \"\u{1F600}\"]\n",
+        )];
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert_eq!(
+            mapped,
+            vec![edit((0, 7), (0, 7), " "), edit((0, 11), (0, 11), " "),]
+        );
+        assert_eq!(
+            apply_to(virtual_text, &mapped),
+            "  [\"\u{3042}\", \"\u{e9}\", \"\u{1F600}\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_long_non_ascii_line_in_many_stretches_converts_in_linear_work() {
+        // One line of 20,000 `"あ"` elements respaced after each comma: some
+        // 20,000 stretches on one line. Their ends and the answer's convert
+        // in one pass each, never one by one rescanning the line.
+        let count = 20_000;
+        let elements = vec!["\"\u{3042}\""; count];
+        let virtual_text = format!("  [{}]\n", elements.join(","));
+        let formatted = format!("[{}]\n", elements.join(", "));
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (1, 0), &formatted)];
+        use super::super::super::{CONVERSIONS, SCANNED};
+        CONVERSIONS.with(|conversions| conversions.set(0));
+        SCANNED.with(|scanned| scanned.set(0));
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert_eq!(mapped.len(), count - 1);
+        assert!(CONVERSIONS.with(|conversions| conversions.get()) <= 16);
+        let scanned = SCANNED.with(|scanned| scanned.get());
+        assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
+        assert_eq!(apply_to(&virtual_text, &mapped), format!("  {formatted}"));
+        // The same answer as an edit after each comma: the answer's own
+        // ends convert in one pass over the line too, each position from
+        // the one before.
+        let mut column = 1;
+        let answer: Vec<TextEdit> = (1..count)
+            .map(|_| {
+                column += 4;
+                edit((0, column), (0, column), " ")
+            })
+            .collect();
+        CONVERSIONS.with(|conversions| conversions.set(0));
+        SCANNED.with(|scanned| scanned.set(0));
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        assert!(CONVERSIONS.with(|conversions| conversions.get()) <= 16);
+        let scanned = SCANNED.with(|scanned| scanned.get());
+        assert!(scanned <= 2 * virtual_text.len(), "{scanned}");
+        assert_eq!(apply_to(&virtual_text, &mapped), format!("  {formatted}"));
+    }
+
+    #[test]
+    fn a_line_inserted_above_an_emptied_whitespace_line_maps_with_its_breaks_switched() {
+        // The whitespace line `  ` emptied by the peer, the answer switching
+        // CRLF to LF (prettier's default) and inserting `y = 2` above it:
+        // the switched break before it and the insertion both meet the
+        // indent the emptied line had, and each leaves it to the next.
+        let virtual_text = "  x = 1\r\n  \r\n  foo(a,b)\r\n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2]);
+        assert_eq!(map.prepared_lines.text, "x = 1\r\n\r\nfoo(a,b)\r\n");
+        let answer = [edit((0, 0), (4, 0), "x = 1\ny = 2\n\nfoo(a, b)\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  x = 1\n  y = 2\n\n  foo(a, b)\n")
+        );
+        // Without the insertion, as before.
+        let answer = [edit((0, 0), (4, 0), "x = 1\n\nfoo(a, b)\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  x = 1\n\n  foo(a, b)\n")
+        );
+    }
+
+    #[test]
+    fn the_final_break_is_judged_on_the_whole_answer() {
+        // `  a`, a blank line, then the closing indent the peer deleted:
+        // P is `a\n\n`.
+        let virtual_text = "  a\n\n  ";
+        let map = prepare(
+            virtual_text,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 2}}, "newText": ""}
+            ]),
+        );
+        assert_eq!(map.prepared_lines.text, "a\n\n");
+        // Both line breaks deleted by two edits: the last one alone, read
+        // against P, seems to leave `a\n`, but nothing breaks the line.
+        assert!(map.drops_the_break_before_the_closing(&[
+            edit((0, 1), (1, 0), ""),
+            edit((1, 0), (2, 0), ""),
+        ]));
+        // The line breaks deleted, an earlier edit writing one in their
+        // place: the answer still ends with a line break.
+        assert!(!map.drops_the_break_before_the_closing(&[
+            edit((0, 0), (0, 1), "b\n"),
+            edit((0, 1), (2, 0), ""),
+        ]));
+    }
+
+    #[test]
+    fn text_after_p_s_final_break_or_its_loss_is_told_apart_from_answers_that_keep_it() {
+        // `\t  x` dedented by three, then the closing indent `\t` the peer
+        // deleted, shallower than the content: P is `x\r\n`.
+        let virtual_text = "\t  x\r\n\t";
+        let map = dedent_lines(virtual_text, &[3, 1]);
+        assert_eq!(map.prepared_lines.text, "x\r\n");
+        // Text after P's final break, written in whole or inserted, or the
+        // break dropped: mapped, it would edit the closing (`\tfoo(a,b)`,
+        // not the content's `\t  foo(a,b)`), so an on-type answer, whose
+        // edges are not restored, is refused.
+        for answer in [
+            [edit((0, 0), (1, 0), "x\r\nfoo(a,b)")],
+            [edit((1, 0), (1, 0), "foo(a,b)")],
+            [edit((0, 1), (1, 0), "\r\nfoo(a,b)")],
+            [edit((0, 0), (1, 0), "y")],
+            [edit((0, 1), (1, 0), "")],
+        ] {
+            assert!(
+                map.drops_the_break_before_the_closing(&answer),
+                "{answer:?}"
+            );
+        }
+        // Answers ending with a line break, or not reaching P's end, keep it.
+        for answer in [
+            [edit((0, 0), (0, 1), "b")],
+            [edit((0, 0), (1, 0), "x\r\nfoo(a,b)\r\n")],
+            [edit((1, 0), (1, 0), "foo(a,b)\n")],
+            [edit((0, 1), (1, 0), "\n")],
+            [edit((0, 0), (0, 0), "w\r\n")],
+        ] {
+            assert!(
+                !map.drops_the_break_before_the_closing(&answer),
+                "{answer:?}"
+            );
+        }
+        // With no closing deleted after P, nothing there to edit.
+        let virtual_text = "\t  x\r\n";
+        let map = dedent_lines(virtual_text, &[3]);
+        assert!(!map.drops_the_break_before_the_closing(&[edit((1, 0), (1, 0), "foo(a,b)")]));
+    }
+
+    #[test]
+    fn copies_and_rewrites_among_lines_left_alone_pair_by_what_they_hold() {
+        // Copies of `y` and `a = 1` around lines rewritten or written anew:
+        // each line keeps its own extra indentation.
+        let virtual_text = "  y\n \n    y\n  f('a')\n  foo(\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2, 2, 2]);
+        let answer = [edit((0, 0), (5, 0), "a = 1\n}\n  y\na = 1\n    a = 1\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a = 1\n  }\n    y\n  a = 1\n      a = 1\n")
+        );
+        let virtual_text = "  a = 1\n  x\n  f(\"a\");\n  a = 1,\n \n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2, 2, 0]);
+        let answer = [edit((0, 0), (5, 0), "}\n  a = 1,\na = 1\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  }\n    a = 1,\n  a = 1\n")
+        );
+        // A line written twice, its copy reindented: mapped, not refused.
+        let virtual_text = "  x\n  }\n    f(\"a\");\n  f(\"a\");\n \n";
+        let map = dedent_lines(virtual_text, &[2, 2, 2, 2, 0]);
+        let answer = [edit(
+            (0, 0),
+            (5, 0),
+            "f(\"a\");\n  a = 1\n    f(\"a\");\n  f(\"a\");\n",
+        )];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  f(\"a\");\n    a = 1\n      f(\"a\");\n    f(\"a\");\n")
+        );
+    }
+
+    #[test]
+    fn long_lines_cost_their_length_in_every_pairing_stage() {
+        // 200-character lines: alike to the byte, alike in letters and
+        // digits (quotes rewritten), joined, copied and rewritten. Each
+        // stage that hashes or compares them charges their length: 1,138
+        // steps take the answer, 1,137 do not.
+        let long = |c: char| c.to_string().repeat(200);
+        let virtual_text: String = [
+            format!("{}1", long('a')),
+            format!("{}('x')", long('b')),
+            long('c'),
+            long('d'),
+            format!("{}1", long('a')),
+            format!("{}2", long('e')),
+        ]
+        .iter()
+        .map(|line| format!("  {line}\n"))
+        .collect();
+        let formatted: String = [
+            format!("{}1", long('a')),
+            format!("{}(\"x\");", long('b')),
+            format!("{} {}", long('c'), long('d')),
+            format!("{}1", long('a')),
+            format!("{}3", long('e')),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect();
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), (6, 0), &formatted)];
+        assert!(map.map_formatting(&answer, 1_138).is_ok());
+        assert_eq!(
+            map.map_formatting(&answer, 1_137),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn the_budget_stops_at_its_cap_however_large_the_texts() {
+        // 1.2 MB of lines alike, then 4,100 lines rewritten with whitespace
+        // lines between: the blank line table needs more than 2^24 steps,
+        // which the allowance per byte of these texts would give, but the
+        // cap does not.
+        let count = 4_100;
+        let head = |indent: &str| -> String {
+            (0..12_000)
+                .map(|line| format!("{indent}{}{line}\n", "h".repeat(90)))
+                .collect()
+        };
+        let virtual_text = format!(
+            "{}{}",
+            head("  "),
+            (0..count)
+                .map(|line| format!("  a{line}\n  \n"))
+                .collect::<String>()
+        );
+        let formatted = format!(
+            "{}{}",
+            head(""),
+            (0..count)
+                .map(|line| format!("b{line}\n\n"))
+                .collect::<String>()
+        );
+        let map = dedent_by_two(&virtual_text);
+        let answer = [edit((0, 0), ((12_000 + 2 * count) as u32, 0), &formatted)];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::OutOfWork)
+        );
+        let uncapped = FORMATTING_DIFF_BUDGET
+            + FORMATTING_DIFF_WORK_PER_BYTE * (map.prepared_lines.text.len() + formatted.len());
+        assert!(uncapped > FORMATTING_DIFF_BUDGET_CAP);
+        assert!(map.map_formatting(&answer, uncapped).is_ok());
+    }
+
+    #[test]
+    fn long_whitespace_lines_cost_their_length_in_the_blank_line_table() {
+        // 50 whitespace lines of 10,000 spaces between two lines rewritten:
+        // nothing alike at the ends is set aside, and the blank lines pair
+        // among themselves. Comparing them costs their length, not a step
+        // a cell: the answer takes at least a step per 64 bytes of them.
+        let count = 50;
+        let blank = " ".repeat(10_000);
+        let virtual_text = format!("a\n{}z\n", format!("{blank}\n").repeat(count));
+        let formatted = format!("b\n{}c\n", format!("{blank}\n").repeat(count));
+        let map = dedent_lines(&virtual_text, &[]);
+        let answer = [edit((0, 0), (count as u32 + 2, 0), &formatted)];
+        let bytes = 2 * count * blank.len();
+        assert_eq!(
+            map.map_formatting(&answer, bytes / BYTES_PER_STEP),
+            Err(FormattingRefusal::OutOfWork)
+        );
+        // Mapped with the work their bytes and the table's cells take.
+        assert_eq!(
+            map.map_formatting(
+                &answer,
+                2 * bytes / BYTES_PER_STEP + 4 * (count + 1) * (count + 1)
+            )
+            .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(formatted.clone())
+        );
+    }
+
+    #[test]
+    fn lines_reordered_keep_their_places_and_indents() {
+        // Patience keeps the longest run of unique lines in order: `b`
+        // and `c` swapped cannot both anchor.
+        let virtual_text = "  a\n  b\n  c\n  d\n  x y\n";
+        let map = dedent_lines(virtual_text, &[2; 5]);
+        let answer = [edit((0, 0), (5, 0), "a\nc\nb\nd\nx y\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  c\n  b\n  d\n  x y\n")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("a\na\nb\n", "  a\n  a\n  b\n")]
+    #[case("b\na\na\n", "  b\n  a\n  a\n")]
+    #[case("x\na\na\n", "  x\n  a\n  a\n")]
+    fn a_line_written_twice_is_not_unique(#[case] answer: &str, #[case] expected: &str) {
+        // Found once in P but twice in the answer, `a` anchors nothing: an
+        // anchor is a line found once on each side.
+        let virtual_text = "  a\n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), answer)];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn a_long_line_respaced_is_diffed_between_its_unchanged_characters() {
+        // 25 KB of JSON on one line, spaced after each `,` and `:`: the
+        // characters other than whitespace pair along one diagonal, and
+        // only the spaces between them are diffed. Anchoring on every
+        // character, or on none, takes millions of steps.
+        let (minified, _) = json_pair(25_000);
+        let spaced = minified.replace(',', ", ").replace(':', ": ");
+        let virtual_text = format!("  {minified}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 0), (1, 0), &format!("{spaced}\n"))];
+        assert_eq!(
+            map.map_formatting(&answer, 50_000)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(format!("  {spaced}\n"))
+        );
+    }
+
+    #[test]
+    fn a_removed_indent_of_tabs_is_left_to_the_next_stretch() {
+        let virtual_text = "\r\n\t\t\t\t \n\t\t\t\t  q";
+        let map = dedent_lines(virtual_text, &[0, 4, 4]);
+        let answer = [edit((0, 0), (2, 3), " \n\n  q")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("\t\t\t\t \n\n\t\t\t\t  q")
+        );
+    }
+
+    #[test]
+    fn blank_lines_pair_as_many_as_can_before_any_alike() {
+        // Pairing `\t` with ` ` and so on down the line pairs all five; any
+        // pairing more alike pairs fewer.
+        let keys = |lines: &[&str]| -> LineKeys {
+            let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+            let trimmed = lines.iter().map(|line| line.trim().to_string()).collect();
+            [lines.clone(), trimmed, lines.clone(), lines]
+        };
+        let old = keys(&["\t", " ", "  ", "   ", "    "]);
+        let new = keys(&[" ", "  ", "   ", "    ", "\t\t"]);
+        assert_eq!(
+            blank_lines(&old, &new, &(0..5), &(0..5), &mut Work::new(usize::MAX)),
+            Some((0..5).map(|line| (line, line)).collect())
+        );
+    }
+
+    #[test]
+    fn a_start_past_the_last_line_names_p_s_end_only_as_an_empty_range() {
+        // P "if x:\n  y\n" has lines 0 to 2; line 3, just past them, names
+        // P's end, as whole-document answers do. A start there with an end
+        // before it is reversed, and one further on names nothing.
+        let (_, map) = dedented();
+        let past = map.prepared_lines.text.lines().count() as u32 + 1;
+        for answer in [
+            [edit((past + 5, 0), (past, 0), "x")],
+            [edit((past, 1), (past, 1), "x")],
+            [edit((past + 1, 0), (past + 1, 0), "x")],
+        ] {
+            assert_eq!(
+                map.map_formatting_answer(&answer),
+                Err(FormattingRefusal::Shape),
+                "{answer:?}"
+            );
+        }
+        // An insertion at P's end is that.
+        let answer = [edit((past, 0), (past, 0), "z\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to("  if x:\n    y\n", &mapped)),
+            Ok("  if x:\n    y\n  z\n".to_string())
+        );
+    }
+
+    #[test]
+    fn kept_whitespace_lines_none_is_typed_on_cost_work_linear_in_them() {
+        // 8,000 kept `\t` lines replaced by 8,001 lines of text, none typed
+        // after a tab: which line each kept line keeps is looked up, not
+        // searched for through every line of the answer.
+        let count = 8_000;
+        let virtual_text = format!("  a\n{}  b\n", "\t\n".repeat(count));
+        let mut removed = vec![2];
+        removed.extend(std::iter::repeat_n(0, count));
+        removed.push(2);
+        let map = dedent_lines(&virtual_text, &removed);
+        let formatted = format!("a\n{}b\n", "x\n".repeat(count + 1));
+        let answer = [edit((0, 0), (count as u32 + 2, 0), &formatted)];
+        let budget = 40 * (virtual_text.len() + formatted.len());
+        assert!(map.map_formatting(&answer, budget).is_ok());
+    }
+
+    #[test]
+    fn a_small_answer_in_a_large_region_costs_work_for_its_size() {
+        // One line changed among 50,000: the lines alike at either end are
+        // set aside before any line is keyed or paired, uncharged.
+        let count = 50_000;
+        let virtual_text: String = (0..count).map(|index| format!("  x{index}\n")).collect();
+        let map = dedent_lines(&virtual_text, &vec![2; count]);
+        let line = (count / 2) as u32;
+        let answer = [edit((line, 0), (line, 0), "y")];
+        let mapped = map
+            .map_formatting(&answer, 1_000)
+            .map(|mapped| apply_to(&virtual_text, &mapped));
+        let expected = virtual_text.replacen(
+            &format!("  x{}\n", count / 2),
+            &format!("  yx{}\n", count / 2),
+            1,
+        );
+        assert_eq!(mapped, Ok(expected));
+        // One character inserted in a line of 1.1 MB: the line is the
+        // stretch that differs, its keys hashed once at a step for every 64
+        // bytes, and the text alike at its ends set aside uncharged.
+        let long = "a".repeat(1_100_000);
+        let virtual_text = format!("  {long}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 550_000), (0, 550_000), "b")];
+        let mut expected = virtual_text.clone();
+        expected.insert(2 + 550_000, 'b');
+        // (Some fifteen passes over the line: its keys and their lookups.)
+        let budget = 16 * 1_100_000 / 64;
+        assert_eq!(
+            map.map_formatting(&answer, budget)
+                .map(|mapped| apply_to(&virtual_text, &mapped)),
+            Ok(expected)
+        );
+    }
+
+    /// `count` assignments written tight, and as a formatter spacing every
+    /// one: the same text but for whitespace inside each line.
+    fn spaced_assignments(count: usize) -> (String, String) {
+        (
+            (0..count).map(|index| format!("x{index}=1\n")).collect(),
+            (0..count).map(|index| format!("x{index} = 1\n")).collect(),
+        )
+    }
+
+    #[rstest::rstest]
+    #[case(1_500)]
+    #[case(20_000)]
+    fn every_line_respaced_maps(#[case] count: usize) {
+        // No line is alike to another but for its edges, and none starts
+        // with an old one: lines alike but for whitespace anywhere pair
+        // first, each diffed by character on its own.
+        let (old, new) = spaced_assignments(count);
+        let map = dedent_lines(&old, &[]);
+        let answer = [edit((0, 0), (count as u32, 0), &new)];
+        assert_eq!(
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&old, &mapped)),
+            Ok(new)
+        );
+    }
+
+    #[test]
+    fn respacing_costs_work_linear_in_the_lines_and_decides_alike() {
+        let (old, new) = spaced_assignments(5_000);
+        let map = dedent_lines(&old, &[]);
+        let answer = [edit((0, 0), (5_000, 0), &new)];
+        let budget = 4 * (old.len() + new.len());
+        let first = map.map_formatting(&answer, budget);
+        assert!(first.is_ok());
+        for _ in 0..3 {
+            assert_eq!(map.map_formatting(&answer, budget), first);
+        }
+    }
+
+    #[test]
+    fn lines_rewritten_with_whitespace_lines_between_cost_no_pairwise_search() {
+        // Every text line changed (no two alike, none joined), whitespace
+        // lines between: looking for joins costs a lookup for each line
+        // and length, not a comparison with every other line.
+        let texts = |count: usize, letter: char| -> String {
+            (0..count)
+                .map(|index| format!("{letter}{index}\n \n"))
+                .collect()
+        };
+        let count = 3_000;
+        let (old, new) = (texts(count, 'a'), texts(count, 'b'));
+        let mut work = Work::new(20 * count);
+        let (old_lines, new_lines) = (lines_with_breaks(&old), lines_with_breaks(&new));
+        let keys = |lines: &[(usize, &str)]| -> LineKeys {
+            let content: Vec<String> = lines
+                .iter()
+                .map(|&(_, line)| line.trim_end_matches(['\r', '\n']).to_string())
+                .collect();
+            let trimmed = content.iter().map(|line| line.trim().to_string()).collect();
+            let bare = content.iter().map(|line| line.replace(' ', "")).collect();
+            let alphanumeric = content
+                .iter()
+                .map(|line| line.chars().filter(|c| c.is_alphanumeric()).collect())
+                .collect();
+            [content, trimmed, bare, alphanumeric]
+        };
+        let pairs = joined_lines(
+            &keys(&old_lines),
+            &keys(&new_lines),
+            &(0..old_lines.len()),
+            &(0..new_lines.len()),
+            &mut work,
+        );
+        assert_eq!(pairs, Some(vec![]));
+        // What bounds such an answer is the table pairing its whitespace
+        // lines, quadratic in them: some 1,100 fit the default budget.
+        let accepted = |count: usize| {
+            let (old, new) = (texts(count, 'a'), texts(count, 'b'));
+            let map = dedent_lines(&old, &[]);
+            let answer = [edit((0, 0), (2 * count as u32, 0), &new)];
+            map.map_formatting_answer(&answer)
+                .map(|mapped| apply_to(&old, &mapped) == new)
+        };
+        assert_eq!(accepted(900), Ok(true));
+        assert_eq!(accepted(1_500), Err(FormattingRefusal::OutOfWork));
+    }
+
+    #[test]
+    fn a_refusal_says_whether_shape_or_size_decided_it() {
+        // Lines dedented by two and by four: a new line has no one indent.
+        let map = dedent_lines("  a\n    b\n", &[2, 4]);
+        let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::Shape)
+        );
+        // Text rewritten past any likeness: the diff runs out of work.
+        let mut seed = 42u64;
+        let mut text = |length: usize| -> String {
+            (0..length)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    char::from(b'a' + (seed >> 60) as u8 % 4)
+                })
+                .collect()
+        };
+        let (old, new) = (text(20_000), text(20_000));
+        let virtual_text = format!("  {old}\n");
+        let map = dedent_lines(&virtual_text, &[2]);
+        let answer = [edit((0, 0), (1, 0), &format!("{new}\n"))];
+        assert_eq!(
+            map.map_formatting_answer(&answer),
+            Err(FormattingRefusal::OutOfWork)
+        );
+    }
+
+    #[test]
+    fn pairing_joined_lines_stops_when_out_of_work() {
+        // Indexing the old lines and each lookup are spent, and out of
+        // work the search refuses, not runs on.
+        let keys = |lines: &[&str]| -> LineKeys {
+            let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+            [lines.clone(), lines.clone(), lines.clone(), lines]
+        };
+        let (old, new) = (keys(&["a"]), keys(&["a b"]));
+        let pairs = |budget| joined_lines(&old, &new, &(0..1), &(0..1), &mut Work::new(budget));
+        assert_eq!(pairs(2), Some(vec![(0, 0)]));
+        assert_eq!(pairs(1), None);
+    }
+
+    #[test]
+    fn pairing_blank_lines_takes_a_table_only_as_large_as_its_work() {
+        // Every blank line's whitespace is numbered, a step each here, and
+        // every cell of the table is spent before it is taken: a run of
+        // blank lines just within the budget pairs, one just past it
+        // refuses at once, not held in memory.
+        let keys = |count: usize| -> LineKeys {
+            let lines = vec![String::new(); count];
+            [lines.clone(), lines.clone(), lines.clone(), lines]
+        };
+        let small = (keys(3), keys(2));
+        let pairs =
+            |budget| blank_lines(&small.0, &small.1, &(0..3), &(0..2), &mut Work::new(budget));
+        assert_eq!(pairs(5 + 12), Some(vec![(0, 0), (1, 1)]));
+        assert_eq!(pairs(5 + 11), None);
+        // The largest square run the default budget holds pairs whole.
+        let side = (1 << 10) - 2;
+        let large = keys(side);
+        let mut work = Work::new(FORMATTING_DIFF_BUDGET);
+        let paired = blank_lines(&large, &large, &(0..side), &(0..side), &mut work);
+        assert_eq!(paired.map(|pairs| pairs.len()), Some(side));
+        let side = (1 << 10) - 1;
+        let large = keys(side);
+        let mut work = Work::new(FORMATTING_DIFF_BUDGET);
+        assert_eq!(
+            blank_lines(&large, &large, &(0..side), &(0..side), &mut work),
+            None
+        );
+        // And so the whole answer, its blank lines all rewritten (the
+        // budget grows with the texts, a little).
+        let side = 1_100;
+        let virtual_text = format!("  a\n{}", "\n".repeat(side));
+        let map = dedent_lines(&virtual_text, &[2]);
+        let formatted = format!("b\n{}", " \n".repeat(side));
+        let answer = [edit((0, 0), (side as u32 + 1, 0), &formatted)];
+        assert_eq!(map.map_formatting_answer(&answer).ok(), None);
+    }
+
+    #[test]
+    fn lines_broken_by_a_lone_cr_are_paired_as_lines() {
+        // A kept ` ` joined onto `a` (dedented), lines broken by a lone CR:
+        // the joined line is `a`'s, its removed indent back.
+        let virtual_text = " \r  a\r\r";
+        let map = dedent_lines(virtual_text, &[0, 2, 0]);
+        let answer = [edit((0, 0), (3, 0), "  a\r\r")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("    a\r\r")
+        );
+    }
+
+    #[test]
+    fn a_lone_cr_turned_crlf_and_back_maps_whole() {
+        let virtual_text = "  a\r  b\r";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "a\r\nb\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\r\n  b\r\n")
+        );
+        let virtual_text = "  a\r\n  b\r\n";
+        let map = dedent_lines(virtual_text, &[2, 2]);
+        let answer = [edit((0, 0), (2, 0), "a\rb\r")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\r  b\r")
+        );
+    }
+
+    #[test]
+    fn blank_lines_pair_as_many_as_can_then_alike_first() {
+        // Two kept ` ` lines and an empty one, rewritten ` `, empty, ` `:
+        // all three pair in order (as many as can), the empty line written
+        // ` ` taking the content's indent as text written on an empty line.
+        let virtual_text = "  a\n \n \n\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 0]);
+        let answer = [edit((0, 0), (4, 0), "a\n \n\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n \n\n   \n")
+        );
+        // Of an empty line and a kept ` `, one going: the ` ` the answer
+        // keeps is the kept one, not the empty line written ` `.
+        let virtual_text = "  a\n\n \n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0]);
+        let answer = [edit((0, 0), (3, 0), "a\n \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n \n")
+        );
+    }
+
+    #[test]
+    fn text_written_beside_a_kept_whitespace_line_is_a_line_of_its_own() {
+        // `  ` and ` ` kept; the answer writes `w` above ` ` and empties
+        // the other: both blank lines pair, `w` is a created line,
+        // indented as the content, not text written on the kept `  `.
+        let virtual_text = "  a\n  \n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 0, 2]);
+        let answer = [edit((0, 0), (4, 0), "a\nw\n \n\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n \n\n  b\n")
+        );
+    }
+
+    #[test]
+    fn text_written_beside_blank_lines_is_a_line_of_its_own() {
+        // ` ` kept and `   ` dedented to ` `; the answer writes `w` above
+        // them and widens the last: the blank lines pair with the blank
+        // lines, and `w` is a created line, indented as the content.
+        let virtual_text = "  a\n \n   \n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\nw\n \n  \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n \n    \n")
+        );
+    }
+
+    #[test]
+    fn a_blank_line_given_other_whitespace_is_the_line_it_was() {
+        // The kept ` ` widened to two spaces, a line inserted above it:
+        // the inserted line is the content's, the blank line its own.
+        let virtual_text = "  a\n \n";
+        let map = dedent_lines(virtual_text, &[2, 0]);
+        let answer = [edit((0, 0), (2, 0), "a\nw\n  \n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  w\n  \n")
+        );
+    }
+
+    #[test]
+    fn a_line_written_beside_a_widened_blank_line_is_one_of_its_own() {
+        // `  w` inserted, the kept ` ` widened to two spaces: the blank
+        // lines pair, so `w` is a created line (content indent and its own
+        // two), not text written on the kept blank line.
+        let virtual_text = "  a\n \n  b\n";
+        let map = dedent_lines(virtual_text, &[2, 0, 2]);
+        let answer = [edit((0, 0), (3, 0), "a\n  w\n  \nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n    w\n  \n  b\n")
+        );
+    }
+
+    #[test]
+    fn a_stretch_ending_at_a_line_start_leaves_its_indent_to_the_next() {
+        // A stretch ending at a dedented line's start takes that line's
+        // removed indent along and gives it back; one starting there (a
+        // blank line inserted, a whitespace-only line cleared) claims the
+        // same indent. They map to touching edits, not overlapping ones.
+        for (virtual_text, removed, formatted, expected) in [
+            ("  a\r\n  c\r\n", &[2, 2][..], "a\n\nc\n", "  a\n\n  c\n"),
+            (
+                "  a\r\n    \r\n  c\r\n",
+                &[2, 2, 2],
+                "a\n\nc\n",
+                "  a\n\n  c\n",
+            ),
+            (
+                "  a\n  c\n",
+                &[2, 2],
+                "a\r\n\r\nc\r\n",
+                "  a\r\n\r\n  c\r\n",
+            ),
+            ("  a\r  b\r", &[2, 2], "a\n\nb\n", "  a\n\n  b\n"),
+            (
+                "  a\n  b\n   \n  c\n",
+                &[2, 2, 2, 2],
+                "a b\n\nc\n",
+                "  a b\n\n  c\n",
+            ),
+            (
+                "  x = [\n    1,\n  ]\n    \n  c\n",
+                &[2, 2, 2, 2, 2],
+                "x = [1]\n\nc\n",
+                "  x = [1]\n\n  c\n",
+            ),
+        ] {
+            let map = dedent_lines(virtual_text, removed);
+            let lines = map.prepared_lines.text.lines().count() as u32 + 1;
+            let answer = [edit((0, 0), (lines, 0), formatted)];
+            assert_eq!(
+                formatted_either_way(&map, virtual_text, &answer).as_deref(),
+                Some(expected),
+                "{virtual_text:?} -> {formatted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_lines_rewritten_in_order_map_without_both_claiming_an_indent() {
+        // Blank lines rewritten in order: the empty line written ` ` (text
+        // on an empty line, taking the content's indent), the dedented ` `
+        // emptied. The stretches touch at the second line's start, each
+        // taking its removed indent along: mapped, they touch, not overlap.
+        let virtual_text = "\r\n     \n      q";
+        let map = dedent_lines(virtual_text, &[0, 4, 4]);
+        assert_eq!(map.prepared_lines.text, "\r\n \n  q");
+        let answer = [edit((0, 0), (3, 0), " \n\n  q")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("     \n\n      q")
+        );
+    }
+
+    #[test]
+    fn a_line_break_changed_before_text_written_on_a_line_keeps_them_apart() {
+        // CRLF turned to LF on `a`, text written where the empty line below
+        // it was: that text is a line of the content, not one the changed
+        // break writes anew.
+        let virtual_text = "\ta\r\n\r\n";
+        let map = dedent_lines(virtual_text, &[1, 0]);
+        let answer = [edit((0, 0), (2, 0), "a\nw\r\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("\ta\n\tw\r\n")
+        );
+    }
+
+    #[test]
+    fn a_whole_document_answer_maps_back_reindented() {
+        let (virtual_text, map) = dedented();
+        assert_eq!(map.prepared_lines.text, "if x:\n  y\n");
+        let answer = [edit((0, 0), (2, 0), "if x:\n    y\n    z\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("  if x:\n      y\n      z\n")
+        );
+        // Only what changed is edited: the first line is left alone.
+        let mapped = map.map_formatting_answer(&answer).ok().unwrap();
+        assert!(mapped.iter().all(|edit| edit.range.start.line >= 1));
+    }
+
+    #[test]
+    fn an_answer_changing_nothing_maps_to_no_edit() {
+        let (_, map) = dedented();
+        let answer = [edit((0, 0), (2, 0), "if x:\n  y\n")];
+        assert_eq!(map.map_formatting_answer(&answer).ok(), Some(vec![]));
+        assert_eq!(map.map_formatting_answer(&[]).ok(), Some(vec![]));
+        // Nothing to diff: not refused for want of work.
+        assert_eq!(map.map_formatting(&answer, 0).ok(), Some(vec![]));
+    }
+
+    #[test]
+    fn a_whole_document_range_may_end_on_the_line_past_the_last() {
+        let (virtual_text, map) = dedented();
+        // P has three lines, the last empty: (3, 0) names its end.
+        let answer = [edit((0, 0), (3, 0), "if  x:\n  y\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("  if  x:\n    y\n")
+        );
+        // Only that exact place: not a column on it, nor a line further.
+        for end in [(3, 1), (4, 0)] {
+            assert_eq!(
+                map.map_formatting_answer(&[edit((0, 0), end, "")]).ok(),
+                None,
+                "{end:?}"
+            );
+        }
+        // An extent names no such place.
+        assert_eq!(
+            map.map_edits(&[edit((0, 0), (3, 0), "")], EditMode::Extent),
+            None
+        );
+    }
+
+    #[test]
+    fn crlf_turned_to_lf_maps_without_splitting_a_line_break() {
+        let virtual_text = "  a\r\n  b\r\n";
+        let map = dedent_by_two(virtual_text);
+        assert_eq!(map.prepared_lines.text, "a\r\nb\r\n");
+        let answer = [edit((0, 0), (2, 0), "a\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, virtual_text, &answer).as_deref(),
+            Some("  a\n  b\n")
+        );
+    }
+
+    #[test]
+    fn lines_created_without_one_indent_to_regain_are_refused() {
+        // Line 0 lost two spaces, line 1 four: no indent for a new line
+        // (nor, a formatting answer, for any line: see
+        // `answers_on_a_peer_dedenting_unevenly_are_refused`).
+        let virtual_text = "  a\n    b\n";
+        let map = prepare(
+            virtual_text,
+            json!([
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+                {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+            ]),
+        );
+        let answer = [edit((0, 0), (2, 0), "a\nb\nc\n")];
+        assert_eq!(map.map_formatting_answer(&answer).ok(), None);
+    }
+
+    #[test]
+    fn deleted_edge_lines_stay_whatever_the_answer() {
+        let (virtual_text, map) = leading_blank_dedented();
+        assert_eq!(map.prepared_lines.text, "a\nb\n");
+        let answer = [edit((0, 0), (3, 0), "a\n\nb\n")];
+        assert_eq!(
+            formatted_either_way(&map, &virtual_text, &answer).as_deref(),
+            Some("\n  a\n\n  b\n")
+        );
+    }
+
+    #[test]
+    fn overlapping_or_reversed_answers_are_refused() {
+        let (_, map) = dedented();
+        let overlapping = [edit((0, 0), (1, 0), "x"), edit((0, 2), (0, 3), "y")];
+        assert_eq!(map.map_formatting_answer(&overlapping).ok(), None);
+        let reversed = [edit((1, 0), (0, 0), "x")];
+        assert_eq!(map.map_formatting_answer(&reversed).ok(), None);
+    }
+}
+
+/// Formatting answers checked against host text built without the map: the
+/// document is generated with the indentation its peer removes (from some
+/// lines, some with indentation of their own past it; others, and kept
+/// whitespace-only lines, left alone), a formatter
+/// rewrites P line by line knowing which line each output line came from,
+/// and the expected host text puts back on each line the indent its rules
+/// (the ADR's) give it:
+///
+/// - a line rewritten: the indent the peer removed from it, none for one it
+///   left alone (a kept whitespace-only line too, written on or not);
+/// - a line created, or text written on an empty line (nothing there for
+///   the peer to remove): the content's, the indent the peer removed;
+/// - the indentation-only last line: its own, text written on it too;
+/// - a blank line joined to the next: that line, the blank one deleted;
+///
+/// and the deleted edge lines around it all. Positions and the application
+/// of edits are this module's own. Provenance no answer shows (a line
+/// written where one went; which of several blank lines went or changed)
+/// is not generated, rather than guessed.
+mod formatting_reference {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
+    use std::cell::Cell;
+
+    const BODIES: [&str; 5] = ["a", "é", "𝄞x", "b c", "if x:"];
+
+    /// Bodies written as they are, unnumbered: lines alike to the byte,
+    /// copies a pairing must tell apart as formatters write them.
+    const SHARED: [&str; 3] = ["}", "a = 1", "f('a')"];
+
+    /// Byte offsets of every line start in `text` (LF, CRLF and a lone CR
+    /// each end a line).
+    fn line_starts(text: &str) -> Vec<usize> {
+        let bytes = text.as_bytes();
+        let mut starts = vec![0];
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\r' if bytes.get(at + 1) == Some(&b'\n') => {
+                    at += 2;
+                    starts.push(at);
+                }
+                b'\r' | b'\n' => {
+                    at += 1;
+                    starts.push(at);
+                }
+                _ => at += 1,
+            }
+        }
+        starts
+    }
+
+    /// The end of line `line`'s content (before its line break).
+    fn content_end(text: &str, starts: &[usize], line: usize) -> usize {
+        let end = starts.get(line + 1).copied().unwrap_or(text.len());
+        let line_text = &text[starts[line]..end];
+        let content = line_text
+            .strip_suffix("\r\n")
+            .or_else(|| line_text.strip_suffix('\n'))
+            .or_else(|| line_text.strip_suffix('\r'))
+            .unwrap_or(line_text);
+        starts[line] + content.len()
+    }
+
+    /// The LSP position (UTF-16 columns) of byte `offset`.
+    fn position_of(text: &str, offset: usize) -> Position {
+        let starts = line_starts(text);
+        let line = starts.partition_point(|&start| start <= offset) - 1;
+        let column: usize = text[starts[line]..offset]
+            .chars()
+            .map(char::len_utf16)
+            .sum();
+        Position::new(line as u32, column as u32)
+    }
+
+    /// The byte offset of `position`: a column past the line's content
+    /// means its end; a line past the last, the text's end.
+    fn offset_of(text: &str, position: Position) -> usize {
+        let starts = line_starts(text);
+        let line = position.line as usize;
+        if line >= starts.len() {
+            return text.len();
+        }
+        let end = content_end(text, &starts, line);
+        let mut column = 0;
+        for (at, character) in text[starts[line]..end].char_indices() {
+            if column >= position.character as usize {
+                return starts[line] + at;
+            }
+            column += character.len_utf16();
+        }
+        end
+    }
+
+    /// `text` with `edits` applied, in order of their start then end.
+    fn apply(text: &str, edits: &[TextEdit]) -> String {
+        let mut spans: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .map(|edit| {
+                (
+                    offset_of(text, edit.range.start),
+                    offset_of(text, edit.range.end),
+                    edit.new_text.as_str(),
+                )
+            })
+            .collect();
+        spans.sort_by_key(|&(start, end, _)| (start, end));
+        let mut output = String::new();
+        let mut cursor = 0;
+        for (start, end, new_text) in spans {
+            assert!(cursor <= start && start <= end, "edits apply in order");
+            output.push_str(&text[cursor..start]);
+            output.push_str(new_text);
+            cursor = end;
+        }
+        output.push_str(&text[cursor..]);
+        output
+    }
+
+    /// One line of a generated document.
+    #[derive(Debug, Clone, Copy)]
+    enum Line {
+        /// Text (`BODIES`, numbered, or `SHARED`), indented and dedented by the peer, or left at
+        /// column 0 and alone.
+        Content {
+            body: usize,
+            dedented: bool,
+            /// Indentation of its own past what the peer removes.
+            deeper: usize,
+        },
+        Empty,
+        /// A single space the peer left alone: shorter than any indent.
+        Space,
+        /// The indent and a space, the peer removing the indent: a
+        /// whitespace line kept with whitespace past the indent.
+        IndentedSpace,
+    }
+
+    fn line() -> impl Strategy<Value = Line> {
+        prop_oneof![
+            5 => (0..BODIES.len() + SHARED.len(), prop::bool::weighted(0.8))
+                .prop_flat_map(|(body, dedented)| {
+                    prop_oneof![4 => Just(0usize), 1 => Just(1usize), 1 => Just(2usize)].prop_map(
+                        move |deeper| Line::Content {
+                            body,
+                            dedented,
+                            deeper,
+                        },
+                    )
+                }),
+            1 => Just(Line::Empty),
+            1 => Just(Line::Space),
+            1 => Just(Line::IndentedSpace),
+        ]
+    }
+
+    /// A generated document: V, the peer's changes, and the host text the
+    /// map keeps around P.
+    struct Document {
+        virtual_text: String,
+        changes: Vec<serde_json::Value>,
+        leading: String,
+        closing: String,
+        /// The last line holds only the indent the peer removed, with no
+        /// closing lines before it: a content line, its indent kept.
+        indent_only_last_line: bool,
+        /// The indent text written on each line of P regains, in order: the
+        /// one the peer removed from it, or for an empty line (text there
+        /// starts a line of the content) `None`, the content's.
+        removed: Vec<Option<&'static str>>,
+        /// The indent of the indentation-only last line.
+        last_line_indent: &'static str,
+        /// The indent lines created in the content regain: the one the peer
+        /// removed, or none when it removed none.
+        uniform: &'static str,
+    }
+
+    /// `lines` indented by `indent` (numbered text made unique per line, so
+    /// a diff has one way to align it; shared text repeated as it is),
+    /// broken by `line_break`, between
+    /// `leading` and `trailing` blank lines, optionally ending with the
+    /// indent alone.
+    fn document(
+        lines: &[Line],
+        indent: &'static str,
+        line_break: &str,
+        (leading, trailing, closing_indent): (usize, usize, bool),
+    ) -> Option<Document> {
+        if !lines
+            .iter()
+            .any(|line| matches!(line, Line::Content { .. }))
+        {
+            return None;
+        }
+        let leading_text = line_break.repeat(leading);
+        let mut text = leading_text.clone();
+        let mut dedented_lines = Vec::new();
+        let mut removed = Vec::new();
+        for (number, line) in lines.iter().enumerate() {
+            match *line {
+                Line::Content {
+                    body,
+                    dedented,
+                    deeper,
+                } => {
+                    if dedented {
+                        dedented_lines.push(text.len());
+                        text.push_str(indent);
+                    }
+                    text.push_str(["", "\t", "  "][deeper]);
+                    match BODIES.get(body) {
+                        Some(body) => text.push_str(&format!("{number}{body}{number}")),
+                        None => text.push_str(SHARED[body - BODIES.len()]),
+                    }
+                    removed.push(Some(if dedented { indent } else { "" }));
+                }
+                Line::Empty => removed.push(None),
+                Line::Space => {
+                    text.push(' ');
+                    removed.push(Some(""));
+                }
+                Line::IndentedSpace => {
+                    dedented_lines.push(text.len());
+                    text.push_str(indent);
+                    text.push(' ');
+                    removed.push(Some(indent));
+                }
+            }
+            text.push_str(line_break);
+        }
+        let content_end = text.len();
+        text.push_str(&line_break.repeat(trailing));
+        if closing_indent {
+            dedented_lines.push(text.len());
+            text.push_str(indent);
+        }
+        let mut changes = Vec::new();
+        let change = |start: usize, end: usize| {
+            json!({"range": {
+                "start": position_of(&text, start),
+                "end": position_of(&text, end)
+            }, "newText": ""})
+        };
+        for &at in &line_starts(&text) {
+            let edge_line = at < leading_text.len()
+                || (at >= content_end && at < content_end + trailing * line_break.len());
+            if edge_line {
+                changes.push(change(at, at + line_break.len()));
+            } else if dedented_lines.contains(&at) {
+                changes.push(change(at, at + indent.len()));
+            }
+        }
+        let indent_only_last_line = closing_indent && trailing == 0;
+        let any_dedented = lines
+            .iter()
+            .any(|line| matches!(line, Line::Content { dedented: true, .. }));
+        Some(Document {
+            closing: if indent_only_last_line {
+                String::new()
+            } else {
+                format!(
+                    "{}{}",
+                    line_break.repeat(trailing),
+                    if closing_indent { indent } else { "" }
+                )
+            },
+            leading: leading_text,
+            indent_only_last_line,
+            virtual_text: text,
+            changes,
+            removed,
+            last_line_indent: indent,
+            uniform: if any_dedented { indent } else { "" },
+        })
+    }
+
+    /// One way a formatter rewrites a line.
+    #[derive(Debug, Clone, Copy)]
+    enum Rewrite {
+        Keep,
+        /// Its leading whitespace becomes this many spaces.
+        Reindent(usize),
+        TrailingSpace,
+        /// A line of text after it, indented by this many spaces.
+        LineAfter(usize),
+        BlankAfter,
+        Delete,
+        JoinNext,
+        /// Its line break switched, LF to CRLF to a lone CR to LF.
+        SwitchBreak,
+        /// Text written on it, after this many spaces, if it is blank.
+        Write(usize),
+        /// Its text replaced by other letters, its leading whitespace kept,
+        /// if it is not blank.
+        Rename,
+    }
+
+    /// Added to the origin of a line no answer places for sure (see
+    /// `Rewrite::Write`): written on that line, or in its place.
+    const AMBIGUOUS: usize = 1 << 40;
+
+    fn rewrite() -> impl Strategy<Value = Rewrite> {
+        prop_oneof![
+            4 => Just(Rewrite::Keep),
+            2 => (0..5usize).prop_map(Rewrite::Reindent),
+            1 => Just(Rewrite::TrailingSpace),
+            2 => (0..3usize).prop_map(Rewrite::LineAfter),
+            1 => Just(Rewrite::BlankAfter),
+            1 => Just(Rewrite::Delete),
+            1 => Just(Rewrite::JoinNext),
+            1 => (0..3usize).prop_map(Rewrite::Write),
+            1 => Just(Rewrite::SwitchBreak),
+            1 => Just(Rewrite::Rename),
+        ]
+    }
+
+    /// A line of a formatter's output: its text, its line break, and the
+    /// line of P it rewrites (`None` for a line it created).
+    type Output = (String, String, Option<usize>);
+
+    /// `prepared` rewritten line by line (`rewrites` cycled), its final
+    /// line break dropped or added when `flip_final_break`.
+    fn format(prepared: &str, rewrites: &[Rewrite], flip_final_break: bool) -> Vec<Output> {
+        let starts = line_starts(prepared);
+        let mut lines: Vec<(String, String)> = (0..starts.len())
+            .map(|line| {
+                let end = content_end(prepared, &starts, line);
+                let next = starts.get(line + 1).copied().unwrap_or(prepared.len());
+                (
+                    prepared[starts[line]..end].to_string(),
+                    prepared[end..next].to_string(),
+                )
+            })
+            .collect();
+        // The empty line after a final break is no line a formatter sees.
+        if lines.len() > 1 && lines.last().is_some_and(|(text, _)| text.is_empty()) {
+            lines.pop();
+        }
+        let mut output: Vec<Output> = Vec::new();
+        let mut rewrites = rewrites.iter().cycle();
+        let mut index = 0;
+        // Whether the line before was removed: a blank line written then
+        // takes its place as much as it is written on.
+        let mut removed_before = false;
+        // Whether the line before was a blank line written on: a line
+        // removed after it reads alike as that line rewritten.
+        let mut written_blank_before = false;
+        while index < lines.len() {
+            let (mut text, line_break) = lines[index].clone();
+            let origin = Some(index);
+            let some_break = if line_break.is_empty() {
+                "\n".to_string()
+            } else {
+                line_break.clone()
+            };
+            let mut rewrite = rewrites.next().copied().unwrap_or(Rewrite::Keep);
+            // Provenance no answer shows is left out, not guessed: a line
+            // written where a line was removed is that line rewritten as much
+            // as a new one; and with other blank lines about, which blank
+            // line went, or took other whitespace or text, is not to be told
+            // (blank lines carry nothing of their own to pair them by).
+            // (Blank lines kept between them hide nothing of which is which.)
+            let created_before = output
+                .iter()
+                .rev()
+                .find(|(text, _, origin)| !(text.trim().is_empty() && origin.is_some()))
+                .is_some_and(|(_, _, origin)| origin.is_none());
+            let is_blank = |at: usize| {
+                lines
+                    .get(at)
+                    .is_some_and(|(text, _)| text.trim().is_empty())
+            };
+            let other_blank =
+                |at: usize| (0..lines.len()).any(|other| other != at && is_blank(other));
+            // The lines this rewrite removes: its own, or the next it joins.
+            let removed = match rewrite {
+                Rewrite::Delete => Some(index),
+                Rewrite::JoinNext if is_blank(index) => Some(index),
+                Rewrite::JoinNext => Some(index + 1),
+                _ => None,
+            };
+            let rewrites_blank = is_blank(index)
+                && matches!(
+                    rewrite,
+                    Rewrite::Reindent(_) | Rewrite::TrailingSpace | Rewrite::Write(_)
+                );
+            let creates_beside_blank =
+                is_blank(index) && matches!(rewrite, Rewrite::LineAfter(_) | Rewrite::BlankAfter);
+            if ((created_before || written_blank_before) && (removed.is_some() || rewrites_blank))
+                || (removed_before && (rewrites_blank || creates_beside_blank))
+                || removed.is_some_and(|at| is_blank(at) && other_blank(at))
+                || (rewrites_blank && other_blank(index))
+                // A blank line created among blank lines: which one is new
+                // is not to be told either.
+                || (matches!(rewrite, Rewrite::BlankAfter)
+                    && (0..lines.len()).any(is_blank))
+            {
+                rewrite = Rewrite::Keep;
+            }
+            written_blank_before = is_blank(index) && matches!(rewrite, Rewrite::Write(_));
+            removed_before = matches!(rewrite, Rewrite::JoinNext if index + 1 < lines.len())
+                || matches!(rewrite, Rewrite::Delete if lines.len() > 1)
+                || (removed_before && is_blank(index));
+            match rewrite {
+                Rewrite::Keep => output.push((text, line_break, origin)),
+                // A formatter leaves no whitespace on a line it rewrites
+                // blank (what blank line took which whitespace is not to be
+                // told, see above).
+                Rewrite::Reindent(_) | Rewrite::TrailingSpace if is_blank(index) => {
+                    output.push((String::new(), line_break, origin))
+                }
+                Rewrite::Reindent(spaces) => {
+                    let trimmed = text.trim_start_matches([' ', '\t']).to_string();
+                    output.push((
+                        format!("{}{trimmed}", " ".repeat(spaces)),
+                        line_break,
+                        origin,
+                    ));
+                }
+                Rewrite::TrailingSpace => output.push((format!("{text} "), line_break, origin)),
+                // Text written where an empty line was is a line of the
+                // content. Text where a kept whitespace line was, typed
+                // after its whitespace or not, is ambiguous in a whole-text
+                // answer (written on it, or in its place), and refused.
+                Rewrite::Write(spaces) if is_blank(index) => {
+                    let written = format!("{}w{index}", " ".repeat(spaces));
+                    let origin = if text.is_empty() {
+                        origin
+                    } else {
+                        origin.map(|line| AMBIGUOUS + line)
+                    };
+                    output.push((written, line_break, origin))
+                }
+                Rewrite::Write(_) => output.push((text, line_break, origin)),
+                Rewrite::Rename if !is_blank(index) => {
+                    let lead = text.len() - text.trim_start_matches([' ', '\t']).len();
+                    output.push((format!("{}r{index}", &text[..lead]), line_break, origin))
+                }
+                Rewrite::Rename => output.push((text, line_break, origin)),
+                Rewrite::LineAfter(spaces) => {
+                    output.push((text, some_break, origin));
+                    output.push((format!("{}w", " ".repeat(spaces)), line_break, None));
+                }
+                Rewrite::BlankAfter => {
+                    output.push((text, some_break, origin));
+                    output.push((String::new(), line_break, None));
+                }
+                Rewrite::Delete if lines.len() > 1 => {}
+                Rewrite::Delete => output.push((text, line_break, origin)),
+                Rewrite::JoinNext if index + 1 < lines.len() => {
+                    index += 1;
+                    // A blank line joined to the next is that line, the
+                    // blank one deleted.
+                    let origin = if text.trim().is_empty() {
+                        Some(index)
+                    } else {
+                        origin
+                    };
+                    text.push(' ');
+                    text.push_str(lines[index].0.trim_start());
+                    output.push((text, lines[index].1.clone(), origin));
+                }
+                Rewrite::JoinNext => output.push((text, line_break, origin)),
+                Rewrite::SwitchBreak => {
+                    let switched = match line_break.as_str() {
+                        "\n" => "\r\n",
+                        "\r\n" => "\r",
+                        "\r" => "\n",
+                        other => other,
+                    };
+                    output.push((text, switched.to_string(), origin));
+                }
+            }
+            index += 1;
+        }
+        if flip_final_break && let Some((_, line_break, _)) = output.last_mut() {
+            if line_break.is_empty() {
+                *line_break = "\n".to_string();
+            } else {
+                line_break.clear();
+            }
+        }
+        output
+    }
+
+    /// The host text a formatter's `output` stands for: every line of text
+    /// it rewrote indented as that line was, every one it created as the
+    /// content is, the deleted edge lines put back around it. `None` when
+    /// the closing lines would not start a line.
+    /// Every host text [`reference`] gives for `output`, each line no
+    /// answer places for sure read both ways: none when it refuses all.
+    /// A line written last with no line break, where an empty line was, as
+    /// other text than its line held, or with `copies` of text about (which
+    /// copy it is no answer tells), is read both ways too when the
+    /// last line holds only an indent: written on that line (the last
+    /// line's break and indent going), or on the last line (that line
+    /// going), which P shows empty.
+    fn readings(
+        document: &Document,
+        prepared: &str,
+        output: &[Output],
+        copies: bool,
+    ) -> Vec<String> {
+        let last = output.len().wrapping_sub(1);
+        let prepared_lines = lines_of(prepared);
+        let on_empty_line_last = output.last().is_some_and(|(text, line_break, origin)| {
+            document.indent_only_last_line
+                && line_break.is_empty()
+                && origin.is_some_and(|line| {
+                    line < AMBIGUOUS
+                        && (copies
+                            || document.removed[line].is_none()
+                            || prepared_lines
+                                .get(line)
+                                .is_none_or(|old| old.trim() != text.trim()))
+                })
+        });
+        [(true, false), (false, false), (true, true), (false, true)]
+            .into_iter()
+            .filter(|&(_, on_last_line)| !on_last_line || on_empty_line_last)
+            .filter_map(|(written_on, on_last_line)| {
+                let resolved: Vec<Output> = output
+                    .iter()
+                    .enumerate()
+                    .map(|(at, (text, line_break, origin))| {
+                        let origin = match origin {
+                            _ if on_last_line && at == last => None,
+                            Some(line) if *line >= AMBIGUOUS => {
+                                written_on.then_some(line - AMBIGUOUS)
+                            }
+                            origin => *origin,
+                        };
+                        (text.clone(), line_break.clone(), origin)
+                    })
+                    .collect();
+                reference(document, &resolved)
+            })
+            .collect()
+    }
+
+    fn reference(document: &Document, output: &[Output]) -> Option<String> {
+        let mut indented = String::new();
+        for (at, (text, line_break, origin)) in output.iter().enumerate() {
+            // A line written last, with no break, is written on the
+            // indentation-only last line, whose indent it keeps.
+            let on_last_line = document.indent_only_last_line
+                && origin.is_none()
+                && line_break.is_empty()
+                && at + 1 == output.len();
+            if !text.is_empty() {
+                indented.push_str(if on_last_line {
+                    document.last_line_indent
+                } else {
+                    origin
+                        .and_then(|line| document.removed[line])
+                        .unwrap_or(document.uniform)
+                });
+            }
+            indented.push_str(text);
+            indented.push_str(line_break);
+        }
+        let at_line_start = indented.is_empty() || indented.ends_with(['\n', '\r']);
+        if document.indent_only_last_line && at_line_start {
+            indented.push_str(document.last_line_indent);
+        }
+        if !document.closing.is_empty() && !indented.is_empty() && !at_line_start {
+            return None;
+        }
+        // A lone CR ending the text would fuse with the closing lines' LF,
+        // and an LF starting it with the leading lines' CR.
+        if indented.ends_with('\r') && document.closing.starts_with('\n')
+            || document.leading.ends_with('\r') && indented.starts_with('\n')
+        {
+            return None;
+        }
+        Some(format!(
+            "{}{indented}{}",
+            document.leading, document.closing
+        ))
+    }
+
+    /// `output` with two lines of text the formatter left as they were,
+    /// the content's indent removed from both, swapped (as sorting imports
+    /// does) when `shuffle` says, each keeping its own line break. (A line
+    /// written twice is left out: beside lines removed, which copy is the
+    /// old line no answer tells.)
+    fn shuffled(
+        document: &Document,
+        prepared: &str,
+        mut output: Vec<Output>,
+        shuffle: u8,
+    ) -> Vec<Output> {
+        let lines: Vec<&str> = lines_of(prepared);
+        let movable = |(text, line_break, origin): &Output| {
+            !text.trim_matches([' ', '\t']).is_empty()
+                && !line_break.is_empty()
+                && origin.is_some_and(|line| {
+                    line < AMBIGUOUS
+                        && document.removed[line] == Some(document.uniform)
+                        && lines.get(line) == Some(&text.as_str())
+                })
+        };
+        let pick = |candidates: Vec<usize>| {
+            (!candidates.is_empty())
+                .then(|| candidates[usize::from(shuffle / 2) % candidates.len()])
+        };
+        // Beside a whitespace line the peer kept, a moved line indented
+        // in P reads as well as text written on it, and beside a line
+        // removed, as that line rewritten: neither is generated.
+        let kept_whitespace = lines
+            .iter()
+            .any(|line| !line.is_empty() && line.trim_matches([' ', '\t']).is_empty());
+        // (The empty line after P's last line break is no line to keep.)
+        let all_kept = (0..lines.len())
+            .filter(|&line| line + 1 < lines.len() || !lines[line].is_empty())
+            .all(|line| output.iter().any(|(_, _, origin)| *origin == Some(line)));
+        match shuffle % 2 {
+            1 if !kept_whitespace && all_kept => {
+                let candidates = (0..output.len().saturating_sub(1))
+                    .filter(|&at| {
+                        movable(&output[at])
+                            && movable(&output[at + 1])
+                            && output[at].0 != output[at + 1].0
+                    })
+                    .collect();
+                if let Some(at) = pick(candidates) {
+                    output.swap(at, at + 1);
+                }
+            }
+            _ => {}
+        }
+        output
+    }
+
+    /// `text`'s lines without their breaks (LF, CRLF or a lone CR).
+    fn lines_of(text: &str) -> Vec<&str> {
+        let starts = line_starts(text);
+        starts
+            .iter()
+            .enumerate()
+            .map(|(index, &start)| {
+                let end = starts.get(index + 1).copied().unwrap_or(text.len());
+                text[start..end].trim_end_matches(['\r', '\n'])
+            })
+            .collect()
+    }
+
+    /// The answer a formatter gives for turning `prepared` into
+    /// `formatted`, in one of a few shapes servers use.
+    fn answer(prepared: &str, formatted: &str, shape: u8) -> Vec<TextEdit> {
+        let whole_end = match shape % 3 {
+            // To the start of the line just past the last.
+            0 => Position::new(line_starts(prepared).len() as u32, 0),
+            // To the document end.
+            1 => position_of(prepared, prepared.len()),
+            // Only what differs, trimmed to whole characters off a CRLF.
+            _ => {
+                let prefix: usize = prepared
+                    .chars()
+                    .zip(formatted.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                let mut prefix = prefix;
+                if prepared[..prefix].ends_with('\r') || formatted[..prefix].ends_with('\r') {
+                    prefix -= 1;
+                }
+                let suffix: usize = prepared[prefix..]
+                    .chars()
+                    .rev()
+                    .zip(formatted[prefix..].chars().rev())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a.len_utf8())
+                    .sum();
+                let mut suffix = suffix;
+                let (old_end, new_end) = (prepared.len() - suffix, formatted.len() - suffix);
+                if prepared[old_end..].starts_with('\n') || formatted[new_end..].starts_with('\n') {
+                    suffix -= 1;
+                }
+                let (old_end, new_end) = (prepared.len() - suffix, formatted.len() - suffix);
+                return vec![TextEdit {
+                    range: LspRange::new(
+                        position_of(prepared, prefix),
+                        position_of(prepared, old_end),
+                    ),
+                    new_text: formatted[prefix..new_end].to_string(),
+                }];
+            }
+        };
+        vec![TextEdit {
+            range: LspRange::new(Position::new(0, 0), whole_end),
+            new_text: formatted.to_string(),
+        }]
+    }
+
+    /// Run `cases` generated answers mapped with `budget`, checking each
+    /// accepted one against [`reference`]; how many were mapped, and how
+    /// many of those changed P.
+    fn check(budget: usize, cases: u32) -> (usize, usize) {
+        let mut runner = property_runner(cases);
+        let (mapped_sets, changing, over_refused) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let strategy = (
+            (
+                prop::collection::vec(line(), 1..6),
+                prop::bool::weighted(0.75),
+            ),
+            prop::sample::select(vec!["  ", "\t", "    "]),
+            prop::sample::select(vec!["\n", "\r\n", "\r"]),
+            (0..3usize, 0..3usize, any::<bool>()),
+            prop::collection::vec(rewrite(), 1..6),
+            (any::<bool>(), any::<u8>(), any::<u8>()),
+        );
+        runner
+            .run(
+                &strategy,
+                |((mut lines, even), indent, line_break, edges, rewrites, (flip, shape, shuffle))| {
+                    // Mostly peers dedenting evenly: every line of text
+                    // dedented as the first is.
+                    let first = lines.iter().find_map(|line| match line {
+                        Line::Content { dedented, .. } => Some(*dedented),
+                        _ => None,
+                    });
+                    if let (true, Some(first)) = (even, first) {
+                        for line in &mut lines {
+                            if let Line::Content { dedented, .. } = line {
+                                *dedented = first;
+                            }
+                        }
+                    }
+                    let Some(document) = document(&lines, indent, line_break, edges) else {
+                        return Ok(());
+                    };
+                    // Some line of text dedented and another left alone.
+                    let dedented = |want: bool| {
+                        lines.iter().any(
+                            |line| matches!(line, Line::Content { dedented, .. } if *dedented == want),
+                        )
+                    };
+                    let uneven = dedented(true) && dedented(false);
+                    let map = prepare(
+                        &document.virtual_text,
+                        serde_json::Value::from(document.changes.clone()),
+                    );
+                    let prepared = map.prepared_lines.text.clone();
+                    let output = shuffled(
+                        &document,
+                        &prepared,
+                        format(&prepared, &rewrites, flip),
+                        shuffle,
+                    );
+                    // A lone CR before an empty line's LF would fuse into
+                    // one line break: lines the formatter did not write.
+                    if output.windows(2).any(|pair| {
+                        pair[0].1 == "\r" && pair[1].0.is_empty() && pair[1].1.starts_with('\n')
+                    }) {
+                        return Ok(());
+                    }
+                    let formatted: String = output
+                        .iter()
+                        .map(|(text, line_break, _)| format!("{text}{line_break}"))
+                        .collect();
+                    let edits = answer(&prepared, &formatted, shape);
+                    prop_assert_eq!(apply(&prepared, &edits), formatted.clone());
+                    let Some(mapped) = map.map_formatting(&edits, budget).ok() else {
+                        // Refused with work enough: an answer the host
+                        // cannot take, or (rarely) one turning line breaks
+                        // among several blank lines, whose pairing can meet
+                        // a CR and an LF the check refuses.
+                        let sure = output
+                            .iter()
+                            .all(|(_, _, origin)| origin.is_none_or(|line| line < AMBIGUOUS));
+                        if budget > 0 && sure && !uneven && reference(&document, &output).is_some() {
+                            over_refused.set(over_refused.get() + 1);
+                        }
+                        return Ok(());
+                    };
+                    mapped_sets.set(mapped_sets.get() + 1);
+                    if formatted != prepared {
+                        // A peer dedenting unevenly: refused whatever the
+                        // answer changes.
+                        prop_assert!(!uneven, "{:?} mapped on {:?}", edits, document.virtual_text);
+                        changing.set(changing.get() + 1);
+                    }
+                    let got = apply(&document.virtual_text, &mapped);
+                    let copies = lines.iter().enumerate().any(|(at, line)| {
+                        matches!(line, Line::Content { body, .. } if *body >= BODIES.len()
+                            && lines[at + 1..].iter().any(|other| {
+                                matches!(other, Line::Content { body: other, .. } if other == body)
+                            }))
+                    });
+                    let expected = readings(&document, &prepared, &output, copies);
+                    // With shared text written twice, which copy was kept
+                    // can move a whitespace line's own whitespace (kept as
+                    // it was, or written anew with the content's indent): a
+                    // blank line's whitespace no answer places.
+                    // So can it move the indentation-only last line's indent
+                    // onto a last line written without a break (written on
+                    // it, or on a copy's line). `text` with its
+                    // whitespace-only lines emptied, and the indent of a
+                    // last line without a break dropped, every other
+                    // character kept.
+                    let blanks_emptied = |text: &str| -> String {
+                        let starts = line_starts(text);
+                        (0..starts.len())
+                            .map(|line| {
+                                let end = content_end(text, &starts, line);
+                                let next = starts.get(line + 1).copied().unwrap_or(text.len());
+                                let content = &text[starts[line]..end];
+                                if content.trim_matches([' ', '\t']).is_empty() {
+                                    text[end..next].to_string()
+                                } else if next == end && document.indent_only_last_line {
+                                    content.trim_start_matches([' ', '\t']).to_string()
+                                } else {
+                                    text[starts[line]..next].to_string()
+                                }
+                            })
+                            .collect()
+                    };
+                    prop_assert!(
+                        expected.contains(&got)
+                            || copies
+                                && expected
+                                    .iter()
+                                    .any(|text| blanks_emptied(text) == blanks_emptied(&got)),
+                        "{:?} -> {:?} on {:?} (P {:?}): {:?} not in {:?}",
+                        edits,
+                        mapped,
+                        document.virtual_text,
+                        prepared,
+                        got,
+                        expected
+                    );
+                    Ok::<(), TestCaseError>(())
+                },
+            )
+            .unwrap();
+        // Cases the host could take, refused: availability only, and rare
+        // (one in 10,000 at most, the fixed seed's 3,000 cases none; one
+        // allowed more from another seed).
+        let fixed_seed = std::env::var_os("KAKEHASHI_PROPTEST_RANDOM").is_none()
+            && std::env::var_os("PROPTEST_RNG_SEED").is_none();
+        assert!(
+            over_refused.get() <= usize::from(!fixed_seed) + cases as usize / 10_000,
+            "refused {} answers the host could take",
+            over_refused.get()
+        );
+        (mapped_sets.get(), changing.get())
+    }
+
+    #[test]
+    fn formatting_answers_give_exactly_the_reference_host_text() {
+        let (mapped, changing) = check(FORMATTING_DIFF_BUDGET, 3000);
+        // Every refusal is checked above; this only keeps the run from
+        // passing on nothing.
+        assert!(changing > 1000, "mapped {mapped}, {changing} changing P");
+    }
+
+    #[test]
+    fn answers_whose_diff_runs_out_of_work_are_refused() {
+        // Only an answer changing nothing needs no diff.
+        let (mapped, changing) = check(0, 1000);
+        assert_eq!(changing, 0, "mapped {mapped}");
+        assert!(mapped > 0);
     }
 }

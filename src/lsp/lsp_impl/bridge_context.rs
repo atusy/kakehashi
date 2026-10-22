@@ -76,11 +76,18 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
 
 /// Whether an edit method stays open to a contiguous prepared document: its
 /// edits are mapped back through the prepared map
-/// (`translate_virtual_text_edits_to_host`).
+/// (`translate_virtual_text_edits_to_host` and
+/// `translate_virtual_text_edit_to_host` for edits keeping their extents,
+/// `translate_virtual_formatting_edits_to_host` for a formatter's answer).
 fn method_maps_prepared_edits(method: &str) -> bool {
     matches!(
         method,
-        "textDocument/colorPresentation" | "textDocument/completion" | "textDocument/inlayHint"
+        "textDocument/colorPresentation"
+            | "textDocument/completion"
+            | "textDocument/formatting"
+            | "textDocument/inlayHint"
+            | "textDocument/onTypeFormatting"
+            | "textDocument/rangeFormatting"
     )
 }
 
@@ -103,32 +110,18 @@ fn method_closed_to_with(
         && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
 }
 
-/// [`prepare_request_context`] for a `method` request: `None` when the
-/// document could not be prepared, or when `method` is closed to it as
-/// prepared — checked again with the answer in, since the lifecycle pass may
-/// not have looked the region up yet.
+/// [`prepare_request_context`] for a `method` request: `Err` when the
+/// document could not be prepared, `Ok(None)` when `method` is closed to it
+/// as prepared — checked again with the answer in, since the lifecycle pass
+/// may not have looked the region up yet.
 pub(crate) async fn prepare_request_context_for(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     host_language: &str,
     ctx: DocumentRequestContext,
     method: &str,
-) -> Option<DocumentRequestContext> {
-    let ctx = prepare_request_context(bridge, host_language, ctx)
-        .await
-        .ok()?;
-    (!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx)
-}
-
-/// Whether a method is open to a region (see
-/// `Kakehashi::method_gate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MethodGate {
-    Open,
-    /// Closed by the region's shape or its prepared document.
-    Closed,
-    /// Its peer could not prepare it: not bridged, a failed request for a
-    /// caller counting them.
-    Unprepared,
+) -> Result<Option<DocumentRequestContext>, crate::lsp::bridge::PrepareMiss> {
+    let ctx = prepare_request_context(bridge, host_language, ctx).await?;
+    Ok((!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx))
 }
 
 /// Start the prepare attempts of every region `regions` names (of a host in
@@ -328,6 +321,7 @@ impl Drop for UpstreamRegistrySweepGuard {
 /// A layer's answer, with the prepared region its edits were mapped
 /// through, if any: what the final answer is checked against once, as it
 /// is chosen (see [`Self::still_current`]).
+#[derive(Clone)]
 pub(crate) struct Sourced<T> {
     pub(crate) value: T,
     prepared: Option<PreparedSource>,
@@ -337,6 +331,7 @@ pub(crate) struct Sourced<T> {
 /// and the host lifetime the region was tracked under as it was (`None`:
 /// not tracked even then, or tracked under another lifetime than the
 /// request's content version was read under).
+#[derive(Clone)]
 struct PreparedSource {
     host_uri: Url,
     language: String,
@@ -347,6 +342,24 @@ struct PreparedSource {
     /// never newer than the text the answer was made on, under the lifetime
     /// in `incarnation` (`None` there when it was read under another).
     content_version: Option<u64>,
+}
+
+impl PreparedSource {
+    /// Whether the map is unrevoked and the region still tracked under the
+    /// host lifetime it was tracked under as the answer was made, which the
+    /// host's store is open for.
+    fn live(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
+        !self.map.revoked()
+            && self.incarnation.is_some_and(|incarnation| {
+                tracked_region_incarnation(tracker, &self.host_uri, &self.region_id)
+                    == Some(incarnation)
+                    && pool.current_host_incarnation(&self.host_uri) == Some(incarnation)
+            })
+    }
 }
 
 /// The host lifetime `region_id` of `host_uri` is tracked under now, if it
@@ -448,6 +461,50 @@ impl<T> Sourced<T> {
         self.prepared.is_some()
     }
 
+    /// Whether nothing has made this answer's region unable to become
+    /// current: its map unrevoked, and its region tracked under the host
+    /// lifetime it was made under. Always so without a map.
+    pub(crate) fn live(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
+        self.prepared
+            .as_ref()
+            .is_none_or(|source| source.live(pool, tracker))
+    }
+
+    /// Whether what [`Self::still_current`] says of this answer may still change while the
+    /// host's content version stays put (see
+    /// `LanguageServerPool::host_settling`): never so without a map, nor
+    /// once nothing can make it current again: its map revoked, or its
+    /// region no longer live under the lifetime it was made under (a hold
+    /// on such a region, as the lifecycle pass leaves on a failed prepare,
+    /// is cleared by no text ever recorded).
+    pub(crate) fn settling(
+        &self,
+        pool: &crate::lsp::bridge::LanguageServerPool,
+        tracker: &crate::language::NodeTracker,
+    ) -> bool {
+        self.prepared.as_ref().is_some_and(|source| {
+            source.live(pool, tracker)
+                && pool.host_settling(&source.host_uri, &source.language, &source.region_id)
+        })
+    }
+
+    /// Whether the host was edited since the request read its text: its
+    /// content version `now` is not the one read before the request's
+    /// text, for an answer mapped through a prepared map. A host gone
+    /// (`now` is `None`) is no move.
+    pub(crate) fn moved(&self, now: Option<u64>) -> bool {
+        now.is_some_and(|now| {
+            self.prepared
+                .as_ref()
+                .and_then(|source| source.content_version)
+                .is_some_and(|version| version != now)
+        })
+    }
+
     /// Whether the edits mapped into the answer still land where they were
     /// mapped: always so without a map. Otherwise the host must not have
     /// been edited since the request's text was read (`current_version`,
@@ -479,11 +536,7 @@ impl<T> Sourced<T> {
             source
                 .content_version
                 .is_some_and(|version| current_version() == Some(version))
-                && source.incarnation.is_some_and(|incarnation| {
-                    tracked_region_incarnation(tracker, &source.host_uri, &source.region_id)
-                        == Some(incarnation)
-                        && pool.current_host_incarnation(&source.host_uri) == Some(incarnation)
-                })
+                && source.live(pool, tracker)
                 && pool.host_text_still_current(
                     &source.host_uri,
                     &source.language,
@@ -493,6 +546,129 @@ impl<T> Sourced<T> {
         })
     }
 }
+
+/// How an answer mapped through prepared regions was judged as the final
+/// answer was chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// Every region it was mapped through is still the host's text.
+    Current,
+    /// The host was edited since the request's text was read.
+    Moved,
+    /// The host's last edit did not settle, or a region stayed held, in
+    /// time: the answer is not judged current.
+    Unsettled,
+    /// Settled, the text unedited, a region it was mapped through is no
+    /// longer the request's: re-prepared to other coordinates, no longer
+    /// tracked, its host closed or reopened, or its map revoked.
+    Stale,
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Current => "the host text is current",
+            Self::Moved => {
+                "the host text moved under a prepared virtual document it was mapped through"
+            }
+            Self::Unsettled => "the host text did not settle in time after its last edit",
+            Self::Stale => {
+                "a prepared virtual document it was mapped through is no longer the request's"
+            }
+        })
+    }
+}
+
+impl Verdict {
+    /// Whether the answer judged so is kept: only one still current.
+    pub(crate) fn keeps(self) -> bool {
+        self == Self::Current
+    }
+}
+
+/// [`settled_verdict`] for an answer mapped through `sources`, the host's
+/// content version read by `current_version`: `Current` at once for one
+/// mapped through no prepared region.
+pub(crate) async fn sources_verdict<'a, T: 'a>(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+) -> Verdict {
+    if !sources.clone().any(Sourced::is_prepared) {
+        return Verdict::Current;
+    }
+    settled_verdict(
+        || {
+            sources
+                .clone()
+                .all(|source| source.still_current(pool, tracker, &current_version))
+        },
+        // Moved only by an edit: a host gone (no version) is no move, and
+        // its answer, nothing left to settle, is stale.
+        || {
+            let now = current_version();
+            sources.clone().any(|source| source.moved(now))
+        },
+        // Settling while every region can still become current: one that
+        // never can makes the whole answer stale, whatever else settles.
+        || {
+            sources.clone().all(|source| source.live(pool, tracker))
+                && sources.clone().any(|source| source.settling(pool, tracker))
+        },
+        crate::lsp::bridge::PREPARE_TIMEOUT,
+    )
+    .await
+}
+
+/// Judge an answer once it can be: `Current` as soon as `current` holds;
+/// `Moved` as soon as `moved` does (the host edited since the request read
+/// its text: no settling brings that back); `Stale` as soon as nothing is
+/// `settling` (no edit left to settle, no hold to clear: what `current`
+/// says stays so). Otherwise wait, polling, until one holds, `Unsettled`
+/// past `within` (each look is one [`poll_verdict`]).
+pub(crate) async fn settled_verdict(
+    current: impl Fn() -> bool,
+    moved: impl Fn() -> bool,
+    settling: impl Fn() -> bool,
+    within: std::time::Duration,
+) -> Verdict {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if let Some(verdict) = poll_verdict(&current, &moved, &settling) {
+            return verdict;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Verdict::Unsettled;
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// One look of [`settled_verdict`] at an answer, without waiting: the
+/// verdict once it can be judged, `None` while it is still settling.
+/// Reads `settling` before `current`: a settle landing between the two
+/// reads then shows in `current`, never as a `Stale` judged on what
+/// `current` said before it.
+pub(crate) fn poll_verdict(
+    current: impl Fn() -> bool,
+    moved: impl Fn() -> bool,
+    settling: impl Fn() -> bool,
+) -> Option<Verdict> {
+    let settling = settling();
+    if current() {
+        Some(Verdict::Current)
+    } else if moved() {
+        Some(Verdict::Moved)
+    } else if !settling {
+        Some(Verdict::Stale)
+    } else {
+        None
+    }
+}
+
+/// How often [`settled_verdict`] looks again while an answer is settling.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 impl Kakehashi {
     /// The host's lifetime and content version, read together before a virt
@@ -522,6 +698,22 @@ impl Kakehashi {
         sourced.still_current(self.bridge.pool(), self.bridge.node_tracker(), || {
             self.host_content_version(lsp_uri)
         })
+    }
+
+    /// [`sources_verdict`] for an answer made for `lsp_uri` and mapped
+    /// through `sources`, read against the host as it is now.
+    pub(crate) async fn settled_verdict_of<'a, T: 'a>(
+        &self,
+        lsp_uri: &Uri,
+        sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+    ) -> Verdict {
+        sources_verdict(
+            self.bridge.pool(),
+            self.bridge.node_tracker(),
+            || self.host_content_version(lsp_uri),
+            sources,
+        )
+        .await
     }
 
     /// The host's current content version.
@@ -1471,7 +1663,7 @@ impl Kakehashi {
         // At once on what the lifecycle pass knows, a pending answer
         // included (most likely prepared); checked again with the answer in
         // (see `prepare_request_context_for`). Formatting waits instead (see
-        // `method_gate`).
+        // its fan-out, which prepares every region's context).
         if method_closed_to_with(&resolved, method_name, || {
             self.lifecycle_prepares(&uri, &resolved)
         }) {
@@ -1710,66 +1902,10 @@ impl Kakehashi {
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
         };
-        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
-    }
-
-    /// Whether `method` is open to a region of a `host_language` host, for
-    /// formatting. Closed by the region's shape ([`method_closed_to`]);
-    /// otherwise, for a method the rule closes on a prepared document, by
-    /// the prepare answer for the text being formatted, waited for (not the
-    /// one the lifecycle pass holds the document on, which can be older): only a document
-    /// sent as is takes edits, and one its peer could not prepare is told
-    /// apart (not bridged at all).
-    ///
-    /// Unlike a request's preamble, which closes an edit method at once on
-    /// what the lifecycle pass knows (a pending answer included) and checks
-    /// again once the answer is in, this waits even while the pass holds the
-    /// document pending: formatting must tell a failed peer apart, which the
-    /// CLI counts as a failure, rather than answer nothing.
-    pub(crate) async fn method_gate(
-        &self,
-        uri: &Url,
-        host_language: &str,
-        resolved: &ResolvedInjection,
-        method: &str,
-    ) -> MethodGate {
-        if method_closed_to(resolved, method, false) {
-            return MethodGate::Closed;
-        }
-        let region = self.bridge.prepare_region(
-            uri,
-            &resolved.injection_language,
-            &resolved.region.region_id,
-        );
-        // Open even were the region prepared: no answer to wait for.
-        if !method_closed_to(resolved, method, true) {
-            return MethodGate::Open;
-        }
-        // The answer, waited for even while the lifecycle pass holds the
-        // document on it: one the peer cannot give is told apart.
-        let Some(target) = self
-            .bridge
-            .prepare_target(host_language, &resolved.injection_language)
-        else {
-            return if region.prepared {
-                MethodGate::Closed
-            } else {
-                MethodGate::Open
-            };
-        };
-        let input = crate::lsp::bridge::PrepareInput {
-            host_uri: uri,
-            host_language,
-            injection_language: &resolved.injection_language,
-            region_id: &resolved.region.region_id,
-            virtual_text: &resolved.virtual_content,
-            gaps: &resolved.gaps,
-        };
-        match self.bridge.prepared_document(&target, input).await {
-            Ok(crate::lsp::bridge::PrepareAnswer::AsIs) => MethodGate::Open,
-            Ok(_) => MethodGate::Closed,
-            Err(_) => MethodGate::Unprepared,
-        }
+        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Whether the lifecycle pass prepares a region's current document (or
@@ -2159,7 +2295,7 @@ impl Kakehashi {
     /// gap: between the race's completion and the next request there is no
     /// subscriber; a cancel landing there is only forwarded downstream via the
     /// upstream-request registry.
-    async fn run_layer_race<R>(
+    pub(crate) async fn run_layer_race<R>(
         &self,
         race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
@@ -2469,6 +2605,435 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// An answer whose reply came before the host's last edit settled (its
+    /// text unchanged by it: another fence edited) is kept once the edit
+    /// settles, not dropped; one the host moved under while it waited is
+    /// dropped as moved.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_judged_once_the_hosts_last_edit_settles() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                .unwrap();
+        for moves in [false, true] {
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            let host = url::Url::parse("file:///test/settle.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            // Another fence edited: version 1, its pass not settled yet. The
+            // request read version 1, its region's text unchanged.
+            pool.note_host_edited(&host, 1, 1);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                1,
+            );
+            let version = Arc::new(AtomicU64::new(1));
+            assert!(!held.still_current(&pool, &tracker, || Some(1)));
+            let settle = {
+                let (pool, host, version) = (Arc::clone(&pool), host.clone(), Arc::clone(&version));
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if moves {
+                        version.store(2, Ordering::SeqCst);
+                    } else {
+                        pool.note_host_settled(&host, 1, 1);
+                    }
+                })
+            };
+            let verdict = settled_verdict(
+                || held.still_current(&pool, &tracker, || Some(version.load(Ordering::SeqCst))),
+                || version.load(Ordering::SeqCst) != 1,
+                || held.settling(&pool, &tracker),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+            settle.await.unwrap();
+            assert_eq!(
+                verdict,
+                if moves {
+                    Verdict::Moved
+                } else {
+                    Verdict::Current
+                }
+            );
+        }
+    }
+
+    /// Staleness nothing can clear (the map revoked, the host reopened)
+    /// is judged at once, not polled until the wait ends: only an edit
+    /// left to settle, or a hold, is waited for.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_nothing_can_make_current_is_judged_at_once() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        for case in ["revoked", "reopened"] {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            // The prepare layer's table, which holds are kept in.
+            pool.prepare_failures_for_test();
+            let host = url::Url::parse("file:///test/stale.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                0,
+            );
+            assert!(held.still_current(&pool, &tracker, || Some(0)));
+            match case {
+                "revoked" => revocation.revoke(u64::MAX),
+                _ => pool.open_host_incarnation(&host, 2).await,
+            }
+            // The lifecycle pass then holds the region on the failure, a
+            // hold no text recorded will clear: still nothing to wait for.
+            pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+            assert!(!held.settling(&pool, &tracker), "{case}");
+            let start = tokio::time::Instant::now();
+            let verdict = settled_verdict(
+                || held.still_current(&pool, &tracker, || Some(0)),
+                || false,
+                || held.settling(&pool, &tracker),
+                crate::lsp::bridge::PREPARE_TIMEOUT,
+            )
+            .await;
+            assert_eq!(verdict, Verdict::Stale, "{case}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
+    }
+
+    /// A settle landing between a poll's reads of `current` and `settling`
+    /// leaves the answer current, not stale: `current` read before the
+    /// settle, `settling` after it, would say neither.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_between_a_polls_reads_is_not_judged_stale() {
+        let settled = std::cell::Cell::new(false);
+        let verdict = settled_verdict(
+            // The settle lands right after this read.
+            || settled.replace(true),
+            || false,
+            || !settled.get(),
+            crate::lsp::bridge::PREPARE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(verdict, Verdict::Current);
+    }
+
+    /// An answer with a region nothing can make current (its map revoked)
+    /// is stale at once, though another region of it is still settling;
+    /// and one whose host closed while it waited is stale, not moved.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_some_region_of_which_cannot_become_current_is_stale_at_once() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        let prepared = || {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            (prepared, revocation)
+        };
+        for case in ["revoked beside a settling region", "host closed"] {
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            let host = url::Url::parse("file:///test/two-regions.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            pool.open_host_incarnation(&host, 1).await;
+            let mut sources = Vec::new();
+            let mut revocations = Vec::new();
+            for (start, end) in [(0, 6), (10, 16)] {
+                let region = tracker
+                    .get_or_create_for_incarnation(&host, start, end, "block", 1)
+                    .unwrap()
+                    .to_string();
+                let (prepared, revocation) = prepared();
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+                sources.push(
+                    crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                        (),
+                        &host,
+                        "lua",
+                        &region,
+                        &prepared.map,
+                        1,
+                        1,
+                    ),
+                );
+                revocations.push(revocation);
+            }
+            // Another fence edited to version 1, its pass not settled.
+            pool.note_host_edited(&host, 1, 1);
+            let current = if case == "host closed" {
+                pool.close_host_incarnation(&host, 1).await;
+                None
+            } else {
+                revocations[0].revoke(u64::MAX);
+                Some(1)
+            };
+            let start = tokio::time::Instant::now();
+            let verdict = sources_verdict(&pool, &tracker, || current, sources.iter()).await;
+            assert_eq!(verdict, Verdict::Stale, "{case}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
+    }
+
+    /// A prepared map for `text` (dedented by two), revocable.
+    fn revocable_prepared(
+        text: &str,
+    ) -> (
+        crate::lsp::bridge::PreparedDocument,
+        std::sync::Arc<crate::lsp::bridge::Revocation>,
+    ) {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{
+            "type": "content", "changes": [{
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                "newText": ""
+            }]
+        }]}))
+        .unwrap();
+        let mut prepared =
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap();
+        let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+        Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        (prepared, revocation)
+    }
+
+    /// Every region of an answer must be current: one current and one
+    /// whose recorded text is no longer the request's, nothing left to
+    /// settle, is stale at once.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_current_only_when_every_region_is() {
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let host = url::Url::parse("file:///test/every-region.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        pool.open_host_incarnation(&host, 1).await;
+        let mut sources = Vec::new();
+        for (start, end, recorded) in [(0, 6, "  red\n"), (10, 16, "  blue\n")] {
+            let region = tracker
+                .get_or_create_for_incarnation(&host, start, end, "block", 1)
+                .unwrap()
+                .to_string();
+            let (requested, _) = revocable_prepared("  red\n");
+            let (recorded, _) = revocable_prepared(recorded);
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &recorded);
+            sources.push(
+                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                    (),
+                    &host,
+                    "lua",
+                    &region,
+                    &requested.map,
+                    1,
+                    0,
+                ),
+            );
+        }
+        let start = tokio::time::Instant::now();
+        let verdict = sources_verdict(&pool, &tracker, || Some(0), sources.iter()).await;
+        assert_eq!(verdict, Verdict::Stale);
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    /// A region held for its prepare answer, the host otherwise settled, is
+    /// waited for: once the request's text is recorded, the answer is
+    /// current.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_waits_for_a_held_region_alone() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host = url::Url::parse("file:///test/held.md").unwrap();
+        let tracker = crate::language::NodeTracker::new();
+        tracker.open_incarnation(&host, 1);
+        pool.open_host_incarnation(&host, 1).await;
+        let region = tracker
+            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+            .unwrap()
+            .to_string();
+        let (requested, _) = revocable_prepared("  red\n");
+        let (older, _) = revocable_prepared("  old\n");
+        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &older);
+        pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+        let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+            (),
+            &host,
+            "lua",
+            &region,
+            &requested.map,
+            1,
+            0,
+        );
+        {
+            let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &requested);
+            });
+        }
+        let start = tokio::time::Instant::now();
+        let verdict = sources_verdict(&pool, &tracker, || Some(0), std::iter::once(&held)).await;
+        assert_eq!(verdict, Verdict::Current);
+        assert!(start.elapsed() >= std::time::Duration::from_secs(1));
+    }
+
+    /// The judgement the formatting methods make as the final answer is
+    /// chosen, through a real pool and tracker: kept only once current;
+    /// moved, stale and never-settled answers dropped, the first two at
+    /// once.
+    #[tokio::test(start_paused = true)]
+    async fn the_final_check_waits_only_for_what_can_settle() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for case in ["settles", "moves", "revoked", "never settles"] {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            let mut prepared =
+                apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
+                    .unwrap();
+            let revocation = Arc::new(crate::lsp::bridge::Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+            // The prepare layer's table, which holds are kept in.
+            pool.prepare_failures_for_test();
+            let host = url::Url::parse("file:///test/final-check.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            // Another fence edited to version 1, its pass not settled: the
+            // request read version 1.
+            pool.note_host_edited(&host, 1, 1);
+            let held = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
+                (),
+                &host,
+                "lua",
+                &region,
+                &prepared.map,
+                1,
+                1,
+            );
+            let version = Arc::new(AtomicU64::new(1));
+            match case {
+                "settles" => {
+                    let (pool, host) = (Arc::clone(&pool), host.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        pool.note_host_settled(&host, 1, 1);
+                    });
+                }
+                "moves" => version.store(2, Ordering::SeqCst),
+                "revoked" => {
+                    pool.note_host_settled(&host, 1, 1);
+                    revocation.revoke(u64::MAX);
+                    // Held on the failure the revocation brings: a hold
+                    // nothing clears.
+                    pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+                }
+                _ => {}
+            }
+            let start = tokio::time::Instant::now();
+            let verdict = sources_verdict(
+                &pool,
+                &tracker,
+                || Some(version.load(Ordering::SeqCst)),
+                std::iter::once(&held),
+            )
+            .await;
+            let waited = start.elapsed();
+            let (expected, at_once) = match case {
+                "settles" => (Verdict::Current, false),
+                "moves" => (Verdict::Moved, true),
+                "revoked" => (Verdict::Stale, true),
+                _ => (Verdict::Unsettled, false),
+            };
+            assert_eq!(verdict, expected, "{case}");
+            assert_eq!(verdict.keeps(), case == "settles", "{case}");
+            if at_once {
+                assert_eq!(waited, std::time::Duration::ZERO, "{case}");
+            } else if case == "settles" {
+                assert!(
+                    waited < std::time::Duration::from_secs(2),
+                    "{case}: {waited:?}"
+                );
+            } else {
+                assert!(
+                    waited >= crate::lsp::bridge::PREPARE_TIMEOUT,
+                    "{case}: {waited:?}"
+                );
+            }
+        }
+    }
 
     /// A transformed answer a fan-in or the layer race held while the host
     /// was re-indented (the same prepared text under a new map) is stale
@@ -2793,13 +3358,6 @@ mod tests {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
         let server = service.inner();
         answer(server, &uri, &resolved, dedented());
-        let gate = |method| server.method_gate(&uri, "markdown", &resolved, method);
-        assert_eq!(gate("textDocument/formatting").await, MethodGate::Closed);
-        assert_eq!(
-            gate("textDocument/rangeFormatting").await,
-            MethodGate::Closed
-        );
-        assert_eq!(gate("textDocument/inlayHint").await, MethodGate::Open);
 
         let ctx = || DocumentRequestContext {
             prepared: None,
@@ -2813,16 +3371,91 @@ mod tests {
             max_fan_out: None,
             client_progress_token: None,
         };
-        let for_method =
-            |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
-        assert!(for_method("textDocument/rename").await.is_none());
-        assert!(for_method("textDocument/codeAction").await.is_none());
-        for method in ["textDocument/inlayHint", "textDocument/completion"] {
+        let for_method = |method| async move {
+            prepare_request_context_for(&server.bridge, "markdown", ctx(), method)
+                .await
+                .ok()
+                .flatten()
+        };
+        for method in ["textDocument/rename", "textDocument/codeAction"] {
+            assert!(for_method(method).await.is_none(), "{method} closes");
+        }
+        for method in [
+            "textDocument/inlayHint",
+            "textDocument/completion",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+        ] {
             let open = for_method(method)
                 .await
                 .unwrap_or_else(|| panic!("{method} stays open"));
             assert!(open.prepared.is_some());
             assert_eq!(open.resolved.virtual_content, "a");
+        }
+    }
+
+    /// Several regions of one request whose peer never answers: their
+    /// attempts all started before the first is waited for, the request
+    /// waits about as long as for one region, not one wait per region.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waits_for_its_regions_prepare_attempts_together() {
+        let waited = |count: usize| async move {
+            let (service, first, uri) = kakehashi_with_an_unlooked_region();
+            let server = service.inner();
+            server.bridge.pool().record_prepare_advertisement(
+                &crate::lsp::bridge::ConnectionKey::for_server("peer"),
+                true,
+            );
+            let regions: Vec<_> = (0..count)
+                .map(|index| {
+                    let mut resolved = first.clone();
+                    resolved.region.region_id = format!("01J000000000000000000000{index}B");
+                    resolved.virtual_content = format!("  a{index}");
+                    resolved
+                })
+                .collect();
+            let start = tokio::time::Instant::now();
+            start_prepare_attempts(
+                &server.bridge,
+                "markdown",
+                regions.iter().map(|resolved| (&uri, resolved)),
+            );
+            for resolved in &regions {
+                let _ = prepare_request_context_for(
+                    &server.bridge,
+                    "markdown",
+                    formatting_ctx(&uri, resolved),
+                    "textDocument/formatting",
+                )
+                .await;
+            }
+            start.elapsed()
+        };
+        let one = waited(1).await;
+        let three = waited(3).await;
+        assert!(
+            three < one + std::time::Duration::from_secs(1),
+            "one region {one:?}, three {three:?}"
+        );
+    }
+
+    /// A context for `resolved` of `uri` as the formatting fan-out builds
+    /// one.
+    fn formatting_ctx(
+        uri: &Url,
+        resolved: &crate::language::injection::ResolvedInjection,
+    ) -> DocumentRequestContext {
+        DocumentRequestContext {
+            prepared: None,
+            uri: uri.clone(),
+            resolved: resolved.clone(),
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
         }
     }
 
@@ -2839,19 +3472,18 @@ mod tests {
             crate::lsp::bridge::PrepareAnswer::Unusable,
             true,
         );
-        assert_eq!(
-            server
-                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
+        assert!(matches!(
+            prepare_request_context(&server.bridge, "markdown", formatting_ctx(&uri, &resolved))
                 .await,
-            MethodGate::Unprepared
-        );
+            Err(crate::lsp::bridge::PrepareMiss::Failed)
+        ));
     }
 
-    /// The gate answers for the text being formatted: an unusable answer the
-    /// lifecycle pass holds the document on, for an older text, does not
-    /// make a text answered as is unprepared.
+    /// Formatting is answered for the text being formatted: an unusable
+    /// answer the lifecycle pass holds the document on, for an older text,
+    /// does not make a text answered as is unprepared.
     #[tokio::test]
-    async fn the_gate_answers_for_the_text_being_formatted() {
+    async fn formatting_is_answered_for_the_text_being_formatted() {
         let (service, older, uri) = kakehashi_with_an_unlooked_region();
         let server = service.inner();
         answer_held(
@@ -2870,12 +3502,11 @@ mod tests {
             crate::lsp::bridge::PrepareAnswer::AsIs,
             false,
         );
-        assert_eq!(
-            server
-                .method_gate(&uri, "markdown", &current, "textDocument/formatting")
-                .await,
-            MethodGate::Open
-        );
+        let ctx =
+            prepare_request_context(&server.bridge, "markdown", formatting_ctx(&uri, &current))
+                .await
+                .expect("answered as is");
+        assert!(ctx.prepared.is_none());
     }
 
     #[tokio::test]
@@ -2888,29 +3519,19 @@ mod tests {
             &resolved,
             crate::lsp::bridge::PrepareAnswer::AsIs,
         );
-        assert_eq!(
-            server
-                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
-                .await,
-            MethodGate::Open
-        );
-        let ctx = DocumentRequestContext {
-            prepared: None,
-            uri: uri.clone(),
-            resolved: resolved.clone(),
-            region_end: None,
-            configs: Vec::new(),
-            upstream_request_id: None,
-            priorities: vec!["*".to_string()],
-            strategy: AggregationStrategy::Preferred,
-            max_fan_out: None,
-            client_progress_token: None,
-        };
-        let ctx =
-            prepare_request_context_for(&server.bridge, "markdown", ctx, "textDocument/rename")
-                .await
-                .expect("a document sent as is takes edits");
-        assert!(ctx.prepared.is_none());
+        for method in ["textDocument/rename", "textDocument/formatting"] {
+            let ctx = prepare_request_context_for(
+                &server.bridge,
+                "markdown",
+                formatting_ctx(&uri, &resolved),
+                method,
+            )
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("a document sent as is takes {method}"));
+            assert!(ctx.prepared.is_none());
+        }
     }
 
     #[test]
@@ -2930,12 +3551,13 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         };
+        // Every edit method whose edits are not mapped back stays closed
+        // (inbound applyEdit is refused on its own path: the region's offset
+        // carries a map).
         for method in [
             "textDocument/rename",
             "textDocument/codeAction",
             "textDocument/prepareRename",
-            "textDocument/formatting",
-            "textDocument/rangeFormatting",
             "textDocument/linkedEditingRange",
         ] {
             assert!(!method_closed_to(&resolved, method, false), "{method}");
@@ -2945,6 +3567,9 @@ mod tests {
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/completion",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+            "textDocument/onTypeFormatting",
         ] {
             assert!(!method_closed_to(&resolved, method, true), "{method}");
         }
@@ -2978,6 +3603,9 @@ mod tests {
             "textDocument/completion",
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+            "textDocument/onTypeFormatting",
         ] {
             assert!(method_maps_prepared_edits(method), "{method}");
             for prepared in [false, true] {
