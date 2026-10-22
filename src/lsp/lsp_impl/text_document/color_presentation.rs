@@ -21,6 +21,9 @@ impl Kakehashi {
     ) -> Result<Vec<ColorPresentation>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
+        // Before either layer reads the text: what a stand-in for an answer
+        // kept aside must still be (see `PassedOver::resolve`).
+        let revision = self.prepared_request_revision(&lsp_uri);
         let virt = async {
             let presentations = self
                 .color_presentation_virt_layer(&lsp_uri, params.range, params.color)
@@ -54,7 +57,11 @@ impl Kakehashi {
         // held, once the host's last edit settles (a picker asks once per
         // interaction, not on every keystroke).
         passed_over
-            .resolve(race, pool, tracker, current_version)
+            .resolve(race, pool, tracker, current_version, || {
+                // Read only once an answer was kept aside, which only a pool
+                // that prepares keeps.
+                revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision
+            })
             .await
     }
 
@@ -299,12 +306,19 @@ impl PassedOver {
     /// race's chosen answer (none, or a layer's error, which the answer
     /// kept aside outranked). A cancel the race returns first stays a
     /// cancel.
+    ///
+    /// Such a stand-in waited for the settle, and answers only while the
+    /// host is still the text the request read (`unchanged`): neither
+    /// edited nor closed and reopened meanwhile, as its edits were read for
+    /// that text. Nothing kept aside, nothing is waited for, and the
+    /// race's answer goes out as it came.
     async fn resolve(
         &self,
         race: impl Future<Output = Result<Option<ColorAnswer>>>,
         pool: &crate::lsp::bridge::LanguageServerPool,
         tracker: &crate::language::NodeTracker,
         current_version: impl Fn() -> Option<u64>,
+        unchanged: impl Fn() -> bool,
     ) -> Result<Vec<ColorPresentation>> {
         let mut race = std::pin::pin!(race);
         let mut settled = std::pin::pin!(self.settled(pool, tracker, &current_version));
@@ -330,6 +344,7 @@ impl PassedOver {
             }
         };
         match chosen? {
+            Some(_) if self.has_kept() && !unchanged() => Ok(Vec::new()),
             Some(answer) => Ok(answer
                 .settled_presentations(pool, tracker, &current_version)
                 .await),
@@ -500,8 +515,9 @@ mod tests {
     /// settling as the race decides outranks the host layer's, and is the
     /// answer when the settle keeps it; dropped then (re-prepared to other
     /// coordinates as it settled), the host layer's presentations answer,
-    /// not none. A current one, or one kept as it settles, answers without
-    /// waiting on the host layer.
+    /// not none, unless the host changed meanwhile: they were read for the
+    /// text it left. A current one, or one kept as it settles, answers
+    /// without waiting on the host layer.
     #[tokio::test(start_paused = true)]
     async fn a_settling_presentation_dropped_at_settle_falls_back_to_the_host_layers() {
         use crate::config::settings::LayerSource::{Host, Virt};
@@ -528,6 +544,7 @@ mod tests {
             "settling, kept",
             "settling, kept, host hung",
             "settling, dropped",
+            "settling, dropped, host reopened",
         ] {
             let prepared = prepare("  red\n");
             let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
@@ -582,18 +599,26 @@ mod tests {
                 |answer: &ColorAnswer| passed_over.answers(answer, &pool, &tracker, || Some(1)),
             );
             let labels = passed_over
-                .resolve(race, &pool, &tracker, || Some(1))
+                .resolve(
+                    race,
+                    &pool,
+                    &tracker,
+                    || Some(1),
+                    || case != "settling, dropped, host reopened",
+                )
                 .await
                 .unwrap()
                 .into_iter()
                 .map(|presentation| presentation.label)
                 .collect::<Vec<_>>();
-            let expected = if case.contains("dropped") {
-                "host"
-            } else {
-                "virt"
+            let expected: &[&str] = match case {
+                // Read for the text the host left while the prepared answer
+                // settled: no stand-in.
+                "settling, dropped, host reopened" => &[],
+                "settling, dropped" => &["host"],
+                _ => &["virt"],
             };
-            assert_eq!(labels, [expected], "{case}");
+            assert_eq!(labels, expected, "{case}");
             match case {
                 "current" => assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}"),
                 // Settled at 500ms, judged as the settle is seen.
