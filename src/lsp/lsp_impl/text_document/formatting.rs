@@ -304,7 +304,7 @@ impl Kakehashi {
         });
         let mut cp_minted: Vec<NumberOrString> = Vec::new();
 
-        let mut seen_edit_ranges = std::collections::HashSet::new();
+        let mut spans = SpanReservations::default();
         for resolved in all_regions.iter() {
             // Non-contiguous combined injections contain masked host-only gaps.
             // A formatter returns a contiguous whole-document replacement, which
@@ -358,28 +358,26 @@ impl Kakehashi {
                 resolved.region.byte_range.start,
                 resolved.region.byte_range.end,
             );
-            if seen_edit_ranges.contains(&span) {
+            if spans.is_reserved(span) {
                 continue;
             }
             // A prepared document's edits are not mapped back through its map:
             // closed as a non-contiguous one is. Asked only of a region that
             // formats: one that would not, being unplanned or its span taken,
             // sends no request, so its peer is not waited for and no failure
-            // of it is counted. One closed or unprepared takes no span.
-            match self
+            // of it is counted. One closed or unprepared takes no span, and
+            // one unprepared counts only if no later alternative formats it.
+            let gate = match self
                 .method_gate(uri, language_name, resolved, "textDocument/formatting")
                 .await
             {
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => {}
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => continue,
-                // Left unformatted because its peer failed: a failed request
-                // (`kakehashi format` exits 2), as `diagnose` counts it.
-                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => {
-                    count_request_errors(&cancel_state.request_error_sink, 1);
-                    continue;
-                }
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Open => Ok(Some(())),
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Closed => Ok(None),
+                crate::lsp::lsp_impl::bridge_context::MethodGate::Unprepared => Err(()),
+            };
+            if spans.admit(span, gate).is_none() {
+                continue;
             }
-            seen_edit_ranges.insert(span);
             let region_ctx = DocumentRequestContext {
                 prepared: None,
                 uri: uri.clone(),
@@ -486,6 +484,11 @@ impl Kakehashi {
                 }
             });
         }
+
+        // A span no alternative could format for want of its prepared text
+        // is left unformatted: a failed request (`kakehashi format` exits 2),
+        // as `diagnose` counts it.
+        count_request_errors(&cancel_state.request_error_sink, spans.unprepared());
 
         // One teardown guard for the whole request, held across the edit
         // collection so the synthetic terminal `End` fires once, after every
@@ -833,6 +836,54 @@ async fn pipeline_step_request_kind(
         select_pipeline_step_request(supports_full, supports_range),
         handle.key().clone(),
     ))
+}
+
+/// Which same-range query alternative formats each host byte span.
+///
+/// Discovery orders same-range alternate languages by query-pattern
+/// priority, but an unconfigured or explicitly disabled language (never
+/// offered here), one whose peer could not prepare it, or one closed to the
+/// method is not a winner: the span is reserved only by the
+/// first alternative that can format it, and later ones are suppressed to
+/// keep emitted edits non-overlapping.
+#[derive(Default)]
+pub(super) struct SpanReservations {
+    reserved: std::collections::HashSet<(usize, usize)>,
+    /// Spans an alternative was offered for whose prepared text is missing.
+    unprepared: std::collections::HashSet<(usize, usize)>,
+}
+
+impl SpanReservations {
+    /// Whether an earlier alternative reserved `span`.
+    pub(super) fn is_reserved(&self, span: (usize, usize)) -> bool {
+        self.reserved.contains(&span)
+    }
+
+    /// The context to format `span` with, offered in discovery order (see
+    /// `prepare_request_context_for`): `None` when an earlier alternative
+    /// reserved the span, or this one could not be prepared (`Err`,
+    /// remembered) or is closed to the method (`Ok(None)`).
+    pub(super) fn admit<T, E>(
+        &mut self,
+        span: (usize, usize),
+        ctx: std::result::Result<Option<T>, E>,
+    ) -> Option<T> {
+        if self.reserved.contains(&span) {
+            return None;
+        }
+        let Ok(ctx) = ctx else {
+            self.unprepared.insert(span);
+            return None;
+        };
+        let ctx = ctx?;
+        self.reserved.insert(span);
+        Some(ctx)
+    }
+
+    /// How many spans no alternative formats for want of prepared text.
+    pub(super) fn unprepared(&self) -> usize {
+        self.unprepared.difference(&self.reserved).count()
+    }
 }
 
 /// `preferred`-strategy formatting for one region: the existing
@@ -2066,6 +2117,23 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_span_goes_to_the_first_alternative_that_can_format_it() {
+        let mut spans = SpanReservations::default();
+        // The first alternative's peer could not prepare it, the next is
+        // closed to the method: the one after that formats the span.
+        assert_eq!(spans.admit::<&str, ()>((0, 4), Err(())), None);
+        assert_eq!(spans.admit::<&str, ()>((0, 4), Ok(None)), None);
+        assert!(!spans.is_reserved((0, 4)));
+        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("lua"))), Some("lua"));
+        assert!(spans.is_reserved((0, 4)));
+        assert_eq!(spans.admit::<_, ()>((0, 4), Ok(Some("vim"))), None);
+        // A span only an unprepared alternative was offered for is left
+        // unformatted.
+        assert_eq!(spans.admit::<&str, ()>((5, 9), Err(())), None);
+        assert_eq!(spans.unprepared(), 1);
     }
 
     #[test]

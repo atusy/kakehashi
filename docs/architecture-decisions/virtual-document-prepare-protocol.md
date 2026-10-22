@@ -210,7 +210,9 @@ candidate advertising the request, or able to start — is a different case:
 there is nothing to prepare the document, and it is sent as is.) Requests on
 such a document get no answer from the virt layer, its pushed diagnostics
 are dropped, and the one-shot CLI (`format`, `diagnose`) counts it as a
-failed request, exiting 2. A peer that prefers a fallback answers `null`
+failed request, exiting 2 — `format` counts a host span left unformatted:
+a same-range alternative language that formats the span makes up for one
+whose peer could not prepare it. A peer that prefers a fallback answers `null`
 (or catches its own errors and does so); kakehashi does not choose one on
 its behalf.
 
