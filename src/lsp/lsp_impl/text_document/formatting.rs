@@ -215,7 +215,9 @@ impl Kakehashi {
                         count_request_errors(&cancel_state.request_error_sink, 1);
                     }
                 }
-                edits
+                // An empty stand-in answers as the race answers when no
+                // layer has edits.
+                edits.filter(|edits| !edits.is_empty())
             }
             AggregationStrategy::Concatenated => {
                 // Sequential cross-layer pipeline (cross-layer-aggregation
@@ -769,6 +771,8 @@ impl Kakehashi {
 /// in): neither edited nor closed and reopened, though a reopen may bring
 /// back the same content version. Refused as moved, nothing stands in:
 /// the host layer's edits were read for the text the host moved from too.
+/// An empty host answer (already formatted) stands in too: the edits are
+/// then `Some(vec![])`, an answer, not a failure.
 pub(super) async fn preferred_formatting_answer<H>(
     answer: Option<(Vec<TextEdit>, Vec<Sourced<()>>)>,
     pool: &crate::lsp::bridge::LanguageServerPool,
@@ -795,7 +799,7 @@ where
             .ok()
             .flatten()
             .map(|(edits, _)| edits)
-            .filter(|edits| !edits.is_empty() && unchanged()),
+            .filter(|_| unchanged()),
         _ => None,
     };
     (stand_in, Some(verdict))
@@ -2420,6 +2424,8 @@ mod tests {
         for case in [
             "current",
             "stale",
+            "stale, host already formatted",
+            "stale, no host answer",
             "stale, no host layer",
             "stale, reopened",
             "moved",
@@ -2458,8 +2464,13 @@ mod tests {
                 "current" => {}
                 _ => revocation.revoke(u64::MAX),
             }
+            let host_edits = match case {
+                "stale, host already formatted" => Some(Vec::new()),
+                "stale, no host answer" => None,
+                _ => Some(vec![edit("host")]),
+            };
             let host_layer = (case != "stale, no host layer")
-                .then_some(async { Ok(Some((vec![edit("host")], Vec::new()))) });
+                .then_some(async move { Ok(host_edits.map(|edits| (edits, Vec::new()))) });
             let (edits, refused) = preferred_formatting_answer(
                 Some((vec![edit("virt")], vec![source])),
                 &pool,
@@ -2472,7 +2483,11 @@ mod tests {
             let (expected, verdict) = match case {
                 "current" => (Some(vec![edit("virt")]), None),
                 "stale" => (Some(vec![edit("host")]), Some(Verdict::Stale)),
-                "stale, no host layer" | "stale, reopened" => (None, Some(Verdict::Stale)),
+                // An answer all the same: nothing to change.
+                "stale, host already formatted" => (Some(Vec::new()), Some(Verdict::Stale)),
+                "stale, no host answer" | "stale, no host layer" | "stale, reopened" => {
+                    (None, Some(Verdict::Stale))
+                }
                 _ => (None, Some(Verdict::Moved)),
             };
             assert_eq!(edits, expected, "{case}");
