@@ -201,7 +201,7 @@ impl LanguageServerPool {
         }
         // Before the host lifecycle guard: the wait can last the whole
         // budget, and a didClose or reopen must not queue behind it.
-        self.wait_for_request_text(&uri_string, connection_key, offset)
+        self.wait_for_request_text(&uri_string, connection_key, offset, &failed)
             .await?;
 
         let host_lifecycle = match expected_incarnation {
@@ -448,6 +448,7 @@ impl LanguageServerPool {
         uri_string: &str,
         connection_key: &super::ConnectionKey,
         offset: &RegionOffset,
+        failed: impl Fn() -> bool,
     ) -> io::Result<()> {
         // Without any prepared text sent, nor a map on the request (always
         // so with experimental features off), every connection holds the
@@ -463,6 +464,12 @@ impl LanguageServerPool {
             let changed = self.document_tracker.held_changed();
             let mut changed = std::pin::pin!(changed);
             changed.as_mut().enable();
+            // Failed since (its peer failed its input): the lifecycle pass
+            // holds the region back and sends nothing, so the text never
+            // comes, and the request is refused when queued anyway.
+            if failed() {
+                return Err(request_text_not_held(connection_key));
+            }
             if !self
                 .document_tracker
                 .is_virtual_doc_open_on_connection(uri_string, connection_key)
@@ -474,6 +481,27 @@ impl LanguageServerPool {
                 return Err(request_text_not_held(connection_key));
             }
         }
+    }
+
+    /// Wake the requests waiting for their text (see
+    /// [`Self::wait_for_request_text`]) to check again: a peer failed an
+    /// input, which no send records.
+    pub(in crate::lsp::bridge) fn wake_request_text_waiters(&self) {
+        self.document_tracker.wake_held_waiters();
+    }
+
+    /// [`Self::wait_for_request_text`], for the registry's tests, whose
+    /// peers fail inputs as production's do.
+    #[cfg(test)]
+    pub(in crate::lsp::bridge) async fn wait_for_request_text_for_test(
+        &self,
+        uri_string: &str,
+        connection_key: &super::ConnectionKey,
+        offset: &RegionOffset,
+        failed: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        self.wait_for_request_text(uri_string, connection_key, offset, failed)
+            .await
     }
 
     /// Like [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle)
@@ -876,7 +904,7 @@ mod tests {
         // Never sent: the request fails once the budget runs out.
         let started = tokio::time::Instant::now();
         assert!(
-            pool.wait_for_request_text(&uri, &key, &offset)
+            pool.wait_for_request_text(&uri, &key, &offset, || false)
                 .await
                 .is_err()
         );
@@ -902,7 +930,7 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            pool.wait_for_request_text(&uri, &key, &offset)
+            pool.wait_for_request_text(&uri, &key, &offset, || false)
                 .await
                 .is_ok()
         );
@@ -914,7 +942,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let other = ConnectionKey::for_server("other");
         assert!(
-            pool.wait_for_request_text(&uri, &other, &offset)
+            pool.wait_for_request_text(&uri, &other, &offset, || false)
                 .await
                 .is_ok()
         );
@@ -963,7 +991,7 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            pool.wait_for_request_text(&uri, &key, &offset)
+            pool.wait_for_request_text(&uri, &key, &offset, || false)
                 .await
                 .is_ok()
         );
@@ -987,7 +1015,7 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            pool.wait_for_request_text(&uri, &key, &other_offset)
+            pool.wait_for_request_text(&uri, &key, &other_offset, || false)
                 .await
                 .is_ok()
         );
@@ -1061,7 +1089,7 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            pool.wait_for_request_text(&uri, &key, &offset)
+            pool.wait_for_request_text(&uri, &key, &offset, || false)
                 .await
                 .is_ok()
         );
