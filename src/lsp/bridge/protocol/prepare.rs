@@ -1401,17 +1401,23 @@ fn is_line_start(text: &str, offset: usize) -> bool {
 /// Whether the rest of `text`'s line from `offset` holds nothing but spaces
 /// and tabs (or nothing).
 fn rest_of_line_blank(text: &str, offset: usize) -> bool {
-    text[offset..]
+    let rest = text[offset..]
         .split(['\n', '\r'])
         .next()
-        .unwrap_or_default()
-        .chars()
-        .all(|c| matches!(c, ' ' | '\t'))
+        .unwrap_or_default();
+    #[cfg(test)]
+    tests::BLANK_SCANNED.with(|scanned| scanned.set(scanned.get() + rest.len()));
+    rest.chars().all(|c| matches!(c, ' ' | '\t'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Bytes `rest_of_line_blank` examined on this thread.
+        pub(super) static BLANK_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     /// An answer whose prepared text would join a lone CR and a following
     /// LF into one CRLF — one line fewer than the virtual document keeps,
