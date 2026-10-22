@@ -491,6 +491,56 @@ fn an_unprepared_document_answers_promptly_beside_a_prepared_one() {
 }
 
 #[test]
+fn range_formatting_does_not_wait_for_regions_outside_its_range() {
+    let (mut client, _dir) = Setup {
+        unprepared_python: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/range-elsewhere.md";
+    let fences = |lua: &str| {
+        format!(
+            "# t\n\n```lua\n{lua}1\n```\n\n```lua\n{lua}2\n```\n\n```lua\n{lua}3\n```\n\n```python\nx = 1\n```\n"
+        )
+    };
+    open(&mut client, uri, &fences("  x"));
+    // Both documents are up.
+    hover_with_retry(&mut client, uri, 3, 2);
+    assert_eq!(
+        hover_text(&hover_with_retry(&mut client, uri, 15, 0)),
+        "x = 1\n"
+    );
+
+    // Each lua fence's new text takes its peer 2 s to answer, one after
+    // another. The python fence alone is selected: its formatting waits for
+    // none of them.
+    change(&mut client, uri, 2, &fences("SLOW"));
+    let started = Instant::now();
+    let response = client.send_request(
+        "textDocument/rangeFormatting",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 15, "character": 0 },
+                "end": { "line": 15, "character": 5 }
+            },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    let elapsed = started.elapsed();
+    assert!(response.get("error").is_none(), "{response}");
+    let edits = response["result"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !edits.is_empty(),
+        "the python fence is formatted: {response}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "range formatting waited {elapsed:?} for regions it does not format"
+    );
+}
+
+#[test]
 fn without_experimental_features_nothing_is_prepared() {
     // The peer advertises the request and is configured to prepare lua, but
     // with experimental features off it is never asked: the document goes
