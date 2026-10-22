@@ -986,10 +986,12 @@ impl PrepareRegistry {
     /// Forget a closed host's documents: until it opens again, nothing is
     /// looked up for it.
     pub(crate) fn forget_host(&self, host_uri: &Url) {
-        self.host_answers.remove(host_uri.as_str());
         // Every close, whether anything was looked up yet or not: a request
-        // resolved before the close may still be about to look up.
+        // resolved before the close may still be about to look up. Marked
+        // before the count is forgotten: an answer landing meanwhile either
+        // is forgotten with it or counts nothing (see `count_host_answer`).
         self.closed_hosts.close(host_uri.as_str());
+        self.host_answers.remove(host_uri.as_str());
         // Withheld marks too: they were set under the incarnation that
         // closed, which no open reads them under.
         let mut removed = false;
@@ -1035,10 +1037,11 @@ impl PrepareRegistry {
         assert!(slot.cell.outcome.set(answer).is_ok(), "answered already");
         self.held_changes.fetch_add(1, Ordering::AcqRel);
         if held {
-            *self
-                .host_answers
-                .entry(input.host_uri.to_string())
-                .or_default() += 1;
+            count_host_answer(
+                &self.host_answers,
+                &self.closed_hosts,
+                input.host_uri.as_str(),
+            );
         }
     }
 
@@ -1246,7 +1249,7 @@ impl PrepareRegistry {
                     // outdated meanwhile re-syncs nothing: the epoch's move
                     // does.
                     if held() && pool.prepare_epoch() == cell.epoch {
-                        *host_answers.entry(job.host_uri.to_string()).or_default() += 1;
+                        count_host_answer(&host_answers, &closed_hosts, job.host_uri.as_str());
                         // The receiver is gone only at shutdown.
                         let edited = cell.after_edit.load(Ordering::Acquire);
                         let _ = resync_tx.send(Resync {
@@ -1293,6 +1296,26 @@ impl PrepareRegistry {
             drop(end);
         });
         true
+    }
+}
+
+/// Count an answer that re-synced `host_uri` (see `host_answers`), unless
+/// the host closed: its count was forgotten, and none created after that
+/// would be. Read under the count's entry, and a close marks the host closed
+/// before it forgets the count: a close either forgets this one or is seen
+/// here.
+fn count_host_answer(
+    host_answers: &DashMap<String, u64>,
+    closed_hosts: &ClosedHosts,
+    host_uri: &str,
+) {
+    match host_answers.entry(host_uri.to_string()) {
+        dashmap::Entry::Occupied(mut answers) => *answers.get_mut() += 1,
+        dashmap::Entry::Vacant(answers) => {
+            if !closed_hosts.contains(host_uri) {
+                answers.insert(1);
+            }
+        }
     }
 }
 
@@ -1866,6 +1889,36 @@ mod tests {
                 cause: ResyncCause::Ready { edited: false },
             })
         );
+    }
+
+    /// An answer landing after its host closed counts nothing for it: the
+    /// close forgot the host's count, and only another close would forget
+    /// one counted after it.
+    #[test]
+    fn an_answer_after_its_host_closed_counts_nothing() {
+        let registry = PrepareRegistry::default();
+        let host = Url::parse("file:///host.md").unwrap();
+        count_host_answer(
+            &registry.host_answers,
+            &registry.closed_hosts,
+            host.as_str(),
+        );
+        assert_eq!(registry.host_answers(&host), 1);
+        registry.forget_host(&host);
+        count_host_answer(
+            &registry.host_answers,
+            &registry.closed_hosts,
+            host.as_str(),
+        );
+        assert!(!registry.host_answers.contains_key(host.as_str()));
+        // Open again, its answers count afresh.
+        registry.host_opened(&host);
+        count_host_answer(
+            &registry.host_answers,
+            &registry.closed_hosts,
+            host.as_str(),
+        );
+        assert_eq!(registry.host_answers(&host), 1);
     }
 
     #[tokio::test]
