@@ -424,8 +424,8 @@ Dropped (moved, stale or unsettled), the whole answer is dropped (the host's own
 those of regions still current too) and the request is counted failed, so
 `kakehashi format` exits 2 and writes nothing (range and on-type
 formatting, which no one-shot run makes, answer nothing). Under the
-`preferred` strategy, a formatting answer dropped as stale or unsettled
-gives way to the host layer's answer when that layer is in the race
+`preferred` strategy, an answer of any of the three formatting methods
+dropped as stale or unsettled gives way to the host layer's answer when that layer is in the race
 (waited for if still running) and the host is still the text the request
 read (not edited, nor closed and reopened): read for that text, it lost
 only to the answer dropped, so it answers (an empty answer, already
@@ -436,9 +436,26 @@ layer's answer stands in for it, dropped as it settles, only while the
 host is still the text the request read. A reply its map
 refuses counts as that server failing, as any failed reply does:
 `kakehashi format` exits 2 when no other server formats the region.
-On-type formatting is the exception: an answer refused, or dropped at the
-final check, is no answer, logged at debug, so that trigger keystrokes do
-not warn the user each time.
+On-type formatting is the exception in what it logs: an answer refused, or
+dropped at the final check with nothing standing in, is no answer, logged
+at debug, so that trigger keystrokes do not warn the user each time.
+
+Formatting outcomes follow one rule, the one `kakehashi format` counts by.
+An answer, an empty one (already formatted) included, is a success. A
+failure is something owed an answer and left without one: a request whose
+servers all failed (under `preferred`, only when none answered), a span
+left unformatted for want of its prepared text (see Failure), a chosen
+answer dropped at the final check, an edit its map refuses. Only an answer
+for the same thing, read for the same text, makes up for one: another
+same-span alternative's for a span, the host layer's for a dropped
+`preferred` answer (above). A server not asked (not configured, or not
+advertising the method) is neither. A failure inside a layer the race
+waits for counts whichever answer it then chooses, as a failed region
+request does without the prepare layer; a layer dropped once a higher one
+wins counts nothing it had not counted yet. A span whose peer failed and
+whose taker failed too counts both: two operations failed. Range and
+on-type formatting choose their answer by the same rule and count
+nothing.
 
 Unlike on an unprepared document, an answer overtaken by typing is
 dropped, not kept stale. How an edit maps back depends on the whole text

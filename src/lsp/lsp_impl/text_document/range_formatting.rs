@@ -32,7 +32,7 @@ use crate::lsp::aggregation::server::{
     dispatch_preferred, dispatch_preferred_with_tokens, mint_region_progress_source,
 };
 use crate::lsp::bridge::{ClientProgressAggregator, ClientProgressDeregisterGuard};
-use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, Sourced, parse_host_verbatim};
+use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, Sourced};
 use crate::text::PositionMapper;
 
 use super::super::{Kakehashi, uri_to_url};
@@ -68,6 +68,9 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
+        // Before the text is read (by either layer): see
+        // `Sourced::from_region`.
+        let revision = self.prepared_request_revision(&lsp_uri);
         let virt = async {
             let lsp_uri = params.text_document.uri;
             let options = params.options;
@@ -80,8 +83,6 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
-            // Before the text is read: see `Sourced::from_region`.
-            let revision = self.prepared_request_revision(&lsp_uri);
             let snapshot = match self.documents.get(&uri) {
                 None => {
                     log::debug!("rangeFormatting: No document found for {}", uri);
@@ -464,29 +465,34 @@ impl Kakehashi {
         // formatting is the partial-document counterpart of full formatting
         // and shares its layer order and aggregation key. request_method is
         // what goes on the wire to host-capable servers.
-        let answer = self
-            .walk_layers(
+        //
+        // The final answer is chosen as whole formatting's is: a prepared one
+        // dropped as stale or unsettled gives way to the host layer's while
+        // the host is unedited. Nothing is counted: no one-shot run
+        // range-formats.
+        let (edits, refused) = self
+            .walk_formatting_layers(
                 &lsp_uri,
                 "textDocument/formatting",
                 "textDocument/rangeFormatting",
                 raw_params,
                 virt,
-                |value| {
-                    parse_host_verbatim::<Vec<TextEdit>>(value).map(|edits| (edits, Vec::new()))
-                },
-                |(edits, _): &(Vec<TextEdit>, Vec<Sourced<()>>)| !edits.is_empty(),
+                revision,
             )
             .await?;
-        // The final answer chosen: its prepared regions' edits checked once
-        // more against the host text, which may have moved while it was held.
-        // A stale one is not counted: no one-shot run range-formats.
-        Ok(match answer {
-            Some((edits, sources)) => self
-                .formatting_sources_current(&lsp_uri, &sources, &None)
-                .await
-                .then_some(edits),
-            None => None,
-        })
+        if let Some(verdict) = refused {
+            log::warn!(
+                target: "kakehashi::formatting",
+                "range formatting result for {} dropped: {verdict}{}",
+                lsp_uri.as_str(),
+                if edits.is_some() {
+                    "; the host layer's answer stands in"
+                } else {
+                    ""
+                }
+            );
+        }
+        Ok(edits.filter(|edits| !edits.is_empty()))
     }
 }
 
