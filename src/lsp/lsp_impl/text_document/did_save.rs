@@ -180,18 +180,10 @@ impl Kakehashi {
                 let injections =
                     crate::lsp::lsp_impl::coordinator::sendable_injections(prepares, injections);
                 // This save reaches the regions sent now: an earlier one of
-                // this version they missed while held is not owed them too.
-                if prepares {
-                    self.bridge.settle_held_save(
-                        uri,
-                        saved_incarnation,
-                        saved_content_version,
-                        injections
-                            .iter()
-                            .map(|injection| injection.region_id.as_str()),
-                    );
-                }
-                pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
+                // this version they missed while held is not owed them too,
+                // unless this one is refused them (see `forward_did_save`).
+                self.bridge
+                    .forward_did_save(uri, saved_incarnation, saved_content_version, &injections)
                     .await;
             }
         }

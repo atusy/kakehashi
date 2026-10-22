@@ -627,7 +627,7 @@ impl super::BridgeCoordinator {
     /// A save of `host_uri` at `(incarnation, content_version)` was
     /// forwarded to these regions: they no longer miss an earlier save of
     /// that same version, so the resync does not forward it to them again.
-    pub(crate) fn settle_held_save<'a>(
+    fn settle_held_save<'a>(
         &self,
         host_uri: &Url,
         incarnation: u64,
@@ -651,6 +651,34 @@ impl super::BridgeCoordinator {
                 .held_saves
                 .remove_if(host_uri, |_, held| held.region_ids.is_empty());
         }
+    }
+
+    /// Forward a save of `host_uri` at `(incarnation, content_version)` to
+    /// `injections` (the regions sent now), settling what an earlier save of
+    /// that version left them owed — but for regions whose save some
+    /// connection was refused (their answer revoked or superseded there
+    /// since it was looked up): they still miss a save of this version, and
+    /// stay owed for the resync to forward.
+    pub(crate) async fn forward_did_save(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        injections: &[super::coordinator::BridgeInjection],
+    ) {
+        let refused = self
+            .pool
+            .sync_and_forward_did_save_to_virtual_docs(host_uri, incarnation, injections)
+            .await;
+        self.settle_held_save(
+            host_uri,
+            incarnation,
+            content_version,
+            injections
+                .iter()
+                .map(|injection| injection.region_id.as_str())
+                .filter(|region_id| !refused.iter().any(|refused| refused == region_id)),
+        );
     }
 
     /// Take the save `host_uri`'s held regions missed, if any.
@@ -1198,6 +1226,93 @@ mod tests {
         );
         off.hold_save(&host, 1, 2, ids(&["a"]));
         assert_eq!(off.take_held_save(&host), None);
+    }
+
+    /// A save forwarded with an answer superseded on a connection since it
+    /// was looked up (a request opened the region with a newer answer for
+    /// the same input) is refused there: the region still misses a save of
+    /// that version and stays owed. Forwarded with the answer the connection
+    /// holds, it is sent and settles the debt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_refused_for_a_superseded_answer_stays_owed() {
+        use super::super::coordinator::BridgeInjection;
+        use super::super::pool::{ConnectionKey, SentText, test_helpers};
+        use super::super::protocol::{
+            Revocation, VirtualDocumentUri, VirtualLayout, apply_prepare_result_at,
+        };
+        for superseded in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let coordinator = BridgeCoordinator::with_cancel_forwarder(
+                Arc::clone(&pool),
+                CancelForwarder::new(Arc::clone(&pool)),
+            );
+            let key = ConnectionKey::for_server("save");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host = Url::parse("file:///test/save-owed.md").unwrap();
+            let region_id = ulid::Ulid::generate().to_string();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+                "lua",
+                &region_id,
+            );
+            pool.register_opened_document(&host, &virtual_uri, &key)
+                .await;
+            // One input's answers: the save's, then the newer one the
+            // connection was opened with.
+            let revocation = Arc::new(Revocation::default());
+            let answer = |text: &str, taken| {
+                let mut map =
+                    apply_prepare_result_at(text, &VirtualLayout::single(text), None, taken)
+                        .unwrap()
+                        .map;
+                Arc::get_mut(&mut map)
+                    .unwrap()
+                    .set_revocation(Arc::clone(&revocation));
+                map
+            };
+            let saved = answer("print(1)", 10);
+            let newer = answer("print(2)", 30);
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: "print(2)",
+                    map: Some(&newer),
+                },
+            );
+            // An earlier save of this version missed the region.
+            coordinator.hold_save(&host, 1, 2, [region_id.clone()]);
+            let (content, map) = if superseded {
+                ("print(1)", saved)
+            } else {
+                ("print(2)", newer)
+            };
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: region_id.clone(),
+                content: content.to_string(),
+                held: false,
+                prepared: Some(map),
+            };
+            coordinator
+                .forward_did_save(&host, 1, 2, &[injection])
+                .await;
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert_eq!(sent.contains("textDocument/didSave"), !superseded, "{sent}");
+            let owed = coordinator.take_held_save(&host);
+            if superseded {
+                assert_eq!(
+                    owed.map(|held| held.region_ids.into_iter().collect::<Vec<_>>()),
+                    Some(vec![region_id])
+                );
+            } else {
+                assert_eq!(owed, None);
+            }
+        }
     }
 
     /// With a peer configured but nothing prepared — every answer given as
