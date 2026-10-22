@@ -1578,6 +1578,7 @@ fn build_combined_virtual_content(
     let mut offsets = Vec::new();
     let mut line_start = span.start;
     let mut range_index = 0;
+    let mut ended_at_line_break = false;
     // Lines are LSP lines, as the virtual document is read: LF, CRLF, and a
     // lone CR each end one (the markdown grammar ends a blockquote line at a
     // lone CR too).
@@ -1621,6 +1622,7 @@ fn build_combined_virtual_content(
             (start < end || includes_line_break).then_some(start)
         });
 
+        let line_output_start = output.len();
         if let Some(first_included) = first_included {
             offsets.push(
                 clamped_slice(text, host_line_start..first_included)
@@ -1637,18 +1639,24 @@ fn build_combined_virtual_content(
             output.push_str(clamped_slice(text, content_end..line_end));
         }
 
-        if cr_cut_from_lf && output.ends_with('\r') {
+        if cr_cut_from_lf && output.len() > line_output_start && output.ends_with('\r') {
             // A CR the virtual document keeps would end a line there; keep
-            // its one column as whitespace instead.
+            // its one column as whitespace instead. Only this line's own CR:
+            // when this line emitted nothing, the CR it cut was dropped, and
+            // a CR already in the output ends an earlier line.
             output.pop();
             output.push(' ');
         }
 
+        ended_at_line_break = content_end < line_end;
         line_start = line_end;
         host_line_start = line_end;
     }
 
-    if output.ends_with(['\n', '\r']) {
+    // A final line end opens one more, empty, virtual line. A final line
+    // without one already has its offset, even when it emitted nothing and
+    // the output ends with an earlier line's end.
+    if ended_at_line_break {
         offsets.push(0);
     }
     (output, offsets)
@@ -2858,10 +2866,9 @@ mod tests {
             resolved[0].virtual_content,
             "if True:\n  print(1)\n\n\n\n  print(2)\n"
         );
-        assert_eq!(
-            resolved[0].line_column_offsets,
-            vec![2, 2, 0, 0, 0, 2, 0, 0]
-        );
+        // One offset per virtual line: the span ends on the closing fence's
+        // `> `, a host-only line that is the empty line after `print(2)`.
+        assert_eq!(resolved[0].line_column_offsets, vec![2, 2, 0, 0, 0, 2, 0]);
         assert!(!resolved[0].contiguous);
     }
 
@@ -2941,6 +2948,27 @@ mod tests {
 
         assert_eq!(content, "a ");
         assert_eq!(offsets, vec![2]);
+    }
+
+    #[rstest]
+    // The cut CR is excluded, so it never reaches the virtual document: the
+    // earlier lone CR, kept verbatim, must still end its line.
+    #[case::excluded_cut_cr_after_a_lone_cr("a\r\r\n", 0..3, "a\r")]
+    #[case::excluded_cut_cr_after_an_lf("a\n\r\n", 0..3, "a\n")]
+    // The span ends mid-line on a host-only line.
+    #[case::span_ending_on_a_host_only_line("a\nbc", 0..4, "a\n")]
+    fn combined_content_gives_a_final_line_without_content_one_offset(
+        #[case] text: &str,
+        #[case] span: Range<usize>,
+        #[case] expected: &str,
+    ) {
+        // The last host line carries no virtual content, so it is the empty
+        // virtual line after the previous line end, and gets that one offset.
+        let (content, offsets) =
+            build_combined_virtual_content(text, span, std::slice::from_ref(&(0..2)));
+
+        assert_eq!(content, expected);
+        assert_eq!(offsets, vec![0, 0]);
     }
 
     #[test]
