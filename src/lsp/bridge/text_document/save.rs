@@ -67,14 +67,19 @@ impl LanguageServerPool {
     /// attaching the projected text when the server requests it. A failed
     /// didChange enqueue suppresses didSave for that target, so a queue becoming
     /// writable between the two cannot expose a stale save hook.
+    ///
+    /// Returns the regions whose save some connection was refused because
+    /// their answer was revoked or superseded there since it was looked up:
+    /// they still miss this save (empty without the prepare layer).
     pub(crate) async fn sync_and_forward_did_save_to_virtual_docs(
         &self,
         host_uri: &Url,
         incarnation: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
-    ) {
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return;
+            return refused;
         };
 
         for injection in injections {
@@ -161,8 +166,12 @@ impl LanguageServerPool {
                 });
                 drop(transition_guard);
                 drop(connections);
+                if revoked && refused.last() != Some(&injection.region_id) {
+                    refused.push(injection.region_id.clone());
+                }
             }
         }
+        refused
     }
 
     /// Shared fan-out: snapshot the host's open virtual docs and send `method`
@@ -314,7 +323,8 @@ mod tests {
             if revoked {
                 revocation.revoke(u64::MAX);
             }
-            pool.sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
+            let _ = pool
+                .sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
                 .await;
             let sent = test_helpers::sent_before_marker(&handle, &wire).await;
             assert!(!sent.contains("textDocument/didChange"), "{sent}");
@@ -376,13 +386,17 @@ mod tests {
             );
             let injection = BridgeInjection {
                 language: "lua".to_string(),
-                region_id,
+                region_id: region_id.clone(),
                 content: saved.0.to_string(),
                 held: false,
                 prepared: Some(Arc::clone(&saved.1)),
             };
-            pool.sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
+            let refused = pool
+                .sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
                 .await;
+            // The refused region still misses the save.
+            let expected: &[String] = if save_is_older { &[region_id] } else { &[] };
+            assert_eq!(refused, expected);
             let sent = test_helpers::sent_before_marker(&handle, &wire).await;
             assert_eq!(
                 sent.contains("textDocument/didChange"),
