@@ -1424,16 +1424,7 @@ fn main() {
                 // With `MOCK_CODE_ACTION_AFTER_RELEASE` set, answered only
                 // once the file `MOCK_RELEASE_FILE` names exists (or a
                 // minute later).
-                if std::env::var_os("MOCK_CODE_ACTION_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_CODE_ACTION_AFTER_RELEASE");
                 // `echo-fix` replaces the first line; `echo-wrap` is lazy, its
                 // resolve wrapping the document in `do`/`end`, the header and
                 // the first line's indent as touching edits.
@@ -2369,16 +2360,7 @@ fn main() {
                 // With `MOCK_COLOR_AFTER_RELEASE` set, answered only once
                 // the file `MOCK_RELEASE_FILE` names exists (or a minute
                 // later): a barrier a test lifts after editing the host.
-                if std::env::var_os("MOCK_COLOR_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_COLOR_AFTER_RELEASE");
                 let range = message.pointer("/params/range").cloned();
                 let result = if mode == "document-color-empty-presentation" {
                     json!([])
@@ -3000,16 +2982,7 @@ fn main() {
                 // in this server's own text and coordinates; with
                 // `MOCK_LINKED_AFTER_RELEASE` set, once the file
                 // `MOCK_RELEASE_FILE` names exists (or a minute later).
-                if std::env::var_os("MOCK_LINKED_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_LINKED_AFTER_RELEASE");
                 let uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -3063,16 +3036,7 @@ fn main() {
                 // The word at the position, in this server's own text and
                 // coordinates; with `MOCK_RENAME_AFTER_RELEASE` set, once the
                 // file `MOCK_RELEASE_FILE` names exists (or a minute later).
-                if std::env::var_os("MOCK_RENAME_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_RENAME_AFTER_RELEASE");
                 let uri = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
@@ -3111,16 +3075,7 @@ fn main() {
                 // With `MOCK_RENAME_AFTER_RELEASE` set, answered only once
                 // the file `MOCK_RELEASE_FILE` names exists (or a minute
                 // later): a barrier a test lifts after editing the host.
-                if std::env::var_os("MOCK_RENAME_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_RENAME_AFTER_RELEASE");
                 // Renames the document's first line.
                 let uri = message
                     .pointer("/params/textDocument/uri")
@@ -3187,6 +3142,19 @@ fn main() {
 /// Apply the mode's transformation and wrap it in a single whole-document
 /// `TextEdit[]`. The end position stays within the document's real line
 /// count (the bridge drops edits past the virtual EOF).
+/// With `flag` set, block until the file `MOCK_RELEASE_FILE` names exists,
+/// or a minute has passed: a barrier a test lifts after editing the host.
+fn wait_for_release(flag: &str) {
+    if std::env::var_os(flag).is_some()
+        && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+    {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !std::path::Path::new(&release).exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 fn whole_document_edit(text: &str, mode: &str, options: Option<&Value>) -> Value {
     let new_text = match mode {
         "append" => {
