@@ -451,16 +451,17 @@ impl LatestText {
     }
 
     /// Whether recording `content` changes nothing but when it was recorded:
-    /// the same text from the same answer, or from one taken before (an
-    /// answer never moves backwards: see `PreparedMap::taken_before`). One
-    /// from a newer answer replaces it, however alike in coordinates (the
-    /// same text prepared again under a new epoch): the cache must hand out
-    /// the answer that stands, not one revoked since.
+    /// the same text from the same answer, or any text from an answer taken
+    /// before for the same input (an answer never moves backwards: see
+    /// `PreparedMap::taken_before`). One from a newer answer replaces it,
+    /// however alike in coordinates (the same text prepared again under a
+    /// new epoch): the cache must hand out the answer that stands, not one
+    /// revoked since.
     fn is(&self, content: SentText<'_>) -> bool {
         let held = self.as_sent();
-        held.text == content.text
-            && (super::protocol::PreparedMap::same_answer(held.map, content.map)
-                || super::protocol::PreparedMap::taken_before(content.map, held.map))
+        super::protocol::PreparedMap::taken_before(content.map, held.map)
+            || (held.text == content.text
+                && super::protocol::PreparedMap::same_answer(held.map, content.map))
     }
 }
 
@@ -10288,6 +10289,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// Nor to an older answer for the same input with another text (a
+    /// save looked up before the epoch moved, recording after a request
+    /// opened with the newer one): a request on the newer answer opens
+    /// with its text, not the older one.
+    #[tokio::test]
+    async fn the_cache_keeps_a_newer_answer_over_an_older_one_of_another_text() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older-text.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |text, map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text,
+                    map: Some(map),
+                },
+            )
+        };
+        record("x = 2", &newer);
+        record("x = 1", &older);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 2",
+                map: Some(&newer),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 2");
     }
 
     /// A resolve's note of the text its connection held: unchanged until
