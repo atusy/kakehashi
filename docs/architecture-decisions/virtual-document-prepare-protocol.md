@@ -429,7 +429,10 @@ gives way to the host layer's answer when that layer is in the race
 read (not edited, nor closed and reopened): read for that text, it lost
 only to the answer dropped, so it answers and the request is not counted
 failed. Dropped as moved, nothing stands in: the host layer's edits were
-read for the text the host moved from too. A reply its map
+read for the text the host moved from too. Color presentations hold the
+same rule for an answer the race passed over while it settled: the host
+layer's answer stands in for it, dropped as it settles, only while the
+host is still the text the request read. A reply its map
 refuses counts as that server failing, as any failed reply does:
 `kakehashi format` exits 2 when no other server formats the region.
 On-type formatting is the exception: an answer refused, or dropped at the
