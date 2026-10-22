@@ -182,21 +182,7 @@ impl Kakehashi {
                 // Non-contiguous combined injections contain masked host-only
                 // gaps. Even a covering range may fall back to full formatting,
                 // whose single replacement would overwrite those real gaps.
-                // A prepared document's edits are not mapped back through its
-                // map: closed as a non-contiguous one is. One left unformatted
-                // because its peer failed (`Unprepared`) is skipped alike, not
-                // counted as `formatting` counts it: no one-shot run range-
-                // formats, so no failure count reads it.
-                if self
-                    .method_gate(
-                        &uri,
-                        &language_name,
-                        resolved,
-                        "textDocument/rangeFormatting",
-                    )
-                    .await
-                    != crate::lsp::lsp_impl::bridge_context::MethodGate::Open
-                {
+                if !resolved.contiguous {
                     continue;
                 }
                 // A covering request (its byte span encloses the whole region)
@@ -278,12 +264,34 @@ impl Kakehashi {
                 // alternatives. Unconfigured/disabled layers deliberately do
                 // not reserve the span, allowing the first configured layer to
                 // format it while preventing overlapping edits from later ones.
-                if !seen_edit_ranges.insert((
+                let span = (
                     resolved.region.byte_range.start,
                     resolved.region.byte_range.end,
-                )) {
+                );
+                if seen_edit_ranges.contains(&span) {
                     continue;
                 }
+                // A prepared document's edits are not mapped back through its
+                // map: closed as a non-contiguous one is. Asked only of a
+                // region that formats: one outside the range, unplanned, or
+                // its span taken sends no request, so its peer is not waited
+                // for. One closed or left unformatted because its peer failed
+                // (`Unprepared`) takes no span, and is not counted as
+                // `formatting` counts it: no one-shot run range-formats, so
+                // no failure count reads it.
+                if self
+                    .method_gate(
+                        &uri,
+                        &language_name,
+                        resolved,
+                        "textDocument/rangeFormatting",
+                    )
+                    .await
+                    != crate::lsp::lsp_impl::bridge_context::MethodGate::Open
+                {
+                    continue;
+                }
+                seen_edit_ranges.insert(span);
                 let region_ctx = DocumentRequestContext {
                     prepared: None,
                     uri: uri.clone(),
