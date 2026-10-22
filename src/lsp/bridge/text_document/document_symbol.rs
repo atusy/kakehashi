@@ -17,11 +17,11 @@ use tower_lsp_server::ls_types::{DocumentSymbol, NumberOrString, SymbolInformati
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
 };
+use super::super::protocol::{translate_contained_ranges_to_host, translate_virtual_range_to_host};
 
 impl LanguageServerPool {
     /// Send a document symbol request and wait for the response.
@@ -224,8 +224,7 @@ fn transform_document_symbol_nested_response(
 ///
 /// Uses saturating_add to prevent overflow for large line numbers.
 fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &RegionOffset) {
-    translate_virtual_range_to_host(&mut symbol.range, offset);
-    translate_virtual_range_to_host(&mut symbol.selection_range, offset);
+    translate_contained_ranges_to_host(&mut symbol.range, &mut symbol.selection_range, offset);
 
     if let Some(children) = &mut symbol.children {
         for child in children {
@@ -236,8 +235,75 @@ fn transform_document_symbol_ranges(symbol: &mut DocumentSymbol, offset: &Region
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::protocol::clamp_range_into;
     use super::super::test_helpers::*;
     use super::*;
+
+    /// Through a prepared document whose lines are dedented, a range ending
+    /// at a line's start maps before the line's indentation while an empty
+    /// selection there maps after it: the selection is clamped back into its
+    /// symbol's range, as LSP requires.
+    #[test]
+    fn a_prepared_symbols_selection_stays_inside_its_range() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::Position;
+        let virtual_text = "  a\n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let result = json!([{
+            "name": "a",
+            "kind": 12,
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "selectionRange": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } }
+        }]);
+        let symbols = transform_document_symbol_nested_response(
+            result,
+            &RegionOffset::new(0, 0).with_prepared(map),
+        )
+        .unwrap();
+        let symbol = &symbols[0];
+        assert!(
+            symbol.selection_range.start >= symbol.range.start,
+            "{symbol:?}"
+        );
+        assert!(symbol.selection_range.end <= symbol.range.end, "{symbol:?}");
+        assert_eq!(symbol.range.end, Position::new(1, 0));
+    }
+
+    #[test]
+    fn a_selection_is_clamped_into_its_range() {
+        use tower_lsp_server::ls_types::{Position, Range};
+        let range = |a: (u32, u32), b: (u32, u32)| {
+            Range::new(Position::new(a.0, a.1), Position::new(b.0, b.1))
+        };
+        let outer = range((3, 2), (5, 0));
+        let mut before = range((3, 0), (3, 4));
+        clamp_range_into(&mut before, outer);
+        assert_eq!(before, range((3, 2), (3, 4)));
+        let mut after = range((4, 0), (6, 1));
+        clamp_range_into(&mut after, outer);
+        assert_eq!(after, range((4, 0), (5, 0)));
+        let mut outside = range((6, 0), (6, 1));
+        clamp_range_into(&mut outside, outer);
+        assert_eq!(outside, range((5, 0), (5, 0)));
+        let mut inside = range((4, 1), (4, 2));
+        clamp_range_into(&mut inside, outer);
+        assert_eq!(inside, range((4, 1), (4, 2)));
+        // A malformed, inverted range: no panic, nothing clamped.
+        let mut any = range((1, 0), (9, 0));
+        clamp_range_into(&mut any, range((5, 0), (3, 2)));
+        assert_eq!(any, range((1, 0), (9, 0)));
+    }
     use rstest::rstest;
     use serde_json::json;
 

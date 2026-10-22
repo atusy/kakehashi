@@ -17,6 +17,28 @@
 //!   uppercases the text. Exercises the pipeline's capability-based
 //!   whole-region rangeFormatting fallback (concatenated-formatting-pipeline
 //!   Decision point 3.2).
+//! - `echo-document` — advertises `hoverProvider`,
+//!   `documentFormattingProvider`, `documentRangeFormattingProvider`,
+//!   `renameProvider`, `diagnosticProvider`, and full sync with save; hover
+//!   answers the full text this server holds for the document, ranged over
+//!   the hovered line in its own coordinates; formatting and range
+//!   formatting uppercase; rename replaces the first line; a pull diagnostic
+//!   spans the first line and carries the full text. Proves what a prepared virtual
+//!   document looks like downstream and how its coordinates map back. On a
+//!   save of a text holding `SHOW` it asks the editor to show the document
+//!   with its first line selected; holding `EDIT`, it asks to apply an edit
+//!   there and logs `echo-document applied: <bool>` with the answer.
+//! - `echo-document-push` — advertises only `hoverProvider` and full sync
+//!   with save: hover and the save hooks as `echo-document`, and instead of
+//!   pull diagnostics it pushes the first-line diagnostic on every
+//!   didOpen/didChange.
+//! - `prepare-peer` — advertises
+//!   `experimental.kakehashi.virtualDocumentPrepare` and answers
+//!   `kakehashi/virtualDocument/prepare`: content dedented by its common
+//!   indentation, blank lines at the document's edges deleted, every gap
+//!   replaced by `MOCK_PREPARE_PLACEHOLDER` (default `--`). A document whose
+//!   content holds `FAIL` gets an error; one holding `SLOW` is answered
+//!   after two seconds.
 //! - `definition` — advertises `definitionProvider` + `hoverProvider`;
 //!   answers definition with a fixed Location that **echoes the requested
 //!   URI** (and hover with the URI in the contents), but only for documents
@@ -322,6 +344,25 @@ fn main() {
                         "definitionProvider": true,
                         "hoverProvider": true,
                         "textDocumentSync": 1
+                    }),
+                    "prepare-peer" => json!({
+                        "textDocumentSync": { "openClose": true, "change": 1 },
+                        "experimental": { "kakehashi": { "virtualDocumentPrepare": true } },
+                    }),
+                    "echo-document-push" => json!({
+                        "hoverProvider": true,
+                        "textDocumentSync": { "openClose": true, "change": 1, "save": true },
+                    }),
+                    "echo-document" => json!({
+                        "hoverProvider": true,
+                        "documentFormattingProvider": true,
+                        "documentRangeFormattingProvider": true,
+                        "renameProvider": true,
+                        "textDocumentSync": { "openClose": true, "change": 1, "save": true },
+                        "diagnosticProvider": {
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        },
                     }),
                     "call-hierarchy-prepare"
                     | "call-hierarchy-replacement"
@@ -632,6 +673,18 @@ fn main() {
             }
             // A response to one of this mock's own requests: nothing to
             // answer (the catch-all below would echo a bogus reply).
+            "" if id == Some(json!(7001)) => {
+                // The editor's answer to the `echo-document` applyEdit.
+                let applied = message
+                    .pointer("/result/applied")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                notify(
+                    &mut writer,
+                    "window/logMessage",
+                    json!({ "type": 2, "message": format!("echo-document applied: {applied}") }),
+                );
+            }
             "" if id.is_some() => {}
             "shutdown" => respond(&mut writer, id, Value::Null),
             "exit" => break,
@@ -645,6 +698,13 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if mode == "echo-document-push" {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            echo_document_diagnostics(uri, text),
+                        );
+                    }
                     // The `-reopen-delayed-` resolvers answer their parked
                     // reply on the reopened lifetime's own `didOpen`: the
                     // upstream has processed the close and the reopen by the
@@ -754,6 +814,13 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if mode == "echo-document-push" {
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            echo_document_diagnostics(uri, text),
+                        );
+                    }
                     // `diagnostics-push`: a follow-up push with an EMPTY list clears
                     // this source's contribution (#427).
                     if mode == "diagnostics-push" {
@@ -869,6 +936,48 @@ fn main() {
                     .as_deref()
                     .and_then(|uri| documents.get(uri))
                     .cloned();
+                if mode == "echo-document" || mode == "echo-document-push" {
+                    // Announce the save with the text this server holds.
+                    notify(
+                        &mut writer,
+                        "window/logMessage",
+                        json!({
+                            "type": 2,
+                            "message": format!(
+                                "echo-document saved: {}",
+                                last_did_save_document_text.clone().unwrap_or_default()
+                            )
+                        }),
+                    );
+                    let saved_uri = last_did_save_uri.clone().unwrap_or_default();
+                    let held = last_did_save_document_text.clone().unwrap_or_default();
+                    let first_line = json!({
+                        "start": { "line": 0, "character": 0 },
+                        "end": {
+                            "line": 0,
+                            "character": held.lines().next().map_or(0, |line| line.encode_utf16().count())
+                        }
+                    });
+                    if held.contains("SHOW") {
+                        request_with_params(
+                            &mut writer,
+                            json!(7000),
+                            "window/showDocument",
+                            json!({ "uri": saved_uri, "selection": first_line }),
+                        );
+                    }
+                    if held.contains("EDIT") {
+                        request_with_params(
+                            &mut writer,
+                            json!(7001),
+                            "workspace/applyEdit",
+                            json!({ "edit": { "changes": { saved_uri: [{
+                                "range": first_line,
+                                "newText": "edited"
+                            }] } } }),
+                        );
+                    }
+                }
             }
             "$/cancelRequest" => {
                 record_mock_event(&mode, "cancel", &message);
@@ -939,7 +1048,39 @@ fn main() {
                         }),
                     );
                 }
-                let result = if mode == "inlay-hint-marker-resolve" {
+                let echoed =
+                    matches!(mode.as_str(), "echo-document" | "echo-document-push").then(|| {
+                        message
+                            .pointer("/params/textDocument/uri")
+                            .and_then(Value::as_str)
+                            .and_then(|uri| documents.get(uri))
+                            .cloned()
+                    });
+                let result = if let Some(text) = echoed {
+                    // The text this server holds, and the hovered line's
+                    // extent in ITS coordinates: a test can then prove both
+                    // what reached the server and how its positions map back.
+                    // A document it never received gets no hover.
+                    let Some(text) = text else {
+                        respond(&mut writer, id, Value::Null);
+                        continue;
+                    };
+                    let line = message
+                        .pointer("/params/position/line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let width = text
+                        .lines()
+                        .nth(line as usize)
+                        .map_or(0, |content| content.encode_utf16().count());
+                    json!({
+                        "contents": text,
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": width }
+                        }
+                    })
+                } else if mode == "inlay-hint-marker-resolve" {
                     let observation = json!({
                         "uri": message.pointer("/params/textDocument/uri"),
                         "position": message.pointer("/params/position"),
@@ -1547,6 +1688,36 @@ fn main() {
                     }
                 }
                 respond(&mut writer, id, json!({ "executed": command }));
+            }
+            "textDocument/diagnostic" if mode == "echo-document" => {
+                // One diagnostic over the document's first line, carrying the
+                // whole text this server holds.
+                let text = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| documents.get(uri))
+                    .cloned();
+                let result = match text {
+                    None => json!({ "kind": "full", "items": [] }),
+                    Some(text) => {
+                        let width = text
+                            .lines()
+                            .next()
+                            .map_or(0, |line| line.encode_utf16().count());
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": width }
+                                },
+                                "message": text,
+                                "source": "echo-document"
+                            }]
+                        })
+                    }
+                };
+                respond(&mut writer, id, result);
             }
             "textDocument/diagnostic" => {
                 if mode == "diagnostics-save" {
@@ -2534,6 +2705,59 @@ fn main() {
                     "params": message.get("params"),
                 }),
             ),
+            "textDocument/rename" if mode == "echo-document" => {
+                // Renames the document's first line.
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let width = documents
+                    .get(&uri)
+                    .and_then(|text| text.lines().next())
+                    .map_or(0, |line| line.encode_utf16().count());
+                respond(
+                    &mut writer,
+                    id,
+                    json!({ "changes": { uri: [{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": width }
+                        },
+                        "newText": "renamed"
+                    }] } }),
+                );
+            }
+            "kakehashi/virtualDocument/prepare" if mode == "prepare-peer" => {
+                let segments = message
+                    .pointer("/params/segments")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let content = |segment: &Value| {
+                    segment
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                if segments
+                    .iter()
+                    .any(|segment| content(segment).contains("FAIL"))
+                {
+                    respond_error(&mut writer, id, -32603, "refusing to prepare");
+                    continue;
+                }
+                if segments
+                    .iter()
+                    .any(|segment| content(segment).contains("SLOW"))
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                let placeholder =
+                    std::env::var("MOCK_PREPARE_PLACEHOLDER").unwrap_or_else(|_| "--".to_string());
+                respond(&mut writer, id, prepare_segments(&segments, &placeholder));
+            }
             _ => {
                 // Unknown REQUESTS get a null result so the client never
                 // hangs; notifications are ignored.
@@ -2624,6 +2848,132 @@ fn read_response<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, expected_
     }
 }
 
+/// One diagnostic over the first line of `text`, carrying the whole text
+/// (`echo-document-push`).
+fn echo_document_diagnostics(uri: &str, text: &str) -> Value {
+    let width = text
+        .lines()
+        .next()
+        .map_or(0, |line| line.encode_utf16().count());
+    json!({
+        "uri": uri,
+        "diagnostics": [{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": width }
+            },
+            "message": text,
+            "source": "echo-document"
+        }]
+    })
+}
+
+/// The `prepare-peer` answer for `segments`: content dedented by its common
+/// indentation and its edge blank lines deleted, every gap replaced by
+/// `placeholder`.
+fn prepare_segments(segments: &[Value], placeholder: &str) -> Value {
+    let kind = |index: usize| segments[index].get("type").and_then(Value::as_str);
+    let text = |index: usize| {
+        segments[index]
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let lines = |index: usize| text(index).split('\n').collect::<Vec<_>>();
+    // A content segment's first line starts a line when the document starts
+    // there or the host text before it (a gap) ended one.
+    let starts_line = |index: usize| index == 0 || text(index - 1).ends_with('\n');
+    let blank = |line: &str| line.trim().is_empty();
+    // Lines whose leading whitespace counts: every non-blank line that
+    // starts a line.
+    let line_starts = |index: usize| {
+        lines(index)
+            .into_iter()
+            .enumerate()
+            .filter(|(line, content)| (*line > 0 || starts_line(index)) && !blank(content))
+            .map(|(line, content)| (line, content.len() - content.trim_start().len()))
+            .collect::<Vec<_>>()
+    };
+    let indent = (0..segments.len())
+        .filter(|&index| kind(index) == Some("content"))
+        .flat_map(|index| line_starts(index).into_iter().map(|(_, indent)| indent))
+        .min()
+        .unwrap_or(0);
+    let whole = |from: usize, to: usize| {
+        json!({
+            "range": {
+                "start": { "line": from, "character": 0 },
+                "end": { "line": to, "character": 0 }
+            },
+            "newText": ""
+        })
+    };
+    // Whole blank lines at the document's edges: from the first segment's
+    // start, and before the last segment's end. A segment of blank lines
+    // only, beside a gap starting or ending a line, keeps them (they sit
+    // beside that gap), unless it is the only segment.
+    let edge_lines = |index: usize| {
+        let lines = lines(index);
+        let last = lines.len() - 1;
+        let beside_gap = if index == 0 {
+            text(index).ends_with('\n')
+        } else {
+            starts_line(index)
+        };
+        if segments.len() > 1 && beside_gap && lines.iter().all(|line| blank(line)) {
+            return Vec::new();
+        }
+        let mut leading = 0;
+        while index == 0 && leading < last && blank(lines[leading]) {
+            leading += 1;
+        }
+        let mut trailing = last;
+        while index == segments.len() - 1
+            && blank(lines[last])
+            && trailing > leading
+            && blank(lines[trailing - 1])
+        {
+            trailing -= 1;
+        }
+        let mut changes = Vec::new();
+        if leading > 0 {
+            changes.push(whole(0, leading));
+        }
+        if trailing < last {
+            changes.push(whole(trailing, last));
+            if !lines[last].is_empty() {
+                // The closing line's indentation goes with the closing lines.
+                changes.push(json!({
+                    "range": {
+                        "start": { "line": last, "character": 0 },
+                        "end": { "line": last, "character": lines[last].len() }
+                    },
+                    "newText": ""
+                }));
+            }
+        }
+        changes
+    };
+    json!({
+        "segments": (0..segments.len()).map(|index| {
+            if kind(index) == Some("gap") {
+                return json!({ "type": "gap", "content": placeholder });
+            }
+            let mut changes = edge_lines(index);
+            if indent > 0 {
+                changes.extend(line_starts(index).into_iter().map(|(line, _)| json!({
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": indent }
+                    },
+                    "newText": ""
+                })));
+            }
+            json!({ "type": "content", "changes": changes })
+        }).collect::<Vec<_>>()
+    })
+}
+
 /// Send a JSON-RPC notification (server-initiated, no `id`).
 fn notify<W: Write>(writer: &mut W, method: &str, params: Value) {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
@@ -2706,7 +3056,10 @@ fn append_wire_log(method: &str, message: &Value) {
     else {
         return;
     };
-    let _ = writeln!(file, "{method}\t{uri}");
+    // One write of the whole line: every mock process appends to the same
+    // log, and a line written in pieces could interleave with another's.
+    // An append-mode write of a line this short lands whole.
+    let _ = file.write_all(format!("{method}\t{uri}\n").as_bytes());
 }
 
 /// True exactly once per test run, across process incarnations: the first

@@ -382,6 +382,10 @@ pub(super) async fn apply_shared_settings_locked(
         (None, false) => {}
     }
     let settings = settings_manager.load_settings();
+    // Prepare targets resolve from these settings from now on: answers given
+    // under other ones stand no more (a pair's peer, or its launch, may have
+    // changed).
+    bridge.prepare_settings_changed(&settings);
     // Update the reader-side copy before propagating downstream settings so a
     // newly suppressed log cannot occupy the bounded window queue after this
     // configuration application completes.
@@ -404,6 +408,11 @@ pub(super) async fn apply_shared_settings_locked(
     // At initialize time there are no connections yet, so it is a clean no-op
     // (downstream-settings-propagation).
     let pushed = bridge.propagate_settings(&settings).await;
+    // Answers a peer gave before its new runtime settings were prepared
+    // under the old ones.
+    if pushed > 0 {
+        bridge.prepare_runtime_settings_pushed();
+    }
     // After propagation, not before: propagation evicts connections whose
     // launch config changed, and a warm-up started ahead of it would be
     // spawned only to be torn down by the same reload. Every settings
@@ -604,7 +613,8 @@ pub struct Kakehashi {
     cli_mode: std::sync::atomic::AtomicBool,
     /// Runtime opt-in for experimental features (`KAKEHASHI_EXPERIMENTAL=true`,
     /// see [`crate::experimental`]) — currently the native lexical-resolution
-    /// layer. Copied from the environment once at construction; atomic
+    /// layer and virtual document preparation (`kakehashi/virtualDocument/prepare`).
+    /// Copied from the environment once at construction; atomic
     /// only so tests can toggle it per instance.
     experimental: std::sync::atomic::AtomicBool,
     /// Per-document coalescing scheduler for the off-ingress parse

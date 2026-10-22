@@ -1,12 +1,17 @@
-//! Debounced synthetic-diagnostic triggers for `didChange` (pull-first-diagnostic-forwarding Phase 3).
+//! Debounced synthetic-diagnostic triggers for `didChange` (pull-first-diagnostic-forwarding Phase 3),
+//! and for the prepare answers an edit's held virtual documents wait for.
 //!
 //! Each document has its own timer that resets on every change; firing after the
-//! debounce delay (default 500ms) collects and publishes diagnostics.
+//! debounce delay (default 500ms) collects and publishes diagnostics. A schedule
+//! replaces the pending timer unless that one outranks it for the same version
+//! (one scheduled after prepare answers over an edit's).
 //!
-//! Snapshot data is captured at *schedule* time, not when the timer fires, so the
-//! published diagnostics match the document state that triggered them and the
-//! timer callback needs no `self` reference. Newer schedules supersede older
-//! in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
+//! An edit's snapshot data is captured at *schedule* time, not when the timer
+//! fires, so the published diagnostics match the document state that triggered
+//! them and the timer callback needs no `self` reference. One scheduled after
+//! prepare answers snapshots again when it fires, for the same version: a region
+//! held when it was scheduled may have been sent since. Newer schedules supersede
+//! older in-flight publishes via `SyntheticDiagnosticsManager`'s `AbortHandle`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +64,11 @@ struct DebouncedDiagnosticData {
     incarnation: u64,
     content_version: u64,
     settings_generation: u64,
+    /// What the collection supersedes among this version's others.
+    trigger: SyntheticDiagnosticTrigger,
+    /// Takes the snapshot again when the timer fires, in place of
+    /// `snapshot_data`, for the version it was scheduled for.
+    resnapshot: Option<Resnapshot>,
     /// Reference to synthetic diagnostics manager for task registration
     synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
     /// The single proactive publisher: feeds the pull result into the cache and
@@ -68,10 +78,17 @@ struct DebouncedDiagnosticData {
     execution_gate: Option<Arc<DebounceExecutionGate>>,
 }
 
+/// The document's diagnostic snapshot as of when a timer fires, given the
+/// `(incarnation, content_version)` it was scheduled for: `None` once the
+/// document moved past it.
+pub(crate) type Resnapshot = Box<dyn FnOnce(u64, u64) -> Option<DiagnosticSnapshot> + Send>;
+
 #[cfg(test)]
 pub(crate) struct DebounceExecutionGate {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
+    /// Whether the collection that ran had a snapshot.
+    pub(crate) collected_with_snapshot: std::sync::Mutex<Option<bool>>,
 }
 
 /// Manager for debounced diagnostic triggers.
@@ -80,9 +97,10 @@ pub(crate) struct DebounceExecutionGate {
 /// collection on expiry. Uses `DashMap` for concurrent access from multiple
 /// tokio tasks via sharded locks (no single global lock).
 pub(crate) struct DebouncedDiagnosticsManager {
-    /// Active debounce timers per document.
-    /// The AbortHandle allows cancelling the timer when a new change arrives.
-    active_timers: DashMap<Url, AbortHandle>,
+    /// Active debounce timers per document, with the version and rank each
+    /// was scheduled for: a new schedule cancels the timer unless it
+    /// outranks the schedule for the same version.
+    active_timers: DashMap<Url, Timer>,
 
     /// Milliseconds to wait after the last change before triggering diagnostics.
     /// Atomic so a `diagnostics_debounce_ms` config change applies to subsequent
@@ -91,6 +109,38 @@ pub(crate) struct DebouncedDiagnosticsManager {
     debounce_millis: AtomicU64,
     #[cfg(test)]
     execution_gate: std::sync::Mutex<Option<Arc<DebounceExecutionGate>>>,
+}
+
+/// A document's pending debounce timer, and the collection it was
+/// scheduled as.
+struct Timer {
+    handle: AbortHandle,
+    /// `(incarnation, content_version, settings_generation)`.
+    lineage: (u64, u64, u64),
+    trigger: SyntheticDiagnosticTrigger,
+}
+
+impl Timer {
+    /// Whether a schedule of `lineage` as `trigger` leaves this timer be: it
+    /// ranks above it for the same text and settings, as one scheduled after
+    /// held regions were sent ranks above an edit's whose snapshot was
+    /// captured before (and so left those regions out).
+    fn outranks(&self, lineage: (u64, u64, u64), trigger: SyntheticDiagnosticTrigger) -> bool {
+        !self.handle.is_finished()
+            && self.lineage == lineage
+            && self.trigger.rank() > trigger.rank()
+    }
+}
+
+#[cfg(test)]
+impl From<AbortHandle> for Timer {
+    fn from(handle: AbortHandle) -> Self {
+        Self {
+            handle,
+            lineage: (0, 0, 0),
+            trigger: SyntheticDiagnosticTrigger::Change,
+        }
+    }
 }
 
 impl Default for DebouncedDiagnosticsManager {
@@ -132,6 +182,7 @@ impl DebouncedDiagnosticsManager {
         let gate = Arc::new(DebounceExecutionGate {
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            collected_with_snapshot: std::sync::Mutex::new(None),
         });
         *self.execution_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
@@ -139,8 +190,11 @@ impl DebouncedDiagnosticsManager {
 
     /// Schedule a debounced diagnostic for a document.
     ///
-    /// Any existing timer for this document is cancelled and replaced; on expiry
-    /// the new timer publishes diagnostics from the pre-captured `snapshot_data`.
+    /// Any existing timer for this document is cancelled and replaced, unless
+    /// it outranks this one for the same version; on expiry the new timer
+    /// publishes diagnostics from the pre-captured `snapshot_data` (or, with
+    /// `resnapshot`, from the snapshot it takes then), ranked as `trigger`
+    /// among the version's collections.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn schedule(
         &self,
@@ -151,24 +205,18 @@ impl DebouncedDiagnosticsManager {
         synthetic_diagnostics: Arc<SyntheticDiagnosticsManager>,
         publisher: Arc<DiagnosticPublisher>,
         documents: Arc<crate::document::DocumentStore>,
+        trigger: SyntheticDiagnosticTrigger,
+        resnapshot: Option<Resnapshot>,
     ) {
         // Opportunistic cleanup: remove finished timers to prevent unbounded growth.
         // This is O(n) but runs infrequently and keeps the map from accumulating
         // stale entries for documents that completed their debounce cycle.
         const CLEANUP_THRESHOLD: usize = 32;
         if self.active_timers.len() > CLEANUP_THRESHOLD {
-            self.active_timers.retain(|_, handle| !handle.is_finished());
+            self.active_timers
+                .retain(|_, timer| !timer.handle.is_finished());
         }
 
-        // Cancel existing timer if any
-        if let Some((_, prev_handle)) = self.active_timers.remove(&uri) {
-            prev_handle.abort();
-            log::trace!(
-                target: LOG_TARGET,
-                "Cancelled previous debounce timer for {}",
-                uri
-            );
-        }
         let Some((incarnation, content_version, settings_generation)) = snapshot_data
             .as_ref()
             .map(|snapshot| {
@@ -184,11 +232,34 @@ impl DebouncedDiagnosticsManager {
                     .map(|doc| (doc.incarnation(), doc.content_version(), 0))
             })
         else {
+            if let Some((_, previous)) = self.active_timers.remove(&uri) {
+                previous.handle.abort();
+            }
             return;
         };
+        let lineage = (incarnation, content_version, settings_generation);
+        // The check and the replacement under the entry's lock: a schedule
+        // racing this one either sees the timer this one leaves or replaces it.
+        let entry = self.active_timers.entry(uri.clone());
+        if let dashmap::mapref::entry::Entry::Occupied(previous) = &entry {
+            if previous.get().outranks(lineage, trigger) {
+                log::trace!(
+                    target: LOG_TARGET,
+                    "Kept the outranking debounce timer for {}",
+                    uri
+                );
+                return;
+            }
+            previous.get().handle.abort();
+            log::trace!(
+                target: LOG_TARGET,
+                "Cancelled previous debounce timer for {}",
+                uri
+            );
+        }
 
         let data = DebouncedDiagnosticData {
-            uri: uri.clone(),
+            uri,
             snapshot_data,
             bridge_pool,
             bridge,
@@ -198,6 +269,8 @@ impl DebouncedDiagnosticsManager {
             incarnation,
             content_version,
             settings_generation,
+            trigger,
+            resnapshot,
             #[cfg(test)]
             execution_gate: self.execution_gate.lock().unwrap().clone(),
         };
@@ -220,15 +293,19 @@ impl DebouncedDiagnosticsManager {
         });
 
         // Register the timer
-        self.active_timers.insert(uri, task.abort_handle());
+        entry.insert(Timer {
+            handle: task.abort_handle(),
+            lineage,
+            trigger,
+        });
     }
 
     /// Cancel the debounce timer for a document.
     ///
     /// Called when a document is closed - no need for debounced diagnostics.
     pub(crate) fn cancel(&self, uri: &Url) {
-        if let Some((_, handle)) = self.active_timers.remove(uri) {
-            handle.abort();
+        if let Some((_, timer)) = self.active_timers.remove(uri) {
+            timer.handle.abort();
             log::trace!(
                 target: LOG_TARGET,
                 "Cancelled debounce timer for closed document {}",
@@ -242,7 +319,7 @@ impl DebouncedDiagnosticsManager {
     /// Called during server shutdown.
     pub(crate) fn cancel_all(&self) {
         for entry in self.active_timers.iter() {
-            entry.value().abort();
+            entry.value().handle.abort();
         }
         self.active_timers.clear();
         log::debug!(
@@ -271,7 +348,7 @@ impl DebouncedDiagnosticsManager {
     pub(crate) fn timer_abort_handle(&self, uri: &Url) -> Option<AbortHandle> {
         self.active_timers
             .get(uri)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().handle.clone())
     }
 }
 
@@ -283,7 +360,7 @@ impl DebouncedDiagnosticsManager {
 async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
     let DebouncedDiagnosticData {
         uri,
-        snapshot_data,
+        mut snapshot_data,
         bridge_pool,
         bridge,
         synthetic_diagnostics,
@@ -291,13 +368,15 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         documents,
         incarnation,
         content_version,
-        settings_generation,
+        mut settings_generation,
+        trigger,
+        resnapshot,
         #[cfg(test)]
         execution_gate,
     } = data;
 
     #[cfg(test)]
-    if let Some(gate) = execution_gate {
+    if let Some(gate) = &execution_gate {
         gate.entered.notify_one();
         gate.release.notified().await;
     }
@@ -317,6 +396,22 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         }
         drop(edit_guard);
         return;
+    }
+    // At the version it was scheduled for, under the edit lock: what the
+    // document's regions are now, not when the timer was scheduled. A region
+    // held then may have been sent since, and collected at once; a snapshot
+    // still leaving it out would replace that collection.
+    if let Some(resnapshot) = resnapshot {
+        snapshot_data = resnapshot(incarnation, content_version);
+        // Ranked under the settings that snapshot was taken with: the timer
+        // knew none (scheduled without a snapshot), or older ones.
+        if let Some(snapshot) = &snapshot_data {
+            settings_generation = snapshot.lineage.settings_generation;
+        }
+    }
+    #[cfg(test)]
+    if let Some(gate) = &execution_gate {
+        *gate.collected_with_snapshot.lock().unwrap() = Some(snapshot_data.is_some());
     }
 
     // #431: re-sync the host document to its `_self` host servers at this debounced
@@ -428,7 +523,7 @@ async fn execute_debounced_diagnostic(data: DebouncedDiagnosticData) {
         incarnation,
         content_version,
         settings_generation,
-        SyntheticDiagnosticTrigger::Change,
+        trigger,
         future,
     );
     drop(edit_guard);
@@ -480,7 +575,7 @@ mod tests {
         });
         manager
             .active_timers
-            .insert(uri.clone(), task.abort_handle());
+            .insert(uri.clone(), task.abort_handle().into());
 
         assert!(manager.has_active_timer(&uri));
 
@@ -505,8 +600,12 @@ mod tests {
         let handle1 = task1.abort_handle();
         let handle2 = task2.abort_handle();
 
-        manager.active_timers.insert(uri1.clone(), handle1.clone());
-        manager.active_timers.insert(uri2.clone(), handle2.clone());
+        manager
+            .active_timers
+            .insert(uri1.clone(), handle1.clone().into());
+        manager
+            .active_timers
+            .insert(uri2.clone(), handle2.clone().into());
 
         assert_eq!(manager.active_timer_count(), 2);
 
@@ -530,7 +629,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(10)).await;
         });
         let handle1 = task1.abort_handle();
-        manager.active_timers.insert(uri.clone(), handle1.clone());
+        manager
+            .active_timers
+            .insert(uri.clone(), handle1.clone().into());
 
         // Insert another timer for the same URI (simulating what schedule does)
         let task2 = tokio::spawn(async {
@@ -540,9 +641,11 @@ mod tests {
 
         // Remove and abort previous
         if let Some((_, prev_handle)) = manager.active_timers.remove(&uri) {
-            prev_handle.abort();
+            prev_handle.handle.abort();
         }
-        manager.active_timers.insert(uri.clone(), handle2.clone());
+        manager
+            .active_timers
+            .insert(uri.clone(), handle2.clone().into());
 
         // Yield to let abort propagate
         tokio::task::yield_now().await;

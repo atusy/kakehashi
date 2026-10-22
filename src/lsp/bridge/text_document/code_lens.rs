@@ -37,7 +37,9 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{CodeLens, NumberOrString};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WholeDocumentRequestParams,
     build_whole_document_request_with_progress, response_has_jsonrpc_error,
@@ -157,18 +159,22 @@ pub(crate) fn strip_code_lens_envelope(lens: &mut CodeLens) -> Option<CodeLensEn
 
 /// Restore the envelope into a lens's `data` field (fail-soft return path).
 fn re_envelope_lens(lens: &mut CodeLens, envelope: &CodeLensEnvelope) {
-    let ctx = CodeLensEnvelopeContext {
-        server_name: &envelope.origin,
-        host_uri: &envelope.host_uri,
-        region_id: &envelope.region_id,
-        injection_language: &envelope.injection_language,
+    // Written as a fresh mint writes it, but keeping the mark of a lens
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    // Field by field: the offset is rewritten, not cloned to be dropped.
+    let rebuilt = CodeLensEnvelope {
+        origin: envelope.origin.clone(),
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        injection_language: envelope.injection_language.clone(),
         incarnation: envelope.incarnation,
         connection_generation: envelope.connection_generation,
-        connection_key: envelope.connection_key.as_ref(),
-        offset: &RegionOffset::from(&envelope.offset),
+        connection_key: envelope.connection_key.clone(),
+        offset: envelope.offset.rewritten(),
+        inner: None,
         host_layer: envelope.host_layer,
     };
-    envelope_lens_data(lens, &ctx);
+    lens.data = Some(wrap_envelope(&rebuilt, lens.data.take()));
 }
 
 pub(crate) fn envelope_host_code_lenses(
@@ -465,6 +471,7 @@ impl LanguageServerPool {
 
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
+        let mut held = HeldNote::default();
         let send_result = if envelope.is_host_layer() {
             self.enqueue_host_resolve(
                 &handle,
@@ -493,6 +500,15 @@ impl LanguageServerPool {
                     "producer connection was replaced before resolve send",
                 ))
             } else {
+                // What the producer holds for the virtual document as the
+                // resolve is queued: the reply (a command computed from it)
+                // must be computed on that text.
+                held = self.note_region_held(
+                    &host_uri,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                    connection_key,
+                );
                 handle.send_request(request, request_id).map_err(Into::into)
             }
         };
@@ -537,7 +553,10 @@ impl LanguageServerPool {
                     })
             })
         };
-        if !producer_is_still_live {
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it, or after it, once its region gained a peer): not on
+        // the text the lens was minted from.
+        if !producer_is_still_live || !self.held_unchanged(&held) {
             re_envelope_lens(&mut lens, &envelope);
             return lens;
         }
@@ -638,6 +657,12 @@ fn transform_code_lens_response_to_host(
 
     for lens in &mut lenses {
         translate_virtual_range_to_host(&mut lens.range, offset);
+        // A code lens should span one line (LSP 3.18 `CodeLens.range`); one
+        // on a prepared line that joins several host lines is kept where it
+        // starts.
+        if offset.prepared().is_some() && lens.range.end.line != lens.range.start.line {
+            lens.range.end = lens.range.start;
+        }
         if should_envelope(lens.data.as_ref(), server_resolves) {
             envelope_lens_data(lens, envelope_ctx);
         }
@@ -672,6 +697,67 @@ mod tests {
         server_resolves: bool,
     ) -> Option<Vec<CodeLens>> {
         transform_code_lens_response_to_host(response, offset, server_resolves, &ctx_with(offset))
+    }
+
+    /// A lens re-enveloped after a refused resolve keeps the mark of a mint
+    /// from a prepared document, and an as-is one is written as a fresh mint
+    /// writes it.
+    #[test]
+    fn a_re_enveloped_lens_keeps_the_prepared_mark() {
+        let envelope = |prepared| CodeLensEnvelope {
+            origin: "lua-ls".into(),
+            host_uri: "file:///test.md".to_string(),
+            region_id: "region".to_string(),
+            injection_language: "lua".to_string(),
+            incarnation: Some(1),
+            connection_generation: Some(2),
+            connection_key: None,
+            offset: EnvelopeOffset {
+                prepared,
+                ..EnvelopeOffset::from(&RegionOffset::new(3, 2))
+            },
+            inner: None,
+            host_layer: false,
+        };
+        for prepared in [false, true] {
+            let mut lens = CodeLens {
+                range: Default::default(),
+                command: None,
+                data: Some(json!({ "token": 1 })),
+            };
+            re_envelope_lens(&mut lens, &envelope(prepared));
+            let back = extract_code_lens_envelope(&lens).unwrap();
+            assert_eq!(back.offset.prepared, prepared);
+            assert_eq!(back.inner, Some(json!({ "token": 1 })));
+        }
+        // As is: what a fresh mint writes.
+        let mut minted = CodeLens {
+            range: Default::default(),
+            command: None,
+            data: Some(json!({ "token": 1 })),
+        };
+        let as_is = envelope(false);
+        envelope_lens_data(
+            &mut minted,
+            &CodeLensEnvelopeContext {
+                server_name: &as_is.origin,
+                host_uri: &as_is.host_uri,
+                region_id: &as_is.region_id,
+                injection_language: &as_is.injection_language,
+                incarnation: as_is.incarnation,
+                connection_generation: as_is.connection_generation,
+                connection_key: None,
+                offset: &RegionOffset::new(3, 2),
+                host_layer: false,
+            },
+        );
+        let mut rewritten = CodeLens {
+            range: Default::default(),
+            command: None,
+            data: Some(json!({ "token": 1 })),
+        };
+        re_envelope_lens(&mut rewritten, &as_is);
+        assert_eq!(rewritten.data, minted.data);
     }
 
     #[test]
@@ -734,6 +820,158 @@ mod tests {
             connection_key: None,
             offset,
             host_layer: false,
+        }
+    }
+
+    /// A lens on a prepared line joining several virtual ones is kept on
+    /// one host line, where it starts: a code lens should span one line
+    /// (LSP 3.18 `CodeLens.range`). Without a prepared text, a lens is
+    /// translated as it was sent.
+    #[test]
+    fn a_lens_over_joined_prepared_lines_stays_on_its_start_line() {
+        use crate::language::injection::VirtualGap;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use tower_lsp_server::ls_types::{Position, Range};
+        let virtual_text = "ab\n  \ncd";
+        let gaps = [VirtualGap {
+            virtual_range: 2..6,
+            host_text: "\n  \n".to_string(),
+        }];
+        let answer = serde_json::from_value(json!({"segments": [
+            {"type": "content"},
+            {"type": "gap", "content": ""},
+            {"type": "content"}
+        ]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::from_gaps(virtual_text, &gaps),
+            Some(answer),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "abcd");
+        let response = |end_line| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": [{
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": end_line, "character": 4}
+                }
+            }]})
+        };
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let lenses = transform_with_resolve_support(response(0), &offset, false).unwrap();
+        assert_eq!(
+            lenses[0].range,
+            Range::new(Position::new(10, 0), Position::new(10, 0))
+        );
+
+        let lenses =
+            transform_with_resolve_support(response(2), &RegionOffset::new(10, 0), false).unwrap();
+        assert_eq!(
+            lenses[0].range,
+            Range::new(Position::new(10, 0), Position::new(12, 4))
+        );
+    }
+
+    /// A resolve has no text check of its own: one whose reply was computed
+    /// on a prepared text (sent before the resolve was queued, or after,
+    /// once its region gained a peer) is dropped, its command computed on
+    /// another text than the lens was minted from.
+    #[tokio::test]
+    async fn a_lens_resolve_computed_on_a_prepared_text_is_dropped() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let record_prepared = |pool: &LanguageServerPool, virtual_uri: &VirtualDocumentUri| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            let prepared =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+            pool.record_sent_for_test(
+                virtual_uri,
+                &ConnectionKey::for_server("lua-ls"),
+                SentText {
+                    text: &prepared.text,
+                    map: Some(&prepared.map),
+                },
+            );
+        };
+        // When a prepared text is sent: never, before the resolve is queued,
+        // after, or before and closed again (the server may still answer
+        // from it); "closed as is" closes a document only ever held as is.
+        for sent in [
+            None,
+            Some("before"),
+            Some("after"),
+            Some("closed"),
+            Some("closed as is"),
+        ] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("lua-ls");
+            let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test.md").unwrap();
+            pool.open_host_incarnation(&host_uri, 1).await;
+            let region_id = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                "lua",
+                region_id,
+            );
+            pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            if matches!(sent, Some("before" | "closed")) {
+                record_prepared(&pool, &virtual_uri);
+            }
+            if matches!(sent, Some("closed" | "closed as is")) {
+                pool.untrack_document(&virtual_uri, &key).await;
+            }
+            let envelope = CodeLensEnvelope {
+                origin: "lua-ls".into(),
+                host_uri: host_uri.to_string(),
+                region_id: region_id.to_string(),
+                injection_language: "lua".to_string(),
+                incarnation: Some(1),
+                connection_generation: Some(pool.document_connection_generation(&key)),
+                connection_key: Some(key.clone()),
+                offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+                inner: Some(json!({ "token": 1 })),
+                host_layer: false,
+            };
+            let upstream_id = UpstreamId::Number(79);
+            let request = {
+                let pool = Arc::clone(&pool);
+                let upstream_id = upstream_id.clone();
+                tokio::spawn(async move {
+                    pool.send_code_lens_resolve_request(
+                        &BridgeServerConfig::default(),
+                        CodeLens {
+                            range: Default::default(),
+                            command: None,
+                            data: Some(json!({ "token": 1 })),
+                        },
+                        envelope,
+                        Some(upstream_id),
+                        &super::super::test_helpers::resolve_host_snapshot,
+                    )
+                    .await
+                })
+            };
+            let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+            if sent == Some("after") {
+                record_prepared(&pool, &virtual_uri);
+            }
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": {
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "command": { "title": "run", "command": "run" }
+                }
+            }));
+            let result = request.await.unwrap();
+            let surfaces = matches!(sent, None | Some("closed as is"));
+            assert_eq!(result.command.is_some(), surfaces, "{sent:?}");
         }
     }
 

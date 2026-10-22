@@ -124,6 +124,14 @@ impl Kakehashi {
             )
             .await;
 
+        // Every region's prepare attempt started before any is waited for:
+        // the waits in the loop below then share attempts already running,
+        // the request waiting about the slowest, not one after another.
+        crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+            &self.bridge,
+            language_name,
+            all_regions.iter().map(|resolved| (&uri, resolved)),
+        );
         for (region_index, resolved) in all_regions.iter().enumerate() {
             // Get ALL bridge server configs for this injection language
             let mut configs = self
@@ -141,6 +149,7 @@ impl Kakehashi {
                 METHOD,
             );
             let region_ctx = DocumentRequestContext {
+                prepared: None,
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -150,6 +159,17 @@ impl Kakehashi {
                 strategy: agg.strategy,
                 max_fan_out: agg.max_fan_out,
                 client_progress_token: None,
+            };
+            // Its attempt already running (see above): waiting for each in
+            // turn costs the slowest one.
+            let Ok(region_ctx) = crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                &self.bridge,
+                language_name,
+                region_ctx,
+            )
+            .await
+            else {
+                continue;
             };
 
             // Mint this region's tracked-source token into the shared aggregator

@@ -231,6 +231,11 @@ impl VirtualDocumentUri {
         }
     }
 
+    /// The host document's URI.
+    pub(crate) fn host_uri(&self) -> &tower_lsp_server::ls_types::Uri {
+        &self.host_uri
+    }
+
     /// Get the region_id.
     pub(crate) fn region_id(&self) -> &str {
         &self.region_id

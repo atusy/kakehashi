@@ -10,7 +10,6 @@
 //! pattern that could violate FIFO ordering.
 
 use std::str::FromStr;
-use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, TextDocumentContentChangeEvent, Uri,
@@ -18,9 +17,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{
-    ConnectionHandle, ConnectionState, LanguageServerPool, NotificationSendResult,
-};
+use super::super::pool::{ConnectionState, LanguageServerPool, NotificationSendResult};
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
 impl LanguageServerPool {
@@ -30,8 +27,9 @@ impl LanguageServerPool {
     /// false if any attempted enqueue fails, leaving its sent fingerprint old
     /// so a synchronization waiter can retry.
     ///
-    /// Notifications go through `send_notification()` (single writer task,
-    /// ls-bridge-message-ordering) for FIFO order — fire-and-forget but no reordering.
+    /// Notifications are recorded and queued together on the connection's
+    /// single writer task (`record_and_queue`, ls-bridge-message-ordering)
+    /// for FIFO order — fire-and-forget but no reordering.
     // TODO: switch to TextDocumentSyncKind::Incremental for large documents.
     pub(crate) async fn forward_didchange_to_opened_docs(
         &self,
@@ -66,7 +64,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -110,36 +108,26 @@ impl LanguageServerPool {
                 // region's extracted content is unchanged since the last didChange to
                 // this connection, so a position-only host edit doesn't re-analyze
                 // every region (#422). Mirrors the host path's fingerprint guard.
-                let Some(version) = self
-                    .increment_version_if_content_changed(
-                        &virtual_uri,
-                        &connection_key,
-                        &injection.content,
-                    )
+                let content = injection.sent();
+                let Some(change) = self
+                    .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
                 else {
                     continue;
                 };
 
                 // Send didChange notification via single-writer loop (ls-bridge-message-ordering).
-                // This is non-blocking and maintains FIFO ordering.
-                let send_result = Self::send_didchange_for_virtual_doc(
+                // This is non-blocking and maintains FIFO ordering. A dropped
+                // send (full/closed queue) leaves the old fingerprint so the
+                // next edit re-sends (#422).
+                let send_result = self.send_didchange_recorded(
                     &handle,
-                    &virtual_uri.to_uri_string(),
-                    &injection.content,
-                    version,
+                    &virtual_uri,
+                    &connection_key,
+                    content,
+                    change,
                 );
-                // Record the fingerprint ONLY on a confirmed enqueue (#422): a dropped
-                // send (full/closed queue) must leave the old fingerprint so the next
-                // edit re-sends, rather than marking content the server never received.
-                if matches!(send_result, NotificationSendResult::Queued) {
-                    self.record_sent_content_fingerprint(
-                        &virtual_uri,
-                        &connection_key,
-                        &injection.content,
-                    )
-                    .await;
-                } else {
+                if !matches!(send_result, Some(NotificationSendResult::Queued)) {
                     synchronized = false;
                 }
                 drop(transition_guard);
@@ -148,19 +136,13 @@ impl LanguageServerPool {
         synchronized
     }
 
-    /// Send a didChange notification for a virtual document, returning the
-    /// enqueue outcome.
-    ///
-    /// Uses the channel-based single-writer loop (ls-bridge-message-ordering): non-blocking, and
-    /// if the queue is full the notification is dropped with a warning log. The
-    /// returned [`NotificationSendResult`] lets the caller record the content
-    /// fingerprint only on a confirmed `Queued` enqueue (#422).
-    pub(super) fn send_didchange_for_virtual_doc(
-        handle: &Arc<ConnectionHandle>,
+    /// The serialized didChange notification for a virtual document; `None`
+    /// when it cannot be built: nothing is sent, nor recorded as sent (#422).
+    pub(in crate::lsp::bridge) fn didchange_payload(
         virtual_uri: &str,
         content: &str,
         version: i32,
-    ) -> NotificationSendResult {
+    ) -> Option<serde_json::Value> {
         let uri = match Uri::from_str(virtual_uri) {
             Ok(u) => u,
             Err(e) => {
@@ -168,9 +150,7 @@ impl LanguageServerPool {
                     target: "kakehashi::bridge",
                     "Skipping didChange for invalid URI '{}': {}", virtual_uri, e
                 );
-                // Nothing was enqueued; treat as a non-`Queued` outcome so the caller
-                // does not record a fingerprint for content the server never received.
-                return NotificationSendResult::SerializationFailed;
+                return None;
             }
         };
 
@@ -184,8 +164,72 @@ impl LanguageServerPool {
         };
 
         let notification = JsonRpcNotification::new("textDocument/didChange", params);
+        serde_json::to_value(notification)
+            .inspect_err(|e| {
+                log::error!(
+                    target: "kakehashi::bridge",
+                    "Failed to serialize didChange for '{}': {}", virtual_uri, e
+                );
+            })
+            .ok()
+    }
+}
 
-        // Send via the single-writer loop (non-blocking, fire-and-forget).
-        handle.send_notification(notification)
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::lsp::bridge::coordinator::BridgeInjection;
+    use crate::lsp::bridge::pool::{ConnectionKey, test_helpers};
+
+    /// A lifecycle didChange whose prepared text was revoked since it was
+    /// taken (across the forwarding's awaits) is not sent; one that stands
+    /// is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lifecycle_did_change_sends_no_revoked_text() {
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("change");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test/change-revoked.md").unwrap();
+            let revocation = Arc::new(Revocation::default());
+            let mut map =
+                apply_prepare_result("print(2)", &VirtualLayout::single("print(2)"), None)
+                    .unwrap()
+                    .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: ulid::Ulid::generate().to_string(),
+                content: "print(2)".to_string(),
+                held: false,
+                prepared: Some(map),
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                &injection.language,
+                &injection.region_id,
+            );
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            pool.record_sent_for_test(&virtual_uri, &key, "print(1)".into());
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            let synchronized = pool
+                .forward_didchange_to_opened_docs(&host_uri, 1, &[injection])
+                .await;
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert_eq!(sent.contains("textDocument/didChange"), !revoked, "{sent}");
+            assert_eq!(synchronized, !revoked);
+        }
     }
 }

@@ -487,6 +487,33 @@ pub(crate) struct EnvelopeOffset {
     /// `None` for non-blockquote injections (backwards-compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_column_offsets: Option<Vec<u32>>,
+    /// The item came from a prepared document, whose map no envelope can
+    /// carry: it never resolves, whatever the region reads as by then
+    /// (after its pair lost its peer, the offsets alone compare equal).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prepared: bool,
+}
+
+impl EnvelopeOffset {
+    /// Whether the region still has the offset this envelope was minted
+    /// with — never for an envelope minted from a prepared document.
+    pub(crate) fn describes(&self, live: &RegionOffset) -> bool {
+        !self.prepared && RegionOffset::from(self) == *live
+    }
+}
+
+impl EnvelopeOffset {
+    /// This offset as a fresh mint writes it, for an item re-enveloped after
+    /// a refused resolve, keeping the mark of an item minted from a prepared
+    /// document, which no `RegionOffset` carries without the map: dropped,
+    /// the item would describe the region again once its pair lost its peer.
+    /// An item minted as is gets exactly the bytes a fresh mint gives.
+    pub(crate) fn rewritten(&self) -> Self {
+        Self {
+            prepared: self.prepared,
+            ..Self::from(&RegionOffset::from(self))
+        }
+    }
 }
 
 impl From<&RegionOffset> for EnvelopeOffset {
@@ -495,6 +522,7 @@ impl From<&RegionOffset> for EnvelopeOffset {
             line: o.line(),
             column: o.column_for_line(0),
             line_column_offsets: Some(o.columns().to_vec()),
+            prepared: o.prepared().is_some(),
         }
     }
 }
@@ -607,6 +635,7 @@ pub(super) fn envelope_host_item(
             line: 0,
             column: 0,
             line_column_offsets: None,
+            prepared: false,
         },
         region_end: None,
         host_layer: true,
@@ -639,6 +668,26 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serde_json::json;
+
+    /// An envelope minted from a prepared document never resolves, even
+    /// against a live offset equal to its own (the region's pair lost its
+    /// peer since): the map it was minted through is not carried. The mark
+    /// survives the round trip through the client.
+    #[test]
+    fn an_envelope_from_a_prepared_document_describes_no_live_offset() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let map = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        let live = RegionOffset::new(3, 2);
+        let as_is = EnvelopeOffset::from(&live);
+        assert!(as_is.describes(&live));
+        let prepared = EnvelopeOffset::from(&live.clone().with_prepared(map));
+        assert!(!prepared.describes(&live));
+        let round_trip: EnvelopeOffset =
+            serde_json::from_value(serde_json::to_value(&prepared).unwrap()).unwrap();
+        assert!(!round_trip.describes(&live));
+    }
 
     /// Run the virt transform for a NON-resolving origin, the shape most
     /// coordinate tests want: ranges translate, `data` passes through bare.
@@ -1275,7 +1324,8 @@ mod tests {
             EnvelopeOffset {
                 line: 3,
                 column: 4,
-                line_column_offsets: Some(vec![4])
+                line_column_offsets: Some(vec![4]),
+                prepared: false,
             }
         );
 
@@ -1628,6 +1678,7 @@ mod tests {
             line: 5,
             column: 2,
             line_column_offsets: Some(vec![2, 2, 2]),
+            prepared: false,
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         let deserialized: EnvelopeOffset =
@@ -1642,6 +1693,7 @@ mod tests {
             line: 5,
             column: 0,
             line_column_offsets: None,
+            prepared: false,
         };
         let json = serde_json::to_value(&offset).expect("should serialize");
         assert!(json.get("line_column_offsets").is_none());

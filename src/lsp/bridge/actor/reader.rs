@@ -84,6 +84,9 @@ pub(crate) enum UpstreamNotification {
         /// cached slot so a later reader exit can evict only this connection's slots,
         /// never a restarted connection's (which gets a fresh id) (#469).
         connection_id: crate::lsp::bridge::ProgressConnectionId,
+        /// What the originating connection held for a region push's document
+        /// as the push was read: decides how its coordinates translate.
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         /// The pushed diagnostics, in the published document's own coordinates
         /// (virtual for a region push, host for a `_self` push).
         diagnostics: Vec<tower_lsp_server::ls_types::Diagnostic>,
@@ -176,6 +179,11 @@ pub(crate) enum UpstreamRequest {
     /// virtual-document URIs); the editor's success flag is relayed back.
     ShowDocument {
         params: tower_lsp_server::ls_types::ShowDocumentParams,
+        /// The watermark of texts held as the request was read (an
+        /// `Observed::Through` stamp of the originating connection): how its
+        /// selection translates, by what that connection's record says at
+        /// placement (see `HeldStamp`).
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<bool>,
         cancel: ForwardedRequestCancel,
     },
@@ -194,6 +202,11 @@ pub(crate) enum UpstreamRequest {
         /// (each connection's didOpen starts its own counter), so the
         /// translation must know which connection's version space applies.
         connection: ConnectionKey,
+        /// The watermark of texts held as the request was read (an
+        /// `Observed::Through` stamp of `connection`): an edit computed for a
+        /// prepared text, or one replaced since, is refused (see
+        /// `HeldStamp`).
+        held: Option<crate::lsp::diagnostic_cache::HeldStamp>,
         reply: oneshot::Sender<tower_lsp_server::ls_types::ApplyWorkspaceEditResponse>,
         cancel: ForwardedRequestCancel,
     },
@@ -325,6 +338,18 @@ pub(crate) struct ServerRequestDeps {
     pub(crate) progress_registry: Arc<crate::lsp::bridge::ProgressRegistry>,
     /// This connection's id, used to scope forward token translation.
     pub(crate) progress_connection_id: crate::lsp::bridge::ProgressConnectionId,
+    /// What each connection holds for each virtual document: a region push
+    /// is stamped with what this connection held for its document as it was
+    /// read, a showDocument or an applyEdit with the watermark of texts held
+    /// so far. `None` when the pool prepares nothing (with
+    /// experimental features off): every connection holds its texts as is,
+    /// and nothing is stamped.
+    pub(crate) document_tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
+    /// This process, among those spawned under `connection_key`: the count
+    /// of the key's purges when it was spawned, stamped with what it sends.
+    /// Taken at spawn, not as messages are read: a purge that retires it
+    /// bumps the count while this reader may still be draining.
+    pub(crate) incarnation: u64,
     /// This server's current workspace settings, shared with the pool, used to
     /// answer downstream `workspace/configuration` pulls (downstream-settings-propagation).
     /// `None` slot = no settings configured for this server. The pool seeds it at
@@ -335,6 +360,21 @@ pub(crate) struct ServerRequestDeps {
     /// Routes bridge-minted client-progress tokens (`kakehashi/bridge/cprog/*`)
     /// to their aggregator (ls-bridge-client-progress).
     pub(crate) client_progress_registry: Arc<crate::lsp::bridge::ClientProgressRegistry>,
+}
+
+impl ServerRequestDeps {
+    /// The watermark of texts held as a request about several documents (or
+    /// one, read later) was read, stamped for this connection: `None` when
+    /// the pool prepares nothing.
+    pub(crate) fn held_through(&self) -> Option<crate::lsp::diagnostic_cache::HeldStamp> {
+        self.document_tracker
+            .as_ref()
+            .map(|tracker| crate::lsp::diagnostic_cache::HeldStamp {
+                connection: self.connection_key.clone(),
+                observed: tracker.observe_through(self.incarnation),
+                origin: None,
+            })
+    }
 }
 
 /// RAII guard that purges this connection's progress-token mappings when the
@@ -621,6 +661,8 @@ where
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         },
     )
 }
@@ -718,6 +760,8 @@ async fn reader_loop(
         progress_registry,
         client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
         progress_connection_id,
+        document_tracker: None,
+        incarnation: 0,
     };
     reader_loop_with_liveness(reader, router, cancel_token, liveness, server_request_deps).await
 }
@@ -1348,6 +1392,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
         (deps, window_rx, (rx, upstream_rx))
     }
@@ -1487,6 +1533,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let notification = |text: &str| {
@@ -1569,6 +1617,8 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: conn,
+                document_tracker: None,
+                incarnation: 0,
             },
         );
 
@@ -2024,6 +2074,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -2601,6 +2653,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         // Then unregister it
@@ -2666,6 +2720,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -2758,6 +2814,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2821,6 +2879,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2882,6 +2942,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -2944,6 +3006,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let create = json!({
@@ -3015,6 +3079,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let make = || {
@@ -3104,6 +3170,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3164,6 +3232,8 @@ mod tests {
             progress_registry: Arc::clone(&progress_registry),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         // A renderable "begin" announces the token (create first) and is forwarded
@@ -3252,6 +3322,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let progress = json!({
@@ -3295,6 +3367,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3354,6 +3428,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3402,6 +3478,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3450,6 +3528,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3504,6 +3584,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3529,6 +3611,7 @@ mod tests {
                 server,
                 connection_id,
                 diagnostics,
+                ..
             } => {
                 assert_eq!(connection_id, deps.progress_connection_id);
                 assert!(uri.contains("kakehashi-virtual-uri-REGION"));
@@ -3538,6 +3621,164 @@ mod tests {
             }
             _ => panic!("expected PublishDiagnostics"),
         }
+    }
+
+    /// A region push is stamped with what its connection held as it was read
+    /// — only when the pool prepares (it then shares its records with the
+    /// reader); otherwise every text is held as is and nothing is stamped.
+    #[tokio::test]
+    async fn a_region_push_is_stamped_only_when_the_pool_prepares() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let host =
+            crate::lsp::lsp_impl::url_to_uri(&url::Url::parse("file:///project/stamp.md").unwrap())
+                .unwrap();
+        let virtual_uri =
+            crate::lsp::bridge::VirtualDocumentUri::new(&host, "lua", "01JPMQ8ZYYQA1W3AVPW4JDRZFR");
+        let key = ConnectionKey::for_server("test");
+        let tracker = Arc::new(crate::lsp::bridge::pool::DocumentTracker::new());
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared =
+            apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+        tracker.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            crate::lsp::bridge::pool::SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+            3,
+        );
+
+        let push = |version: i32| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "textDocument/publishDiagnostics",
+                "params": {
+                    "uri": virtual_uri.to_uri_string(),
+                    "version": version,
+                    "diagnostics": []
+                }
+            })
+        };
+        let held_of = |tracker: Option<Arc<crate::lsp::bridge::pool::DocumentTracker>>,
+                       version: i32| {
+            let (upstream_tx, mut upstream_rx) = mpsc::unbounded_channel();
+            let deps = ServerRequestDeps {
+                experimental_enabled: true,
+                settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+                server_name: Some("luals".to_string()),
+                connection_key: key.clone(),
+                peer_directory: Arc::new(peer::PeerDirectory::default()),
+                response_tx: mpsc::channel(16).0,
+                dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+                upstream_tx,
+                workspace_folders: WorkspaceFolderSet::new(None),
+                window_tx: mpsc::channel(16).0,
+                upstream_request_tx: mpsc::unbounded_channel().0,
+                inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+                progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+                client_progress_registry: Arc::new(
+                    crate::lsp::bridge::ClientProgressRegistry::new(),
+                ),
+                progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+                document_tracker: tracker,
+                incarnation: 0,
+            };
+            crate::lsp::bridge::text_document::publish_diagnostics::forward_push(
+                push(version),
+                &deps,
+            );
+            match upstream_rx.try_recv().expect("the push is routed upstream") {
+                UpstreamNotification::PublishDiagnostics { held, .. } => held,
+                _ => panic!("expected PublishDiagnostics"),
+            }
+        };
+
+        // The pool prepares nothing: not stamped.
+        assert_eq!(held_of(None, 3), None);
+        // It prepares: stamped with the prepared text this connection holds,
+        // and whether the push names another version than the one sent.
+        let stamp = |stale_version| crate::lsp::diagnostic_cache::HeldStamp {
+            connection: key.clone(),
+            observed: crate::lsp::bridge::Observed::Read {
+                generation: Some(1),
+                prepared: true,
+                stale_version,
+                incarnation: 0,
+            },
+            origin: None,
+        };
+        assert_eq!(held_of(Some(Arc::clone(&tracker)), 3), Some(stamp(false)));
+        assert_eq!(held_of(Some(Arc::clone(&tracker)), 2), Some(stamp(true)));
+    }
+
+    /// A showDocument or applyEdit is stamped as it is read with the
+    /// watermark of texts held so far — only when the pool prepares, and
+    /// without reading it until a prepared text was ever sent.
+    #[tokio::test]
+    async fn a_request_about_documents_is_stamped_with_the_texts_held_so_far() {
+        use crate::lsp::bridge::Observed;
+        let key = ConnectionKey::for_server("test");
+        let deps_with = |tracker| ServerRequestDeps {
+            experimental_enabled: true,
+            settings: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+            server_name: Some("luals".to_string()),
+            connection_key: key.clone(),
+            peer_directory: Arc::new(peer::PeerDirectory::default()),
+            response_tx: mpsc::channel(16).0,
+            dynamic_capabilities: Arc::new(DynamicCapabilityRegistry::new()),
+            upstream_tx: mpsc::unbounded_channel().0,
+            workspace_folders: WorkspaceFolderSet::new(None),
+            window_tx: mpsc::channel(16).0,
+            upstream_request_tx: mpsc::unbounded_channel().0,
+            inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry::default(),
+            progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
+            client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
+            progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: tracker,
+            incarnation: 0,
+        };
+        assert_eq!(deps_with(None).held_through(), None);
+
+        let tracker = Arc::new(crate::lsp::bridge::pool::DocumentTracker::new());
+        let deps = deps_with(Some(Arc::clone(&tracker)));
+        let observed = || deps.held_through().map(|stamp| stamp.observed);
+        assert_eq!(observed(), Some(Observed::AsIsThen));
+
+        let host = crate::lsp::lsp_impl::url_to_uri(
+            &url::Url::parse("file:///project/through.md").unwrap(),
+        )
+        .unwrap();
+        let virtual_uri =
+            crate::lsp::bridge::VirtualDocumentUri::new(&host, "lua", "01JPMQ8ZYYQA1W3AVPW4JDRZFR");
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        for text in ["a", "b"] {
+            tracker.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                crate::lsp::bridge::pool::SentText {
+                    text,
+                    map: Some(&map),
+                },
+                1,
+            );
+        }
+        assert_eq!(
+            observed(),
+            Some(Observed::Through {
+                generation: 2,
+                incarnation: 0
+            })
+        );
     }
 
     /// A non-virtual (real host URI) push is now routed up too — the publisher
@@ -3566,6 +3807,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3623,6 +3866,8 @@ mod tests {
                     crate::lsp::bridge::ClientProgressRegistry::new(),
                 ),
                 progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+                document_tracker: None,
+                incarnation: 0,
             };
             (deps, upstream_rx)
         };
@@ -3706,6 +3951,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -3750,6 +3997,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         // client/registerCapability with no params field at all
@@ -3809,6 +4058,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         // client/unregisterCapability with no params field at all
@@ -3879,6 +4130,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
         let handle = tokio::spawn(async move {
             let message = json!({
@@ -3944,6 +4197,8 @@ mod tests {
             progress_registry: Arc::new(crate::lsp::bridge::ProgressRegistry::new()),
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id: crate::lsp::bridge::ProgressConnectionId::for_test(0),
+            document_tracker: None,
+            incarnation: 0,
         };
 
         let message = json!({
@@ -4467,6 +4722,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
         (deps, response_rx, upstream_request_rx)
     }
@@ -4921,6 +5178,8 @@ mod tests {
             progress_registry,
             client_progress_registry: Arc::new(crate::lsp::bridge::ClientProgressRegistry::new()),
             progress_connection_id,
+            document_tracker: None,
+            incarnation: 0,
         };
         (deps, (rx, upstream_rx, window_rx))
     }

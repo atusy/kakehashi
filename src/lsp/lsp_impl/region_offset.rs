@@ -141,7 +141,7 @@ impl Kakehashi {
         // server the region now routes to. An envelope with no language
         // (cleared by the client) names no region.
         .is_some_and(|(live_offset, _, _, live_language)| {
-            live_offset == RegionOffset::from(offset) && live_language == injection_language
+            offset.describes(&live_offset) && live_language == injection_language
         })
     }
 }
@@ -154,6 +154,11 @@ impl Kakehashi {
 /// whether the virtual content maps to one contiguous host span; the fourth
 /// is the region's live injection language, so a resolve gate can refuse an
 /// envelope whose echoed language no longer names this region.
+///
+/// A region whose document is prepared (or held back for its peer), or a
+/// prepared text of which a server still holds, reads as not rebuildable: an
+/// offset kept from one of its texts — a resolve envelope's — carries no map
+/// and describes nothing its servers hold.
 pub(super) fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
@@ -161,7 +166,57 @@ pub(super) fn resolve_region_offset(
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool, String)> {
-    resolve_region(documents, language, bridge, host_url, region_id).map(resolved_region_geometry)
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    if bridge.region_coordinates_may_be_prepared(host_url, &resolved.injection_language, region_id)
+    {
+        return None;
+    }
+    Some(resolved_region_geometry(resolved))
+}
+
+/// Rebuild the region's current host offset (see [`resolve_region_offset`])
+/// for coordinates a connection sent about `origin_uri`: through the text it
+/// held when they were read (`held`; see `BridgeCoordinator::place_held`).
+/// `None` also when they describe no current host position — among them,
+/// once the region resolves to another document than `origin_uri` (a
+/// shebang edit re-routing it to another language under the same id): the
+/// coordinates are the old document's, whose text and record the live
+/// region's do not describe.
+pub(super) fn resolve_region_offset_for_held(
+    documents: &DocumentStore,
+    language: &Arc<LanguageCoordinator>,
+    bridge: &BridgeCoordinator,
+    host_url: &Url,
+    region_id: &str,
+    origin_uri: &str,
+    held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
+) -> Option<(RegionOffset, Position, bool, String)> {
+    let resolved = resolve_region(documents, language, bridge, host_url, region_id)?;
+    // Only once preparing is in play: without it, both documents' text is
+    // the region's text as is, and placement stays what it always was.
+    if bridge.pool().prepares() {
+        let host = crate::lsp::lsp_impl::url_to_uri(host_url).ok()?;
+        if crate::lsp::bridge::VirtualDocumentUri::new(
+            &host,
+            &resolved.injection_language,
+            region_id,
+        )
+        .to_uri_string()
+            != origin_uri
+        {
+            return None;
+        }
+    }
+    let presentation = bridge.place_held(
+        host_url,
+        &resolved.injection_language,
+        region_id,
+        &resolved.virtual_content,
+        held,
+    );
+    let (offset, region_end, contiguous, language) = resolved_region_geometry(resolved);
+    let offset = presentation.into_offset(offset)?;
+    Some((offset, region_end, contiguous, language))
 }
 
 /// Resolve geometry and content from the same current snapshot.
@@ -227,6 +282,72 @@ mod tests {
     use super::*;
     use crate::language::injection::{CacheableInjectionRegion, ResolvedInjection};
 
+    /// Coordinates a connection sent about one virtual document are placed
+    /// only while its region still resolves to that document: re-routed to
+    /// another language under the same id (a shebang edit), the region's
+    /// text and records are another document's.
+    #[tokio::test]
+    async fn coordinates_are_placed_only_through_the_document_they_came_from() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        let host = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        let origin = |language: &str| {
+            crate::lsp::bridge::VirtualDocumentUri::new(&host, language, &region.region_id)
+                .to_uri_string()
+        };
+        let place = |origin_uri: &str| {
+            resolve_region_offset_for_held(
+                &server.documents,
+                &server.language,
+                &server.bridge,
+                &uri,
+                &region.region_id,
+                origin_uri,
+                None,
+            )
+        };
+        assert!(place(&origin("rust")).is_some());
+        assert!(place(&origin("python")).is_none());
+    }
+
     #[test]
     fn geometry_uses_virtual_content_end_not_raw_node_end() {
         let resolved = ResolvedInjection {
@@ -242,6 +363,7 @@ mod tests {
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
             contiguous: true,
+            gaps: Default::default(),
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);

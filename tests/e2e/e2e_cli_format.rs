@@ -551,6 +551,438 @@ languages = ["lua"]
 }
 
 #[test]
+fn e2e_format_counts_a_region_its_prepare_peer_failed_as_a_failure() {
+    // With experimental features on, a prepare peer that answers with an
+    // error leaves its region unsent, so unformatted: something the run
+    // could not do, which exits 2 like any failed request.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-upper"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a region its prepare peer failed must exit 2; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("doc.md: 1 downstream formatting operation(s) failed"),
+        "stderr should report the failed region; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        markdown,
+        "the file must be left untouched"
+    );
+}
+
+#[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_where_formatting_is_disabled() {
+    // The same failing peer, on a region with formatting disabled
+    // (`priorities = []`): no formatting request would have been sent, so
+    // none failed, and the run exits 0.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+priorities = []
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a region with formatting disabled must exit 0 whatever its peer \
+         answers; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_of_a_same_range_alternative_left_out() {
+    // Two alternatives inject the same span: lua, found first, formats it;
+    // `peerlang`, whose peer fails, comes after. The later one sends no
+    // formatting request, as its span is already taken, so none failed:
+    // the run formats the span and exits 0.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("injections.scm"),
+        r#"
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+
+(fenced_code_block
+  (code_fence_content) @injection.content
+  (#set! injection.language "peerlang"))
+"#,
+    )
+    .expect("write injection query");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown]
+queries = [{{ path = "injections.scm", kind = "injections" }}]
+
+[languages.markdown.bridge.peerlang.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["peerlang"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua", "peerlang"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an alternative left out for a span already taken must not count \
+         its peer's failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        "# Test\n\n```lua\nPRINT('FAIL')\n```\n",
+        "the first alternative must format the span"
+    );
+}
+
+#[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_whose_span_a_later_alternative_formats() {
+    // The same two alternatives, the other way round: `peerlang`, found
+    // first, has a failing peer, so it takes no span; lua, after it,
+    // formats the span. Nothing is left unformatted, so nothing failed:
+    // the run exits 0.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("injections.scm"),
+        r#"
+(fenced_code_block
+  (code_fence_content) @injection.content
+  (#set! injection.language "peerlang"))
+
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+"#,
+    )
+    .expect("write injection query");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown]
+queries = [{{ path = "injections.scm", kind = "injections" }}]
+
+[languages.markdown.bridge.peerlang.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["peerlang"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua", "peerlang"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a failed prepare peer whose span a later alternative formats must \
+         not count; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        "# Test\n\n```lua\nPRINT('FAIL')\n```\n",
+        "the later alternative must format the span"
+    );
+}
+
+/// `peerlang`, found first, has a failing peer, so it takes no span; lua,
+/// after it, is served as `lua_config` (TOML) says. Runs `kakehashi format`
+/// on the workspace and returns its output with the workspace.
+fn format_after_a_failed_prepare_alternative(
+    markdown: &str,
+    lua_config: &str,
+) -> (std::process::Output, tempfile::TempDir) {
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("injections.scm"),
+        r#"
+(fenced_code_block
+  (code_fence_content) @injection.content
+  (#set! injection.language "peerlang"))
+
+(fenced_code_block
+  (info_string (language) @injection.language)
+  (code_fence_content) @injection.content)
+"#,
+    )
+    .expect("write injection query");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown]
+queries = [{{ path = "injections.scm", kind = "injections" }}]
+
+[languages.markdown.bridge.peerlang.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["peerlang"]
+
+[languageServers.mock-peerlang]
+cmd = ['{bin}', 'upper']
+languages = ["peerlang"]
+
+{lua_config}
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter"),
+            lua_config = lua_config.replace("{bin}", env!("CARGO_BIN_EXE_mock-lsp-formatter")),
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    (output, ws)
+}
+
+#[test]
+fn e2e_format_counts_a_failed_prepare_peer_whose_span_a_later_alternative_takes_but_never_formats()
+{
+    // lua takes the span, but its only server formats nothing (it
+    // advertises no formatting): no alternative answered for the span the
+    // failing peer left, so it is left unformatted, and the run exits 2.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languageServers.mock-definition]
+cmd = ['{bin}', 'definition']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a span no alternative answered for must count its peer's failure; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_counts_a_failed_prepare_peer_whose_span_a_later_pipeline_takes_but_never_formats() {
+    // The same under the concatenated pipeline: its only step advertises
+    // no formatting, so no step answers, and the run exits 2.
+    let markdown = "# Test\n\n```lua\nprint('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-definition"]
+
+[languageServers.mock-definition]
+cmd = ['{bin}', 'definition']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a span no pipeline step answered for must count its peer's \
+         failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_does_not_count_a_failed_prepare_peer_whose_span_a_later_pipeline_finds_formatted() {
+    // The pipeline's step answers, but the span is already formatted, so
+    // it changes nothing: an answer all the same, and the run exits 0.
+    let markdown = "# Test\n\n```lua\nPRINT('FAIL')\n```\n";
+    let (output, ws) = format_after_a_failed_prepare_alternative(
+        markdown,
+        r#"[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-upper"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "an already formatted span is answered; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
+fn e2e_format_does_not_count_a_region_its_prepare_peer_prepared() {
+    // The same region, prepared by its peer, is no failure: the run
+    // exits 0.
+    let markdown = "# Test\n\n```lua\nprint('ok')\n```\n";
+    let ws = workspace_with(&[("doc.md", markdown)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            r#"autoInstall = false
+
+[languages.markdown.bridge.lua.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = ["peer"]
+
+[languages.markdown.bridge.lua.aggregation._]
+priorities = ["mock-upper"]
+
+[languageServers.peer]
+cmd = ['{bin}', 'prepare-peer']
+languages = ["lua"]
+
+[languageServers.mock-upper]
+cmd = ['{bin}', 'upper']
+languages = ["lua"]
+"#,
+            bin = env!("CARGO_BIN_EXE_mock-lsp-formatter")
+        ),
+    )
+    .expect("write prepare config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .arg("format")
+        .arg("--config-file")
+        .arg("kakehashi.toml")
+        .arg("doc.md")
+        .current_dir(ws.path())
+        .env("KAKEHASHI_DATA_DIR", data_dir())
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .output()
+        .expect("spawn kakehashi format");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a region its prepare peer prepared must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Formatting is closed to a prepared document: the region is left as
+    // is, which the run does not count as a failure.
+    assert_eq!(read(ws.path(), "doc.md"), markdown);
+}
+
+#[test]
 fn e2e_format_preferred_non_winning_failure_is_not_counted() {
     // Preferred fan-out (the bridge-level default for formatting): the
     // higher-priority server errors, the fallback formats and WINS. Under

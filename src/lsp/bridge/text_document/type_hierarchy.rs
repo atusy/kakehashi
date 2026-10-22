@@ -14,11 +14,13 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::pool::ConnectionKey;
-use super::super::pool::{ConnectionState, LanguageServerPool, UpstreamId, VirtualUriObserver};
+use super::super::pool::{
+    ConnectionState, HeldNote, LanguageServerPool, UpstreamId, VirtualUriObserver,
+};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, response_has_jsonrpc_error,
-    translate_host_position_to_virtual, translate_host_range_to_virtual,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    translate_contained_ranges_to_host, translate_host_position_to_virtual,
+    translate_host_range_to_virtual, virtual_uri_to_lsp_uri,
 };
 use super::completion::EnvelopeOffset;
 use crate::config::settings::BridgeServerConfig;
@@ -238,6 +240,9 @@ impl LanguageServerPool {
             type_hierarchy_item_to_downstream(params.item, &envelope, virtual_uri.as_ref());
         let request = build_type_hierarchy_expansion_request(request_id, method, params);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        // What the producer holds for the virtual document as the request
+        // is queued: the reply must be computed on that text.
+        let mut held = HeldNote::default();
         let (send_result, virtual_uri_observer) = {
             let connections = self.connections().await;
             let producer_is_live = connections.get(connection_key).is_some_and(|current| {
@@ -259,6 +264,7 @@ impl LanguageServerPool {
                     envelope.connection_generation,
                 );
                 if let Some(uri) = virtual_uri.as_ref().map(VirtualDocumentUri::to_uri_string) {
+                    held = self.note_held(&uri, connection_key);
                     observer.insert(uri);
                 }
                 let queued = if handle.has_static_type_hierarchy_provider() {
@@ -308,6 +314,12 @@ impl LanguageServerPool {
             )
             .await
         {
+            return None;
+        }
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its items are not
+        // in the envelope's coordinates.
+        if !self.held_unchanged(&held) {
             return None;
         }
         transform_type_hierarchy_expansion_response_to_host(
@@ -447,25 +459,24 @@ fn re_envelope_item(
     envelope: &TypeHierarchyEnvelope,
     projected_from_virtual: bool,
 ) {
-    let offset = RegionOffset::from(&envelope.offset);
-    envelope_item_data(
-        item,
-        &TypeHierarchyEnvelopeContext {
-            server_name: &envelope.origin,
-            host_uri: &envelope.host_uri,
-            region_id: &envelope.region_id,
-            injection_language: &envelope.injection_language,
-            revision: TypeHierarchyDocumentRevision {
-                incarnation: envelope.incarnation,
-                content_version: envelope.content_version,
-            },
-            connection_generation: envelope.connection_generation,
-            connection_key: &envelope.connection_key,
-            offset: &offset,
-            host_layer: envelope.host_layer,
-            projected_from_virtual,
-        },
-    );
+    // Written as a fresh mint writes it, but keeping the mark of an item
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    // Field by field: the offset is rewritten, not cloned to be dropped.
+    let rebuilt = TypeHierarchyEnvelope {
+        origin: envelope.origin.clone(),
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        injection_language: envelope.injection_language.clone(),
+        incarnation: envelope.incarnation,
+        content_version: envelope.content_version,
+        connection_generation: envelope.connection_generation,
+        connection_key: envelope.connection_key.clone(),
+        offset: envelope.offset.rewritten(),
+        inner: item.data.take(),
+        host_layer: envelope.host_layer,
+        projected_from_virtual,
+    };
+    item.data = Some(serde_json::json!({ ENVELOPE_KEY: rebuilt }));
 }
 
 pub(crate) struct TypeHierarchyDocumentRevision {
@@ -601,8 +612,11 @@ fn transform_type_hierarchy_prepare_response_to_host(
                     return None;
                 }
                 item.uri = host_uri.clone();
-                translate_virtual_range_to_host(&mut item.range, offset);
-                translate_virtual_range_to_host(&mut item.selection_range, offset);
+                translate_contained_ranges_to_host(
+                    &mut item.range,
+                    &mut item.selection_range,
+                    offset,
+                );
                 true
             } else {
                 false
@@ -664,8 +678,11 @@ fn transform_type_hierarchy_expansion_response_to_host(
                     return None;
                 }
                 item.uri = host_uri.clone();
-                translate_virtual_range_to_host(&mut item.range, &offset);
-                translate_virtual_range_to_host(&mut item.selection_range, &offset);
+                translate_contained_ranges_to_host(
+                    &mut item.range,
+                    &mut item.selection_range,
+                    &offset,
+                );
                 true
             } else {
                 false
@@ -856,6 +873,72 @@ mod tests {
             serde_json::json!({ "line": 0, "character": 2 })
         );
         assert_eq!(value["params"]["workDoneToken"], "progress");
+    }
+
+    /// Through a prepared document, an item's selection is clamped into its
+    /// range, as LSP requires (see `translate_contained_ranges_to_host`).
+    #[test]
+    fn a_prepared_items_selection_stays_inside_its_range() {
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        let key = ConnectionKey::shared("lua-ls");
+        let virtual_text = "  a\n  b\n";
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = crate::lsp::bridge::protocol::apply_prepare_result(
+            virtual_text,
+            &crate::lsp::bridge::protocol::VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(0, 0).with_prepared(map);
+        let virtual_uri = VirtualDocumentUri::new(&host_uri, "lua", "region");
+        let response = serde_json::json!({ "result": [{
+            "name": "Child",
+            "kind": 5,
+            "uri": virtual_uri.to_uri_string(),
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "selectionRange": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "data": { "token": 9 }
+        }]});
+        let known_virtual_uris = HashSet::from([virtual_uri.to_uri_string()]);
+        let items = transform_type_hierarchy_prepare_response_to_host(
+            response,
+            &virtual_uri.to_uri_string(),
+            &host_uri,
+            &offset,
+            &known_virtual_uris,
+            &TypeHierarchyEnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: host_uri.as_str(),
+                region_id: "region",
+                injection_language: "lua",
+                revision: TypeHierarchyDocumentRevision {
+                    incarnation: Some(2),
+                    content_version: 3,
+                },
+                connection_generation: 4,
+                connection_key: &key,
+                offset: &offset,
+                host_layer: false,
+                projected_from_virtual: false,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            items[0].selection_range.start >= items[0].range.start,
+            "{:?}",
+            items[0]
+        );
+        assert!(
+            items[0].selection_range.end <= items[0].range.end,
+            "{:?}",
+            items[0]
+        );
     }
 
     #[test]

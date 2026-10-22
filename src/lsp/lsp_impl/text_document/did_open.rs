@@ -1386,6 +1386,7 @@ print("hello")
             virt_contexts: vec![],
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
+            prepare_pending: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1449,6 +1450,8 @@ print("hello")
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         wait_version(1)
             .await
@@ -1475,11 +1478,94 @@ print("hello")
             std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
             std::sync::Arc::new(DiagnosticPublisher::new(server)),
             std::sync::Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         wait_version(2).await.expect(
             "second debounce fire must re-read the updated store text and advance to version 2 \
              (a snapshot-only sync would dedup at version 1)",
         );
+    }
+
+    /// A debounced collection that takes its snapshot when it fires runs
+    /// under the settings that snapshot was taken with, not the ones (or
+    /// none) its timer was scheduled under: it supersedes lower-ranked work
+    /// at its version under those settings rather than losing to it.
+    #[tokio::test]
+    async fn a_resnapshot_registers_under_the_settings_it_was_taken_with() {
+        use std::sync::Arc;
+
+        use crate::lsp::debounced_diagnostics::{DebouncedDiagnosticsManager, Resnapshot};
+        use crate::lsp::lsp_impl::DiagnosticPublisher;
+        use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
+            DiagnosticSnapshot, DiagnosticSnapshotLineage,
+        };
+        use crate::lsp::synthetic_diagnostics::{
+            SyntheticDiagnosticTrigger, SyntheticDiagnosticsManager,
+        };
+
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/resnapshot_settings.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn a() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let document = server.documents.get(&uri).unwrap();
+            (document.incarnation(), document.content_version())
+        };
+        let synthetic = Arc::new(SyntheticDiagnosticsManager::new());
+        // Change-ranked work at this version under settings generation 5.
+        let earlier = tokio::spawn(std::future::pending::<()>());
+        assert!(synthetic.register_task_for_lineage(
+            uri.clone(),
+            incarnation,
+            content_version,
+            5,
+            SyntheticDiagnosticTrigger::Change,
+            earlier.abort_handle(),
+        ));
+        let resnapshot: Resnapshot = Box::new(|incarnation, content_version| {
+            Some(DiagnosticSnapshot {
+                lineage: DiagnosticSnapshotLineage {
+                    incarnation,
+                    content_version,
+                    settings_generation: 5,
+                },
+                virt_contexts: vec![],
+                host: None,
+                host_pull_enabled: false,
+                narrower_than_editor_pull: false,
+                prepare_pending: false,
+                layer_cfg: crate::config::settings::ResolvedLayerConfig {
+                    priorities: vec![],
+                    strategy: crate::config::settings::AggregationStrategy::Concatenated,
+                },
+            })
+        });
+        let manager = DebouncedDiagnosticsManager::with_duration(Duration::ZERO);
+        // Scheduled with no snapshot: its timer knows no settings generation.
+        manager.schedule(
+            uri.clone(),
+            None,
+            server.bridge.pool_arc(),
+            Arc::clone(&server.bridge),
+            Arc::clone(&synthetic),
+            Arc::new(DiagnosticPublisher::new(server)),
+            Arc::clone(&server.documents),
+            SyntheticDiagnosticTrigger::Prepared,
+            Some(resnapshot),
+        );
+        timeout(Duration::from_secs(1), async {
+            while !earlier.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the collection under generation 5 supersedes the change-ranked work");
     }
 
     #[tokio::test]
@@ -1517,6 +1603,7 @@ print("hello")
             virt_contexts: vec![],
             host_pull_enabled: true,
             narrower_than_editor_pull: false,
+            prepare_pending: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1544,6 +1631,8 @@ print("hello")
             Arc::new(SyntheticDiagnosticsManager::new()),
             Arc::new(DiagnosticPublisher::new(server)),
             Arc::clone(&server.documents),
+            crate::lsp::synthetic_diagnostics::SyntheticDiagnosticTrigger::Change,
+            None,
         );
         gate.entered.notified().await;
         let timer = manager.timer_abort_handle(&uri).unwrap();
@@ -2410,6 +2499,96 @@ print("hello")
                 .is_some(),
             "the completion exercised the two-stage regions handoff"
         );
+    }
+
+    /// A collection after a resync pass is for the revision the pass synced:
+    /// a later edit's text may hold regions its own pass has yet to send, and
+    /// a collection of it ranked as one after they were sent would leave them
+    /// out for good.
+    #[tokio::test]
+    async fn a_collection_after_prepare_is_for_the_revision_its_pass_synced() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/collect_synced_revision.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let parse = || async {
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None, None)
+                .await
+        };
+        parse().await;
+        let scheduler = server.diagnostic_scheduler();
+        let synced = scheduler.current_revision(&uri);
+        // Edited and parsed since the pass.
+        server
+            .documents
+            .update_document(uri.clone(), "fn edited() {}".to_string(), None);
+        parse().await;
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_some());
+        scheduler.spawn_diagnostic_task_after_prepare(uri.clone(), synced);
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone(), synced);
+        assert!(!server.synthetic_diagnostics.has_active_task(&uri));
+        assert!(!server.debounced_diagnostics.has_active_timer(&uri));
+        // For the revision it is at, both collect.
+        let current = scheduler.current_revision(&uri);
+        scheduler.schedule_debounced_diagnostic_after_prepare(uri.clone(), current);
+        assert!(server.debounced_diagnostics.has_active_timer(&uri));
+        scheduler.spawn_diagnostic_task_after_prepare(uri.clone(), current);
+        assert!(server.synthetic_diagnostics.has_active_task(&uri));
+        server.debounced_diagnostics.cancel_all();
+    }
+
+    /// A collection scheduled after prepare takes its snapshot when it fires:
+    /// a region still held when it was scheduled may be sent and collected at
+    /// once before then, and a snapshot from scheduling would leave it out of
+    /// a collection that replaces that one.
+    #[tokio::test]
+    async fn a_debounced_collection_after_prepare_snapshots_when_it_fires() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+        let uri = Url::parse("file:///test/prepared_snapshot_at_fire.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let scheduler = server.diagnostic_scheduler();
+        // Nothing to snapshot yet: no tree.
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_none());
+        let gate = server.debounced_diagnostics.install_execution_gate();
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
+        gate.entered.notified().await;
+        // By the time it fires, there is.
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None, None)
+            .await;
+        assert!(scheduler.prepare_diagnostic_snapshot(&uri).is_some());
+        gate.release.notify_one();
+        let collected = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(collected) = *gate.collected_with_snapshot.lock().unwrap() {
+                    break collected;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the timer ran");
+        assert!(collected, "collected with the snapshot taken when it fired");
+        server.debounced_diagnostics.cancel_all();
     }
 
     /// Regression (parse-actor flip): the debounced diagnostic — which drives the

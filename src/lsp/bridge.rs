@@ -35,7 +35,13 @@ pub(crate) mod envelope;
 mod inbound_request_registry;
 mod peer;
 mod pool;
-pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS};
+pub(crate) use pool::{HostLanguageAdmission, INIT_TIMEOUT_SECS, Observed, Presentation};
+mod prepare_layer;
+mod prepare_registry;
+pub(crate) use prepare_registry::{
+    Answer as PrepareAnswer, PrepareInput, PrepareLookup, PrepareMiss, PrepareTarget, Resync,
+    ResyncCause, retry_delay as prepare_retry_delay,
+};
 mod progress_registry;
 mod protocol;
 mod root_markers;
@@ -75,6 +81,9 @@ pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
+#[cfg(test)]
+pub(crate) use protocol::PreparedDocument;
+pub(crate) use protocol::PreparedMap;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
@@ -88,6 +97,10 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
+/// Re-exported for tests outside the bridge that place coordinates through a
+/// prepared map.
+#[cfg(test)]
+pub(crate) use protocol::{VirtualLayout, apply_prepare_result};
 pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::HostResolveSnapshot;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};

@@ -22,6 +22,7 @@ mod handshake;
 mod liveness_timeout;
 mod message_sender;
 mod pending_reopen;
+mod presentation;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
@@ -49,13 +50,14 @@ pub(crate) struct CrashedConnection {
 }
 pub(crate) use crash_recovery::{RecoveryDecision, Reservation};
 pub(in crate::lsp::bridge) use document_tracker::DocumentTracker;
-pub(crate) use document_tracker::{OpenedVirtualDoc, VirtualUriObserver};
+pub(crate) use document_tracker::{HeldText, OpenedVirtualDoc, SentText, VirtualUriObserver};
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
 /// Re-exported so the server-side re-open handler bounds its work by the same
 /// budget requests wait on — the two must not drift apart.
 pub(crate) use pending_reopen::REOPEN_WAIT;
+pub(crate) use presentation::{Observed, Presentation, RegionPrepare};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 #[derive(Clone)]
@@ -324,8 +326,8 @@ pub(in crate::lsp::bridge) type HostDocuments =
     Mutex<HashMap<String, HashMap<ConnectionKey, HostDocSyncState>>>;
 
 enum VirtualOpenContent<'a> {
-    LatestKnown(&'a str),
-    Snapshot(&'a str),
+    LatestKnown(SentText<'a>),
+    Snapshot(SentText<'a>),
 }
 
 /// Cancellation-safe rollback for the pre-send virtual-document claim.
@@ -360,7 +362,138 @@ pub(crate) struct HostVirtualContents {
     /// Only accepted parse-label promotions establish this admission fence.
     /// Explicit aliases keep their existing canonical request behavior.
     promoted_language: Option<HostLanguageAdmission>,
-    contents: DashMap<String, DashMap<String, Arc<str>>>,
+    contents: DashMap<String, DashMap<String, LatestText>>,
+}
+
+/// What a text meets for one region of one host, read at once from the
+/// prepare registry's table (see [`LanguageServerPool::region_admission`]).
+/// Everything is admitted without the prepare layer.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RegionAdmission {
+    /// The failure the lifecycle pass holds the region on stands at the
+    /// current epoch: no text as is goes through it.
+    failed: bool,
+    /// The lifecycle pass withholds the region for a prepare peer known to
+    /// prepare it, under the host's current incarnation (see
+    /// [`LanguageServerPool::hold_latest_virtual_content`]): no request
+    /// opens it with text as is.
+    held: bool,
+}
+
+impl RegionAdmission {
+    /// Whether a text from `map` (`None`: a text as is) is refused for its
+    /// failure: a map its peer revoked since (see `PreparedMap::revoked`),
+    /// or a text as is while the region's failure stands.
+    fn refuses_answer(&self, map: Option<&super::protocol::PreparedMap>) -> bool {
+        map.map_or(self.failed, super::protocol::PreparedMap::revoked)
+    }
+
+    /// [`Self::refuses_answer`], or a text as is of a withheld region.
+    fn refuses(&self, map: Option<&super::protocol::PreparedMap>) -> bool {
+        self.refuses_answer(map) || map.is_none() && self.held
+    }
+}
+
+/// What a connection held for a virtual document as a resolve was queued
+/// (see [`LanguageServerPool::note_held`]): its URI, the connection, the
+/// generation of the text on record, and whether that text is held as is.
+/// Empty without the prepare layer, and before anything is noted: an
+/// empty note is unchanged (see [`LanguageServerPool::held_unchanged`]).
+#[derive(Default)]
+pub(crate) struct HeldNote(Option<(String, ConnectionKey, Option<u64>, bool)>);
+
+/// The latest text forwarded for a virtual document, which a deferred
+/// didOpen substitutes: what downstream servers are sent, with the prepared
+/// map when a peer prepared it.
+#[derive(Debug, Clone)]
+pub(crate) enum LatestText {
+    /// Without experimental features: the text alone, one allocation as
+    /// before preparing existed, since nothing reads a map or a stamp.
+    Text(Arc<str>),
+    /// With them: when it was recorded, and the map a peer prepared it with.
+    Stamped(Arc<StampedText>),
+}
+
+#[derive(Debug)]
+pub(crate) struct StampedText {
+    text: String,
+    map: Option<Arc<super::protocol::PreparedMap>>,
+    /// When it was last recorded (see [`super::protocol::next_presentation`]),
+    /// the same text recorded again included: the pass recording it decided
+    /// on it then.
+    recorded: std::sync::atomic::AtomicU64,
+}
+
+impl LatestText {
+    fn as_sent(&self) -> SentText<'_> {
+        match self {
+            Self::Text(text) => SentText { text, map: None },
+            Self::Stamped(stamped) => SentText {
+                text: &stamped.text,
+                map: stamped.map.as_ref(),
+            },
+        }
+    }
+
+    fn map(&self) -> Option<&Arc<super::protocol::PreparedMap>> {
+        match self {
+            Self::Text(_) => None,
+            Self::Stamped(stamped) => stamped.map.as_ref(),
+        }
+    }
+
+    /// When it was last recorded; never, without experimental features.
+    fn recorded(&self) -> u64 {
+        match self {
+            Self::Text(_) => 0,
+            Self::Stamped(stamped) => stamped.recorded.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Whether recording `content` keeps this text: the same text from the
+    /// same answer (recorded again, so only when it was recorded changes),
+    /// or any text from an answer taken before for the same input (which
+    /// changes nothing, not even that: see [`Self::is_older`]). One from a
+    /// newer answer replaces it, however alike in coordinates (the same text
+    /// prepared again under a new epoch): the cache must hand out the answer
+    /// that stands, not one revoked since.
+    fn is(&self, content: SentText<'_>) -> bool {
+        let held = self.as_sent();
+        super::protocol::PreparedMap::taken_before(content.map, held.map)
+            || (held.text == content.text
+                && super::protocol::PreparedMap::same_answer(held.map, content.map))
+    }
+
+    /// Whether `content` comes from an answer taken before this one's for
+    /// the same input (an answer never moves backwards: see
+    /// `PreparedMap::taken_before`). Recording it is not recording this
+    /// text again: a lazy open weighs when the cache was recorded against
+    /// when a request's input was taken, and a late older answer would make
+    /// this text look newer than a later input's.
+    fn is_older(&self, content: SentText<'_>) -> bool {
+        super::protocol::PreparedMap::taken_before(content.map, self.as_sent().map)
+    }
+}
+
+/// The error an open refused by its region's admission fails with (see
+/// [`RegionAdmission`]).
+fn held_for_prepare_peer() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        "bridge: the region is held for its prepare peer",
+    )
+}
+
+/// The error a send of a text from a revoked answer fails with: nothing was
+/// recorded or sent (see `DocumentTracker::record_and_queue`).
+fn revoked_text(virtual_uri: &VirtualDocumentUri) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotConnected,
+        format!(
+            "bridge: the prepared text of {} was revoked by its peer",
+            virtual_uri.to_uri_string()
+        ),
+    )
 }
 
 pub(crate) struct HostLanguageAdmission {
@@ -590,6 +723,16 @@ pub struct LanguageServerPool {
     inbound_request_registry: super::InboundRequestRegistry,
     /// Palette command name → origin server (#628 palette-fired executeCommand).
     command_origins: Arc<CommandOriginRegistry>,
+    /// What each connection advertised of `kakehashi/virtualDocument/prepare`
+    /// in its last handshake, so a (host, injection) pair none of whose
+    /// candidates prepares is not held back on each revision to find that
+    /// out again; and the prepare epoch.
+    /// `None` with experimental features off (decided once, at
+    /// construction): no connection's advertisement is then recorded.
+    prepare_advertisements: Option<Arc<PrepareAdvertisements>>,
+    /// The failures the prepare registry holds regions on, read in place
+    /// (see [`Self::prepare_failed`]). Installed with the prepare layer.
+    prepare_failures: std::sync::OnceLock<super::prepare_registry::PrepareFailures>,
 }
 
 impl Default for LanguageServerPool {
@@ -663,6 +806,8 @@ impl LanguageServerPool {
             client_progress_registry: Arc::new(super::ClientProgressRegistry::new()),
             inbound_request_registry: super::InboundRequestRegistry::default(),
             command_origins: Arc::new(CommandOriginRegistry::default()),
+            prepare_advertisements: crate::experimental::enabled().then(Arc::default),
+            prepare_failures: std::sync::OnceLock::new(),
         }
     }
 
@@ -941,6 +1086,9 @@ impl LanguageServerPool {
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
                 handle.begin_shutdown();
+                if let Some(advertisements) = &self.prepare_advertisements {
+                    advertisements.retire(handle);
+                }
             }
             self.host_documents.lock().await.retain(|_, connections| {
                 connections.remove(&key);
@@ -2006,7 +2154,7 @@ impl LanguageServerPool {
     ///
     /// Used by did_change to forward notifications to every connection that has
     /// the document open, not just the first one found.
-    pub(super) fn get_all_connections_for_virtual_uri(
+    pub(in crate::lsp::bridge) fn get_all_connections_for_virtual_uri(
         &self,
         virtual_uri: &VirtualDocumentUri,
     ) -> Vec<ConnectionKey> {
@@ -2087,6 +2235,8 @@ impl LanguageServerPool {
         // Failed/SpawnNew path and repeats the idempotent purge instead of
         // leaving a Closing entry that fails fast forever.
         failed_handle.set_state(ConnectionState::Failed);
+        // What it advertised stands for the replacement that is most
+        // likely coming (see `PrepareAdvertisements::adopt`).
         // Own teardown independently of this cleanup future. The purge below
         // can await several locks and be cancelled; the detached, bounded
         // shutdown must still retire the live process before a replacement is
@@ -2568,19 +2718,22 @@ impl LanguageServerPool {
 
     /// Open or synchronize a virtual document from a revision-validated snapshot.
     /// The caller keeps that revision stable until enqueue completes.
-    pub(crate) async fn ensure_document_opened_from_snapshot<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened_from_snapshot<
+        'a,
+        S: message_sender::MessageSender,
+    >(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::Snapshot(virtual_content),
+            VirtualOpenContent::Snapshot(virtual_content.into()),
             connection_key,
         )
         .await
@@ -2597,57 +2750,90 @@ impl LanguageServerPool {
     ///
     /// Generic over `MessageSender` (channel or `ConnectionHandleSender`) for
     /// the single-writer-loop architecture (ls-bridge-message-ordering).
-    pub(crate) async fn ensure_document_opened<S: message_sender::MessageSender>(
+    pub(crate) async fn ensure_document_opened<'a, S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         host_uri: &Url,
         virtual_uri: &VirtualDocumentUri,
-        virtual_content: &str,
+        virtual_content: impl Into<SentText<'a>>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         self.ensure_document_opened_with_content(
             sender,
             host_uri,
             virtual_uri,
-            VirtualOpenContent::LatestKnown(virtual_content),
+            VirtualOpenContent::LatestKnown(virtual_content.into()),
             connection_key,
         )
         .await
     }
 
     /// Called with the document transition lock held so the repair cannot race
-    /// another open or content update. Only confirmed sends advance the content
+    /// another open or content update. Only queued sends advance the content
     /// fingerprint, allowing a failed enqueue to be retried.
     async fn sync_open_document_from_snapshot<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,
         virtual_uri: &VirtualDocumentUri,
-        content: &str,
+        content: SentText<'_>,
         connection_key: &ConnectionKey,
     ) -> io::Result<()> {
         let uri = virtual_uri
             .to_uri_string()
             .parse()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if let Some(version) = self
+        let Some(change) = self
             .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
-        {
-            let params = DidChangeTextDocumentParams {
-                text_document: VersionedTextDocumentIdentifier::new(uri, version),
-                content_changes: vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: content.to_owned(),
-                }],
-            };
-            sender
-                .send_notification(JsonRpcNotification::new("textDocument/didChange", params))
-                .await?;
-            self.record_sent_content_fingerprint(virtual_uri, connection_key, content)
-                .await;
-        }
-        Ok(())
+        else {
+            return Ok(());
+        };
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier::new(uri, change.version()),
+            content_changes: vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: content.text.to_owned(),
+            }],
+        };
+        // Serialized before the record's lock is taken: only the enqueue
+        // happens under it.
+        let payload = message_sender::serialize_notification(JsonRpcNotification::new(
+            "textDocument/didChange",
+            params,
+        ))?;
+        self.document_tracker
+            .record_and_queue(
+                virtual_uri,
+                connection_key,
+                content,
+                change,
+                || sender.send_serialized(payload),
+                io::Result::is_ok,
+            )
+            .unwrap_or_else(|| Err(revoked_text(virtual_uri)))
+    }
+
+    /// Whether a text sent as is, from outside the lifecycle pass, must not
+    /// reach `virtual_uri` on this connection: the connection holds a
+    /// prepared text of it, or the lifecycle pass holds the region for its
+    /// prepare peer. Taken under the document's transition lock, which the
+    /// lifecycle pass sends and holds under too.
+    pub(in crate::lsp::bridge) fn refuses_text_as_is(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+    ) -> bool {
+        // Nothing is ever prepared or held without the prepare layer.
+        self.prepares()
+            && (self
+                .document_tracker
+                .held_text(&virtual_uri.to_uri_string(), connection_key)
+                .is_some_and(|held| held.map.is_some())
+                || self
+                    .region_admission(host_uri, virtual_uri.language(), virtual_uri.region_id())
+                    .held)
     }
 
     async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
@@ -2661,6 +2847,28 @@ impl LanguageServerPool {
         let connection_generation = self.document_tracker.connection_generation(connection_key);
         let transition = self.open_transition_lock(virtual_uri, connection_key);
         let transition_guard = Arc::clone(&transition).lock_owned().await;
+        // Under the transition the lifecycle pass closes held documents
+        // under too: a region it holds for its prepare peer is not opened
+        // with text as is (a request resolved before its pair gained the
+        // peer), whether its own or the last forwarded.
+        // Nothing is ever held without the prepare layer.
+        // A region its peer failed opens with no text from an answer taken
+        // before it failed (the peer no longer gives that answer), as the
+        // registry says the moment it is recorded.
+        let admission =
+            || self.region_admission(host_uri, virtual_uri.language(), virtual_uri.region_id());
+        // Whatever the text comes from: a snapshot checked against the
+        // host's revision too, as the hold can come after it was taken
+        // without moving that revision (an epoch move gaining the pair its
+        // peer).
+        let (VirtualOpenContent::LatestKnown(provided) | VirtualOpenContent::Snapshot(provided)) =
+            content;
+        let provided_map = provided.map.map(|map| &**map);
+        if admission().refuses(provided_map) {
+            drop(transition_guard);
+            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+            return Err(held_for_prepare_peer());
+        }
         if !self
             .document_tracker
             .is_document_opened_on_connection(virtual_uri, connection_key)
@@ -2751,9 +2959,30 @@ impl LanguageServerPool {
         self.document_tracker
             .register_pending_document(host_uri, virtual_uri, connection_key)
             .await;
+        // Asked again now that the document is registered: the lifecycle
+        // pass publishes a hold before its close sweep, which finds only
+        // registered documents (an ordering kept on purpose: publishing at
+        // the lookup instead would refuse opens the sweep closes today). A
+        // hold published while this open awaited its claim, and swept past
+        // it, is seen here; one published after this read is followed by a
+        // sweep that finds the document and closes it.
+        let registered = admission();
+        if registered.refuses(provided_map) {
+            self.abandon_claimed_open(
+                host_uri,
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
+            )
+            .await;
+            return Err(held_for_prepare_peer());
+        }
         // A deferred open refreshes from the forwarded-content cache as close
         // to enqueue as possible. A revision-guarded repair already owns newer
         // authoritative text: that cache can still trail the completed parse.
+        let latest_known = matches!(content, VirtualOpenContent::LatestKnown(_));
         let (provided, current_content) = match content {
             VirtualOpenContent::LatestKnown(provided) => (
                 provided,
@@ -2763,22 +2992,81 @@ impl LanguageServerPool {
                         .and_then(|regions| {
                             regions
                                 .get(virtual_uri.region_id())
-                                .map(|entry| Arc::clone(entry.value()))
+                                .map(|entry| entry.value().clone())
                         })
                 }),
             ),
             VirtualOpenContent::Snapshot(provided) => (provided, None),
         };
-        let virtual_content = current_content.as_deref().unwrap_or(provided);
-        let did_open = build_didopen_notification(virtual_uri, virtual_content);
-        if let Err(e) = sender.send_notification(did_open).await {
+        // A prepared request opens with the newer of its own text and the
+        // cached one, by when its answer's input was taken and when the cache
+        // was recorded: a cache from before (sent as is before the pair
+        // gained its peer, or prepared from an earlier text) would hold back
+        // a request whose answer is already in, and a newer one (the
+        // lifecycle pass's, as is since the pair lost its peer, say) must not
+        // be replaced by the stale request. A request built as is opens with
+        // the cache — most likely the lifecycle pass's newer text, which the
+        // server should hold even though this request then fails its own
+        // check.
+        // Never a cached text as is for a held region, however new.
+        let virtual_content = current_content
+            .as_ref()
+            .filter(|cached| {
+                provided
+                    .map
+                    .is_none_or(|request| cached.recorded() > request.built())
+                    && (cached.map().is_some() || !registered.held)
+            })
+            .map_or(provided, LatestText::as_sent);
+        // Checked again on the text it sends when that is the cached one:
+        // an answer its peer failed since is not opened, whichever it is.
+        // (Its failure alone: a hold was read on it above.)
+        if latest_known && admission().refuses_answer(virtual_content.map.map(|map| &**map)) {
+            self.abandon_claimed_open(
+                host_uri,
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
+            )
+            .await;
+            return Err(held_for_prepare_peer());
+        }
+        // What the connection holds is recorded as the didOpen is queued,
+        // taken back unless it is (see `DocumentTracker::record_and_queue`):
+        // a server pushing diagnostics the moment it opens the document finds
+        // its text on record. (The fingerprint also keeps the first
+        // position-only host edit, which leaves this region's content
+        // unchanged, from re-sending a didChange — and flickering a server
+        // that clears on didChange, #422.) Serialized first: only the
+        // enqueue happens under the record's lock.
+        let queued = message_sender::serialize_notification(build_didopen_notification(
+            virtual_uri,
+            virtual_content.text,
+        ))
+        .and_then(|payload| {
             self.document_tracker
-                .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim)
-                .await;
-            claim_guard.disarm();
-            drop(claim_guard);
-            drop(transition_guard);
-            self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, &transition);
+                .record_and_queue(
+                    virtual_uri,
+                    connection_key,
+                    virtual_content,
+                    document_tracker::ContentChange::opening(virtual_content.text),
+                    || sender.send_serialized(payload),
+                    io::Result::is_ok,
+                )
+                .unwrap_or_else(|| Err(revoked_text(virtual_uri)))
+        });
+        if let Err(e) = queued {
+            self.abandon_claimed_open(
+                host_uri,
+                virtual_uri,
+                connection_key,
+                claim_guard,
+                transition_guard,
+                &transition,
+            )
+            .await;
             return Err(e);
         }
         // Once didOpen has entered the FIFO, promotion must outlive cancellation
@@ -2830,46 +3118,239 @@ impl LanguageServerPool {
                 "bridge: didOpen claim invalidated during enqueue",
             ));
         }
-        // The didOpen was confirmed enqueued (the `MessageSender` maps `Queued` →
-        // `Ok`), so seed the content fingerprint with the opened content. Without
-        // this, the FIRST position-only host edit — which leaves this region's
-        // content unchanged — would still re-send a didChange (and, for a server that
-        // clears on didChange, flicker the diagnostics) because no fingerprint existed
-        // to compare against (#422).
-        self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, virtual_content)
-            .await;
         Ok(())
     }
 
-    pub(crate) fn record_latest_virtual_content(
+    /// Give up an open whose didOpen was not queued: its claim rolled back,
+    /// then its transition released.
+    async fn abandon_claimed_open(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        mut claim_guard: OpenClaimGuard,
+        transition_guard: tokio::sync::OwnedMutexGuard<()>,
+        transition: &Arc<tokio::sync::Mutex<()>>,
+    ) {
+        self.document_tracker
+            .rollback_open_claim_if(host_uri, virtual_uri, connection_key, &claim_guard.claim)
+            .await;
+        claim_guard.disarm();
+        drop(claim_guard);
+        drop(transition_guard);
+        self.remove_open_transition_lock_if_unshared(virtual_uri, connection_key, transition);
+    }
+
+    pub(crate) fn record_latest_virtual_content<'a>(
         &self,
         host_uri: &Url,
         incarnation: u64,
         language: &str,
         region_id: &str,
-        content: &str,
+        content: impl Into<SentText<'a>>,
     ) {
+        let content = content.into();
         let Some(host) = self.latest_virtual_contents.get(host_uri) else {
             return;
         };
         if host.incarnation != incarnation {
             return;
         }
-        if let Some(regions) = host.contents.get(language) {
-            if regions
-                .get(region_id)
-                .is_some_and(|cached| cached.as_ref() == content)
-            {
-                return;
+        // When it was recorded is read only against a prepared text's
+        // answer: nothing to order without experimental features.
+        let stamped = self.prepare_advertisements.is_some();
+        let stamp = || {
+            if stamped {
+                super::protocol::next_presentation()
+            } else {
+                0
             }
-            regions.insert(region_id.to_string(), Arc::<str>::from(content));
-            return;
+        };
+        let latest = || {
+            if stamped {
+                LatestText::Stamped(Arc::new(StampedText {
+                    text: content.text.to_string(),
+                    map: content.map.cloned(),
+                    recorded: std::sync::atomic::AtomicU64::new(stamp()),
+                }))
+            } else {
+                LatestText::Text(Arc::from(content.text))
+            }
+        };
+        match host.contents.get(language) {
+            Some(regions) => match regions.get(region_id).filter(|cached| cached.is(content)) {
+                Some(cached) => match cached.value() {
+                    LatestText::Text(_) => return,
+                    held @ LatestText::Stamped(_) if held.is_older(content) => {}
+                    LatestText::Stamped(cached) => cached
+                        .recorded
+                        .store(stamp(), std::sync::atomic::Ordering::Relaxed),
+                },
+                None => {
+                    regions.insert(region_id.to_string(), latest());
+                }
+            },
+            None => {
+                host.contents
+                    .entry(language.to_string())
+                    .or_default()
+                    .insert(region_id.to_string(), latest());
+            }
         }
-        host.contents
-            .entry(language.to_string())
-            .or_default()
-            .insert(region_id.to_string(), Arc::<str>::from(content));
+        // Only once the text to open with is in: a request checking the hold
+        // in between would open the text it replaces. Under the host's
+        // guard, as the hold is set: a close waits for both.
+        if stamped && let Some(failures) = self.prepare_failures.get() {
+            failures.release(host_uri, language, region_id, incarnation);
+        }
+    }
+
+    /// Note that the lifecycle pass holds `region_id` (under `language`)
+    /// for a prepare peer known to prepare it: what was last forwarded for
+    /// it was sent as is, and a request opening it lazily must not send
+    /// that (or its own text as is) while it waits — or after its peer
+    /// failed. Cleared once text is recorded for it again.
+    pub(crate) fn hold_latest_virtual_content(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        language: &str,
+        region_id: &str,
+    ) {
+        // Nothing is held without the prepare layer. Kept in the prepare
+        // registry's table by the incarnation it is for: read under another
+        // (a reopen's), it holds nothing.
+        // The table is the prepare layer's, installed with it before any
+        // pass runs.
+        if self.prepares()
+            && let Some(failures) = self.prepare_failures.get()
+            && let Some(host) = self.latest_virtual_contents.get(host_uri)
+            && host.incarnation == incarnation
+        {
+            failures.withhold(host_uri, language, region_id, incarnation);
+            drop(host);
+        }
+    }
+
+    /// What `connection_key` holds for `virtual_uri`, noted as a resolve is
+    /// queued: a resolve has no text check of its own (its item was minted
+    /// from the region's text as is — one minted from a prepared text never
+    /// resolves), so whether its reply was computed on a text held as is,
+    /// and that one, is told afterwards by [`Self::held_unchanged`]. Nothing
+    /// is noted without the prepare layer, where every text is held as is.
+    pub(crate) fn note_held(&self, virtual_uri: &str, connection_key: &ConnectionKey) -> HeldNote {
+        HeldNote(self.prepares().then(|| {
+            let (generation, as_is) = self
+                .document_tracker
+                .held_as_is(virtual_uri, connection_key);
+            (
+                virtual_uri.to_owned(),
+                connection_key.clone(),
+                generation,
+                as_is,
+            )
+        }))
+    }
+
+    /// [`Self::note_held`] for the virtual document of `region_id` (under
+    /// `injection_language`) of `host_uri`, as a resolve names it by its
+    /// envelope. Empty without the prepare layer, where nothing is noted
+    /// (and no URI is built), or for a host URI no virtual document is named
+    /// under.
+    pub(crate) fn note_region_held(
+        &self,
+        host_uri: &Url,
+        injection_language: &str,
+        region_id: &str,
+        connection_key: &ConnectionKey,
+    ) -> HeldNote {
+        if !self.prepares() {
+            return HeldNote::default();
+        }
+        let Ok(host) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
+            return HeldNote::default();
+        };
+        let virtual_uri = VirtualDocumentUri::new(&host, injection_language, region_id);
+        self.note_held(&virtual_uri.to_uri_string(), connection_key)
+    }
+
+    /// Whether the reply to a resolve noted as `note` was computed on a text
+    /// held as is: the connection held one as the resolve was queued (not a
+    /// prepared text sent before it, after a peer was gained), and no text
+    /// was recorded for the document since (one sent ahead of it after the
+    /// note), so the reply is in the coordinates of the item's text.
+    pub(crate) fn held_unchanged(&self, note: &HeldNote) -> bool {
+        note.0
+            .as_ref()
+            .is_none_or(|(virtual_uri, connection_key, generation, as_is)| {
+                *as_is
+                    && self
+                        .held_text(virtual_uri, connection_key)
+                        .map(|held| held.generation)
+                        == *generation
+            })
+    }
+
+    /// Whether a text from `answer`'s map (`None`: a text as is) is refused
+    /// for `region_id` (under `language`) of `host_uri`: a map its peer
+    /// revoked since (see `PreparedMap::revoked`), or a text as is while the
+    /// failure the lifecycle pass holds the region on stands (see
+    /// `PrepareFailures::admission`). Such a request reads no
+    /// coordinates through it, as no push is placed through it. Read as the
+    /// failure is recorded; never without the prepare layer.
+    pub(crate) fn prepare_failed(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+        answer: Option<&super::protocol::PreparedMap>,
+    ) -> bool {
+        match answer {
+            Some(map) => map.revoked(),
+            None => self.region_admission(host_uri, language, region_id).failed,
+        }
+    }
+
+    /// What a text meets for `region_id` (under `language`) of `host_uri`
+    /// (see [`RegionAdmission`]): the one read of the prepare registry's
+    /// table every open and request goes through, at the current epoch and
+    /// host incarnation. Nothing is read without the prepare layer.
+    pub(crate) fn region_admission(
+        &self,
+        host_uri: &Url,
+        language: &str,
+        region_id: &str,
+    ) -> RegionAdmission {
+        let Some(failures) = self.prepare_failures.get() else {
+            return RegionAdmission::default();
+        };
+        let standing = failures.admission(host_uri, language, region_id, self.prepare_epoch());
+        RegionAdmission {
+            failed: standing.failed,
+            held: self.prepares()
+                && standing.withheld.is_some_and(|incarnation| {
+                    self.current_host_incarnation(host_uri) == Some(incarnation)
+                }),
+        }
+    }
+
+    /// Read the failures the prepare registry holds regions on (see
+    /// [`Self::prepare_failed`]): installed once, with the prepare layer.
+    pub(crate) fn install_prepare_failures(
+        &self,
+        failures: super::prepare_registry::PrepareFailures,
+    ) {
+        // Once, before anything reads it: a table read before would be
+        // another than the registry's, where no failure is ever recorded.
+        let installed = self.prepare_failures.set(failures).is_ok();
+        debug_assert!(installed, "the prepare failures were read before installed");
+    }
+
+    /// The failures [`Self::prepare_failed`] reads, installed on first use
+    /// for a pool no prepare layer was built over.
+    #[cfg(test)]
+    pub(crate) fn prepare_failures_for_test(&self) -> &super::prepare_registry::PrepareFailures {
+        self.prepare_failures.get_or_init(Default::default)
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -3028,29 +3509,131 @@ impl LanguageServerPool {
     /// (content unchanged, or the doc isn't registered for this connection). The
     /// content guard keeps a position-only host edit from re-analyzing every region
     /// (#422). Delegates to [`DocumentTracker::increment_version_if_content_changed`].
-    pub(super) async fn increment_version_if_content_changed(
+    pub(super) async fn increment_version_if_content_changed<'a>(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
-    ) -> Option<i32> {
+        content: impl Into<SentText<'a>>,
+    ) -> Option<document_tracker::ContentChange> {
         self.document_tracker
             .increment_version_if_content_changed(virtual_uri, connection_key, content)
             .await
     }
 
-    /// Record `content`'s fingerprint as sent to this connection — call only after a
-    /// confirmed-enqueued didChange (#422). Delegates to
-    /// [`DocumentTracker::record_sent_content_fingerprint`].
-    pub(super) async fn record_sent_content_fingerprint(
+    /// Send a didChange of `content` and record it as what the connection
+    /// holds (see `DocumentTracker::record_and_queue`): recorded first, so a
+    /// push the server answers it with already finds it, and taken back
+    /// unless the send was queued. `None`, nothing sent, for a map revoked
+    /// since the text was admitted.
+    pub(in crate::lsp::bridge) fn send_didchange_recorded(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        content: SentText<'_>,
+        change: document_tracker::ContentChange,
+    ) -> Option<NotificationSendResult> {
+        // Serialized before the record's lock is taken: only the enqueue
+        // happens under it.
+        let Some(payload) =
+            Self::didchange_payload(&virtual_uri.to_uri_string(), content.text, change.version())
+        else {
+            return Some(NotificationSendResult::SerializationFailed);
+        };
+        self.document_tracker.record_and_queue(
+            virtual_uri,
+            connection_key,
+            content,
+            change,
+            || handle.send_serialized_notification(payload),
+            |result| matches!(result, NotificationSendResult::Queued),
+        )
+    }
+
+    /// Forget which of `host_uri`'s documents a connection was ever sent a
+    /// prepared text of (see `DocumentTracker::forget_prepared_history`).
+    pub(super) fn forget_prepared_history(&self, host_uri: &Url) {
+        // Nothing to forget before any prepared text was sent.
+        if !self.document_tracker.ever_held_prepared() {
+            return;
+        }
+        if let Ok(host_uri) = crate::lsp::lsp_impl::url_to_uri(host_uri) {
+            self.document_tracker.forget_prepared_history(&host_uri);
+        }
+    }
+
+    /// How coordinates `connection_key` computed for `virtual_uri` translate
+    /// (see `DocumentTracker::presentation`).
+    pub(crate) fn presentation(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        observed: Observed,
+        region: RegionPrepare,
+        virtual_text: &str,
+    ) -> Presentation {
+        self.document_tracker.presentation(
+            virtual_uri,
+            connection_key,
+            observed,
+            region,
+            virtual_text,
+        )
+    }
+
+    /// Whether coordinates `connection_key` sent, read as `observed`, came
+    /// from a process retired since (see `DocumentTracker::sent_by_retired`).
+    pub(crate) fn sent_by_retired(
+        &self,
+        connection_key: &ConnectionKey,
+        observed: Observed,
+    ) -> bool {
+        self.document_tracker
+            .sent_by_retired(connection_key, observed)
+    }
+
+    /// How coordinates of a connection whose text is not on record — read
+    /// while the pool stamped nothing — translate, by the one rule (see
+    /// `DocumentTracker::presentation`): as is, unless `region` is bridged
+    /// only through a prepared text.
+    pub(crate) fn unrecorded_presentation(&self, region: RegionPrepare) -> Presentation {
+        presentation::presentation(None, false, Observed::AsIsThen, region, "")
+    }
+
+    /// Whether what connections hold can make [`Self::presentation`] other
+    /// than as is for a region the lifecycle pass knows `region` of (see
+    /// `DocumentTracker::held_texts_matter`).
+    pub(crate) fn held_texts_matter(&self, region: RegionPrepare) -> bool {
+        self.document_tracker.held_texts_matter(region)
+    }
+
+    /// What `connection_key` was last sent for `virtual_uri` (see
+    /// [`HeldText`]).
+    pub(crate) fn held_text(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Option<HeldText> {
+        self.document_tracker.held_text(virtual_uri, connection_key)
+    }
+
+    /// Record `content` as sent to this connection, as a queued send would.
+    #[cfg(test)]
+    pub(super) fn record_sent_for_test(
         &self,
         virtual_uri: &VirtualDocumentUri,
         connection_key: &ConnectionKey,
-        content: &str,
+        content: SentText<'_>,
     ) {
         self.document_tracker
-            .record_sent_content_fingerprint(virtual_uri, connection_key, content)
-            .await
+            .record_sent_for_test(virtual_uri, connection_key, content, 1);
+    }
+
+    /// Purge this connection's document records, as retiring its process
+    /// does.
+    #[cfg(test)]
+    pub(super) async fn purge_connection_for_test(&self, connection_key: &ConnectionKey) {
+        self.document_tracker.purge_connection(connection_key).await;
     }
 
     /// Get or create a connection for the specified server, spawning the server
@@ -4373,6 +4956,8 @@ impl LanguageServerPool {
                 client_progress_registry: Arc::clone(&self.client_progress_registry),
                 progress_connection_id,
                 settings: Arc::clone(&settings_cell),
+                document_tracker: self.prepares().then(|| Arc::clone(&self.document_tracker)),
+                incarnation: self.document_connection_generation(&connection_key),
             },
         );
 
@@ -4404,6 +4989,9 @@ impl LanguageServerPool {
 
         // Insert into pool immediately so concurrent requests see Initializing state
         connections.insert(connection_key.clone(), Arc::clone(&handle));
+        if let Some(advertisements) = &self.prepare_advertisements {
+            advertisements.adopt(&handle);
+        }
         self.peer_directory.register(&handle);
 
         // Release lock before spawning handshake task
@@ -4431,6 +5019,7 @@ impl LanguageServerPool {
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
         let pending_reopen = Arc::clone(&self.pending_reopen);
+        let prepare_advertisements = self.prepare_advertisements.clone();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
         let supports_dynamic_command_registration =
@@ -4453,7 +5042,7 @@ impl LanguageServerPool {
 
             // Handle initialization result - transition state
             match init_result {
-                Ok(Ok((capabilities, bridge_routing, type_hierarchy_provider))) => {
+                Ok(Ok((capabilities, extensions, type_hierarchy_provider))) => {
                     // Init succeeded - store capabilities and transition to Ready
                     log::info!(
                         target: "kakehashi::bridge::init",
@@ -4468,7 +5057,9 @@ impl LanguageServerPool {
                         .as_ref()
                         .map(|options| options.commands.clone());
                     handle_for_handshake.set_server_capabilities(capabilities);
-                    handle_for_handshake.set_bridge_routing(bridge_routing);
+                    handle_for_handshake.set_bridge_routing(extensions.bridge_routing);
+                    handle_for_handshake
+                        .set_virtual_document_prepare(extensions.virtual_document_prepare);
                     handle_for_handshake.set_type_hierarchy_provider(type_hierarchy_provider);
                     // Path a: push this server's settings now that `initialized`
                     // has been sent, so push-model servers are configured even
@@ -4516,6 +5107,16 @@ impl LanguageServerPool {
                             io::ErrorKind::Interrupted,
                             "bridge: connection was invalidated during initialization",
                         ));
+                    }
+                    // Only a connection that became Ready records its
+                    // advertisement of `kakehashi/virtualDocument/prepare`: one
+                    // retired during its handshake (a settings reload replacing
+                    // it) must not overwrite what its replacement recorded.
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.record_from(
+                            &handle_for_handshake,
+                            extensions.virtual_document_prepare,
+                        );
                     }
                     // Record advertised palette command names AFTER Ready, so a
                     // command fired without an action context (raw name) routes
@@ -4676,6 +5277,11 @@ impl LanguageServerPool {
                         e
                     );
                     handle_for_handshake.set_state(ConnectionState::Failed);
+                    // What the connection it replaced advertised describes
+                    // no running server any more.
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.retire(&handle_for_handshake);
+                    }
                     Err(io::Error::new(
                         e.kind(),
                         format!("bridge: handshake failed: {}", e),
@@ -4689,6 +5295,9 @@ impl LanguageServerPool {
                         server_name_for_log
                     );
                     handle_for_handshake.set_state(ConnectionState::Failed);
+                    if let Some(advertisements) = &prepare_advertisements {
+                        advertisements.retire(&handle_for_handshake);
+                    }
                     Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "bridge: initialize timeout",
@@ -5244,6 +5853,391 @@ fn incapable_shared_serves(handle: &ConnectionHandle, root: &Url) -> bool {
             .any(|folder| super::root_markers::same_root_uri(folder.uri.as_str(), root.as_str()))
 }
 
+/// Whether each connection advertised
+/// `experimental.kakehashi.virtualDocumentPrepare` in its last handshake
+/// (`false` too once it answered `MethodNotFound`), kept per server: a
+/// server advertises it while any of its connections (one per workspace
+/// root) does, so one root's withdrawal does not pass over another's.
+///
+/// Also the prepare epoch (see [`LanguageServerPool::prepare_epoch`]): every
+/// change here that can change which candidate answers a prepare request,
+/// or how, moves it.
+pub(crate) struct PrepareAdvertisements {
+    by_server: DashMap<String, HashMap<ConnectionKey, bool>>,
+    /// The connection now serving each key: one it replaced (retired while
+    /// its handshake or a request still ran) records no advertisement.
+    current: DashMap<ConnectionKey, std::sync::Weak<ConnectionHandle>>,
+    /// (server, host document) pairs the server could not be started for
+    /// to prepare: passed over for that host's documents — another workspace
+    /// root's healthy connection keeps preparing — until the server's next
+    /// handshake that advertises the request, a settings change, or the
+    /// host closing.
+    start_failures: std::sync::Mutex<StartFailures>,
+    epoch: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for PrepareAdvertisements {
+    fn default() -> Self {
+        Self {
+            by_server: DashMap::new(),
+            current: DashMap::new(),
+            start_failures: std::sync::Mutex::default(),
+            epoch: tokio::sync::watch::channel(0).0,
+        }
+    }
+}
+
+/// How many buckets the clearings of one server's, or one host's, start
+/// failures are counted in (see [`StartFailures`]).
+const CLEARING_BUCKETS: usize = 32;
+
+/// See `PrepareAdvertisements::start_failures`.
+#[derive(Default)]
+struct StartFailures {
+    failed: std::collections::HashSet<(String, Url)>,
+    /// Clearings, counted by what they could clear: a failure seen by an
+    /// attempt that began acquiring before one that could have cleared it
+    /// is not recorded after it. Every pair's (settings), and one
+    /// server's (its handshake advertising) or one host's (its close) by
+    /// the bucket its name or URI hashes to. A clearing of another server
+    /// or host blocks no record, but for one sharing its bucket, which only
+    /// costs that attempt a retry: the count stays bounded.
+    cleared_all: u64,
+    cleared_servers: [u64; CLEARING_BUCKETS],
+    cleared_hosts: [u64; CLEARING_BUCKETS],
+}
+
+/// What a start-failure clearing clears.
+#[derive(Clone, Copy)]
+enum StartFailureScope<'a> {
+    /// Every pair: the settings that failed to start them changed.
+    All,
+    /// One server's pairs: a handshake of it advertised the request.
+    Server(&'a str),
+    /// One host's pairs: it closed.
+    Host(&'a Url),
+}
+
+/// The clearings an attempt saw that could clear one (server, host) pair's
+/// start failure (see [`LanguageServerPool::prepare_start_failures_cleared`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StartFailureClearings {
+    all: u64,
+    server: u64,
+    host: u64,
+}
+
+fn clearing_bucket(key: impl std::hash::Hash) -> usize {
+    use std::hash::{BuildHasher, BuildHasherDefault};
+    let hash =
+        BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(key);
+    (hash % CLEARING_BUCKETS as u64) as usize
+}
+
+impl StartFailures {
+    fn clearings(&self, server_name: &str, host_uri: &Url) -> StartFailureClearings {
+        StartFailureClearings {
+            all: self.cleared_all,
+            server: self.cleared_servers[clearing_bucket(server_name)],
+            host: self.cleared_hosts[clearing_bucket(host_uri.as_str())],
+        }
+    }
+}
+
+impl PrepareAdvertisements {
+    fn start_failures(&self) -> std::sync::MutexGuard<'_, StartFailures> {
+        self.start_failures
+            .lock()
+            .recover_poison("PrepareAdvertisements::start_failures")
+    }
+
+    /// Take `handle` as the connection serving its key from now on. What the
+    /// connection it replaces advertised stands until `handle`'s handshake
+    /// records its own (or fails, which [`Self::retire`]s it): a server
+    /// restarted under the same key most likely advertises what it did, and
+    /// forgetting it would hold its pairs' documents back again meanwhile.
+    fn adopt(&self, handle: &Arc<ConnectionHandle>) {
+        *self.current.entry(handle.key().clone()).or_default() = Arc::downgrade(handle);
+    }
+
+    /// Drop `connection`'s record; `true` when there was one.
+    fn forget(&self, connection: &ConnectionKey) -> bool {
+        // An emptied entry aggregates as none recorded, like a missing one.
+        self.by_server
+            .get_mut(connection.server())
+            .is_some_and(|mut connections| connections.remove(connection).is_some())
+    }
+
+    /// Forget `handle`'s advertisement as it leaves the pool with no
+    /// replacement: a connection that is gone prepares nothing, and its
+    /// handshake, should it still finish, records nothing.
+    fn retire(&self, handle: &ConnectionHandle) {
+        // Held across the removal, as in `record_from`.
+        let mut current = self.current.entry(handle.key().clone()).or_default();
+        if current.strong_count() != 0
+            && !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle))
+        {
+            return;
+        }
+        *current = std::sync::Weak::new();
+        let removed = self.forget(handle.key());
+        drop(current);
+        // As in `record`: an attempt asks a candidate through the host's own
+        // connection, so one root's record going changes its hosts' answers
+        // even while the server still advertises it through another — and
+        // the next first record for that root compares against nothing.
+        if removed {
+            self.advance();
+        }
+    }
+
+    /// [`Self::record`] for `handle`'s advertisement, unless another
+    /// connection has taken its key since.
+    fn record_from(&self, handle: &ConnectionHandle, advertised: bool) -> bool {
+        // Held across the record: a replacement adopting the key meanwhile
+        // waits, and records after.
+        let current = self.current.get(handle.key());
+        if current
+            .as_ref()
+            .is_some_and(|current| !std::ptr::eq(current.as_ptr(), std::ptr::from_ref(handle)))
+        {
+            return false;
+        }
+        self.record(handle.key(), advertised)
+    }
+
+    /// Whether a server's connections advertise the request: while any
+    /// does; `None` with none recorded.
+    fn aggregate(connections: &HashMap<ConnectionKey, bool>) -> Option<bool> {
+        (!connections.is_empty()).then(|| connections.values().any(|advertised| *advertised))
+    }
+
+    /// Record `connection`'s advertisement; `true` when it changed what its
+    /// server was recorded to advertise, or what that connection was: an
+    /// attempt asks a candidate through the host's own connection, so one
+    /// root's change can alter its answers while the server still
+    /// advertises it through another. (A first record changes no candidate's
+    /// selection: an unrecorded candidate is asked.)
+    fn record(&self, connection: &ConnectionKey, advertised: bool) -> bool {
+        let server_name = connection.server();
+        // A handshake advertising the request: the server started somewhere,
+        // and is tried again where it could not be — the answers given
+        // without it (as is, or a later candidate's) are asked again.
+        let retried =
+            advertised && self.forget_start_failures(StartFailureScope::Server(server_name));
+        let (server_changed, connection_changed) = {
+            let mut connections = self.by_server.entry(server_name.to_string()).or_default();
+            let previous = Self::aggregate(&connections);
+            let was = connections.insert(connection.clone(), advertised);
+            (
+                previous.is_some_and(|previous| Self::aggregate(&connections) != Some(previous)),
+                was.is_some_and(|was| was != advertised),
+            )
+        };
+        let changed = server_changed || connection_changed;
+        if changed || retried {
+            self.advance();
+        }
+        changed
+    }
+
+    /// Forget the start failures of `scope`; `true` when any went. A
+    /// clearing of `scope` either way: a failure of it an attempt saw
+    /// before is not recorded (see [`StartFailures::cleared_all`]).
+    fn forget_start_failures(&self, scope: StartFailureScope<'_>) -> bool {
+        let mut failures = self.start_failures();
+        match scope {
+            StartFailureScope::All => failures.cleared_all += 1,
+            StartFailureScope::Server(server_name) => {
+                failures.cleared_servers[clearing_bucket(server_name)] += 1;
+            }
+            StartFailureScope::Host(host_uri) => {
+                failures.cleared_hosts[clearing_bucket(host_uri.as_str())] += 1;
+            }
+        }
+        let mut removed = false;
+        failures.failed.retain(|(server, host)| {
+            let goes = match scope {
+                StartFailureScope::All => true,
+                StartFailureScope::Server(server_name) => server == server_name,
+                StartFailureScope::Host(host_uri) => host == host_uri,
+            };
+            removed |= goes;
+            !goes
+        });
+        removed
+    }
+
+    /// Move the prepare epoch.
+    fn advance(&self) {
+        self.epoch.send_modify(|epoch| *epoch += 1);
+    }
+
+    fn get(&self, server_name: &str) -> Option<bool> {
+        self.by_server
+            .get(server_name)
+            .and_then(|connections| Self::aggregate(&connections))
+    }
+}
+
+impl LanguageServerPool {
+    /// Whether this pool records prepare advertisements (experimental
+    /// features on): the bridge's prepare layer exists exactly then.
+    pub(crate) fn prepares(&self) -> bool {
+        self.prepare_advertisements.is_some()
+    }
+
+    /// A pool recording prepare advertisements, as with experimental
+    /// features on.
+    #[cfg(test)]
+    pub(crate) fn preparing() -> Self {
+        Self {
+            prepare_advertisements: Some(Arc::default()),
+            ..Self::new()
+        }
+    }
+
+    /// Record whether `handle`'s connection advertises
+    /// `kakehashi/virtualDocument/prepare` (its handshake, or a
+    /// `MethodNotFound` answer since), unless another connection has
+    /// replaced it since: `true` when this changed what is recorded, which
+    /// moves the prepare epoch.
+    pub(crate) fn record_prepare_advertisement_from(
+        &self,
+        handle: &ConnectionHandle,
+        advertised: bool,
+    ) -> bool {
+        self.prepare_advertisements
+            .as_ref()
+            .is_some_and(|advertisements| advertisements.record_from(handle, advertised))
+    }
+
+    /// [`Self::record_prepare_advertisement_from`] by the connection's key,
+    /// whichever handle serves it: tests stand for a connection by its key.
+    #[cfg(test)]
+    pub(crate) fn record_prepare_advertisement(
+        &self,
+        connection: &ConnectionKey,
+        advertised: bool,
+    ) -> bool {
+        self.prepare_advertisements
+            .as_ref()
+            .is_some_and(|advertisements| advertisements.record(connection, advertised))
+    }
+
+    /// Whether `server_name` advertises `kakehashi/virtualDocument/prepare`,
+    /// as last recorded; `None` before anything was.
+    pub(crate) fn prepare_advertisement(&self, server_name: &str) -> Option<bool> {
+        self.prepare_advertisements
+            .as_ref()
+            .and_then(|advertisements| advertisements.get(server_name))
+    }
+
+    /// The prepare epoch: an answer to `kakehashi/virtualDocument/prepare`
+    /// stands only under the epoch it was asked in. It moves whenever which
+    /// candidate answers, or how, may have changed: a server's recorded
+    /// advertisement, start failures cleared (but a host's closing, which
+    /// takes its answers with it), and [`Self::advance_prepare_epoch`].
+    pub(crate) fn prepare_epoch(&self) -> u64 {
+        self.prepare_advertisements
+            .as_ref()
+            .map_or(0, |advertisements| *advertisements.epoch.borrow())
+    }
+
+    /// Watch the prepare epoch move: hosts whose documents were prepared, or
+    /// sent as is, under the epoch before are synced again.
+    pub(crate) fn subscribe_prepare_epoch(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.prepare_advertisements
+            .as_ref()
+            .map(|advertisements| advertisements.epoch.subscribe())
+    }
+
+    /// Move the prepare epoch for a change outside the pool: settings, or
+    /// runtime settings pushed to servers, under which a peer may prepare
+    /// differently.
+    pub(crate) fn advance_prepare_epoch(&self) {
+        if let Some(advertisements) = &self.prepare_advertisements {
+            advertisements.advance();
+        }
+    }
+
+    /// The clearings that could clear `server_name`'s start failure for
+    /// `host_uri`, read by an attempt before it acquires that candidate
+    /// (see [`Self::record_prepare_start_failure`]).
+    pub(crate) fn prepare_start_failures_cleared(
+        &self,
+        server_name: &str,
+        host_uri: &Url,
+    ) -> StartFailureClearings {
+        self.prepare_advertisements.as_ref().map_or_else(
+            StartFailureClearings::default,
+            |advertisements| {
+                advertisements
+                    .start_failures()
+                    .clearings(server_name, host_uri)
+            },
+        )
+    }
+
+    /// Note that `server_name` could not be started for `host_uri`'s
+    /// documents to prepare them — unless a clearing that could clear it
+    /// came since `cleared` was read: the settings that failed to start it
+    /// changed, it started since, or the host closed. `false` then: the
+    /// failure says nothing current. A clearing of another server's or
+    /// host's failures says nothing about this one.
+    pub(crate) fn record_prepare_start_failure(
+        &self,
+        server_name: &str,
+        host_uri: &Url,
+        cleared: StartFailureClearings,
+    ) -> bool {
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return false;
+        };
+        let mut failures = advertisements.start_failures();
+        if failures.clearings(server_name, host_uri) != cleared {
+            return false;
+        }
+        failures
+            .failed
+            .insert((server_name.to_string(), host_uri.clone()));
+        true
+    }
+
+    /// Whether `server_name` could not be started for `host_uri`'s
+    /// documents (see [`Self::record_prepare_start_failure`]).
+    pub(crate) fn prepare_start_failed(&self, server_name: &str, host_uri: &Url) -> bool {
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return false;
+        };
+        let failures = advertisements.start_failures();
+        !failures.failed.is_empty()
+            && failures
+                .failed
+                .contains(&(server_name.to_string(), host_uri.clone()))
+    }
+
+    /// Forget the start failures recorded for `host_uri` (closed: its
+    /// answers go with it), or for every host when `None` — the settings
+    /// that failed to start them changed, and the answers given without
+    /// them stand no more.
+    pub(crate) fn forget_prepare_start_failures(&self, host_uri: Option<&Url>) {
+        let Some(advertisements) = &self.prepare_advertisements else {
+            return;
+        };
+        match host_uri {
+            Some(host_uri) => {
+                advertisements.forget_start_failures(StartFailureScope::Host(host_uri));
+            }
+            None => {
+                if advertisements.forget_start_failures(StartFailureScope::All) {
+                    advertisements.advance();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5258,6 +6252,299 @@ mod tests {
     // Unit tests for ConnectionHandle, ConnectionState, GlobalShutdownTimeout,
     // and OpenedVirtualDoc live in their respective submodules.
     // This file contains integration tests that exercise cross-module behavior.
+
+    #[test]
+    fn a_prepare_start_failure_holds_for_its_host_until_a_handshake_settings_or_close() {
+        let pool = LanguageServerPool::preparing();
+        let a = Url::parse("file:///a/doc.md").unwrap();
+        let b = Url::parse("file:///b/doc.md").unwrap();
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared("peer", &b)
+        ));
+        assert!(pool.prepare_start_failed("peer", &b));
+        assert!(!pool.prepare_start_failed("peer", &a));
+        // Another root's healthy connection keeps its advertisement.
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // A handshake advertising the request tries it again: the answers
+        // given without it stand no more.
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        assert!(!pool.prepare_start_failed("peer", &b));
+        assert_eq!(pool.prepare_epoch(), epoch + 1);
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared("peer", &b)
+        ));
+        pool.forget_prepare_start_failures(Some(&a));
+        assert!(pool.prepare_start_failed("peer", &b));
+        pool.forget_prepare_start_failures(Some(&b));
+        assert!(!pool.prepare_start_failed("peer", &b));
+        // A closed host's answers go with it: nothing else moves.
+        assert_eq!(pool.prepare_epoch(), epoch + 1);
+        // A failure an attempt saw before failures were cleared is not
+        // recorded after: the peer may have started since.
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.forget_prepare_start_failures(Some(&b));
+        assert!(!pool.record_prepare_start_failure("peer", &b, seen));
+        assert!(!pool.prepare_start_failed("peer", &b));
+        // Nor one seen before its server started elsewhere.
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        assert!(!pool.record_prepare_start_failure("peer", &b, seen));
+        let epoch = pool.prepare_epoch();
+        // Another host closing, or another server starting, clears nothing
+        // of it: still recorded, and the attempt passes the candidate over.
+        // (Counted apart: their buckets differ.)
+        assert_ne!(clearing_bucket("peer"), clearing_bucket("other"));
+        assert_ne!(clearing_bucket(a.as_str()), clearing_bucket(b.as_str()));
+        let seen = pool.prepare_start_failures_cleared("peer", &b);
+        pool.forget_prepare_start_failures(Some(&a));
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("other"), true);
+        assert!(pool.record_prepare_start_failure("peer", &b, seen));
+        assert!(pool.prepare_start_failed("peer", &b));
+        pool.forget_prepare_start_failures(Some(&b));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // A settings change does move the epoch.
+        assert!(pool.record_prepare_start_failure(
+            "peer",
+            &b,
+            pool.prepare_start_failures_cleared("peer", &b)
+        ));
+        let seen = pool.prepare_start_failures_cleared("peer", &a);
+        pool.forget_prepare_start_failures(None);
+        assert!(!pool.prepare_start_failed("peer", &b));
+        assert_eq!(pool.prepare_epoch(), epoch + 1);
+        // A settings change clears every pair's.
+        assert!(!pool.record_prepare_start_failure("peer", &a, seen));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_connection_records_no_prepare_advertisement() {
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("peer");
+        let retired =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&retired);
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&replacement);
+        assert!(!pool.record_prepare_advertisement_from(&replacement, true));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        // The retired connection's handshake, finishing late, changes nothing.
+        assert!(!pool.record_prepare_advertisement_from(&retired, false));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_replacement_keeps_what_its_key_advertised_until_it_says_otherwise() {
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("peer");
+        let failed =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        pool.prepare_advertisements.as_ref().unwrap().adopt(&failed);
+        pool.record_prepare_advertisement_from(&failed, true);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        let epoch = pool.prepare_epoch();
+
+        // Replaced (say after a crash): what it advertised stands for the
+        // replacement until its handshake says otherwise.
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&replacement);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // The same answer moves nothing.
+        assert!(!pool.record_prepare_advertisement_from(&replacement, true));
+        assert_eq!(pool.prepare_epoch(), epoch);
+        // Its handshake failing: what it would advertise is unknown again.
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .retire(&replacement);
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_whose_handshake_fails_forgets_what_its_key_advertised() {
+        let pool = LanguageServerPool::preparing();
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        let config = BridgeServerConfig {
+            cmd: Some(vec!["sh".into(), "-c".into(), "exit 1".into()]),
+            ..Default::default()
+        };
+        assert!(
+            pool.get_or_create_connection_wait_ready("peer", &config, None, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_whose_handshake_times_out_forgets_what_its_key_advertised() {
+        let pool = LanguageServerPool::preparing();
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+        let epoch = pool.prepare_epoch();
+        // Reads the initialize request and never answers it.
+        let config = BridgeServerConfig {
+            cmd: Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]),
+            ..Default::default()
+        };
+        let error = pool
+            .get_or_create_connection_wait_ready("peer", &config, None, Duration::from_millis(300))
+            .await
+            .err()
+            .expect("the handshake never completes");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(pool.prepare_advertisement("peer"), None);
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
+    #[tokio::test]
+    async fn retiring_one_root_changes_its_hosts_answers() {
+        let pool = LanguageServerPool::preparing();
+        let advertisements = pool.prepare_advertisements.as_ref().unwrap();
+        let a = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("peer", Some("file:///a".to_string())),
+        )
+        .await;
+        let b = test_helpers::create_handle_with_key(
+            ConnectionState::Ready,
+            ConnectionKey::new("peer", Some("file:///b".to_string())),
+        )
+        .await;
+        for handle in [&a, &b] {
+            advertisements.adopt(handle);
+            pool.record_prepare_advertisement_from(handle, true);
+        }
+        let epoch = pool.prepare_epoch();
+        advertisements.retire(&a);
+        // The server still advertises it through the other root, but the
+        // retired root's hosts asked through its own connection.
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert!(pool.prepare_epoch() > epoch);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_non_peer_moves_no_epoch() {
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("lua_ls");
+        let advertisements = pool.prepare_advertisements.as_ref().unwrap();
+        let crashed =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        advertisements.adopt(&crashed);
+        pool.record_prepare_advertisement_from(&crashed, false);
+        let epoch = pool.prepare_epoch();
+        let replacement =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        advertisements.adopt(&replacement);
+        // Still known not to prepare while the replacement starts: its pairs
+        // are not held back to find that out again.
+        assert_eq!(pool.prepare_advertisement("lua_ls"), Some(false));
+        assert!(!pool.record_prepare_advertisement_from(&replacement, false));
+        assert_eq!(pool.prepare_epoch(), epoch);
+    }
+
+    #[tokio::test]
+    async fn a_retired_connection_stops_advertising_prepare() {
+        let pool = LanguageServerPool::preparing();
+        let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
+        let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
+        let handle_a =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, a.clone()).await;
+        let handle_b =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, b.clone()).await;
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&handle_a);
+        pool.prepare_advertisements
+            .as_ref()
+            .unwrap()
+            .adopt(&handle_b);
+        pool.insert_connection(Arc::clone(&handle_a)).await;
+        pool.insert_connection(Arc::clone(&handle_b)).await;
+        pool.record_prepare_advertisement_from(&handle_a, true);
+        pool.record_prepare_advertisement_from(&handle_b, false);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        let epoch = pool.prepare_epoch();
+
+        // Root `a` leaves the workspace: its connection goes, unreplaced.
+        let retired = {
+            let mut connections = pool.connections.lock().await;
+            pool.retire_invalidated_connections(&mut connections, vec![a.clone()])
+                .await
+        };
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            pool.prepare_advertisement("peer"),
+            Some(false),
+            "only the remaining connection's advertisement counts"
+        );
+        assert!(pool.prepare_epoch() > epoch);
+        // Its handshake, finishing late, records nothing.
+        assert!(!pool.record_prepare_advertisement_from(&handle_a, true));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+    }
+
+    #[test]
+    fn a_server_advertises_prepare_while_any_of_its_connections_does() {
+        let pool = LanguageServerPool::preparing();
+        let a = ConnectionKey::new("peer", Some("file:///a".to_string()));
+        let b = ConnectionKey::new("peer", Some("file:///b".to_string()));
+        pool.record_prepare_advertisement(&a, true);
+        let epoch = pool.prepare_epoch();
+        // One root's connection withdrawing it (a `MethodNotFound`) leaves
+        // the other's preparing.
+        pool.record_prepare_advertisement(&b, false);
+        assert_eq!(pool.prepare_advertisement("peer"), Some(true));
+        assert_eq!(
+            pool.prepare_epoch(),
+            epoch,
+            "a connection's first record changes nothing"
+        );
+        // That connection regaining it changes its own answers, though the
+        // server advertised it all along.
+        assert!(pool.record_prepare_advertisement(&b, true));
+        assert_eq!(pool.prepare_epoch(), epoch + 1);
+        pool.record_prepare_advertisement(&b, false);
+        // Withdrawn by every connection: the server is passed over.
+        assert!(pool.record_prepare_advertisement(&a, false));
+        assert_eq!(pool.prepare_advertisement("peer"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_prepare_epoch_move_is_seen_by_its_watchers() {
+        let pool = LanguageServerPool::preparing();
+        let mut epochs = pool.subscribe_prepare_epoch().unwrap();
+        // A first handshake that advertises: nothing was sent as is for it.
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("tsudoi"), true);
+        assert!(!epochs.has_changed().unwrap());
+        // Runtime settings pushed to servers.
+        pool.advance_prepare_epoch();
+        assert!(epochs.has_changed().unwrap());
+        assert_eq!(*epochs.borrow_and_update(), pool.prepare_epoch());
+    }
 
     /// A client `window/workDoneProgress/cancel` for a bridge-minted token is
     /// routed to the owning downstream with its ORIGINAL token restored.
@@ -8302,6 +9589,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "local x = 42".to_string(),
+            held: false,
+            prepared: None,
         }];
 
         let start = Instant::now();
@@ -8395,6 +9684,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('current')".to_string(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -8433,6 +9724,8 @@ mod tests {
                 language: "lua".into(),
                 region_id: TEST_ULID_LUA_0.into(),
                 content: "print('previous')".into(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -8543,6 +9836,843 @@ mod tests {
         assert_eq!(change["params"]["contentChanges"][0]["text"], "current");
     }
 
+    /// The text a didOpen sent, from what `rx` received.
+    fn opened_text(rx: &mut tokio::sync::mpsc::Receiver<OutboundMessage>) -> String {
+        let Some(OutboundMessage::Untracked(payload)) = rx.try_recv().ok() else {
+            panic!("a didOpen was queued");
+        };
+        payload["params"]["textDocument"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A map dedenting `virtual_text`'s first line by two columns.
+    fn dedent_map(virtual_text: &str) -> Arc<crate::lsp::bridge::protocol::PreparedMap> {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map
+    }
+
+    /// [`dedent_map`] for `input` of the lua region of `host_uri`, as the
+    /// registry gives it out: what revokes it is shared with every answer
+    /// for that input.
+    fn answered_map(
+        pool: &LanguageServerPool,
+        host_uri: &Url,
+        input: u64,
+    ) -> Arc<crate::lsp::bridge::protocol::PreparedMap> {
+        let mut map = dedent_map("  x = 1");
+        let fresh = Arc::get_mut(&mut map).unwrap();
+        fresh.set_input(input);
+        pool.prepare_failures_for_test()
+            .share_for_test(host_uri, "lua", TEST_ULID_LUA_0, fresh);
+        map
+    }
+
+    #[tokio::test]
+    async fn a_lazy_open_sends_a_newer_prepared_text_and_otherwise_the_forwarded_one() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-order.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        // Forwarded as is before the request's answer was taken: the
+        // prepared request opens with its own text, under its map.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        let map = dedent_map("  x = 1");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+        let held = pool.held_text(&virtual_uri.to_uri_string(), &key).unwrap();
+        assert!(Arc::ptr_eq(held.map.as_ref().unwrap(), &map));
+
+        // A request built as is opens with the forwarded text, as on any
+        // unprepared path.
+        let other = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_1);
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_1, "print('new')");
+        pool.ensure_document_opened(&mut sender, &host_uri, &other, "print('old')", &key)
+            .await
+            .unwrap();
+        assert_eq!(opened_text(&mut rx), "print('new')");
+    }
+
+    #[tokio::test]
+    async fn a_prepared_open_takes_a_text_forwarded_after_its_answer_was_taken() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-newer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The request's answer was taken, then the lifecycle pass forwarded
+        // the text as is (its pair lost its peer since, say).
+        let map = dedent_map("  x = 1");
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 2");
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "  x = 2");
+        assert!(
+            pool.held_text(&virtual_uri.to_uri_string(), &key)
+                .unwrap()
+                .map
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_region_opens_with_a_prepared_request_text_over_a_newer_one_as_is() {
+        let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host_uri = Url::parse("file:///test/lazy-open-held-newer.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // A request's answer taken; the pair then lost its peer (the text
+        // forwarded as is) and regained one (the region held again).
+        let map = dedent_map("  x = 1");
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A region the lifecycle pass holds while a lazy open awaits its claim
+    /// is not opened as is: the pass's close sweep finds only registered
+    /// documents, and this one registers after the sweep ran.
+    #[tokio::test]
+    async fn a_region_held_while_its_open_awaits_its_claim_is_not_opened_as_is() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host_uri = Url::parse("file:///test/lazy-open-held-late.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        let versions = pool
+            .document_tracker
+            .lock_document_versions_for_test()
+            .await;
+        let open = {
+            let pool = Arc::clone(&pool);
+            let host_uri = host_uri.clone();
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                let mut sender = sender;
+                pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                    .await
+            })
+        };
+        // Past its first look, awaiting its claim.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !pool
+                .open_transition_locks
+                .contains_key(&(key.clone(), virtual_uri.to_uri_string()))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open takes its transition");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // The pass holds the region; its sweep finds nothing registered.
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        drop(versions);
+        assert!(open.await.unwrap().is_err());
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        assert!(!pool.is_document_opened_on_connection(&virtual_uri, &key));
+    }
+
+    /// A region its peer failed is not opened lazily even with a request's
+    /// prepared text: that text is from an answer the peer no longer gives.
+    /// One merely pending is, as before.
+    #[tokio::test]
+    async fn a_region_its_peer_failed_is_not_opened_even_prepared() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-failed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        // The request's answer, taken before its peer failed the region.
+        let map = answered_map(&pool, &host_uri, 1);
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 1,
+            }),
+        );
+        let prepared = SentText {
+            text: "x = 1",
+            map: Some(&map),
+        };
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+        // Pending again (a new epoch's attempt): an answer taken after the
+        // failure opens it.
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            None,
+        );
+        let newer = answered_map(&pool, &host_uri, 1);
+        let prepared = SentText {
+            text: "x = 1",
+            map: Some(&newer),
+        };
+        pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, prepared, &key)
+            .await
+            .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A lazy open substituting the newer cached text for a request's
+    /// checks the text it sends: a cached answer its peer failed since is
+    /// not opened, though the request's own answer stands.
+    #[tokio::test]
+    async fn a_lazy_open_does_not_send_a_cached_answer_its_peer_failed() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-cached-failed.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        // The request's answer, for one input.
+        let request = answered_map(&pool, &host_uri, 1);
+        // A newer answer, for another input, cached by the lifecycle pass.
+        let cached = answered_map(&pool, &host_uri, 2);
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: "x = 1",
+                map: Some(&cached),
+            },
+        );
+        // Its peer failed that newer input since.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 2,
+            }),
+        );
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        let opened = pool
+            .ensure_document_opened(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                SentText {
+                    text: "x = 1",
+                    map: Some(&request),
+                },
+                &key,
+            )
+            .await;
+        assert!(opened.is_err());
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+    }
+
+    /// The same text prepared again under a new answer, alike in
+    /// coordinates to one revoked since, replaces it in the lazy-open cache:
+    /// a request on the new answer opens with it.
+    #[tokio::test]
+    async fn the_cache_takes_a_new_answer_alike_to_a_revoked_one() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-recovered.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let first = answered_map(&pool, &host_uri, 1);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&first);
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 1,
+            }),
+        );
+        assert!(first.revoked());
+        let second = answered_map(&pool, &host_uri, 1);
+        assert!(!second.revoked());
+        record(&second);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&second),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// The lazy-open cache takes an older answer for another input (an
+    /// undo back to a text answered before the edit): the rule against
+    /// moving backwards is per input.
+    #[tokio::test]
+    async fn the_cache_takes_an_older_answer_for_another_input() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-undo.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let undone = answered_map(&pool, &host_uri, 1);
+        let edited = answered_map(&pool, &host_uri, 2);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&edited);
+        record(&undone);
+        // The edited input failing revokes nothing the undo holds.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: crate::lsp::bridge::protocol::next_presentation(),
+                input: 2,
+            }),
+        );
+        assert!(edited.revoked());
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&undone),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// The lazy-open cache never moves back to an older answer alike in
+    /// coordinates (one a stale pass records): revoked alone later, it
+    /// would refuse a request on the newer answer that stands.
+    #[tokio::test]
+    async fn the_cache_keeps_a_newer_answer_over_an_older_alike_one() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text: "x = 1",
+                    map: Some(map),
+                },
+            )
+        };
+        record(&newer);
+        record(&older);
+        // A failure taken between the two answers revokes the older only.
+        pool.prepare_failures_for_test().hold_for_test(
+            &host_uri,
+            "lua",
+            TEST_ULID_LUA_0,
+            pool.prepare_epoch(),
+            Some(crate::lsp::bridge::protocol::AnswerOrigin {
+                taken: older.built() + 1,
+                input: 1,
+            }),
+        );
+        assert!(older.revoked());
+        assert!(!newer.revoked());
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&newer),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// Nor to an older answer for the same input with another text (a
+    /// save looked up before the epoch moved, recording after a request
+    /// opened with the newer one): a request on the newer answer opens
+    /// with its text, not the older one.
+    #[tokio::test]
+    async fn the_cache_keeps_a_newer_answer_over_an_older_one_of_another_text() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older-text.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |text, map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text,
+                    map: Some(map),
+                },
+            )
+        };
+        record("x = 2", &newer);
+        record("x = 1", &older);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 2",
+                map: Some(&newer),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 2");
+    }
+
+    /// Nor does the older answer make the newer one's text look recorded
+    /// since: a request on an answer for a later input, taken after the
+    /// newer text was recorded, opens with its own text, not the cache.
+    #[tokio::test]
+    async fn an_older_answer_leaves_when_the_cache_was_recorded() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older-stamp.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |text, map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text,
+                    map: Some(map),
+                },
+            )
+        };
+        record("x = 2", &newer);
+        let later = answered_map(&pool, &host_uri, 2);
+        record("x = 1", &older);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 3",
+                map: Some(&later),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 3");
+    }
+
+    /// A resolve's note of the text its connection held: unchanged until
+    /// another text is recorded; never taken without the prepare layer.
+    #[tokio::test]
+    async fn a_held_note_tells_a_text_recorded_since() {
+        let host_uri = Url::parse("file:///test/held-note.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        let pool = LanguageServerPool::preparing();
+        pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+        let note = pool.note_held(&uri, &key);
+        assert!(pool.held_unchanged(&note));
+        let map = dedent_map("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: "a",
+                map: Some(&map),
+            },
+        );
+        assert!(!pool.held_unchanged(&note));
+        // Noted while a prepared text is held: the item's text as is is not.
+        let note = pool.note_held(&uri, &key);
+        assert!(!pool.held_unchanged(&note));
+        let plain = LanguageServerPool::new();
+        plain.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+        let note = plain.note_held(&uri, &key);
+        plain.record_sent_for_test(&virtual_uri, &key, SentText::from("  b"));
+        assert!(plain.held_unchanged(&note), "nothing noted flag off");
+    }
+
+    #[tokio::test]
+    async fn a_text_as_is_is_refused_over_a_prepared_or_held_region() {
+        let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host_uri = Url::parse("file:///test/refuse-as-is.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        assert!(!pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  x = 1"));
+        assert!(
+            !pool.refuses_text_as_is(&host_uri, &virtual_uri, &key),
+            "held as is"
+        );
+        // Held for its peer.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        // Holding a prepared text of it.
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        assert!(
+            !pool.refuses_text_as_is(&host_uri, &virtual_uri, &key),
+            "released"
+        );
+        let map = dedent_map("  x = 1");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+        );
+        assert!(pool.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+        // Without the prepare layer, nothing is.
+        let plain = LanguageServerPool::new();
+        assert!(!plain.refuses_text_as_is(&host_uri, &virtual_uri, &key));
+    }
+
+    /// A snapshot open (an eager open checked against the host's revision)
+    /// is refused like any other once the lifecycle pass holds its region:
+    /// the hold can come after the snapshot was taken without moving the
+    /// host's revision (an epoch move gaining the pair its peer).
+    #[tokio::test]
+    async fn a_snapshot_open_of_a_held_region_is_refused_as_is() {
+        let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host_uri = Url::parse("file:///test/snapshot-open-held.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened_from_snapshot(
+                &mut sender,
+                &host_uri,
+                &virtual_uri,
+                "  x = 1",
+                &key
+            )
+            .await
+            .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        // A prepared snapshot opens it.
+        let map = dedent_map("  x = 1");
+        pool.ensure_document_opened_from_snapshot(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+    }
+
+    /// A hold outlives every forget of its region's answers in the
+    /// registry it shares a table with (a replaced, invalidated or re-routed
+    /// region): a request resolved before still opens nothing as is.
+    #[tokio::test]
+    async fn a_held_region_is_not_opened_as_is_after_its_answers_are_forgotten() {
+        let host_uri = Url::parse("file:///test/held-forgotten.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        let forgets: [fn(&super::super::prepare_registry::PrepareRegistry, &Url); 3] = [
+            |registry, host| registry.forget_region(host, Some("lua"), TEST_ULID_LUA_0),
+            |registry, host| registry.forget_regions(host, &[TEST_ULID_LUA_0.to_string()]),
+            |registry, host| registry.forget_region_except(host, TEST_ULID_LUA_0, Some("python")),
+        ];
+        for forget in forgets {
+            let pool = LanguageServerPool::preparing();
+            let registry = super::super::prepare_registry::PrepareRegistry::default();
+            pool.install_prepare_failures(registry.failures());
+            pool.open_host_incarnation(&host_uri, 1).await;
+            pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+            pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+            // An answer to forget, so no forget is skipped as nothing was
+            // ever looked up.
+            let target = super::super::prepare_registry::PrepareTarget {
+                candidates: Arc::from([]),
+                epoch: pool.prepare_epoch(),
+            };
+            registry.answer_for_test(
+                &target,
+                super::super::prepare_registry::PrepareInput {
+                    host_uri: &host_uri,
+                    host_language: "markdown",
+                    injection_language: "lua",
+                    region_id: TEST_ULID_LUA_0,
+                    virtual_text: "  x = 1",
+                    gaps: &[],
+                },
+                super::super::prepare_registry::Answer::AsIs,
+                true,
+            );
+            assert!(!registry.unused());
+            forget(&registry, &host_uri);
+            let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+            assert!(
+                pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                    .await
+                    .is_err()
+            );
+            assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_region_held_for_its_peer_is_not_opened_as_is() {
+        let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let host_uri = Url::parse("file:///test/lazy-open-held.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  x = 1");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        assert!(
+            pool.ensure_document_opened(&mut sender, &host_uri, &virtual_uri, "  x = 1", &key)
+                .await
+                .is_err()
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent as is");
+        // A prepared text opens it.
+        let map = dedent_map("  x = 1");
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 1");
+        // Recording the prepared text releases the hold.
+        pool.record_latest_virtual_content(
+            &host_uri,
+            1,
+            "lua",
+            TEST_ULID_LUA_0,
+            SentText {
+                text: "x = 1",
+                map: Some(&map),
+            },
+        );
+        assert!(
+            !pool
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        );
+        // Nothing is left of the region in the registry's table.
+        assert_eq!(
+            pool.prepare_failures_for_test().admission(
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                pool.prepare_epoch()
+            ),
+            Default::default()
+        );
+    }
+
+    /// A pool that prepares nothing holds nothing, and builds no table to
+    /// hold regions in.
+    #[tokio::test]
+    async fn a_pool_that_prepares_nothing_holds_nothing() {
+        let host_uri = Url::parse("file:///test/no-held-set.md").unwrap();
+        let plain = LanguageServerPool::new();
+        plain.open_host_incarnation(&host_uri, 1).await;
+        plain.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(plain.prepare_failures.get().is_none());
+        assert!(
+            !plain
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        );
+        let preparing = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        preparing.prepare_failures_for_test();
+        preparing.open_host_incarnation(&host_uri, 1).await;
+        preparing.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(
+            preparing
+                .region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        );
+    }
+
+    /// A hold is the host incarnation's it was published under: a reopen
+    /// holds nothing, and a stale pass neither holds nor releases the
+    /// reopen's regions.
+    #[tokio::test]
+    async fn a_hold_stands_only_under_its_incarnation() {
+        let host_uri = Url::parse("file:///test/hold-incarnation.md").unwrap();
+        let pool = LanguageServerPool::preparing();
+        // The prepare layer's table, which holds are kept in.
+        pool.prepare_failures_for_test();
+        let held = || {
+            pool.region_admission(&host_uri, "lua", TEST_ULID_LUA_0)
+                .held
+        };
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(held());
+        pool.close_host_incarnation(&host_uri, 1).await;
+        assert!(!held(), "a closed host holds nothing");
+        pool.open_host_incarnation(&host_uri, 2).await;
+        assert!(!held(), "the reopen holds nothing of the closed lifetime");
+        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
+        assert!(!held(), "a stale pass holds nothing");
+        pool.hold_latest_virtual_content(&host_uri, 2, "lua", TEST_ULID_LUA_0);
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "x");
+        assert!(held(), "a stale pass releases nothing");
+        pool.record_latest_virtual_content(&host_uri, 2, "lua", TEST_ULID_LUA_0, "x");
+        assert!(!held());
+    }
+
     #[tokio::test]
     async fn stale_incarnation_cannot_repopulate_latest_virtual_content_after_fast_reopen() {
         let pool = LanguageServerPool::new();
@@ -8583,6 +10713,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -8630,6 +10762,8 @@ mod tests {
                     language: "lua".to_string(),
                     region_id: TEST_ULID_LUA_0.to_string(),
                     content: "print('old lifetime')".to_string(),
+                    held: false,
+                    prepared: None,
                 }],
             )
             .await;
@@ -8653,6 +10787,8 @@ mod tests {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
                 content: "print('cached')".to_string(),
+                held: false,
+                prepared: None,
             }],
         )
         .await;
@@ -8674,7 +10810,7 @@ mod tests {
         let before = {
             let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
             let regions = host.contents.get("lua").unwrap();
-            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+            regions.get(TEST_ULID_LUA_0).unwrap().value().clone()
         };
 
         pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "print('same')");
@@ -8682,7 +10818,11 @@ mod tests {
         let after = {
             let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
             let regions = host.contents.get("lua").unwrap();
-            Arc::clone(regions.get(TEST_ULID_LUA_0).unwrap().value())
+            regions.get(TEST_ULID_LUA_0).unwrap().value().clone()
+        };
+        // Without experimental features, the text alone: one allocation.
+        let (LatestText::Text(before), LatestText::Text(after)) = (before, after) else {
+            panic!("no stamp nor map without experimental features");
         };
         assert!(Arc::ptr_eq(&before, &after));
     }
@@ -9217,33 +11357,20 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_document_opened_unclaims_when_task_is_aborted_before_enqueue() {
-        struct BlockingSender {
-            entered: Arc<tokio::sync::Notify>,
-        }
-
-        impl message_sender::MessageSender for BlockingSender {
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                std::future::pending().await
-            }
-        }
-
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/abort.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, before its didOpen is queued.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut first_rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let task = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
             tokio::spawn(async move {
-                let mut sender = BlockingSender { entered };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9254,14 +11381,18 @@ mod tests {
                 .await
             })
         };
-
-        entered.notified().await;
-        assert!(!pool.is_document_opened(&virtual_uri));
-        assert!(
-            pool.document_tracker
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
                 .open_claim_waiter(&virtual_uri, &connection_key)
-                .is_some()
-        );
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
+        assert!(!pool.is_document_opened(&virtual_uri));
         let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let retry = {
             let pool = Arc::clone(&pool);
@@ -9287,12 +11418,17 @@ mod tests {
         );
         task.abort();
         let _ = task.await;
+        drop(registrations);
         tokio::time::timeout(Duration::from_secs(1), retry)
             .await
             .expect("waiting retry should resume after abort rollback")
             .expect("retry task should not panic")
             .expect("retry should enqueue didOpen");
         assert!(rx.try_recv().is_ok(), "a later didOpen must be retryable");
+        assert!(
+            first_rx.try_recv().is_err(),
+            "the aborted open queued nothing"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(
             pool.document_tracker
@@ -9302,46 +11438,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_document_opened_finishes_promotion_after_enqueue_when_caller_is_aborted() {
-        struct GatedSender {
-            entered: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-            sent: Arc<tokio::sync::Notify>,
+    async fn a_didopen_finds_its_text_on_record_as_it_goes_out_and_takes_it_back_if_not() {
+        /// Queues under the record's lock, or refuses to.
+        struct ObservedSender {
+            tracker: Arc<DocumentTracker>,
+            queue: bool,
+            locked: Arc<std::sync::atomic::AtomicBool>,
         }
 
-        impl message_sender::MessageSender for GatedSender {
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                self.release.notified().await;
-                self.sent.notify_one();
-                Ok(())
+        impl message_sender::MessageSender for ObservedSender {
+            fn send_serialized(&mut self, _payload: serde_json::Value) -> io::Result<()> {
+                self.locked.store(
+                    self.tracker.held_texts_locked_for_test(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if self.queue {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "full"))
+                }
             }
         }
 
         let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/record-open.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let connection_key = ConnectionKey::for_server("lua");
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut refusing = ObservedSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            queue: false,
+            locked: Arc::clone(&locked),
+        };
+        assert!(
+            pool.ensure_document_opened(
+                &mut refusing,
+                &host_uri,
+                &virtual_uri,
+                "print('old')",
+                &connection_key,
+            )
+            .await
+            .is_err()
+        );
+        assert!(locked.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            pool.document_tracker
+                .held_text(&uri, &connection_key)
+                .is_none(),
+            "a didOpen that never went out leaves nothing on record"
+        );
+
+        let mut queueing = ObservedSender {
+            tracker: Arc::clone(&pool.document_tracker),
+            queue: true,
+            locked: Arc::clone(&locked),
+        };
+        pool.ensure_document_opened(
+            &mut queueing,
+            &host_uri,
+            &virtual_uri,
+            "print('old')",
+            &connection_key,
+        )
+        .await
+        .expect("the retry opens the document");
+        let held = pool
+            .document_tracker
+            .held_text(&uri, &connection_key)
+            .expect("a queued didOpen is on record");
+        assert_eq!(held.version, crate::lsp::bridge::protocol::DIDOPEN_VERSION);
+    }
+
+    #[tokio::test]
+    async fn ensure_document_opened_finishes_promotion_after_enqueue_when_caller_is_aborted() {
+        let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/abort-after-enqueue.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let sent = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, so the version map can be taken before
+        // its promotion needs it.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let task = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            let sent = Arc::clone(&sent);
             tokio::spawn(async move {
-                let mut sender = GatedSender {
-                    entered,
-                    release,
-                    sent,
-                };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9352,14 +11538,29 @@ mod tests {
                 .await
             })
         };
-
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
         let versions = pool
             .document_tracker
             .lock_document_versions_for_test()
             .await;
-        release.notify_one();
-        sent.notified().await;
+        drop(registrations);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while rx.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the didOpen is queued");
         tokio::task::yield_now().await;
         let provenance = pool.observe_virtual_uris_for_connection(
             &connection_key,
@@ -9422,37 +11623,20 @@ mod tests {
 
     #[tokio::test]
     async fn did_close_waits_for_open_enqueue_then_removes_sent_state() {
-        struct GatedSender {
-            entered: Arc<tokio::sync::Notify>,
-            release: Arc<tokio::sync::Notify>,
-        }
-
-        impl message_sender::MessageSender for GatedSender {
-            async fn send_notification<P: serde::Serialize + Send>(
-                &mut self,
-                _notification: JsonRpcNotification<P>,
-            ) -> io::Result<()> {
-                self.entered.notify_one();
-                self.release.notified().await;
-                Ok(())
-            }
-        }
-
         let pool = Arc::new(LanguageServerPool::new());
         let host_uri = Url::parse("file:///test/open-close.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
         let connection_key = ConnectionKey::for_server("lua");
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
+        // Stalled after its claim, before its didOpen is queued.
+        let registrations = pool.document_tracker.lock_host_to_virtual_for_test().await;
+        let (sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
         let opening = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
             let virtual_uri = virtual_uri.clone();
             let connection_key = connection_key.clone();
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
             tokio::spawn(async move {
-                let mut sender = GatedSender { entered, release };
+                let mut sender = sender;
                 pool.ensure_document_opened(
                     &mut sender,
                     &host_uri,
@@ -9463,7 +11647,17 @@ mod tests {
                 .await
             })
         };
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool
+                .document_tracker
+                .open_claim_waiter(&virtual_uri, &connection_key)
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the open claims the document");
         let closing = {
             let pool = Arc::clone(&pool);
             let host_uri = host_uri.clone();
@@ -9475,8 +11669,9 @@ mod tests {
             "close must serialize behind didOpen"
         );
 
-        release.notify_one();
+        drop(registrations);
         opening.await.unwrap().unwrap();
+        assert!(rx.try_recv().is_ok(), "the didOpen went out");
         let closed = closing.await.unwrap();
         assert_eq!(closed.len(), 1);
         assert!(!pool.is_document_opened(&virtual_uri));
@@ -11384,6 +13579,8 @@ mod tests {
                         language: "lua".to_string(),
                         region_id: TEST_ULID_LUA_0.to_string(),
                         content: "print('new')".to_string(),
+                        held: false,
+                        prepared: None,
                     }],
                 )
                 .await;
@@ -11457,6 +13654,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.forward_didchange_to_opened_docs(&host_uri, 1, &injections)
@@ -11529,6 +13728,8 @@ mod tests {
             language: "lua".to_string(),
             region_id: TEST_ULID_LUA_0.to_string(),
             content: "print('hello')".to_string(),
+            held: false,
+            prepared: None,
         }];
         pool.open_host_incarnation(&host_uri, 1).await;
         pool.forward_didchange_to_opened_docs(&host_uri, 1, &injections)
