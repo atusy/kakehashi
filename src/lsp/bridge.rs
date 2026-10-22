@@ -96,7 +96,7 @@ pub(crate) use protocol::host_range_selects_nothing;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
-pub(crate) use protocol::transform_workspace_edit_to_host;
+pub(crate) use protocol::transform_workspace_edit_to_host_explained;
 pub(crate) use protocol::translate_virtual_formatting_edits_to_host;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
@@ -109,6 +109,8 @@ pub(crate) use protocol::{VirtualLayout, apply_prepare_result};
 pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::HostResolveSnapshot;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
+#[cfg(test)]
+pub(crate) use text_document::prepared_map_refusal_for_test;
 pub(crate) use text_document::{
     CallHierarchyDocumentRevision, CallHierarchyEnvelope, CodeActionEnvelope, EnvelopeOffset,
     InlayHintDocumentRevision, InlayHintEnvelope, KakehashiEnvelope, TypeHierarchyDocumentRevision,
@@ -118,6 +120,7 @@ pub(crate) use text_document::{
     extract_call_hierarchy_envelope, extract_code_action_envelope, extract_code_lens_envelope,
     extract_document_link_envelope, extract_envelope, extract_inlay_hint_envelope,
     extract_type_hierarchy_envelope, parse_code_actions_leniently, parse_type_hierarchy_items,
+    refused_by_prepared_map,
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome, OpenRevision};
 pub(crate) use workspace::{ClientWorkspace, ClientWorkspaceSnapshot, WorkspaceFolderSet};

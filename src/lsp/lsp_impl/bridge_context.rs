@@ -74,46 +74,23 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
     )
 }
 
-/// Whether an edit method stays open to a contiguous prepared document: its
-/// edits are mapped back through the prepared map
+/// Whether `method` is closed to a region: one that is not contiguous
+/// cannot take the edits the method answers with. A contiguous prepared one
+/// can, every such method's edits mapping back through the prepared map
 /// (`translate_virtual_text_edits_to_host` and
 /// `translate_virtual_text_edit_to_host` for edits keeping their extents,
-/// `translate_virtual_formatting_edits_to_host` for a formatter's answer).
-fn method_maps_prepared_edits(method: &str) -> bool {
-    matches!(
-        method,
-        "textDocument/colorPresentation"
-            | "textDocument/completion"
-            | "textDocument/formatting"
-            | "textDocument/inlayHint"
-            | "textDocument/onTypeFormatting"
-            | "textDocument/rangeFormatting"
-    )
-}
-
-/// Whether `method` is closed to a region: one that is not contiguous, or
-/// whose document is prepared (`prepared`), cannot take the edits the method
-/// answers with — but for the methods whose edits are mapped back through a
-/// prepared document ([`method_maps_prepared_edits`]).
-pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
-    method_closed_to_with(resolved, method, || prepared)
-}
-
-/// [`method_closed_to`], asking whether the document is prepared only for
-/// a method that depends on it.
-fn method_closed_to_with(
-    resolved: &ResolvedInjection,
-    method: &str,
-    prepared: impl FnOnce() -> bool,
-) -> bool {
-    method_requires_contiguous_injection(method)
-        && (!resolved.contiguous || (!method_maps_prepared_edits(method) && prepared()))
+/// `translate_virtual_formatting_edits_to_host` for a formatter's answer,
+/// `translate_virtual_replayed_edits_to_host` for a workspace edit), or its
+/// ranges standing for their text reading alike in the host
+/// (`translate_editable_virtual_range_to_host`: prepareRename's and
+/// linkedEditingRange's).
+pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str) -> bool {
+    method_requires_contiguous_injection(method) && !resolved.contiguous
 }
 
 /// [`prepare_request_context`] for a `method` request: `Err` when the
-/// document could not be prepared, `Ok(None)` when `method` is closed to it
-/// as prepared — checked again with the answer in, since the lifecycle pass
-/// may not have looked the region up yet.
+/// document could not be prepared, `Ok(None)` when `method` is closed to its
+/// region.
 pub(crate) async fn prepare_request_context_for(
     bridge: &crate::lsp::bridge::BridgeCoordinator,
     host_language: &str,
@@ -121,7 +98,7 @@ pub(crate) async fn prepare_request_context_for(
     method: &str,
 ) -> Result<Option<DocumentRequestContext>, crate::lsp::bridge::PrepareMiss> {
     let ctx = prepare_request_context(bridge, host_language, ctx).await?;
-    Ok((!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx))
+    Ok((!method_closed_to(&ctx.resolved, method)).then_some(ctx))
 }
 
 /// Start the prepare attempts of every region `regions` names (of a host in
@@ -595,6 +572,25 @@ pub(crate) async fn sources_verdict<'a, T: 'a>(
     current_version: impl Fn() -> Option<u64>,
     sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
 ) -> Verdict {
+    sources_verdict_within(
+        pool,
+        tracker,
+        current_version,
+        sources,
+        crate::lsp::bridge::PREPARE_TIMEOUT,
+    )
+    .await
+}
+
+/// [`sources_verdict`], waiting at most `within` (what is left of a wait
+/// shared with other answers).
+pub(crate) async fn sources_verdict_within<'a, T: 'a>(
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+    sources: impl Iterator<Item = &'a Sourced<T>> + Clone,
+    within: std::time::Duration,
+) -> Verdict {
     if !sources.clone().any(Sourced::is_prepared) {
         return Verdict::Current;
     }
@@ -616,7 +612,7 @@ pub(crate) async fn sources_verdict<'a, T: 'a>(
             sources.clone().all(|source| source.live(pool, tracker))
                 && sources.clone().any(|source| source.settling(pool, tracker))
         },
-        crate::lsp::bridge::PREPARE_TIMEOUT,
+        within,
     )
     .await
 }
@@ -670,6 +666,148 @@ pub(crate) fn poll_verdict(
 /// How often [`settled_verdict`] looks again while an answer is settling.
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// One poll of [`settled_verdict`] for an answer mapped through `source`,
+/// read at once, never waited on: whether it may still be judged current —
+/// current now, or not yet (the host's last edit settling, or its region
+/// held, while it can still become current) and the host unedited since
+/// the request read its text.
+/// `false` once moved or stale, which no wait brings back. For a race
+/// choosing among answers, where one that may not be kept is no answer;
+/// the final check still judges the one chosen.
+pub(crate) fn source_may_keep<T>(
+    source: &Sourced<T>,
+    pool: &crate::lsp::bridge::LanguageServerPool,
+    tracker: &crate::language::NodeTracker,
+    current_version: impl Fn() -> Option<u64>,
+) -> bool {
+    if !source.is_prepared() {
+        return true;
+    }
+    matches!(
+        poll_verdict(
+            || source.still_current(pool, tracker, &current_version),
+            || source.moved(current_version()),
+            || source.live(pool, tracker) && source.settling(pool, tracker),
+        ),
+        None | Some(Verdict::Current)
+    )
+}
+
+/// Whether a layer's answer is one a layers' race may choose: it has a
+/// result (`has_result`), and, mapped through a prepared map, may still be
+/// kept (`may_keep`, see [`source_may_keep`]). One moved or stale is no
+/// answer of its layer, and the race falls through to the next layer's
+/// rather than choosing what the final check drops. Unprepared answers read
+/// nothing.
+pub(crate) fn layer_answers<T>(
+    sourced: &Sourced<T>,
+    has_result: impl FnOnce(&T) -> bool,
+    may_keep: impl FnOnce(&Sourced<T>) -> bool,
+) -> bool {
+    has_result(&sourced.value) && (!sourced.is_prepared() || may_keep(sourced))
+}
+
+/// The stale fallback: a prepared answer a layers' race passed over as one
+/// it cannot keep ([`layer_answers`]), kept for when no other layer
+/// answers, so a method that answers a dropped answer otherwise than with
+/// nothing (a rename's `ContentModified`) still does, through its final
+/// check. Unlike code actions' refused fallback, what it keeps is never
+/// returned as it is: the final check drops it.
+pub(crate) struct StaleAnswerFallback<T>(std::sync::Mutex<Option<Sourced<T>>>);
+
+impl<T> Default for StaleAnswerFallback<T> {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+}
+
+impl<T: Clone> StaleAnswerFallback<T> {
+    /// [`layer_answers`], keeping aside, once (the race asks in priority
+    /// order: the highest-ranked), an answer with a result it passes over.
+    pub(crate) fn answers(
+        &self,
+        sourced: &Sourced<T>,
+        has_result: impl Fn(&T) -> bool,
+        may_keep: impl FnOnce(&Sourced<T>) -> bool,
+    ) -> bool {
+        if !has_result(&sourced.value) {
+            return false;
+        }
+        if layer_answers(sourced, &has_result, may_keep) {
+            return true;
+        }
+        let mut kept = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if kept.is_none() {
+            *kept = Some(sourced.clone());
+        }
+        false
+    }
+
+    /// The race's `result`, or, when it found no answer (nothing, or only
+    /// a layer's error, which the answer passed over would have
+    /// outranked), the answer kept aside. A cancel stays a cancel.
+    pub(crate) fn or_kept(
+        self,
+        result: tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>>,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>> {
+        let kept = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (result, kept) {
+            (Ok(None), Some(kept)) => Ok(Some(kept)),
+            (Err(error), Some(kept))
+                if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+            {
+                Ok(Some(kept))
+            }
+            (result, _) => result,
+        }
+    }
+}
+
+/// A `preferred` race over [virt, host] whose virt layer answers `virt`,
+/// prepared, at once, and whose host layer answers `host` after
+/// `host_delay_ms`, the virt answer read as `may_keep` says: which value
+/// won, for a method's race test.
+#[cfg(test)]
+pub(crate) async fn race_prepared_virt_against_host<T>(
+    virt: T,
+    host: T,
+    host_delay_ms: u64,
+    may_keep: bool,
+    has_result: impl Fn(&T) -> bool,
+) -> T {
+    use crate::config::settings::LayerSource::{Host, Native, Virt};
+    let host_uri = url::Url::parse("file:///test/race.md").unwrap();
+    let map = crate::lsp::bridge::apply_prepare_result(
+        "a",
+        &crate::lsp::bridge::VirtualLayout::single("a"),
+        None,
+    )
+    .unwrap()
+    .map;
+    let virt = Sourced::prepared_for_test(virt, &host_uri, "lua", "r", &map, 1, 0);
+    let host = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(host_delay_ms)).await;
+        Ok(Some(Sourced::unprepared(host)))
+    };
+    race_layers_preferred(
+        &[Virt, Host, Native],
+        std::future::ready(Ok(Some(virt))),
+        host,
+        std::future::ready(Ok(None)),
+        |sourced: &Sourced<T>| layer_answers(sourced, &has_result, |_| may_keep),
+    )
+    .await
+    .unwrap()
+    .expect("a layer answers")
+    .value
+}
+
 impl Kakehashi {
     /// The host's lifetime and content version, read together before a virt
     /// layer resolves the request's text, for its prepared answer's final
@@ -714,6 +852,43 @@ impl Kakehashi {
             sources,
         )
         .await
+    }
+
+    /// [`source_may_keep`] for a layer's answer to a request on `lsp_uri`:
+    /// read as a layers' race decides on it.
+    pub(crate) fn answer_may_keep<T>(&self, lsp_uri: &Uri, sourced: &Sourced<T>) -> bool {
+        source_may_keep(
+            sourced,
+            self.bridge.pool(),
+            self.bridge.node_tracker(),
+            || self.host_content_version(lsp_uri),
+        )
+    }
+
+    /// The final check of the one answer chosen for a request on `lsp_uri`
+    /// (see [`Self::settled_verdict_of`]): its value while still current,
+    /// else the verdict that drops it, logged at `level` as `{method}`'s
+    /// result dropped.
+    pub(crate) async fn settled_answer<T>(
+        &self,
+        lsp_uri: &Uri,
+        sourced: Sourced<T>,
+        method: &str,
+        level: log::Level,
+    ) -> Result<T, Verdict> {
+        let verdict = self
+            .settled_verdict_of(lsp_uri, std::iter::once(&sourced))
+            .await;
+        if !verdict.keeps() {
+            log::log!(
+                target: "kakehashi::bridge",
+                level,
+                "{method} result for {} dropped: {verdict}",
+                lsp_uri.as_str()
+            );
+            return Err(verdict);
+        }
+        Ok(sourced.value)
     }
 
     /// The host's current content version.
@@ -1660,13 +1835,7 @@ impl Kakehashi {
             return None;
         };
 
-        // At once on what the lifecycle pass knows, a pending answer
-        // included (most likely prepared); checked again with the answer in
-        // (see `prepare_request_context_for`). Formatting waits instead (see
-        // its fan-out, which prepares every region's context).
-        if method_closed_to_with(&resolved, method_name, || {
-            self.lifecycle_prepares(&uri, &resolved)
-        }) {
+        if method_closed_to(&resolved, method_name) {
             return None;
         }
 
@@ -1906,20 +2075,6 @@ impl Kakehashi {
             .await
             .ok()
             .flatten()
-    }
-
-    /// Whether the lifecycle pass prepares a region's current document (or
-    /// holds it back for its peer): what [`method_closed_to`] closes edit
-    /// methods by. Not whether a server still holds a prepared text of it
-    /// (see `BridgeCoordinator::region_coordinates_may_be_prepared`).
-    pub(crate) fn lifecycle_prepares(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
-        self.bridge
-            .prepare_region(
-                uri,
-                &resolved.injection_language,
-                &resolved.region.region_id,
-            )
-            .prepared
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
@@ -2517,9 +2672,7 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if method_closed_to_with(&resolved, method_name, || {
-                self.lifecycle_prepares(&uri, &resolved)
-            }) {
+            if method_closed_to(&resolved, method_name) {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
@@ -2605,6 +2758,60 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// Read at once, an answer may still be kept while current or settling
+    /// (it would be waited on), and may not once moved or stale.
+    #[tokio::test]
+    async fn an_answer_may_be_kept_while_current_or_settling_only() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let prepare = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let prepared = prepare("  red\n");
+        for case in ["current", "settling", "settling, moved", "moved", "stale"] {
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            let host = url::Url::parse("file:///test/keep.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            if case.starts_with("settling") {
+                pool.note_host_edited(&host, 1, 1);
+            }
+            if case == "stale" {
+                // Re-prepared to other coordinates, the host unedited.
+                let other = prepare("  blue\n");
+                pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &other);
+            }
+            let version = if case.ends_with("moved") { 2 } else { 1 };
+            let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
+            assert_eq!(
+                source_may_keep(&source, &pool, &tracker, || Some(version)),
+                matches!(case, "current" | "settling"),
+                "{case}"
+            );
+        }
+        // Unprepared: nothing read.
+        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+        let tracker = crate::language::NodeTracker::new();
+        assert!(source_may_keep(
+            &Sourced::unprepared(()),
+            &pool,
+            &tracker,
+            || unreachable!()
+        ));
+    }
 
     /// An answer whose reply came before the host's last edit settled (its
     /// text unchanged by it: another fence edited) is kept once the edit
@@ -3307,7 +3514,18 @@ mod tests {
         answer: crate::lsp::bridge::PrepareAnswer,
     ) {
         answer_held(server, uri, resolved, answer, false);
-        assert!(!server.lifecycle_prepares(uri, resolved));
+        // The lifecycle pass neither prepares the region's document nor
+        // holds it back for its peer.
+        assert!(
+            !server
+                .bridge
+                .prepare_region(
+                    uri,
+                    &resolved.injection_language,
+                    &resolved.region.region_id,
+                )
+                .prepared
+        );
     }
 
     /// [`answer`], the lifecycle pass holding the document on it when
@@ -3350,11 +3568,11 @@ mod tests {
         ))
     }
 
-    /// An edit method on a region the lifecycle pass has not looked up yet
-    /// is closed once its answer is in, unless the document goes as is;
-    /// inlay hints and completion stay open (their edits are mapped back).
+    /// An edit method on a contiguous region the lifecycle pass has not
+    /// looked up yet stays open once its answer is in, its context prepared:
+    /// every one maps its edits back.
     #[tokio::test]
-    async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
+    async fn an_answer_in_before_the_lifecycle_pass_looks_prepares_edit_methods() {
         let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
         let server = service.inner();
         answer(server, &uri, &resolved, dedented());
@@ -3377,10 +3595,9 @@ mod tests {
                 .ok()
                 .flatten()
         };
-        for method in ["textDocument/rename", "textDocument/codeAction"] {
-            assert!(for_method(method).await.is_none(), "{method} closes");
-        }
         for method in [
+            "textDocument/codeAction",
+            "textDocument/rename",
             "textDocument/inlayHint",
             "textDocument/completion",
             "textDocument/formatting",
@@ -3535,7 +3752,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prepared_document_is_closed_to_edit_methods_but_those_mapping_their_edits() {
+    fn a_contiguous_prepared_document_is_open_to_every_edit_method() {
         let mut resolved = crate::language::injection::ResolvedInjection {
             region: crate::language::injection::CacheableInjectionRegion {
                 language: "lua".to_string(),
@@ -3551,37 +3768,29 @@ mod tests {
             contiguous: true,
             gaps: Default::default(),
         };
-        // Every edit method whose edits are not mapped back stays closed
-        // (inbound applyEdit is refused on its own path: the region's offset
-        // carries a map).
         for method in [
-            "textDocument/rename",
             "textDocument/codeAction",
-            "textDocument/prepareRename",
-            "textDocument/linkedEditingRange",
-        ] {
-            assert!(!method_closed_to(&resolved, method, false), "{method}");
-            assert!(method_closed_to(&resolved, method, true), "{method}");
-        }
-        for method in [
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/completion",
             "textDocument/formatting",
             "textDocument/rangeFormatting",
             "textDocument/onTypeFormatting",
+            "textDocument/prepareRename",
+            "textDocument/rename",
+            "textDocument/linkedEditingRange",
         ] {
-            assert!(!method_closed_to(&resolved, method, true), "{method}");
+            assert!(!method_closed_to(&resolved, method), "{method}");
         }
-        assert!(!method_closed_to(&resolved, "textDocument/hover", true));
+        assert!(!method_closed_to(&resolved, "textDocument/hover"));
         resolved.contiguous = false;
-        assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
+        assert!(method_closed_to(&resolved, "textDocument/inlayHint"));
     }
 
     /// The carriers mapping edits back through a prepared map open on
     /// contiguous regions only: a noncontiguous one, whose map has gaps
-    /// (where `map_edits`' indentation is not yet exact), never reaches it,
-    /// prepared or not.
+    /// (where `map_edits`' indentation is not exact in every shape), never
+    /// reaches it, prepared or not.
     #[test]
     fn edit_carriers_mapping_prepared_edits_stay_closed_to_noncontiguous_regions() {
         let resolved = crate::language::injection::ResolvedInjection {
@@ -3600,17 +3809,18 @@ mod tests {
             gaps: Default::default(),
         };
         for method in [
+            "textDocument/codeAction",
             "textDocument/completion",
             "textDocument/inlayHint",
             "textDocument/colorPresentation",
             "textDocument/formatting",
-            "textDocument/rangeFormatting",
+            "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
+            "textDocument/prepareRename",
+            "textDocument/rangeFormatting",
+            "textDocument/rename",
         ] {
-            assert!(method_maps_prepared_edits(method), "{method}");
-            for prepared in [false, true] {
-                assert!(method_closed_to(&resolved, method, prepared), "{method}");
-            }
+            assert!(method_closed_to(&resolved, method), "{method}");
         }
     }
 

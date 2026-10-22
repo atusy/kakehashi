@@ -64,6 +64,23 @@ struct Setup {
     /// Have the echo mock answer color presentations only once the test
     /// creates `release` in its directory.
     color_after_release: bool,
+    /// Have the echo mock answer renames only once the test creates
+    /// `release` in its directory.
+    rename_after_release: bool,
+    /// Have the echo mock answer code actions only once the test creates
+    /// `release` in its directory.
+    code_action_after_release: bool,
+    /// Have the echo mock ask to apply its save edit only once it has read
+    /// the document's next change.
+    apply_edit_after_change: bool,
+    /// Also bridge lua to a `code-action` mock, ranked below the echo mock
+    /// for code actions under `preferred`.
+    second_code_action: bool,
+    /// Rank the echo mock alone under a `preferred` code action walk.
+    echo_code_action_preferred: bool,
+    /// Have the echo mock answer linked editing ranges only once the test
+    /// creates `release` in its directory.
+    linked_after_release: bool,
 }
 
 impl Default for Setup {
@@ -82,6 +99,12 @@ impl Default for Setup {
             host_mode: "slow-empty",
             second_on_type: false,
             color_after_release: false,
+            rename_after_release: false,
+            code_action_after_release: false,
+            apply_edit_after_change: false,
+            second_code_action: false,
+            echo_code_action_preferred: false,
+            linked_after_release: false,
         }
     }
 }
@@ -104,6 +127,14 @@ impl Setup {
         if self.second_on_type {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/onTypeFormatting"] =
                 json!({ "priorities": ["echo", "second"] });
+        }
+        if self.second_code_action {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/codeAction"] =
+                json!({ "strategy": "preferred", "priorities": ["echo", "second"] });
+        }
+        if self.echo_code_action_preferred {
+            markdown["bridge"]["lua"]["aggregation"]["textDocument/codeAction"] =
+                json!({ "strategy": "preferred", "priorities": ["echo"] });
         }
         if self.concatenated {
             markdown["bridge"]["lua"]["aggregation"]["textDocument/formatting"] =
@@ -147,6 +178,18 @@ impl Setup {
         if self.color_after_release {
             builder = builder.env("MOCK_COLOR_AFTER_RELEASE", "1");
         }
+        if self.rename_after_release {
+            builder = builder.env("MOCK_RENAME_AFTER_RELEASE", "1");
+        }
+        if self.code_action_after_release {
+            builder = builder.env("MOCK_CODE_ACTION_AFTER_RELEASE", "1");
+        }
+        if self.linked_after_release {
+            builder = builder.env("MOCK_LINKED_AFTER_RELEASE", "1");
+        }
+        if self.apply_edit_after_change {
+            builder = builder.env("MOCK_APPLY_EDIT_AFTER_CHANGE", "1");
+        }
         if self.wire_log {
             builder = builder.env(
                 "MOCK_LSP_WIRE_LOG",
@@ -174,6 +217,12 @@ impl Setup {
         if self.second_on_type {
             servers["second"] = json!({
                 "cmd": [mock_bin(), "on-type"],
+                "languages": ["lua"]
+            });
+        }
+        if self.second_code_action {
+            servers["second"] = json!({
+                "cmd": [mock_bin(), "code-action"],
                 "languages": ["lua"]
             });
         }
@@ -950,29 +999,358 @@ fn formatting_before_the_document_was_looked_up_waits_for_its_prepared_text() {
 }
 
 #[test]
-fn a_rename_before_the_document_was_looked_up_is_refused_once_it_is_prepared() {
+fn a_rename_maps_back_through_the_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/rename.md";
-    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
     open(&mut client, uri, text);
 
-    // At once: the answer is not in yet. The request waits for it, finds
-    // the document prepared, and is refused — the echo mock would rename.
-    for _ in 0..20 {
-        let response = client.send_request(
-            "textDocument/rename",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": { "line": 3, "character": 8 },
-                "newName": "y"
-            }),
-        );
-        assert!(response.get("error").is_none(), "{response}");
-        assert!(response["result"].is_null(), "{response}");
-        std::thread::sleep(Duration::from_millis(50));
+    // At once, the answer not in yet: the request waits for it, and the
+    // rename (the echo mock replaces its first line) is placed after the
+    // host's indentation, which the server never saw.
+    let response = client.send_request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 8 },
+            "newName": "y"
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    let edits = response["result"]["changes"][uri]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    assert_eq!(
+        apply_edits(text, &edits),
+        "# t\n\n```lua\n  renamed\n  return x\n```\n",
+        "{response}"
+    );
+}
+
+#[test]
+fn a_rename_the_host_moved_under_is_answered_as_content_modified() {
+    // The echo mock answers renames only once released. The host is
+    // edited (outside the region) while the request is out: the rename,
+    // made for the text before the edit, is not applied, and the editor is
+    // told the content was modified, not that there is nothing to rename.
+    let (mut client, dir) = Setup {
+        rename_after_release: true,
+        wire_log: true,
+        ..Setup::default()
     }
-    // The document was bridged meanwhile.
+    .start();
+    let uri = "file:///prepare/rename-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 3, "character": 8 },
+        "newName": "y"
+    });
+    let id = client.send_request_async("textDocument/rename", request);
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/rename\t"))
+    {
+        assert!(Instant::now() < until, "rename request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(response["error"]["code"], -32801, "{response}");
+}
+
+#[test]
+fn linked_editing_ranges_map_back_through_the_prepared_document() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/linked.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/linkedEditingRange",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+    );
+    // `x` where the host has it: past each line's indent, which the server
+    // never saw.
+    assert_eq!(
+        response["result"]["ranges"],
+        json!([
+            { "start": { "line": 3, "character": 8 }, "end": { "line": 3, "character": 9 } },
+            { "start": { "line": 4, "character": 9 }, "end": { "line": 4, "character": 10 } }
+        ]),
+        "{response}"
+    );
+}
+
+fn code_action_request(uri: &str) -> Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": 3, "character": 8 },
+            "end": { "line": 3, "character": 8 }
+        },
+        "context": { "diagnostics": [] }
+    })
+}
+
+#[test]
+fn code_actions_map_back_through_the_prepared_document() {
+    // Lazy actions resolved by the editor, and for an editor that cannot,
+    // within the request: either way through the prepared document's map.
+    for resolves in [true, false] {
+        let (mut client, _dir) = Setup {
+            capabilities: if resolves {
+                json!({ "textDocument": { "codeAction": {
+                    "dataSupport": true,
+                    "resolveSupport": { "properties": ["edit"] }
+                } } })
+            } else {
+                json!({})
+            },
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/action.md";
+        let text = "# t\n\n```lua\n  local x = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+        let actions = response["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("{response}"));
+        let action = |title: &str| {
+            actions
+                .iter()
+                .find(|action| {
+                    action["title"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with(title))
+                })
+                .cloned()
+                .unwrap_or_else(|| panic!("no {title}: {response}"))
+        };
+        let edited = |action: &Value| {
+            let edits = action["edit"]["changes"][uri]
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("{action}"));
+            apply_edits(text, &edits)
+        };
+        assert_eq!(edited(&action("echo-fix")), "# t\n\n```lua\n  fixed\n```\n");
+        let wrap = action("echo-wrap");
+        let wrap = if resolves {
+            assert!(wrap.get("edit").is_none(), "{wrap}");
+            let resolved = client.send_request("codeAction/resolve", wrap);
+            resolved["result"].clone()
+        } else {
+            wrap
+        };
+        assert_eq!(
+            edited(&wrap),
+            "# t\n\n```lua\n  do\n    local x = 1\n  end\n```\n",
+            "resolves: {resolves}"
+        );
+    }
+}
+
+#[test]
+fn a_prepared_answer_of_refused_actions_does_not_win_a_preferred_walk() {
+    // The echo mock, ranked first, answers one action whose edit the map
+    // refuses: disabled for this editor, it is no answer, and the server
+    // ranked below is asked, its action offered.
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "codeAction": { "disabledSupport": true } } }),
+        second_code_action: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action-refused.md";
+    let text = "# t\n\n```lua\n  local x = 1 -- REFUSE\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+    let titles: Vec<String> = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"))
+        .iter()
+        .filter_map(|action| action["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        titles
+            .iter()
+            .any(|title| title.starts_with("Replace with fixed")),
+        "{response}"
+    );
+    assert!(
+        !titles.iter().any(|title| title.starts_with("echo-refused")),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_prepared_answer_of_refused_actions_answers_a_preferred_walk_nothing_else_answers() {
+    // The echo mock, alone under `preferred`, answers one action whose edit
+    // the map refuses: no server ranked below answers, so it is offered
+    // disabled, for this editor to show why.
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "codeAction": { "disabledSupport": true } } }),
+        echo_code_action_preferred: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action-refused-alone.md";
+    let text = "# t\n\n```lua\n  local x = 1 -- REFUSE\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request("textDocument/codeAction", code_action_request(uri));
+    let actions = response["result"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{response}"));
+    let refused = actions
+        .iter()
+        .find(|action| {
+            action["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("echo-refused"))
+        })
+        .unwrap_or_else(|| panic!("{response}"));
+    assert!(refused["disabled"]["reason"].is_string(), "{response}");
+    assert!(refused.get("edit").is_none(), "{response}");
+}
+
+#[test]
+fn code_actions_the_host_moved_under_are_dropped() {
+    // The echo mock answers code actions only once released. The host is
+    // edited (outside the region) while the request is out: the actions,
+    // made for the text before the edit, are not offered.
+    let (mut client, dir) = Setup {
+        code_action_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/action-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let id = client.send_request_async("textDocument/codeAction", code_action_request(uri));
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/codeAction\t"))
+    {
+        assert!(Instant::now() < until, "code action request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
+}
+
+#[test]
+fn a_rename_range_the_host_moved_under_is_no_answer() {
+    // The echo mock answers prepareRename (the word at the position) only
+    // once released. Unedited, the word maps where the host has it; the
+    // host edited above the region while the request is out, its range,
+    // for the text before the edit, is no answer.
+    for moved in [false, true] {
+        let (mut client, dir) = Setup {
+            rename_after_release: true,
+            wire_log: true,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/prepare-rename.md";
+        let text = "# t\n\n```lua\n  local x = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let id = client.send_request_async(
+            "textDocument/prepareRename",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+        );
+        let wire = dir.path().join("wire.log");
+        let until = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&wire)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("textDocument/prepareRename\t"))
+        {
+            assert!(Instant::now() < until, "prepareRename not sent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if moved {
+            change(&mut client, uri, 2, &format!("# u\n{text}"));
+            hover(&mut client, uri, 0, 0);
+        }
+        std::fs::write(dir.path().join("release"), "").expect("release");
+        let response = client.receive_response_for_id_public(id);
+        assert!(response.get("error").is_none(), "{response}");
+        if moved {
+            assert!(response["result"].is_null(), "{response}");
+        } else {
+            assert_eq!(
+                response["result"],
+                json!({
+                    "start": { "line": 3, "character": 8 },
+                    "end": { "line": 3, "character": 9 }
+                }),
+                "{response}"
+            );
+        }
+    }
+}
+
+#[test]
+fn linked_editing_ranges_the_host_moved_under_are_no_answer() {
+    // The echo mock answers linked ranges only once released: the host
+    // edited above the region while the request is out, its ranges, for
+    // the text before the edit, are no answer.
+    let (mut client, dir) = Setup {
+        linked_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/linked-moved.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  return x\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let id = client.send_request_async(
+        "textDocument/linkedEditingRange",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 8 } }),
+    );
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/linkedEditingRange\t"))
+    {
+        assert!(Instant::now() < until, "linkedEditingRange not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u\n{text}"));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
 }
 
 #[test]
@@ -1580,8 +1958,41 @@ fn a_show_document_selection_maps_through_the_prepared_text() {
     );
 }
 
+/// Save `uri`.
+fn save(client: &mut LspClient, uri: &str) {
+    client.send_notification(
+        "textDocument/didSave",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+}
+
+/// Answer the echo mock's applyEdit with `applied`, returning the
+/// request's params (`None` when the editor is never asked) and what the
+/// mock logged it was told.
+fn answer_apply_edit(client: &mut LspClient, applied: bool) -> (Option<Value>, String) {
+    let marker = "echo-document applied: ";
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut asked = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = client
+            .try_receive_message(remaining)
+            .unwrap_or_else(|| panic!("no `{marker}` log"));
+        if message["method"] == "workspace/applyEdit" {
+            client.send_response(message["id"].clone(), json!({ "applied": applied }));
+            asked = Some(message["params"].clone());
+        } else if message["method"] == "window/logMessage"
+            && let Some((_, told)) = message["params"]["message"]
+                .as_str()
+                .and_then(|text| text.split_once(marker))
+        {
+            return (asked, told.to_string());
+        }
+    }
+}
+
 #[test]
-fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
+fn an_edit_a_server_computed_for_a_prepared_text_maps_back_through_it() {
     let (mut client, _dir) = Setup {
         capabilities: json!({ "workspace": { "applyEdit": true } }),
         ..Setup::default()
@@ -1592,33 +2003,45 @@ fn an_edit_a_server_computed_for_a_prepared_text_is_refused() {
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // On save the echo mock asks to apply an edit to its first line: no edit
-    // is mapped back through a prepared document, so the editor is never
-    // asked, and the server is told it was not applied.
-    client.send_notification(
-        "textDocument/didSave",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    let marker = "echo-document applied: ";
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let applied = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let message = client
-            .try_receive_message(remaining)
-            .unwrap_or_else(|| panic!("no `{marker}` log"));
-        assert_ne!(
-            message["method"], "workspace/applyEdit",
-            "the editor was asked to apply an edit: {message}"
-        );
-        if message["method"] == "window/logMessage"
-            && let Some((_, applied)) = message["params"]["message"]
-                .as_str()
-                .and_then(|text| text.split_once(marker))
-        {
-            break applied.to_string();
+    // On save the echo mock asks to apply an edit to its first line: the
+    // editor is asked to apply it where the host has that line, after its
+    // indentation, and the server told what the editor answered.
+    save(&mut client, uri);
+    let (asked, told) = answer_apply_edit(&mut client, true);
+    let asked = asked.expect("the editor is asked");
+    let edits = asked["edit"]["changes"][uri]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("{asked}"));
+    assert_eq!(apply_edits(text, &edits), "# t\n\n```lua\n  edited\n```\n");
+    assert_eq!(told, "true");
+}
+
+#[test]
+fn an_edit_for_a_text_the_host_moved_from_is_refused() {
+    // The echo mock's edit on save is pinned to the version it holds.
+    // Unmoved, it applies. Moved: the mock asks only once it has read the
+    // region's next change, its edit still for the text saved; the edit is
+    // refused, the editor never asked, the server told it was not applied.
+    for moved in [false, true] {
+        let (mut client, _dir) = Setup {
+            capabilities: json!({ "workspace": { "applyEdit": true } }),
+            apply_edit_after_change: moved,
+            ..Setup::default()
         }
-    };
-    assert_eq!(applied, "false");
+        .start();
+        let uri = "file:///prepare/apply-moved.md";
+        let text = "# t\n\n```lua\n  local x = 1 -- EDIT VERSIONED\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        save(&mut client, uri);
+        if moved {
+            change(&mut client, uri, 2, &text.replace("local x", "local y"));
+        }
+        let (asked, told) = answer_apply_edit(&mut client, true);
+        assert_eq!(asked.is_some(), !moved, "moved: {moved}: {asked:?}");
+        assert_eq!(told, (!moved).to_string(), "moved: {moved}");
+    }
 }
 
 #[test]

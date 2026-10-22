@@ -24,11 +24,17 @@
 //!   Decision point 3.2).
 //! - `echo-document` — advertises `hoverProvider`, `completionProvider`,
 //!   `inlayHintProvider`, `colorProvider`, `documentFormattingProvider`,
-//!   `documentRangeFormattingProvider`, `renameProvider`,
+//!   `documentRangeFormattingProvider`, `renameProvider`, `linkedEditingRangeProvider`,
+//!   `codeActionProvider` (with resolve),
 //!   `diagnosticProvider`, and full sync with save; hover
 //!   answers the full text this server holds for the document, ranged over
 //!   the hovered line in its own coordinates; formatting, range and on-type
-//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line; a pull diagnostic
+//!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
+//!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists, as
+//!   prepareRename answers the word at the position); linked
+//!   editing ranges are every occurrence of the word at the position; code
+//!   actions are `echo-fix` (the first line replaced) and the lazy
+//!   `echo-wrap` (resolved: the document wrapped in `do`/`end`); a pull diagnostic
 //!   spans the first line and carries the full text; completion inserts
 //!   `int(x)\nprint(y)` at the caret and the line `-- c` above the
 //!   document's first (and offers `echo-plain` with no edit), inlay hints
@@ -38,7 +44,10 @@
 //!   document looks like downstream and how its coordinates map back. On a
 //!   save of a text holding `SHOW` it asks the editor to show the document
 //!   with its first line selected; holding `EDIT`, it asks to apply an edit
-//!   there and logs `echo-document applied: <bool>` with the answer.
+//!   there (pinned to the version it holds when the text holds `VERSIONED`;
+//!   with `MOCK_APPLY_EDIT_AFTER_CHANGE`, once it has read the document's
+//!   next change) and
+//!   logs `echo-document applied: <bool>` with the answer.
 //! - `echo-document-push` — advertises only `hoverProvider` and full sync
 //!   with save: hover and the save hooks as `echo-document`, and instead of
 //!   pull diagnostics it pushes the first-line diagnostic on every
@@ -274,6 +283,11 @@ fn main() {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     let mut documents: HashMap<String, String> = HashMap::new();
+    // The version of each document as last opened or changed.
+    let mut versions: HashMap<String, i64> = HashMap::new();
+    // An applyEdit held for its document's next didChange (see
+    // `MOCK_APPLY_EDIT_AFTER_CHANGE`).
+    let mut pending_apply_edit: Option<(String, Value)> = None;
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
@@ -387,7 +401,9 @@ fn main() {
                         "documentFormattingProvider": true,
                         "documentRangeFormattingProvider": true,
                         "documentOnTypeFormattingProvider": { "firstTriggerCharacter": ";" },
-                        "renameProvider": true,
+                        "renameProvider": { "prepareProvider": true },
+                        "linkedEditingRangeProvider": true,
+                        "codeActionProvider": { "resolveProvider": true },
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                         "diagnosticProvider": {
                             "interFileDependencies": false,
@@ -728,6 +744,12 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if let Some(version) = message
+                        .pointer("/params/textDocument/version")
+                        .and_then(Value::as_i64)
+                    {
+                        versions.insert(uri.to_string(), version);
+                    }
                     if mode == "echo-document-push" {
                         notify(
                             &mut writer,
@@ -844,6 +866,24 @@ fn main() {
                         .and_then(Value::as_str),
                 ) {
                     documents.insert(uri.to_string(), text.to_string());
+                    if let Some(version) = message
+                        .pointer("/params/textDocument/version")
+                        .and_then(Value::as_i64)
+                    {
+                        versions.insert(uri.to_string(), version);
+                    }
+                    if pending_apply_edit
+                        .as_ref()
+                        .is_some_and(|(pending, _)| pending == uri)
+                        && let Some((_, params)) = pending_apply_edit.take()
+                    {
+                        request_with_params(
+                            &mut writer,
+                            json!(7001),
+                            "workspace/applyEdit",
+                            params,
+                        );
+                    }
                     if mode == "echo-document-push" {
                         notify(
                             &mut writer,
@@ -997,15 +1037,34 @@ fn main() {
                         );
                     }
                     if held.contains("EDIT") {
-                        request_with_params(
-                            &mut writer,
-                            json!(7001),
-                            "workspace/applyEdit",
-                            json!({ "edit": { "changes": { saved_uri: [{
-                                "range": first_line,
-                                "newText": "edited"
-                            }] } } }),
-                        );
+                        let edit = json!([{ "range": first_line, "newText": "edited" }]);
+                        // Holding `VERSIONED`: pinned to the version this
+                        // server holds.
+                        let edit = if held.contains("VERSIONED") {
+                            json!({ "documentChanges": [{
+                                "textDocument": {
+                                    "uri": saved_uri,
+                                    "version": versions.get(&saved_uri).copied()
+                                },
+                                "edits": edit
+                            }] })
+                        } else {
+                            json!({ "changes": { saved_uri.clone(): edit } })
+                        };
+                        // With `MOCK_APPLY_EDIT_AFTER_CHANGE` set, asked only
+                        // once the document's next didChange is read: the
+                        // edit is for the text saved, the server holding a
+                        // newer one by then.
+                        if std::env::var_os("MOCK_APPLY_EDIT_AFTER_CHANGE").is_some() {
+                            pending_apply_edit = Some((saved_uri.clone(), json!({ "edit": edit })));
+                        } else {
+                            request_with_params(
+                                &mut writer,
+                                json!(7001),
+                                "workspace/applyEdit",
+                                json!({ "edit": edit }),
+                            );
+                        }
                     }
                 }
             }
@@ -1360,6 +1419,90 @@ fn main() {
                 } else {
                     respond(&mut writer, id, item);
                 }
+            }
+            "textDocument/codeAction" if mode == "echo-document" => {
+                // With `MOCK_CODE_ACTION_AFTER_RELEASE` set, answered only
+                // once the file `MOCK_RELEASE_FILE` names exists (or a
+                // minute later).
+                wait_for_release("MOCK_CODE_ACTION_AFTER_RELEASE");
+                // `echo-fix` replaces the first line; `echo-wrap` is lazy, its
+                // resolve wrapping the document in `do`/`end`, the header and
+                // the first line's indent as touching edits.
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // Holding `REFUSE`: one action whose edit reaches past the
+                // document's end, which no map takes.
+                if documents
+                    .get(&uri)
+                    .is_some_and(|text| text.contains("REFUSE"))
+                {
+                    respond(
+                        &mut writer,
+                        id,
+                        json!([{
+                            "title": "echo-refused",
+                            "kind": "quickfix",
+                            "edit": { "changes": { uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 99, "character": 0 },
+                                    "end": { "line": 99, "character": 0 }
+                                },
+                                "newText": "x"
+                            }] } }
+                        }]),
+                    );
+                    continue;
+                }
+                let width = documents
+                    .get(&uri)
+                    .and_then(|text| text.lines().next())
+                    .map_or(0, |line| line.encode_utf16().count());
+                respond(
+                    &mut writer,
+                    id,
+                    json!([
+                        {
+                            "title": "echo-fix",
+                            "kind": "quickfix",
+                            "edit": { "changes": { uri.clone(): [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": width }
+                                },
+                                "newText": "fixed"
+                            }] } }
+                        },
+                        { "title": "echo-wrap", "kind": "refactor", "data": { "uri": uri } }
+                    ]),
+                );
+            }
+            "codeAction/resolve" if mode == "echo-document" => {
+                let mut action = message.get("params").cloned().unwrap_or(Value::Null);
+                let uri = action
+                    .pointer("/data/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let lines = documents.get(&uri).map_or(0, |text| text.lines().count());
+                let at = |line: usize, text: &str| {
+                    json!({
+                        "range": {
+                            "start": { "line": line, "character": 0 },
+                            "end": { "line": line, "character": 0 }
+                        },
+                        "newText": text
+                    })
+                };
+                let mut edits = vec![at(0, "do\n")];
+                for line in 0..lines {
+                    edits.push(at(line, "  "));
+                }
+                edits.push(at(lines, "end\n"));
+                action["edit"] = json!({ "changes": { uri: edits } });
+                respond(&mut writer, id, action);
             }
             "textDocument/codeAction" => {
                 let result = message
@@ -2217,16 +2360,7 @@ fn main() {
                 // With `MOCK_COLOR_AFTER_RELEASE` set, answered only once
                 // the file `MOCK_RELEASE_FILE` names exists (or a minute
                 // later): a barrier a test lifts after editing the host.
-                if std::env::var_os("MOCK_COLOR_AFTER_RELEASE").is_some()
-                    && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
-                {
-                    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while !std::path::Path::new(&release).exists()
-                        && std::time::Instant::now() < until
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
+                wait_for_release("MOCK_COLOR_AFTER_RELEASE");
                 let range = message.pointer("/params/range").cloned();
                 let result = if mode == "document-color-empty-presentation" {
                     json!([])
@@ -2843,7 +2977,105 @@ fn main() {
                     "params": message.get("params"),
                 }),
             ),
+            "textDocument/linkedEditingRange" if mode == "echo-document" => {
+                // Every occurrence, as a word, of the word at the position,
+                // in this server's own text and coordinates; with
+                // `MOCK_LINKED_AFTER_RELEASE` set, once the file
+                // `MOCK_RELEASE_FILE` names exists (or a minute later).
+                wait_for_release("MOCK_LINKED_AFTER_RELEASE");
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let line = message
+                    .pointer("/params/position/line")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let character = message
+                    .pointer("/params/position/character")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let text = documents.get(uri).cloned().unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                let word = lines.get(line).and_then(|text| {
+                    let chars: Vec<char> = text.chars().collect();
+                    let start = (0..character.min(chars.len()))
+                        .rev()
+                        .take_while(|&at| is_word(chars[at]))
+                        .last()
+                        .unwrap_or(character);
+                    let end = (character..chars.len())
+                        .take_while(|&at| is_word(chars[at]))
+                        .last()
+                        .map_or(character, |at| at + 1);
+                    (start < end).then(|| chars[start..end].iter().collect::<String>())
+                });
+                let result = word.map_or(Value::Null, |word| {
+                    let mut ranges = Vec::new();
+                    for (index, text) in lines.iter().enumerate() {
+                        let chars: Vec<char> = text.chars().collect();
+                        let width = word.chars().count();
+                        for at in 0..chars.len() {
+                            if chars[at..].iter().take(width).collect::<String>() == word
+                                && (at == 0 || !is_word(chars[at - 1]))
+                                && chars.get(at + width).is_none_or(|&next| !is_word(next))
+                            {
+                                ranges.push(json!({
+                                    "start": { "line": index, "character": at },
+                                    "end": { "line": index, "character": at + width }
+                                }));
+                            }
+                        }
+                    }
+                    json!({ "ranges": ranges })
+                });
+                respond(&mut writer, id, result);
+            }
+            "textDocument/prepareRename" if mode == "echo-document" => {
+                // The word at the position, in this server's own text and
+                // coordinates; with `MOCK_RENAME_AFTER_RELEASE` set, once the
+                // file `MOCK_RELEASE_FILE` names exists (or a minute later).
+                wait_for_release("MOCK_RENAME_AFTER_RELEASE");
+                let uri = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let line = message
+                    .pointer("/params/position/line")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let character = message
+                    .pointer("/params/position/character")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let text = documents.get(uri).cloned().unwrap_or_default();
+                let chars: Vec<char> = text.lines().nth(line).unwrap_or_default().chars().collect();
+                let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                let start = (0..character.min(chars.len()))
+                    .rev()
+                    .take_while(|&at| is_word(chars[at]))
+                    .last()
+                    .unwrap_or(character);
+                let end = (character..chars.len())
+                    .take_while(|&at| is_word(chars[at]))
+                    .last()
+                    .map_or(character, |at| at + 1);
+                let result = if start < end {
+                    json!({
+                        "start": { "line": line, "character": start },
+                        "end": { "line": line, "character": end }
+                    })
+                } else {
+                    Value::Null
+                };
+                respond(&mut writer, id, result);
+            }
             "textDocument/rename" if mode == "echo-document" => {
+                // With `MOCK_RENAME_AFTER_RELEASE` set, answered only once
+                // the file `MOCK_RELEASE_FILE` names exists (or a minute
+                // later): a barrier a test lifts after editing the host.
+                wait_for_release("MOCK_RENAME_AFTER_RELEASE");
                 // Renames the document's first line.
                 let uri = message
                     .pointer("/params/textDocument/uri")
@@ -2910,6 +3142,19 @@ fn main() {
 /// Apply the mode's transformation and wrap it in a single whole-document
 /// `TextEdit[]`. The end position stays within the document's real line
 /// count (the bridge drops edits past the virtual EOF).
+/// With `flag` set, block until the file `MOCK_RELEASE_FILE` names exists,
+/// or a minute has passed: a barrier a test lifts after editing the host.
+fn wait_for_release(flag: &str) {
+    if std::env::var_os(flag).is_some()
+        && let Ok(release) = std::env::var("MOCK_RELEASE_FILE")
+    {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !std::path::Path::new(&release).exists() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 fn whole_document_edit(text: &str, mode: &str, options: Option<&Value>) -> Value {
     let new_text = match mode {
         "append" => {

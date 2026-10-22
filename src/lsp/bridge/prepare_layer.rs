@@ -517,8 +517,7 @@ impl super::BridgeCoordinator {
     /// text's: the lifecycle pass prepares its document (or holds it back
     /// for its peer), or a server still holds a prepared text of it (right
     /// after its pair lost its peer). What resolving through the region's
-    /// offset alone is refused by; edit methods close by the lifecycle pass
-    /// alone (see `method_closed_to`).
+    /// offset alone is refused by.
     pub(crate) fn region_coordinates_may_be_prepared(
         &self,
         host_uri: &Url,

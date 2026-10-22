@@ -989,15 +989,23 @@ impl DocumentTracker {
     /// a text held as is, or nothing on record for a document it was never
     /// sent a prepared text of. A document it held prepared and closed since
     /// is not: the server may still answer from that text.
-    pub(super) fn held_as_is(
+    ///
+    /// With `expected` a prepared map (a resolve of an item minted through
+    /// it, within its request), whether what it computes now is of the text
+    /// that map describes: a text held with alike coordinates.
+    pub(super) fn held_under(
         &self,
         virtual_uri: &str,
         connection_key: &ConnectionKey,
+        expected: Option<&PreparedMap>,
     ) -> (Option<u64>, bool) {
         let (held, history) = self.held_now(virtual_uri, connection_key);
         match held {
-            Some(held) => (Some(held.generation), held.map.is_none()),
-            None => (None, !history),
+            Some(held) => (
+                Some(held.generation),
+                PreparedMap::same_coordinates(held.map.as_deref(), expected),
+            ),
+            None => (None, expected.is_none() && !history),
         }
     }
 

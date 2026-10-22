@@ -44,7 +44,7 @@ pub(crate) use prepare::{
     VirtualLayout, apply_prepare_result_at, next_presentation, parse_prepare_response,
 };
 #[cfg(test)]
-pub(crate) use prepare::{SegmentKind, apply_prepare_result};
+pub(crate) use prepare::{CONVERSIONS, SegmentKind, apply_prepare_result};
 pub(crate) use request::*;
 pub(crate) use request_id::RequestId;
 pub(crate) use response::*;
@@ -52,7 +52,8 @@ pub(crate) use routing::*;
 pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
 pub(crate) use workspace_edit::{
-    region_host_end, strip_bridge_local_versions, text_edit_safe_in_region,
-    transform_workspace_edit_to_host, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    WorkspaceEditRefusal, region_host_end, strip_bridge_local_versions, text_edit_safe_in_region,
+    transform_workspace_edit_to_host, transform_workspace_edit_to_host_explained,
+    workspace_edit_has_effect, workspace_edit_preserves_line_prefixes,
+    workspace_edit_within_region,
 };

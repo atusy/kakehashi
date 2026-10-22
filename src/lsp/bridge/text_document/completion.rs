@@ -838,8 +838,11 @@ pub(crate) struct EnvelopeOffset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_column_offsets: Option<Vec<u32>>,
     /// The item came from a prepared document, whose map no envelope can
-    /// carry: it never resolves, whatever the region reads as by then
-    /// (after its pair lost its peer, the offsets alone compare equal).
+    /// carry: it never resolves through these offsets alone, whatever the
+    /// region reads as by then (after its pair lost its peer, the offsets
+    /// alone compare equal) — a code action's resolves through the text its
+    /// server held as it was listed (see `CodeActionEnvelope`), other items
+    /// not at all.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prepared: bool,
 }

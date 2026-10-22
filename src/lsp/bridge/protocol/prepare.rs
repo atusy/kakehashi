@@ -964,6 +964,12 @@ impl PreparedMap {
         self.virtual_lines.position(end).character
     }
 
+    /// Where V ends, read from its line index.
+    pub(crate) fn virtual_end(&self) -> Position {
+        self.virtual_lines
+            .positions(&[self.virtual_lines.text.len()])[0]
+    }
+
     /// The virtual text this map's answer was given for.
     pub(crate) fn virtual_text(&self) -> &str {
         &self.virtual_lines.text
@@ -1054,6 +1060,76 @@ impl PreparedMap {
         self.virtual_range_reaches_into_gap(
             self.virtual_lines.offset_clamped(range.start),
             self.virtual_lines.offset_clamped(range.end),
+        )
+    }
+
+    /// [`Self::map_ranges_alike`] for one range, converted on its own: the
+    /// reference the batch is checked against.
+    #[cfg(test)]
+    pub(crate) fn range_reads_alike(&self, range: tower_lsp_server::ls_types::Range) -> bool {
+        if range.start > range.end {
+            return false;
+        }
+        let start = self.prepared_lines.offset_clamped(range.start);
+        let end = self.prepared_lines.offset_clamped(range.end);
+        let virtual_start = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
+        let virtual_end = if start == end {
+            virtual_start
+        } else {
+            map_offset(&self.runs, end, Bias::End, Side::Prepared)
+        };
+        virtual_start <= virtual_end
+            && self.prepared_lines.text[start..end]
+                == self.virtual_lines.text[virtual_start..virtual_end]
+    }
+
+    /// Whether every one of `ranges`, P ranges mapped as ranges are (each
+    /// start as positions, each end after any run it ends inside), covers
+    /// in V exactly the text it covers in P: no indentation the peer
+    /// removed, no hidden line nor gap text inside it. A range a client
+    /// shows as the text an action works on (the symbol a rename will
+    /// replace) or edits through in place (linked ranges typed into
+    /// together) is right only so. Each is mapped to V as ranges are when
+    /// all read alike (`None` otherwise): their ends converted all at once,
+    /// a pass over each line they fall on, not one conversion each (many
+    /// ranges on a long line, linked ones say, would cost the line's length
+    /// each).
+    pub(crate) fn map_ranges_alike(
+        &self,
+        ranges: &[tower_lsp_server::ls_types::Range],
+    ) -> Option<Vec<tower_lsp_server::ls_types::Range>> {
+        if ranges.iter().any(|range| range.start > range.end) {
+            return None;
+        }
+        let ends: Vec<Position> = ranges
+            .iter()
+            .flat_map(|range| [range.start, range.end])
+            .collect();
+        let offsets = self.prepared_lines.offsets_clamped(&ends);
+        let mut virtual_ends = Vec::with_capacity(offsets.len());
+        for &[start, end] in offsets.as_chunks::<2>().0 {
+            let virtual_start = map_offset(&self.runs, start, Bias::Start, Side::Prepared);
+            let virtual_end = if start == end {
+                virtual_start
+            } else {
+                map_offset(&self.runs, end, Bias::End, Side::Prepared)
+            };
+            if virtual_start > virtual_end
+                || self.prepared_lines.text[start..end]
+                    != self.virtual_lines.text[virtual_start..virtual_end]
+            {
+                return None;
+            }
+            virtual_ends.extend([virtual_start, virtual_end]);
+        }
+        let positions = self.virtual_lines.positions(&virtual_ends);
+        Some(
+            positions
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[start, end]| tower_lsp_server::ls_types::Range { start, end })
+                .collect(),
         )
     }
 
@@ -1410,7 +1486,7 @@ impl LineMap {
 #[cfg(test)]
 thread_local! {
     /// Positions or offsets converted one by one (see `LineMap::position`).
-    static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Bytes the batch conversions scanned (see `LineMap::positions`).
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Lines `LineMap::positions` looked up to find its offsets' lines.
@@ -1943,6 +2019,22 @@ mod tests {
             "no such line"
         );
         assert_eq!(lines.offset_clamped(Position::new(1, u32::MAX)), 2);
+    }
+
+    /// V's end read from its line index is where a position mapper over the
+    /// whole text puts it, whatever its line breaks.
+    #[test]
+    fn the_virtual_end_is_where_a_mapper_over_the_text_puts_it() {
+        for text in ["", "a", "a\n", "a\r\nb", "a\rb\r", "é𝄞\n\nx", "\r\n\r\n"] {
+            let map = apply_prepare_result(text, &VirtualLayout::single(text), None)
+                .unwrap()
+                .map;
+            assert_eq!(
+                Some(map.virtual_end()),
+                crate::text::PositionMapper::new(text).byte_to_position(text.len()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

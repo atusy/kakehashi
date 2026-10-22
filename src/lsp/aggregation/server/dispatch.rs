@@ -102,6 +102,19 @@ fn tracked_progress_source<'a>(
     None
 }
 
+/// Of `arrived` (server, result) pairs, in the order they arrived, the one
+/// a `preferred` fan-in over `ctx` would have chosen had each counted as a
+/// result: the highest-ranked server's, the first to arrive of a `"*"`
+/// group. For a result a caller passed over in the fan-in, kept as the
+/// answer when no other result came.
+pub(crate) fn preferred_among<T>(
+    ctx: &DocumentRequestContext,
+    arrived: Vec<(String, T)>,
+) -> Option<T> {
+    let mut buffered: indexmap::IndexMap<String, T> = arrived.into_iter().collect();
+    preferred::pick_best_buffered(&mut buffered, &expanded_entries(ctx))
+}
+
 /// Expand `ctx.priorities` into the priority walk for this request:
 /// allowlist + `"*"` expansion against the configured servers, then the
 /// `max_fan_out` cap.

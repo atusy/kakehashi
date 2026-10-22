@@ -28,6 +28,17 @@ pub(crate) enum EditMode {
     /// Edits keeping their extents (a completion's replace range, an inlay
     /// hint's text edits), mapped one by one.
     Extent,
+    /// One document's edits a client applies together (a rename's, a code
+    /// action's workspace edit): each edit, or run of edits touching one
+    /// another, within one line maps keeping its extent; one creating,
+    /// removing or rewriting lines is replayed on P and diffed on its own
+    /// lines, as a formatting answer is (see [`PreparedMap::map_edits`]).
+    Replay,
+    /// Edits that must map one for each (annotated edits, keeping their
+    /// identity): taken only when each stays within one line, apart from
+    /// the others, where replaying them maps each as it keeps its extent;
+    /// any other set refused.
+    InLine,
 }
 
 /// Why a formatting answer was refused (see
@@ -140,6 +151,8 @@ impl PreparedMap {
     pub(crate) fn map_edits(&self, edits: &[TextEdit], mode: EditMode) -> Option<Vec<TextEdit>> {
         match mode {
             EditMode::Extent => self.map_extents(edits),
+            EditMode::Replay => self.map_replayed(edits),
+            EditMode::InLine => self.map_in_line(edits),
         }
     }
 
@@ -273,9 +286,38 @@ impl PreparedMap {
             .saturating_add(per_byte.saturating_mul(prepared.len() + edited.len()))
             .min(cap.unwrap_or(usize::MAX));
         let mut work = Work::new(budget);
+        let mapped = self.map_span_diff(0..prepared.len(), &edited, 0..edited.len(), &mut work)?;
+        self.to_text_edits(mapped).ok_or(FormattingRefusal::Shape)
+    }
+
+    /// The stretches `edited[new]` differs from P's `old` bytes in (see
+    /// `diff_hunks`), each mapped onto V as one edit does, in P's order;
+    /// stretches touching at a line start leave a removed indent there to
+    /// the later one. Not yet checked as a set.
+    ///
+    /// The spans are whole lines, each starting at a line start and ending
+    /// at one or at its text's end, and `edited[new]` is what replaced
+    /// `old` (other spans may have changed elsewhere): the diff pairs the
+    /// spans' lines, and keeps its edges off a CRLF's middle, only within
+    /// them.
+    fn map_span_diff(
+        &self,
+        old: Range<usize>,
+        edited: &str,
+        new: Range<usize>,
+        work: &mut Work,
+    ) -> Result<Vec<(Range<usize>, String)>, FormattingRefusal> {
+        let prepared = &self.prepared_lines.text;
+        debug_assert!(
+            is_line_start(prepared, old.start)
+                && (old.end == prepared.len() || is_line_start(prepared, old.end))
+                && is_line_start(edited, new.start)
+                && (new.end == edited.len() || is_line_start(edited, new.end)),
+            "a span diffed is whole lines"
+        );
         // Told apart from the refusals below, which the answer's shape
         // decides: this one only its size does.
-        let hunks = diff_hunks(prepared, &edited, &mut work)?;
+        let hunks = diff_hunks(&prepared[old.clone()], &edited[new.clone()], work)?;
         // Each stretch maps on its own as an edit does: stretches touch only
         // at a line start where the later replaces some of that line's start
         // with text, or where the earlier ends with a line break of P and the
@@ -284,8 +326,12 @@ impl PreparedMap {
         let mut mapped = hunks
             .into_iter()
             .map(|hunk| {
-                let following = prepared[hunk.old.end..].chars().next();
-                self.hunk_to_virtual(hunk.old, &edited[hunk.new], following, true)
+                let (old, new) = (
+                    hunk.old.start + old.start..hunk.old.end + old.start,
+                    hunk.new.start + new.start..hunk.new.end + new.start,
+                );
+                let following = prepared[old.end..].chars().next();
+                self.hunk_to_virtual(old, &edited[new], following, true)
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(FormattingRefusal::Shape)?;
@@ -341,7 +387,7 @@ impl PreparedMap {
                 }
             }
         }
-        self.to_text_edits(mapped).ok_or(FormattingRefusal::Shape)
+        Ok(mapped)
     }
 
     /// [`EditMode::Extent`]: each edit mapped on its own.
@@ -416,6 +462,201 @@ impl PreparedMap {
             .any(|&(earlier, later)| mapped[earlier].0.start != mapped[later].0.start)
         {
             return None;
+        }
+        self.to_text_edits(mapped)
+    }
+
+    /// [`EditMode::InLine`]: each edit within one line (neither what it
+    /// replaces nor its text holds a line break) and touching no other, as
+    /// replaying them would take each, mapped keeping its extent.
+    fn map_in_line(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        let prepared = &self.prepared_lines.text;
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, false)?;
+        let breaks = |text: &str| text.contains(['\n', '\r']);
+        if order
+            .windows(2)
+            .any(|pair| ranges[pair[0]].end == ranges[pair[1]].start)
+            || edits
+                .iter()
+                .zip(&ranges)
+                .any(|(edit, range)| breaks(&prepared[range.clone()]) || breaks(&edit.new_text))
+        {
+            return None;
+        }
+        self.map_extents(edits)
+    }
+
+    /// [`EditMode::Replay`]. The edits are taken in P's order and grouped
+    /// where they touch (one ending where the next starts, two inserting at
+    /// one place): mapped one by one, touching edits could each claim the
+    /// removed indent of the line they meet at. A group within one line
+    /// (neither what it replaces nor its text holds a line break) creates no
+    /// line and regains no indent: it maps as the one edit it makes, keeping
+    /// its extent, as completion edits do. Any other group is replayed on
+    /// the whole lines it reaches and diffed there against P, each changed
+    /// stretch mapping as a formatting answer's does: what it leaves alike
+    /// stays as the host has it (a blank line's whitespace, a line the peer
+    /// left alone), and its new lines regain the content's indent. Such a
+    /// group is refused, with the whole set, where the peer dedented the
+    /// region unevenly (see [`Self::dedents_unevenly`]), or where the diff
+    /// runs out of work. Groups are diffed apart, never as one text: a
+    /// whole-text diff could slide a change onto another line reading the
+    /// same in P, against what the edits state. Groups whose lines meet are
+    /// diffed together. The mapped set is checked as a whole.
+    fn map_replayed(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        let prepared = &self.prepared_lines.text;
+        // An end at the start of the line just past P's last names P's end,
+        // as whole-document replacements (a fix-all's) send it, read as a
+        // formatting answer's is.
+        let (ranges, order) = sorted_extents(&self.prepared_lines, edits, true)?;
+        // The edited P, and where each edit's text lands in it.
+        let mut edited = String::with_capacity(prepared.len());
+        let mut landed = vec![0..0; edits.len()];
+        let mut cursor = 0;
+        for &index in &order {
+            edited.push_str(&prepared[cursor..ranges[index].start]);
+            let start = edited.len();
+            edited.push_str(&edits[index].new_text);
+            landed[index] = start..edited.len();
+            cursor = ranges[index].end;
+        }
+        edited.push_str(&prepared[cursor..]);
+
+        // How far each edit, in order, and the ones before it moved the text
+        // after them: where a P offset outside every edit lands in the
+        // edited P is read from it, never added up from distances in P,
+        // which other edits on the same lines would make stale.
+        let mut shifts = Vec::with_capacity(order.len() + 1);
+        shifts.push(0isize);
+        for &index in &order {
+            let moved = landed[index].len() as isize - ranges[index].len() as isize;
+            shifts.push(shifts.last().expect("starts with one") + moved);
+        }
+
+        // Groups of touching edits, in order: P range, the edits it holds
+        // (as positions in `order`), and whether it reaches across lines.
+        struct Unit {
+            old: Range<usize>,
+            edits: Range<usize>,
+            lines: bool,
+        }
+        // The edited P a unit's P range became: its edits are every edit
+        // within it.
+        let new_of = |unit: &Unit| {
+            let at =
+                |offset: usize, shift: isize| offset.checked_add_signed(shift).expect("in text");
+            at(unit.old.start, shifts[unit.edits.start])..at(unit.old.end, shifts[unit.edits.end])
+        };
+        let mut groups: Vec<Unit> = Vec::new();
+        for (at, &index) in order.iter().enumerate() {
+            let old = ranges[index].clone();
+            match groups.last_mut() {
+                Some(group) if group.old.end == old.start => {
+                    group.old.end = old.end;
+                    group.edits.end = at + 1;
+                }
+                _ => groups.push(Unit {
+                    old,
+                    edits: at..at + 1,
+                    lines: false,
+                }),
+            }
+        }
+        let breaks = |text: &str| text.contains(['\n', '\r']);
+        for group in &mut groups {
+            group.lines = breaks(&prepared[group.old.clone()]) || breaks(&edited[new_of(group)]);
+        }
+        // A group reaching across lines takes the whole lines it reaches, in
+        // P and alike in the edited P; groups whose lines meet or overlap are
+        // one.
+        // The start of the line `offset` is on, looked for back to `floor`
+        // only (the end of the unit before, which units visited in P's
+        // order never reach back past): `floor` itself when the line starts
+        // before it, the group then joining that unit, whose start is
+        // looked for in turn. Each stretch of P is so searched once, not
+        // once for each group on a long line.
+        let line_start = |offset: usize, floor: usize| {
+            // (A group starting inside the unit before joins it anyway.)
+            let floor = floor.min(offset);
+            prepared[floor..offset]
+                .rfind(['\n', '\r'])
+                .map_or(floor, |at| floor + at + 1)
+        };
+        // Past the line break ending the line `offset` is on (P's end on the
+        // last line).
+        let line_end = |offset: usize| {
+            let rest = &prepared[offset..];
+            rest.find(['\n', '\r']).map_or(prepared.len(), |at| {
+                offset + at + if rest[at..].starts_with("\r\n") { 2 } else { 1 }
+            })
+        };
+        // An end both texts have a line boundary at: a line start (not
+        // inside a CRLF the group's text completes) or the text's end.
+        let boundary = |text: &str, at: usize| {
+            at == text.len() || is_line_start(text, at) && !splits_crlf(text, at)
+        };
+        // A unit's end, past the line it ends on unless both texts have a
+        // line boundary there; read once the unit holds every edit up to it.
+        let line_end_of = |unit: &Unit| {
+            if boundary(prepared, unit.old.end) && boundary(&edited, new_of(unit).end) {
+                unit.old.end
+            } else {
+                line_end(unit.old.end)
+            }
+        };
+        let mut units: Vec<Unit> = Vec::with_capacity(groups.len());
+        for mut group in groups {
+            let floor = |units: &[Unit]| units.last().map_or(0, |unit| unit.old.end);
+            if group.lines {
+                group.old.start = line_start(group.old.start, floor(&units));
+            }
+            // Every unit the group's lines reach, before it on its first
+            // line included, joins it first: only then does it hold every
+            // edit within it.
+            while let Some(last) = units.last()
+                && (group.lines || last.lines)
+                && group.old.start <= last.old.end
+            {
+                let last = units.pop().expect("a unit is there");
+                group = Unit {
+                    old: line_start(last.old.start.min(group.old.start), floor(&units))
+                        ..last.old.end.max(group.old.end),
+                    edits: last.edits.start..group.edits.end,
+                    lines: true,
+                };
+            }
+            if group.lines {
+                group.old.end = line_end_of(&group);
+            }
+            units.push(group);
+        }
+
+        let diffed_bytes: usize = units
+            .iter()
+            .filter(|unit| unit.lines)
+            .map(|unit| unit.old.len() + new_of(unit).len())
+            .sum();
+        let mut work = Work::new(
+            FORMATTING_DIFF_BUDGET
+                .saturating_add(FORMATTING_DIFF_WORK_PER_BYTE.saturating_mul(diffed_bytes))
+                .min(FORMATTING_DIFF_BUDGET_CAP),
+        );
+        let mut unevenly = None;
+        let mut mapped = Vec::with_capacity(units.len());
+        for unit in units {
+            let new = new_of(&unit);
+            if !unit.lines {
+                let following = prepared[unit.old.end..].chars().next();
+                mapped.push(self.hunk_to_virtual(unit.old, &edited[new], following, false)?);
+                continue;
+            }
+            if prepared[unit.old.clone()] == edited[new.clone()] {
+                continue;
+            }
+            if *unevenly.get_or_insert_with(|| self.dedents_unevenly()) {
+                return None;
+            }
+            mapped.extend(self.map_span_diff(unit.old, &edited, new, &mut work).ok()?);
         }
         self.to_text_edits(mapped)
     }
@@ -1333,7 +1574,9 @@ enum Alignment {
 ///   once on each side paired too (by the fewest changes): only once every
 ///   line telling where it belongs is placed may a line alike to several
 ///   (`}`) take one of them, and only where each has one to take.
-/// - Lines of text other lines were joined onto.
+/// - Lines of text other lines were joined onto (but for a line whose
+///   text, or the text it joins onto, has several copies still to pair:
+///   left to the stages below, see [`joined_lines`]).
 /// - Blank lines among themselves: as many as can pair, so that text the
 ///   formatter writes beside blank lines is never read as written on one
 ///   while a blank line of the answer could be that line; of the
@@ -1432,9 +1675,10 @@ fn blank_lines<'a>(
     Some(pairs)
 }
 
-/// Pairs of an old line and the new line written as its text with more
-/// after it, in order: the first such old line for each new line, past the
-/// one paired before.
+/// Pairs of an old line and the new line written as its text (or as its
+/// text with more after it), in order: the one such old line past the one
+/// paired before, for each new line — none where several copies of that
+/// text are still to pair, which of them no order tells.
 ///
 /// The old lines' texts are indexed: each new line looks up its own
 /// prefixes of the lengths old texts have, each lookup spent from `work`,
@@ -1464,6 +1708,7 @@ fn joined_lines(
     for new_line in new_range.clone() {
         let written = new_keys[1][new_line].as_str();
         let mut first: Option<usize> = None;
+        let mut ambiguous = false;
         for &length in lengths
             .iter()
             .take_while(|&&length| length <= written.len())
@@ -1475,12 +1720,20 @@ fn joined_lines(
             work.spend(1 + length / BYTES_PER_STEP)?;
             if let Some(lines) = index.get(&written[..length]) {
                 let at = lines.partition_point(|&line| line < old_from);
-                if let Some(&line) = lines.get(at) {
-                    first = Some(first.map_or(line, |first| first.min(line)));
+                match &lines[at..] {
+                    [] => {}
+                    [line] => first = Some(first.map_or(*line, |first| first.min(*line))),
+                    // Several copies of the line it was written as, or was
+                    // joined onto, still to pair: which one the order does
+                    // not tell (the first could pair it across blank lines
+                    // and copies another reading keeps), so the line is left
+                    // to the alignments below, which place it among what
+                    // they pair.
+                    _ => ambiguous = true,
                 }
             }
         }
-        if let Some(old_line) = first {
+        if let Some(old_line) = first.filter(|_| !ambiguous) {
             pairs.push((old_line, new_line));
             old_from = old_line + 1;
         }

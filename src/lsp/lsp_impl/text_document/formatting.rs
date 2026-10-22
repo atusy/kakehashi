@@ -367,7 +367,6 @@ impl Kakehashi {
                 !crate::lsp::lsp_impl::bridge_context::method_closed_to(
                     resolved,
                     "textDocument/formatting",
-                    false,
                 )
             })
             .collect();

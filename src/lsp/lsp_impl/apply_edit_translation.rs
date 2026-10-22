@@ -18,6 +18,12 @@
 //! that touches exactly one virtual document is translated
 //! against that region's live offset (rebuilt exactly as goto/showDocument do,
 //! via [`resolve_region_offset`](super::region_offset::resolve_region_offset)).
+//! For a prepared document, that offset carries the map of the text the
+//! sending connection held as the request arrived (its watermark: a text
+//! recorded after it is not the one the edit was computed on, and none is
+//! placed), and the edit maps back through it as a rename's does; decided
+//! at once, never waited on, `applied: false` with the reason when it
+//! cannot be placed.
 //!
 //! **Version validation** (before the nulling): a downstream that versions a
 //! `TextDocumentEdit` for a VIRTUAL document pins the edit to the content
@@ -81,7 +87,7 @@ use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
     BridgeCoordinator, ConnectionKey, RegionOffset, VirtualDocumentUri,
-    strip_bridge_local_versions, transform_workspace_edit_to_host,
+    strip_bridge_local_versions, transform_workspace_edit_to_host_explained,
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
@@ -190,15 +196,9 @@ impl ApplyEditTranslator {
             );
         };
         ensure_editable_region(contiguous)?;
-        if offset.prepared().is_some() {
-            // An inbound edit is not mapped back through a prepared
-            // document: its WorkspaceEdit shapes go through no edit seam.
-            return Err(
-                "kakehashi: the edit targets a prepared virtual document; it cannot be \
-                 applied to the host document"
-                    .to_string(),
-            );
-        }
+        // Through a prepared document, the edit maps back through the map of
+        // the text its connection held as the request arrived (the offset
+        // carries it), as a rename's does; decided at once, never waited on.
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
@@ -407,11 +407,8 @@ fn transform_params_to_host(
     offset: &RegionOffset,
     region_end: Position,
 ) -> Result<(), String> {
-    if !transform_workspace_edit_to_host(&mut params.edit, virtual_uri, host_uri, offset) {
-        return Err(
-            "kakehashi: the edit performs file operations on a virtual document".to_string(),
-        );
-    }
+    transform_workspace_edit_to_host_explained(&mut params.edit, virtual_uri, host_uri, offset)
+        .map_err(|refusal| format!("kakehashi: {refusal}"))?;
     // Bound the edit to the region on both ends, per line, so a pass-through
     // host-URI edit can't reach host text above/below the region or into a
     // line's prefix (blockquote `> `).
@@ -1142,5 +1139,134 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(collect_virtual_uris(&non_empty), vec![uri]);
+    }
+
+    /// An inbound edit to a prepared document maps through the text its
+    /// connection held when the request was read: placed while that is
+    /// still the text held, refused once a newer one was recorded after
+    /// the read (whatever the edit's version, an unversioned one included).
+    #[tokio::test]
+    async fn an_inbound_edit_maps_only_through_the_text_held_when_it_was_read() {
+        use crate::lsp::bridge::{Observed, VirtualLayout, apply_prepare_result};
+        use crate::lsp::diagnostic_cache::HeldStamp;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///edited.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        let host = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&host, "rust", &region.region_id);
+        let key = ConnectionKey::for_server("peer");
+        server.bridge.insert_ready_test_connection("peer").await;
+        server
+            .bridge
+            .register_opened_document_for_test(&uri, &virtual_uri, &key)
+            .await;
+        let map = apply_prepare_result(
+            &region.content,
+            &VirtualLayout::single(&region.content),
+            None,
+        )
+        .unwrap()
+        .map;
+        server
+            .bridge
+            .record_sent_prepared_for_test(&virtual_uri, &key, &region.content, &map);
+        let uri_string = virtual_uri.to_uri_string();
+        let generation = server
+            .bridge
+            .pool()
+            .held_text(&uri_string, &key)
+            .unwrap()
+            .generation;
+        let stamp = HeldStamp {
+            connection: key.clone(),
+            observed: Observed::Read {
+                generation: Some(generation),
+                prepared: true,
+                stale_version: false,
+                incarnation: 0,
+            },
+            origin: None,
+        };
+        let translator = ApplyEditTranslator::new(
+            Arc::clone(&server.documents),
+            Arc::clone(&server.language),
+            Arc::clone(&server.bridge),
+        );
+        let params = || {
+            params_with_edit(json!({ "changes": { uri_string.clone(): [{
+                "range": {
+                    "start": { "line": 0, "character": 1 },
+                    "end": { "line": 0, "character": 2 }
+                },
+                "newText": "b"
+            }] } }))
+        };
+        let placed = translator
+            .translate(params(), &key, Some(&stamp))
+            .await
+            .expect("placed through the text held");
+        assert!(placed.edit.changes.unwrap().contains_key(&host));
+        // A newer text recorded since the request was read.
+        server
+            .bridge
+            .record_sent_prepared_for_test(&virtual_uri, &key, "\"z\"", &map);
+        assert!(
+            translator
+                .translate(params(), &key, Some(&stamp))
+                .await
+                .is_err()
+        );
+        // Read after that text was recorded: placed through it.
+        let newer = HeldStamp {
+            observed: Observed::Read {
+                generation: Some(generation + 1),
+                prepared: true,
+                stale_version: false,
+                incarnation: 0,
+            },
+            ..stamp
+        };
+        assert!(
+            translator
+                .translate(params(), &key, Some(&newer))
+                .await
+                .is_ok()
+        );
     }
 }
