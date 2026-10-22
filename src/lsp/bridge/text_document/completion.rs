@@ -6,9 +6,11 @@
 //! escape it, break per-line `> ` prefixes, or merge content into the closing
 //! fence — if applied verbatim (see `transform_completion_item`).
 //! On a prepared document the items' edits map back through its map,
-//! re-indented; a literal snippet goes out as plain text, and an item without
-//! an edit is made an explicit one where its text at the caret regains an
-//! indent, or dropped where it would map off the caret.
+//! re-indented; a one-line snippet maps as its expansion and goes out with
+//! the indent its expansion regained before it (one without a tabstop as
+//! the plain text it stands for), and an item without an edit is made an
+//! explicit one where its text at the caret regains an indent, or dropped
+//! where it would map off the caret.
 //! Messages are queued via the channel-based writer task (ls-bridge-message-ordering) for FIFO
 //! ordering with other messages.
 
@@ -29,6 +31,7 @@ use super::super::protocol::{
     translate_virtual_main_and_additional_edits_to_host, translate_virtual_range_to_host,
 };
 use super::keep_additional_edits_if_safe;
+use super::snippet::{Expansion, SnippetStandIn};
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
 impl LanguageServerPool {
@@ -216,8 +219,10 @@ fn transform_completion_response_to_host(
 /// additionalTextEdits if present. On a prepared document the edits go
 /// through its map (`translate_virtual_main_and_additional_edits_to_host`),
 /// their text re-indented, and the item may be given `insertTextMode: asIs`
-/// (see `ClientInsertMode`). A literal snippet there is sent as plain text,
-/// and an item without an edit is probed as an edit at the caret: made that
+/// (see `ClientInsertMode`). A snippet there is checked as its expansion
+/// (see [`Expansion`]) and sent with the indentation its expansion regained
+/// before it, one without a tabstop as the plain text it stands for; an
+/// item without an edit is probed as an edit at the caret: made that
 /// explicit edit when its text regains an indent, dropped when it maps off
 /// the caret.
 ///
@@ -228,9 +233,10 @@ fn transform_completion_response_to_host(
 /// drop the whole item (same fail-closed rule as WorkspaceEdit bridging).
 /// On a prepared document also when its edit does not map back (or its
 /// insert and replace ranges map its text apart), a mapped range no longer
-/// contains the caret, its snippet is no literal text, its text without an
-/// edit breaks a line, or its multi-line edit would reach a client that
-/// always adjusts indentation.
+/// contains the caret, its snippet expands differently on some client (one
+/// breaking a line or holding a tab included) or regains other than
+/// spaces before it, its text without an edit breaks a line, or its
+/// multi-line edit would reach a client that always adjusts indentation.
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
@@ -384,23 +390,41 @@ fn transform_prepared_completion_item(
     insert_mode: ClientInsertMode,
 ) -> bool {
     use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextMode, TextEdit};
+    // Whether the server sent a snippet, as it came (the format may be
+    // rewritten below).
+    let snippet =
+        item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET);
     // The text the map checks must be the text the client inserts: a
-    // snippet is kept only when it is literal text, with no tabstop,
-    // placeholder, variable or escape for the client to expand. (So no
-    // snippet variable is left to expand into lines at the insertion point,
-    // as the unprepared path has to check.)
-    if item.insert_text_format == Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET) {
-        let inserted = match &item.text_edit {
-            Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
-            Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
-            None => item.insert_text.as_ref().unwrap_or(&item.label),
-        };
+    // snippet's expansion, every tabstop at its default, kept only when
+    // every client expands it alike. The expansion stands in for the
+    // snippet through every check below, and the snippet goes out with the
+    // indentation its expansion regained before it (`stand_in`). (An
+    // expansion holds no variable, so none is left to expand into lines at
+    // the insertion point, as the unprepared path has to check.)
+    let mut stand_in: Option<SnippetStandIn> = None;
+    if snippet {
+        let inserted = inserted_text(item);
         if inserted.contains(['$', '\\']) {
-            return false;
+            // One breaking a line or holding a tab is refused too: snippet
+            // engines rewrite both whatever the item asks (see
+            // `Expansion::of`).
+            let Some(expansion) = Expansion::of(inserted) else {
+                return false;
+            };
+            // Nothing but spaces to check, where the user types at a
+            // tabstop: on a blank line among dedented ones the map regains
+            // no indent for it, and what is typed would land short of the
+            // content's.
+            if expansion.text().chars().all(|c| c == ' ') {
+                return false;
+            }
+            stand_in = Some(SnippetStandIn::install(item, expansion));
+        } else {
+            // Literal text means the same as plain text, which a client's
+            // snippet engine cannot re-indent once more on insertion.
+            item.insert_text_format =
+                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
         }
-        // Literal text means the same as plain text, which a client's
-        // snippet engine cannot re-indent once more on insertion.
-        item.insert_text_format = Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT);
     }
     // LSP requires an item's edit ranges to contain the requested position.
     // Out of a prepared document a range can map past it: the server saw the
@@ -471,24 +495,18 @@ fn transform_prepared_completion_item(
     // A multi-line edit already regained the indentation the peer removed:
     // a client adjusting it to the line's indentation as well would indent
     // it twice, inserting other text than was checked.
-    if let Some(text_edit) = &item.text_edit {
-        let new_text = match text_edit {
-            CompletionTextEdit::Edit(edit) => &edit.new_text,
-            CompletionTextEdit::InsertAndReplace(edit) => &edit.new_text,
-        };
-        if new_text.contains(['\n', '\r']) {
-            match insert_mode {
-                ClientInsertMode::AsIsSettable => {
-                    item.insert_text_mode = Some(InsertTextMode::AS_IS);
-                }
-                ClientInsertMode::AdjustsIndentation => return false,
-                // The client's default inserts as is; an item asking it to
-                // adjust instead (honored if the client supports that
-                // override) is cleared back to the default.
-                ClientInsertMode::AsIs => {
-                    if item.insert_text_mode == Some(InsertTextMode::ADJUST_INDENTATION) {
-                        item.insert_text_mode = None;
-                    }
+    if item.text_edit.is_some() && inserted_text(item).contains(['\n', '\r']) {
+        match insert_mode {
+            ClientInsertMode::AsIsSettable => {
+                item.insert_text_mode = Some(InsertTextMode::AS_IS);
+            }
+            ClientInsertMode::AdjustsIndentation => return false,
+            // The client's default inserts as is; an item asking it to
+            // adjust instead (honored if the client supports that
+            // override) is cleared back to the default.
+            ClientInsertMode::AsIs => {
+                if item.insert_text_mode == Some(InsertTextMode::ADJUST_INDENTATION) {
+                    item.insert_text_mode = None;
                 }
             }
         }
@@ -572,7 +590,55 @@ fn transform_prepared_completion_item(
             "completion: dropped an item's additionalTextEdits ({dropped}): a member is unsafe for the injection region (escapes it, breaks line prefixes, merges content into the closing fence, or reaches host text its prepared document hides)",
         );
     }
+    // The snippet goes out where its expansion was checked, or the item is
+    // refused (see `SnippetStandIn::restore`).
+    if let Some(stand_in) = stand_in
+        && !stand_in.restore(item)
+    {
+        return false;
+    }
+    // A snippet item inserting its label says so: a client may otherwise
+    // insert its filterText (mini.completion does), not the text checked.
+    if snippet && item.text_edit.is_none() && item.insert_text.is_none() {
+        item.insert_text = Some(item.label.clone());
+    }
+    // A client may insert an item of the snippet kind as a snippet whatever
+    // its format says (mini.completion does, for text with a line break, a
+    // tab or a `$` opening a word): plain text a prepared document sends
+    // could then be re-indented or read as tabstops. Such an item is
+    // refused rather than shown under another kind.
+    if item.kind == Some(tower_lsp_server::ls_types::CompletionItemKind::SNIPPET)
+        && item.insert_text_format != Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+    {
+        let sent = inserted_text(item);
+        if sent.contains(['\n', '\r', '\t']) || super::snippet::reads_as_snippet(sent) {
+            return false;
+        }
+    }
     true
+}
+
+/// The text a client inserts for `item`: its edit's (both ranges of an
+/// insert/replace edit share it), else its insertText, else its label.
+pub(super) fn inserted_text(item: &CompletionItem) -> &str {
+    use tower_lsp_server::ls_types::CompletionTextEdit;
+    match &item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => &edit.new_text,
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => &edit.new_text,
+        None => item.insert_text.as_deref().unwrap_or(&item.label),
+    }
+}
+
+/// The text of `item`'s edit, to rewrite in place (both ranges of an
+/// insert/replace edit share it); `None` for an item without one, whose
+/// insertText or label the caller handles.
+pub(super) fn inserted_text_mut(item: &mut CompletionItem) -> Option<&mut String> {
+    use tower_lsp_server::ls_types::CompletionTextEdit;
+    match &mut item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => Some(&mut edit.new_text),
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(&mut edit.new_text),
+        None => None,
+    }
 }
 
 /// Translate both ranges of a prepared document's insert/replace completion
@@ -1364,24 +1430,69 @@ mod tests {
         );
     }
 
+    /// The text a client inserts: an edit's (either form), else the
+    /// insertText (empty included), else the label; the mutable form
+    /// reaches an edit's text only.
+    #[test]
+    fn an_items_inserted_text_is_its_edits_then_its_insert_text_then_its_label() {
+        let range =
+            json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+        let mut edit = item(json!({"label": "l", "insertText": "i",
+            "textEdit": {"range": range, "newText": "e"}}));
+        assert_eq!(inserted_text(&edit), "e");
+        assert_eq!(
+            inserted_text_mut(&mut edit).map(|text| text.as_str()),
+            Some("e")
+        );
+        let mut insert_replace = item(json!({"label": "l", "insertText": "i",
+            "textEdit": {"insert": range, "replace": range, "newText": "r"}}));
+        assert_eq!(inserted_text(&insert_replace), "r");
+        assert_eq!(
+            inserted_text_mut(&mut insert_replace).map(|text| text.as_str()),
+            Some("r")
+        );
+        let mut empty_insert_text = item(json!({"label": "l", "insertText": ""}));
+        assert_eq!(inserted_text(&empty_insert_text), "");
+        assert_eq!(inserted_text_mut(&mut empty_insert_text), None);
+        let mut label = item(json!({"label": "l"}));
+        assert_eq!(inserted_text(&label), "l");
+        assert_eq!(inserted_text_mut(&mut label), None);
+    }
+
     #[rstest]
-    #[case::tabstop("x$0", false)]
-    #[case::placeholder("${1:x}", false)]
-    #[case::escape("x\\$", false)]
-    #[case::escaped_brace("x\\}", false)]
-    #[case::literal("x", true)]
-    fn a_prepared_snippet_is_kept_only_as_literal_text(#[case] snippet: &str, #[case] kept: bool) {
+    #[case::tabstop("x$0", true, None)]
+    #[case::placeholder("${1:x}", true, None)]
+    #[case::choice("${1|x,y|}", false, None)]
+    #[case::mirror("${1:x}$1", true, None)]
+    // Without a tabstop: the plain text its escapes stand for.
+    #[case::escape("x\\$", true, Some("x$"))]
+    #[case::escaped_brace("x\\}", true, Some("x}"))]
+    #[case::literal("x", true, Some("x"))]
+    #[case::variable("$TM_SELECTED_TEXT", false, None)]
+    #[case::variable_with_default("${CLIPBOARD:x}", false, None)]
+    #[case::transform("${1/a/b/}", false, None)]
+    #[case::nested_placeholder("${1:${2:x}}", false, None)]
+    #[case::two_defaults("${1:a}${1:b}", false, None)]
+    #[case::choice_escaping_a_dollar("${1|a\\$|}", false, None)]
+    fn a_prepared_snippet_is_kept_as_every_client_expands_it(
+        #[case] snippet: &str,
+        #[case] kept: bool,
+        #[case] plain: Option<&str>,
+    ) {
+        use tower_lsp_server::ls_types::InsertTextFormat;
         let offset = dedented_offset("  a\n");
         for completed in [
             json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+            json!({"label": snippet, "insertTextFormat": 2}),
             json!({"label": "x", "insertTextFormat": 2, "textEdit": {
                 "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
                 "newText": snippet
             }}),
         ] {
+            let mut transformed = item(completed.clone());
             assert_eq!(
                 transform_completion_item(
-                    &mut item(completed.clone()),
+                    &mut transformed,
                     &offset,
                     Position::new(11, 0),
                     Some(Position::new(10, 3)),
@@ -1390,23 +1501,36 @@ mod tests {
                 kept,
                 "{completed}"
             );
-        }
-        // Kept, it goes out as the plain text it is.
-        let mut literal = item(json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}));
-        assert_eq!(
-            transform_completion_item(
-                &mut literal,
-                &offset,
-                Position::new(11, 0),
-                Some(Position::new(10, 3)),
-                ClientInsertMode::default(),
-            ),
-            kept
-        );
-        if kept {
+            if !kept {
+                continue;
+            }
+            // Kept, it goes out as it came: on one line, the map writes
+            // nothing into it. Text without a tabstop goes out as the plain
+            // text it stands for, which every client inserts as is.
             assert_eq!(
-                literal.insert_text_format,
-                Some(tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT)
+                inserted_text(&transformed),
+                plain.unwrap_or(snippet),
+                "{completed}"
+            );
+            // An item inserting its label says so (see
+            // `a_prepared_snippet_inserting_its_label_says_so`).
+            if plain.is_none() {
+                assert_eq!(
+                    transformed.insert_text.as_deref(),
+                    completed["insertText"]
+                        .as_str()
+                        .or(completed.get("textEdit").is_none().then_some(snippet)),
+                    "{completed}"
+                );
+            }
+            assert_eq!(
+                transformed.insert_text_format,
+                Some(if plain.is_some() {
+                    InsertTextFormat::PLAIN_TEXT
+                } else {
+                    InsertTextFormat::SNIPPET
+                }),
+                "{completed}"
             );
         }
         // As is, a snippet is the client's to expand.
@@ -1418,9 +1542,174 @@ mod tests {
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
+        assert_eq!(as_is.insert_text_format, Some(InsertTextFormat::SNIPPET));
+        assert_eq!(as_is.insert_text.as_deref(), Some(snippet));
+    }
+
+    /// A snippet breaking a line or holding a tab is refused whatever the
+    /// client declares: snippet engines indent the lines after the first
+    /// by the caret line's and turn tabs into spaces whatever the item asks
+    /// (Neovim's vim.snippet.expand; mini.snippets, behind a completion
+    /// declaring it inserts as is), so the text checked is not the text
+    /// inserted. A literal one is plain text, inserted as is.
+    #[rstest]
+    #[case::tabstop_only_line("{\n$0\n}")]
+    #[case::placeholder_then_tabstop("if ${1:x}:\n\t$0")]
+    #[case::placeholder_spanning_lines("${1:b\nc}\nd")]
+    #[case::mirrored_line_breaking_default("${1:b\nc}$1")]
+    #[case::tab("f(\t$1)")]
+    fn a_prepared_snippet_breaking_a_line_or_holding_a_tab_is_refused_for_every_client(
+        #[case] snippet: &str,
+    ) {
+        use tower_lsp_server::ls_types::{InsertTextFormat, InsertTextMode};
+        let offset = dedented_offset("  a\n");
+        let edit_of = |new_text: &str| {
+            item(json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+                "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                "newText": new_text
+            }}))
+        };
+        let transform = |completed: &mut CompletionItem, insert_mode| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                insert_mode,
+            )
+        };
+        for insert_mode in [
+            ClientInsertMode::AsIsSettable,
+            ClientInsertMode::AsIs,
+            ClientInsertMode::AdjustsIndentation,
+        ] {
+            assert!(
+                !transform(&mut edit_of(snippet), insert_mode),
+                "{insert_mode:?}"
+            );
+        }
+        let mut literal = edit_of("{\n}");
+        assert!(transform(&mut literal, ClientInsertMode::AsIsSettable));
+        assert_eq!(inserted_text(&literal), "{\n  }");
         assert_eq!(
-            as_is.insert_text_format,
-            Some(tower_lsp_server::ls_types::InsertTextFormat::SNIPPET)
+            literal.insert_text_format,
+            Some(InsertTextFormat::PLAIN_TEXT)
+        );
+        assert_eq!(literal.insert_text_mode, Some(InsertTextMode::AS_IS));
+    }
+
+    /// On tab-indented content the indent a one-line snippet regains is a
+    /// tab, which snippet engines may turn into spaces short of its column:
+    /// refused for every client; a literal one goes out as plain text.
+    #[test]
+    fn a_snippet_regaining_a_tab_indent_is_refused_for_every_client() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        // `\ta\n\n\tb\n`, dedented by a tab; the caret on the blank line.
+        let virtual_text = "\ta\n\n\tb\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": ""},
+            {"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let transform = |completed: &mut CompletionItem, insert_mode| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        let snippet = json!({"label": "f", "insertTextFormat": 2, "insertText": "f(${1:x})$0"});
+        for insert_mode in [
+            ClientInsertMode::AsIsSettable,
+            ClientInsertMode::AsIs,
+            ClientInsertMode::AdjustsIndentation,
+        ] {
+            assert!(
+                !transform(&mut item(snippet.clone()), insert_mode),
+                "{insert_mode:?}"
+            );
+        }
+        let mut literal = item(json!({"label": "f", "insertTextFormat": 2, "insertText": "f()"}));
+        assert!(transform(&mut literal, ClientInsertMode::AsIs));
+        assert_eq!(inserted_text(&literal), "\tf()");
+    }
+
+    /// A snippet expanding to nothing but spaces is refused: the user types
+    /// at its tabstop, which on a blank line among dedented ones would
+    /// regain no indent. One expanding to text regains it before the
+    /// tabstop.
+    #[rstest]
+    #[case::tabstop("$1", None)]
+    #[case::braced_tabstop("${1}", None)]
+    #[case::final_tabstop("$0", None)]
+    #[case::space_default("${1: }", None)]
+    #[case::text_after("$1x", Some("  $1x"))]
+    #[case::default("${1:x}", Some("  ${1:x}"))]
+    fn a_prepared_snippet_expanding_to_spaces_only_is_refused(
+        #[case] snippet: &str,
+        #[case] sent: Option<&str>,
+    ) {
+        // A blank line among dedented ones, with a textEdit, an insertText
+        // or only a label.
+        let offset = dedented_offset("  a\n\n  b\n");
+        for completed in [
+            json!({"label": "x", "insertTextFormat": 2, "textEdit": {
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+                "newText": snippet
+            }}),
+            json!({"label": "x", "insertTextFormat": 2, "insertText": snippet}),
+            json!({"label": snippet, "insertTextFormat": 2}),
+        ] {
+            let mut transformed = item(completed.clone());
+            let kept = transform_completion_item(
+                &mut transformed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                ClientInsertMode::default(),
+            );
+            assert_eq!(
+                kept.then(|| inserted_text(&transformed)),
+                sent,
+                "{completed}"
+            );
+        }
+    }
+
+    /// Without a textEdit, a snippet inserted at a caret regaining an
+    /// indent goes out as that edit, the snippet in it.
+    #[test]
+    fn an_implicit_snippet_made_an_edit_keeps_its_tabstops() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextFormat};
+        // A blank line among dedented ones: the caret there regains the indent.
+        let offset = dedented_offset("  a\n\n  b\n");
+        let mut completed =
+            item(json!({"label": "f", "insertTextFormat": 2, "insertText": "f(${1:x})$0"}));
+        assert!(transform_completion_item(
+            &mut completed,
+            &offset,
+            Position::new(13, 0),
+            Some(Position::new(11, 0)),
+            ClientInsertMode::default(),
+        ));
+        let Some(CompletionTextEdit::Edit(edit)) = &completed.text_edit else {
+            panic!("made an edit: {completed:?}");
+        };
+        assert_eq!(edit.new_text, "  f(${1:x})$0");
+        assert_eq!(completed.insert_text.as_deref(), Some("f(${1:x})$0"));
+        assert_eq!(
+            completed.insert_text_format,
+            Some(InsertTextFormat::SNIPPET)
         );
     }
 
@@ -1678,17 +1967,169 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_prepared_snippet_label_is_checked_when_it_is_the_text() {
+    /// Unprepared, a snippet goes as the server sent it, its ranges
+    /// translated only, whatever it holds and the client declares: no
+    /// expansion, no indent, no insert mode set, a variable refused only
+    /// where a prefixed line would take its expansion.
+    #[rstest]
+    #[case::as_is_settable(ClientInsertMode::AsIsSettable)]
+    #[case::as_is(ClientInsertMode::AsIs)]
+    #[case::adjusting(ClientInsertMode::AdjustsIndentation)]
+    fn an_unprepared_snippet_goes_as_the_server_sent_it(#[case] insert_mode: ClientInsertMode) {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, InsertTextFormat, Range};
+        let offset = RegionOffset::new(10, 2);
+        let transform = |completed: &mut CompletionItem| {
+            transform_completion_item(
+                completed,
+                &offset,
+                Position::new(13, 0),
+                Some(Position::new(11, 0)),
+                insert_mode,
+            )
+        };
+        for (snippet, text_edit) in [
+            ("do\n\t${1:body}\n$0end", true),
+            ("{\n$0\n}", true),
+            ("\tf(${1|a,b|})$0$0", true),
+            ("f(${1:x})$0", false),
+            ("cost: $ ${1:a\\qb}", false),
+        ] {
+            let mut completed = item(if text_edit {
+                json!({"label": "s", "insertTextFormat": 2, "textEdit": {
+                    "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 0}},
+                    "newText": snippet
+                }})
+            } else {
+                json!({"label": "s", "insertTextFormat": 2, "insertText": snippet})
+            });
+            let came = completed.clone();
+            assert!(transform(&mut completed), "{snippet:?}");
+            let mut expected = came;
+            if let Some(CompletionTextEdit::Edit(edit)) = &mut expected.text_edit {
+                edit.range = Range::new(Position::new(11, 0), Position::new(11, 0));
+            }
+            assert_eq!(completed, expected, "{snippet:?}");
+            assert_eq!(completed.insert_text_mode, None);
+            assert_eq!(
+                completed.insert_text_format,
+                Some(InsertTextFormat::SNIPPET)
+            );
+        }
+    }
+
+    /// A prepared snippet item inserting its label goes out with the label
+    /// as its insertText, so that a client reaching for its filterText
+    /// first still inserts the text checked; unprepared, it goes as sent.
+    #[rstest]
+    #[case::snippet("f(${1:x})$0", "f(${1:x})$0", 2)]
+    #[case::literal("fx", "fx", 1)]
+    #[case::escapes_only("f\\$", "f$", 1)]
+    fn a_prepared_snippet_inserting_its_label_says_so(
+        #[case] label: &str,
+        #[case] insert_text: &str,
+        #[case] format: u8,
+    ) {
+        let completed = json!({"label": label, "filterText": "f", "insertTextFormat": 2});
+        let mut prepared = item(completed.clone());
+        assert!(transform_completion_item(
+            &mut prepared,
+            &dedented_offset("  a\n"),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(prepared.text_edit, None);
+        assert_eq!(prepared.insert_text.as_deref(), Some(insert_text));
+        assert_eq!(
+            serde_json::to_value(prepared.insert_text_format).unwrap(),
+            json!(format)
+        );
+        let mut unprepared = item(completed.clone());
+        assert!(transform_completion_item(
+            &mut unprepared,
+            &RegionOffset::new(10, 0),
+            Position::new(11, 0),
+            Some(Position::new(10, 3)),
+            ClientInsertMode::default(),
+        ));
+        assert_eq!(unprepared, item(completed));
+    }
+
+    /// An item of the snippet kind sent as plain text is refused where a
+    /// client inserting it as a snippet would read it otherwise: with a
+    /// line break (re-indented), or a `$` opening a word (a tabstop).
+    /// Unprepared, it goes as the server sent it.
+    #[rstest]
+    #[case::literal_lines(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "textEdit": {
+        "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+        "newText": "{\n}"
+    }}), false)]
+    #[case::plain_lines(json!({"label": "x", "kind": 15, "textEdit": {
+        "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+        "newText": "{\n}"
+    }}), false)]
+    #[case::escaped_dollar(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "price: \\$5"}), false)]
+    #[case::plain_dollar(json!({"label": "x", "kind": 15, "insertText": "a$b"}), false)]
+    #[case::one_line(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "x\\}"}), true)]
+    #[case::snippet(json!({"label": "x", "kind": 15, "insertTextFormat": 2, "insertText": "f($1)"}), true)]
+    #[case::other_kind(json!({"label": "x", "kind": 3, "insertTextFormat": 2, "insertText": "price: \\$5"}), true)]
+    fn a_prepared_item_of_the_snippet_kind_sent_as_plain_text_reads_alike(
+        #[case] completed: serde_json::Value,
+        #[case] kept: bool,
+    ) {
         let offset = dedented_offset("  a\n");
-        let mut completed = item(json!({"label": "x$1", "insertTextFormat": 2}));
-        assert!(!transform_completion_item(
+        for insert_mode in [ClientInsertMode::AsIsSettable, ClientInsertMode::AsIs] {
+            assert_eq!(
+                transform_completion_item(
+                    &mut item(completed.clone()),
+                    &offset,
+                    Position::new(11, 0),
+                    Some(Position::new(10, 3)),
+                    insert_mode,
+                ),
+                kept,
+                "{completed} {insert_mode:?}"
+            );
+            assert!(transform_completion_item(
+                &mut item(completed.clone()),
+                &RegionOffset::new(10, 0),
+                Position::new(11, 0),
+                Some(Position::new(10, 3)),
+                insert_mode,
+            ));
+        }
+    }
+
+    /// An insert/replace snippet maps through both ranges as its expansion,
+    /// and goes out as the snippet over both.
+    #[test]
+    fn a_prepared_insert_replace_snippet_maps_both_ranges() {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range};
+        let offset = dedented_offset("  foo\n");
+        let mut completed = item(json!({"label": "f", "insertTextFormat": 2, "textEdit": {
+            "insert": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+            "replace": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+            "newText": "f(${1:x})$0"
+        }}));
+        assert!(transform_completion_item(
             &mut completed,
             &offset,
             Position::new(11, 0),
             Some(Position::new(10, 3)),
             ClientInsertMode::default(),
         ));
+        let Some(CompletionTextEdit::InsertAndReplace(edit)) = &completed.text_edit else {
+            panic!("kept as insert/replace: {completed:?}");
+        };
+        assert_eq!(edit.new_text, "f(${1:x})$0");
+        assert_eq!(
+            edit.insert,
+            Range::new(Position::new(10, 2), Position::new(10, 3))
+        );
+        assert_eq!(
+            edit.replace,
+            Range::new(Position::new(10, 2), Position::new(10, 5))
+        );
     }
 
     #[test]
@@ -3339,5 +3780,501 @@ mod tests {
         let list =
             transform_for_non_resolving_server(response, &plain, region_end, Some(4)).unwrap();
         assert_eq!(list.items.len(), 1, "all-zero regions keep no boundary");
+    }
+
+    /// Snippet completions on generated prepared documents against a
+    /// reference built another way: the snippet generated as a tree and
+    /// expanded by its own rule (not [`Expansion`]), the expansion placed by
+    /// the exact-text reference for plain edits, and the snippet that goes
+    /// out read back by a parser of its own — expanded at its defaults, and
+    /// with text typed at each tabstop.
+    mod snippet_reference {
+        use super::*;
+        use crate::lsp::bridge::PreparedMap;
+        use crate::lsp::bridge::protocol::exact_reference::{
+            self, Document, apply_to, property_floor, property_runner,
+        };
+        use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range as LspRange, TextEdit};
+
+        /// One node of a generated snippet.
+        #[derive(Debug, Clone, PartialEq)]
+        enum Node {
+            Text(String),
+            Tabstop(u8),
+            Placeholder(u8, String),
+            Choice(u8, Vec<String>),
+            /// Snippet text written as is, unescaped (see [`RAW`]).
+            Raw(&'static str),
+        }
+
+        /// Snippet text as servers write it, unescaped: an unbraced tabstop,
+        /// and forms clients read apart or not at all (an escape of anything
+        /// but `$`, `}` or `\\`, a `$` opening nothing, a variable, a mirror
+        /// or an odd escape in a default, a transform, a tabstop number with
+        /// a leading zero or past 9999).
+        const RAW: [&str; 11] = [
+            "$1",
+            "\\q",
+            "\\.",
+            "$",
+            "$TM_X",
+            "${1:$2}",
+            "${1:a\\qb}",
+            "${1/a/b/}",
+            "$01",
+            "${01:a}",
+            "$10000",
+        ];
+
+        /// Texts the nodes hold: words repeating the generated lines,
+        /// spaces, every character the grammar escapes somewhere, and line
+        /// breaks and tabs, which no client expands alike.
+        const TEXTS: [&str; 15] = [
+            "", "a", "b c", " ", "  ", "$", "}", "\\", ",", "|", "é", "{", "x\n", "\t", "a = 1",
+        ];
+
+        /// What the user types at a tabstop.
+        const TYPED: &str = "T";
+
+        fn text() -> impl Strategy<Value = String> {
+            prop::sample::select(TEXTS.to_vec()).prop_map(str::to_string)
+        }
+
+        fn node() -> impl Strategy<Value = Node> {
+            prop_oneof![
+                1 => prop::sample::select(RAW.to_vec()).prop_map(Node::Raw),
+                4 => text().prop_map(Node::Text),
+                2 => (0..3u8).prop_map(Node::Tabstop),
+                2 => (0..3u8, text()).prop_map(|(n, default)| Node::Placeholder(n, default)),
+                1 => (0..3u8, prop::collection::vec(text(), 1..3))
+                    .prop_map(|(n, options)| Node::Choice(n, options)),
+            ]
+        }
+
+        fn escape(text: &str, special: &[char]) -> String {
+            let mut escaped = String::new();
+            for c in text.chars() {
+                if special.contains(&c) {
+                    escaped.push('\\');
+                }
+                escaped.push(c);
+            }
+            escaped
+        }
+
+        /// The snippet text of `nodes`, every character the grammar would
+        /// read otherwise escaped where it stands.
+        fn render(nodes: &[Node]) -> String {
+            nodes
+                .iter()
+                .map(|node| match node {
+                    Node::Raw(raw) => raw.to_string(),
+                    Node::Text(text) => escape(text, &['$', '}', '\\']),
+                    Node::Tabstop(n) => format!("${{{n}}}"),
+                    Node::Placeholder(n, default) => {
+                        format!("${{{n}:{}}}", escape(default, &['$', '}', '\\']))
+                    }
+                    Node::Choice(n, options) => format!(
+                        "${{{n}|{}|}}",
+                        options
+                            .iter()
+                            .map(|option| escape(option, &[',', '|', '\\']))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                })
+                .collect()
+        }
+
+        /// Whether every client expands `nodes` alike: no choice (VS Code
+        /// inserts its first option, Neovim nothing), at most one default
+        /// per tabstop and only on its first occurrence (mini.snippets
+        /// mirrors no later one), the final tabstop at most once, nothing a
+        /// snippet engine rewrites (a line break, a tab), and, holding a
+        /// tabstop, a `$` opening a word after anything but a backslash
+        /// (mini.completion inserts other text as is).
+        fn alike(nodes: &[Node]) -> bool {
+            let mut defaults = HashMap::new();
+            let mut seen = std::collections::HashSet::new();
+            let mut finals = 0;
+            for node in nodes {
+                match node {
+                    Node::Tabstop(n) | Node::Placeholder(n, _) | Node::Choice(n, _) => {
+                        if matches!(node, Node::Placeholder(..)) && seen.contains(n) {
+                            return false;
+                        }
+                        seen.insert(*n);
+                    }
+                    Node::Raw("$1") => {
+                        seen.insert(1);
+                    }
+                    _ => {}
+                }
+                match node {
+                    Node::Raw("$1") => {}
+                    Node::Raw(_) | Node::Choice(..) => return false,
+                    Node::Text(text) if text.contains(['\n', '\r', '\t']) => return false,
+                    Node::Placeholder(n, default)
+                        if default.contains(['\n', '\r', '\t'])
+                            || defaults.insert(*n, ()).is_some() =>
+                    {
+                        return false;
+                    }
+                    _ => {}
+                }
+                if matches!(node, Node::Tabstop(0) | Node::Placeholder(0, _)) {
+                    finals += 1;
+                }
+            }
+            let rendered = render(nodes).into_bytes();
+            let opens_word = |at: usize| rendered.get(at).is_some_and(u8::is_ascii_alphanumeric);
+            let read_as_snippet = (0..rendered.len()).any(|at| {
+                rendered[at] == b'$'
+                    && (at == 0 || rendered[at - 1] != b'\\')
+                    && (opens_word(at + 1)
+                        || (rendered.get(at + 1) == Some(&b'{') && opens_word(at + 2)))
+            });
+            finals <= 1 && (seen.is_empty() || read_as_snippet)
+        }
+
+        /// What a client inserts for `nodes` (alike), the user having typed
+        /// `typed` at tabstop `at` (its every occurrence) and nothing else.
+        fn expand(nodes: &[Node], at: Option<(u8, &str)>) -> String {
+            let defaults: HashMap<u8, &str> = nodes
+                .iter()
+                .filter_map(|node| match node {
+                    Node::Placeholder(n, default) => Some((*n, default.as_str())),
+                    _ => None,
+                })
+                .collect();
+            nodes
+                .iter()
+                .map(|node| match node {
+                    Node::Text(text) => text.as_str(),
+                    Node::Raw("$1") => match at {
+                        Some((1, typed)) => typed,
+                        _ => defaults.get(&1).copied().unwrap_or(""),
+                    },
+                    Node::Raw(raw) => raw,
+                    Node::Tabstop(n) | Node::Placeholder(n, _) | Node::Choice(n, _) => match at {
+                        Some((typed_at, typed)) if typed_at == *n => typed,
+                        _ => defaults.get(n).copied().unwrap_or(""),
+                    },
+                })
+                .collect()
+        }
+
+        /// `snippet` read back in the shapes [`render`] writes, `$n` too (a
+        /// `$` opens a tabstop, a `\` escapes `$`, `}` or `\` and is text
+        /// before anything else); `None` for anything else.
+        fn parse(snippet: &str) -> Option<Vec<Node>> {
+            let mut chars = snippet.chars().peekable();
+            let mut nodes = Vec::new();
+            let mut text = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.peek() {
+                        Some('$' | '}' | '\\') => text.push(chars.next()?),
+                        _ => text.push('\\'),
+                    },
+                    '$' => {
+                        if !text.is_empty() {
+                            nodes.push(Node::Text(std::mem::take(&mut text)));
+                        }
+                        let braced = chars.next_if_eq(&'{').is_some();
+                        let n = u8::try_from(chars.next()?.to_digit(10)?).ok()?;
+                        if !braced {
+                            nodes.push(Node::Tabstop(n));
+                            continue;
+                        }
+                        match chars.next()? {
+                            '}' => nodes.push(Node::Tabstop(n)),
+                            ':' => {
+                                let mut default = String::new();
+                                loop {
+                                    match chars.next()? {
+                                        '\\' => default.push(chars.next()?),
+                                        '}' => break,
+                                        '$' => return None,
+                                        c => default.push(c),
+                                    }
+                                }
+                                nodes.push(Node::Placeholder(n, default));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    c => text.push(c),
+                }
+            }
+            if !text.is_empty() {
+                nodes.push(Node::Text(text));
+            }
+            Some(nodes)
+        }
+
+        /// What `nodes` keeps whatever indentation goes into its texts: the
+        /// tabstops in order, with their defaults.
+        fn skeleton(nodes: &[Node]) -> Vec<Node> {
+            nodes
+                .iter()
+                .filter_map(|node| match node {
+                    Node::Text(_) | Node::Raw("\\q") => None,
+                    Node::Raw("$1") => Some(Node::Tabstop(1)),
+                    other => Some(other.clone()),
+                })
+                .collect()
+        }
+
+        /// How the host holds a generated virtual document: as it is, or as
+        /// a list item's fence holds it (each non-empty row behind the
+        /// item's two-space indentation, recorded as its column; an empty
+        /// row recording none).
+        #[derive(Debug, Clone, Copy)]
+        enum Host {
+            Fence,
+            ListItem,
+        }
+
+        impl Host {
+            fn columns(self, virtual_text: &str) -> Vec<u32> {
+                match self {
+                    Host::Fence => vec![0],
+                    Host::ListItem => virtual_text
+                        .split('\n')
+                        .map(|line| if line.is_empty() { 0 } else { 2 })
+                        .collect(),
+                }
+            }
+
+            /// The host text holding `virtual_text`.
+            fn text(self, virtual_text: &str) -> String {
+                match self {
+                    Host::Fence => virtual_text.to_string(),
+                    Host::ListItem => virtual_text
+                        .split_inclusive('\n')
+                        .map(|line| {
+                            if line == "\n" {
+                                line.to_string()
+                            } else {
+                                format!("  {line}")
+                            }
+                        })
+                        .collect(),
+                }
+            }
+        }
+
+        /// One generated completion: the snippet `nodes` as a textEdit over
+        /// `range` of P. A kept item must be one every client expands alike,
+        /// go out as a snippet with the generated tabstops, and give the
+        /// reference host text both at its defaults and with text typed at
+        /// each tabstop. `Ok(Some(literal))` when kept.
+        fn check_one(
+            document: &Document,
+            map: &std::sync::Arc<PreparedMap>,
+            indent: &str,
+            host: Host,
+            nodes: &[Node],
+            range: LspRange,
+        ) -> Result<Option<bool>, TestCaseError> {
+            let snippet = render(nodes);
+            let mut completed = item(json!({
+                "label": "s",
+                "insertTextFormat": 2,
+                "textEdit": { "range": range, "newText": snippet }
+            }));
+            let virtual_text = exact_reference::virtual_text(document);
+            let host_text = host.text(virtual_text);
+            let region_end = crate::text::PositionMapper::new(&host_text)
+                .byte_to_position(host_text.len())
+                .unwrap();
+            let offset = RegionOffset::with_per_line_offsets(0, host.columns(virtual_text))
+                .with_prepared(map.clone());
+            if !transform_completion_item(
+                &mut completed,
+                &offset,
+                region_end,
+                None,
+                ClientInsertMode::AsIsSettable,
+            ) {
+                return Ok(None);
+            }
+            // Text without a tabstop goes out as the plain text it stands
+            // for, inserted as is; any other snippet must be one clients
+            // expand alike.
+            let literal = !snippet.contains(['$', '\\'])
+                || (alike(nodes)
+                    && nodes
+                        .iter()
+                        .all(|node| matches!(node, Node::Text(_) | Node::Raw("\\q"))));
+            prop_assert!(
+                literal || alike(nodes),
+                "kept though clients expand it apart: {:?}",
+                snippet
+            );
+            prop_assert_eq!(
+                completed.insert_text_format,
+                Some(if literal {
+                    tower_lsp_server::ls_types::InsertTextFormat::PLAIN_TEXT
+                } else {
+                    tower_lsp_server::ls_types::InsertTextFormat::SNIPPET
+                })
+            );
+            let Some(CompletionTextEdit::Edit(sent)) = &completed.text_edit else {
+                return Err(TestCaseError::fail(format!(
+                    "kept without its edit: {completed:?}"
+                )));
+            };
+            // Nothing in a snippet a snippet engine rewrites.
+            prop_assert!(
+                literal || !sent.new_text.contains(['\t', '\n', '\r']),
+                "sent {:?}",
+                sent.new_text
+            );
+            let parsed = if literal {
+                Some(vec![Node::Text(sent.new_text.clone())])
+            } else {
+                parse(&sent.new_text)
+            };
+            prop_assert!(parsed.is_some(), "no snippet: {:?}", sent.new_text);
+            let parsed = parsed.unwrap();
+            prop_assert_eq!(skeleton(&parsed), skeleton(nodes), "{:?}", sent.new_text);
+            let numbers: Vec<Option<(u8, &str)>> = std::iter::once(None)
+                .chain(nodes.iter().filter_map(|node| match node {
+                    Node::Tabstop(n) | Node::Placeholder(n, _) => Some(Some((*n, TYPED))),
+                    Node::Raw("$1") => Some(Some((1, TYPED))),
+                    _ => None,
+                }))
+                .collect();
+            for at in numbers {
+                let got = apply_to(
+                    &host_text,
+                    &[TextEdit {
+                        range: sent.range,
+                        new_text: expand(&parsed, at),
+                    }],
+                );
+                let expected = exact_reference::reference(
+                    document,
+                    map,
+                    &[TextEdit {
+                        range,
+                        new_text: expand(nodes, at),
+                    }],
+                    indent,
+                )
+                .map(|expected| host.text(&expected));
+                prop_assert_eq!(
+                    Some(&got),
+                    expected.as_ref(),
+                    "{:?} at {:?} typed {:?} on {:?} (P {:?}) sent {:?}",
+                    snippet,
+                    range,
+                    at,
+                    virtual_text,
+                    exact_reference::prepared_text(map),
+                    sent
+                );
+            }
+            Ok(Some(literal))
+        }
+
+        /// Generated documents (see `exact_reference`), each with one
+        /// snippet completion over a random range of P; how many snippets
+        /// with tabstops were kept.
+        fn check(cases: u32, host: Host) -> u32 {
+            let mut runner = property_runner(cases);
+            let kept = Cell::new(0);
+            let strategy = (
+                prop::collection::vec(exact_reference::line(), 1..6),
+                prop::sample::select(vec!["  ", "\t", "    "]),
+                (0..3usize, 0..3usize, any::<bool>()),
+                prop::collection::vec(node(), 1..5),
+                (any::<u16>(), any::<u16>()),
+            );
+            runner
+                .run(
+                    &strategy,
+                    |(lines, indent, (leading, trailing, closing), nodes, (a, b))| {
+                        let Some((document, map)) =
+                            exact_reference::prepared(&lines, indent, leading, trailing, closing)
+                        else {
+                            return Ok(());
+                        };
+                        let prepared = exact_reference::prepared_text(&map);
+                        let mapper = crate::text::PositionMapper::new(prepared);
+                        let boundaries: Vec<usize> = (0..=prepared.len())
+                            .filter(|&at| prepared.is_char_boundary(at))
+                            .collect();
+                        let a = boundaries[a as usize % boundaries.len()];
+                        let b = boundaries[b as usize % boundaries.len()];
+                        let range = LspRange::new(
+                            mapper.byte_to_position(a.min(b)).unwrap(),
+                            mapper.byte_to_position(a.max(b)).unwrap(),
+                        );
+                        if check_one(&document, &map, indent, host, &nodes, range)? == Some(false) {
+                            kept.set(kept.get() + 1);
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            kept.get()
+        }
+
+        #[test]
+        fn kept_snippets_give_exactly_the_reference_host_text() {
+            let kept = check(8000, Host::Fence);
+            assert!(kept as usize > property_floor(200, 8000), "kept {kept}");
+        }
+
+        /// On a list item's fence the empty rows record no indentation: a
+        /// snippet whose text lands on one, or text typed at its tabstop
+        /// there, would sit at the host's column 0, out of the item. Some
+        /// must still be kept (text on rows the item indents), lest a guard
+        /// refusing everything pass.
+        #[test]
+        #[ignore = "needs the shared region guard's protected empty rows (the list-fence empty-row fix), the offset built with them"]
+        fn kept_snippets_on_a_list_item_fence_give_exactly_the_reference_host_text() {
+            let kept = check(8000, Host::ListItem);
+            assert!(kept as usize > property_floor(50, 8000), "kept {kept}");
+        }
+
+        /// The list-item shape the property generates, a snippet completed
+        /// on an empty row of the item's fence: refused, as the row records
+        /// no indentation for its text (nor for what is typed at its
+        /// tabstop) to land behind.
+        #[test]
+        #[ignore = "needs the shared region guard's protected empty rows (the list-fence empty-row fix), the offset built with them"]
+        fn a_snippet_on_an_empty_row_of_a_list_item_fence_is_refused() {
+            use crate::lsp::bridge::protocol::exact_reference::Line;
+            let lines = [
+                Line::Content { body: 0, gap: None },
+                Line::Empty,
+                Line::Content { body: 0, gap: None },
+            ];
+            let (document, map) = exact_reference::prepared(&lines, "  ", 0, 0, false).unwrap();
+            // P is `a\n\na\n`; the snippet goes on its empty row.
+            let at = Position::new(1, 0);
+            let kept = check_one(
+                &document,
+                &map,
+                "  ",
+                Host::ListItem,
+                &[
+                    Node::Text("f(".into()),
+                    Node::Tabstop(1),
+                    Node::Text(")".into()),
+                ],
+                LspRange::new(at, at),
+            )
+            .unwrap();
+            assert_eq!(kept, None);
+        }
     }
 }

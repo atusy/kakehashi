@@ -486,8 +486,8 @@ fn edits_on_a_prepared_document_map_back_reindented() {
 
 #[test]
 fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
-    // Every item is a snippet, which a prepared document cannot carry: no
-    // item comes back, but the ask to re-query does, as the next keystroke
+    // Every item is a snippet inserting a variable, which a prepared
+    // document cannot carry: no item comes back, but the ask to re-query does, as the next keystroke
     // may yield items that map.
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/requery.md";
@@ -503,6 +503,48 @@ fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
         json!({ "isIncomplete": true, "items": [] }),
         "{response}"
     );
+}
+
+#[test]
+fn a_snippet_completion_on_a_prepared_document_keeps_its_tabstops() {
+    // A one-line snippet keeps its tabstops. `do\n\t${1:body}\n$0end` is
+    // refused whatever the editor declares: snippet engines indent a
+    // snippet's later lines by the caret line's, and turn its tabs into
+    // spaces, whatever the item asks.
+    for capabilities in [
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true,
+            "insertTextModeSupport": { "valueSet": [1, 2] }
+        }}}}),
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true
+        }}}}),
+    ] {
+        let (mut client, _dir) = Setup {
+            capabilities,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/snippet.md";
+        let text = "# t\n\n```lua\n  local SNIPPET_EDIT = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 24 } }),
+        );
+        let at = json!({
+            "start": { "line": 3, "character": 24 },
+            "end": { "line": 3, "character": 24 }
+        });
+        assert_eq!(
+            response["result"]["items"],
+            json!([{"label": "call", "insertTextFormat": 2, "textEdit": {
+                "range": at, "newText": "f(${1:x})$0"
+            }}]),
+            "{response}"
+        );
+    }
 }
 
 /// Apply LSP `TextEdit`s to `text`, fixtures being ASCII (a UTF-16 column
@@ -1571,6 +1613,52 @@ fn without_experimental_features_formatting_answers_as_unprepared() {
                 "newText": "  LOCAL X = 1\nLOCAL Y = 2\n"
             }]),
             "{method}"
+        );
+    }
+}
+
+#[test]
+fn without_experimental_features_snippet_completions_go_as_the_server_sent_them() {
+    // Nothing is prepared: a snippet keeps its text and insert mode
+    // whatever the editor declares, its range translated only.
+    for capabilities in [
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true,
+            "insertTextModeSupport": { "valueSet": [1, 2] }
+        }}}}),
+        json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true
+        }}}}),
+    ] {
+        let (mut client, _dir) = Setup {
+            capabilities,
+            experimental: false,
+            ..Setup::default()
+        }
+        .start();
+        let uri = "file:///prepare/flag-off-snippet.md";
+        let text = "# t\n\n```lua\n  local SNIPPET_EDIT = 1\n```\n";
+        open(&mut client, uri, text);
+        hover_with_retry(&mut client, uri, 3, 4);
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 24 } }),
+        );
+        let at = json!({
+            "start": { "line": 3, "character": 24 },
+            "end": { "line": 3, "character": 24 }
+        });
+        assert_eq!(
+            response["result"]["items"],
+            json!([
+                {"label": "call", "insertTextFormat": 2, "textEdit": {
+                    "range": at, "newText": "f(${1:x})$0"
+                }},
+                {"label": "block", "insertTextFormat": 2, "textEdit": {
+                    "range": at, "newText": "do\n\t${1:body}\n$0end"
+                }}
+            ]),
+            "{response}"
         );
     }
 }
