@@ -1162,6 +1162,14 @@ impl DocumentTracker {
         }
     }
 
+    /// Wake every request waiting on [`Self::held_changed`], whatever the
+    /// count: for a change no record makes (a failure, which the waiters
+    /// read outside the lock records go under), so the count read here
+    /// could miss a waiter that just took it.
+    pub(super) fn wake_held_waiters(&self) {
+        self.held_changed.notify_waiters();
+    }
+
     /// Whether any connection was ever sent a prepared text.
     pub(super) fn ever_held_prepared(&self) -> bool {
         self.ever_held_prepared.load(Ordering::Acquire)

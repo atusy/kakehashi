@@ -1234,6 +1234,11 @@ impl PrepareRegistry {
                     }
                     let _ = cell.outcome.set(answer);
                     held_changes.fetch_add(1, Ordering::AcqRel);
+                    // A request waiting for a text this input's revoked
+                    // maps were answered for gives up: it never comes.
+                    if !ready {
+                        pool.wake_request_text_waiters();
+                    }
                     // The answer the lifecycle pass holds the document on
                     // re-syncs the host, whoever asked. An unusable one
                     // does too, unready: nothing more is coming for this
@@ -2414,6 +2419,63 @@ mod tests {
                 cause: ResyncCause::Recollect { edited: true },
             })
         );
+    }
+
+    /// A request waiting for its connection to hold the text its map was
+    /// answered for gives up as soon as its peer fails that input (under a
+    /// new epoch, say): the lifecycle pass holds the region back then and
+    /// sends nothing, so the text never comes, and the request does not
+    /// wait out its budget for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_waiting_for_its_text_gives_up_once_its_peer_fails_its_input() {
+        use crate::lsp::bridge::protocol::{RegionOffset, VirtualDocumentUri};
+        let registry = Arc::new(PrepareRegistry::default());
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let dir = tempfile::tempdir().unwrap();
+        // Failed while the request waits.
+        refusing_candidate(&pool, "peer", &dir.path().join("peer"), 0.3, -32603).await;
+        let host = Url::parse("file:///host.md").unwrap();
+        let target = target_of(&pool, &[("peer", &["peer"])]);
+        registry.slot(
+            &target,
+            input(&host, "a"),
+            Holder::LifecyclePass,
+            target.epoch,
+        );
+        // Answered before (under an earlier epoch, say); the connection
+        // still holds an older text.
+        let earlier = registry.failures().answered_for_test(input(&host, "a"), 0);
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            REGION,
+        );
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host, &virtual_uri, &key)
+            .await;
+        pool.record_sent_for_test(&virtual_uri, &key, "older".into());
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&earlier.map));
+        let asking = {
+            let registry = Arc::clone(&registry);
+            let pool = Arc::clone(&pool);
+            let target = target.clone();
+            let host = host.clone();
+            tokio::spawn(async move { registry.prepare(&pool, &target, input(&host, "a")).await })
+        };
+        let started = Instant::now();
+        let waited = pool
+            .wait_for_request_text_for_test(&virtual_uri.to_uri_string(), &key, &offset, || {
+                pool.prepare_failed(&host, "lua", REGION, Some(&earlier.map))
+            })
+            .await;
+        assert!(waited.is_err(), "its text never comes");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "gave up at the failure, not the budget: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(asking.await.unwrap().err(), Some(PrepareMiss::Failed));
     }
 
     #[cfg(unix)]
