@@ -152,6 +152,15 @@ impl Kakehashi {
                 )
                 .await;
 
+            // Every region's prepare attempt started before any is waited
+            // for: the waits in the loop below then share attempts already
+            // running, the request waiting about the slowest, not one after
+            // another.
+            crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+                &self.bridge,
+                &language_name,
+                all_regions.iter().map(|resolved| (&uri, resolved)),
+            );
             for (region_index, resolved) in all_regions.iter().enumerate() {
                 // Get ALL bridge server configs for this injection language
                 let mut configs = self.bridge_configs_for_injection_language(
@@ -182,9 +191,9 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
-                // The lifecycle pass has started every region's attempt already:
-                // waiting for each in turn costs the slowest one. A region with
-                // no answer after that wait is left out of the reply. Its peer
+                // Its attempt already running (see above): waiting for each in
+                // turn costs the slowest one. A region with no answer after
+                // that wait is left out of the reply. Its peer
                 // failed, gave no answer and is backing off, or the epoch moved
                 // under it. Nothing refreshes the reply when the answer comes
                 // later: LSP has no refresh for links or colors, so the next
@@ -427,6 +436,163 @@ mod tests {
     use std::future::ready;
     use tower_lsp_server::LspService;
     use url::Url;
+
+    /// A rust document of `count` lua string regions, none looked up by a
+    /// lifecycle pass, whose peer `peer` never answers. The peer is bridged
+    /// for lua too, but sent no document link, symbol or diagnostic request:
+    /// a region sent as is adds no wait of its own.
+    pub(crate) fn kakehashi_with_unlooked_regions(
+        count: usize,
+    ) -> (LspService<Kakehashi>, tower_lsp_server::ls_types::Uri) {
+        let pool = std::sync::Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            Kakehashi::with_cancel_forwarder(
+                client,
+                std::sync::Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(std::sync::Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            std::sync::Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal (string_content) @injection.content) (#set! injection.language "lua"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let no_links = crate::config::settings::BridgeLanguageConfig {
+            enabled: None,
+            aggregation: Some(
+                [
+                    "textDocument/documentLink",
+                    "textDocument/documentSymbol",
+                    "textDocument/diagnostic",
+                ]
+                .into_iter()
+                .map(|method| {
+                    (
+                        method.to_string(),
+                        crate::config::settings::AggregationConfig {
+                            priorities: Some(Vec::new()),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ),
+        };
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    bridge: Some(HashMap::from([("lua".to_string(), no_links)])),
+                    ..Default::default()
+                },
+            )]),
+            language_servers: [(
+                "peer".to_string(),
+                crate::lsp::bridge::test_helpers::devnull_config_for_language("lua"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        server.settings_manager.apply_settings(settings.clone());
+        server
+            .bridge
+            .prepare_settings_changed(&std::sync::Arc::new(settings));
+        pool.record_prepare_advertisement(
+            &crate::lsp::bridge::ConnectionKey::for_server("peer"),
+            true,
+        );
+        let text: String = (0..count)
+            .map(|index| format!("fn f{index}() {{ let s = \"  a{index}\"; }}\n"))
+            .collect();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///test/unlooked.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            text.clone(),
+            Some("rust".into()),
+            parser.parse(&text, None),
+        );
+        let lsp_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        (service, lsp_uri)
+    }
+
+    /// A whole-document request over several regions whose peer never
+    /// answers, none looked up yet: it waits about as long as for one
+    /// region, its regions' attempts started together, not one after
+    /// another. So do document symbols and a diagnostic pull, which fan out
+    /// over the regions as these methods do.
+    #[rstest::rstest]
+    #[case::document_link("textDocument/documentLink")]
+    #[case::document_symbol("textDocument/documentSymbol")]
+    #[case::diagnostic("textDocument/diagnostic")]
+    #[tokio::test(start_paused = true)]
+    async fn a_whole_document_request_waits_for_its_regions_prepare_attempts_together(
+        #[case] method: &str,
+    ) {
+        use tower_lsp_server::ls_types::TextDocumentIdentifier;
+        let waited = |count: usize| async move {
+            let (service, uri) = kakehashi_with_unlooked_regions(count);
+            let server = service.inner();
+            let text_document = TextDocumentIdentifier { uri };
+            let start = tokio::time::Instant::now();
+            match method {
+                "textDocument/documentLink" => {
+                    let _ = server
+                        .document_link_impl(tower_lsp_server::ls_types::DocumentLinkParams {
+                            text_document,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await;
+                }
+                "textDocument/documentSymbol" => {
+                    let _ = server
+                        .document_symbol_impl(tower_lsp_server::ls_types::DocumentSymbolParams {
+                            text_document,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await;
+                }
+                _ => {
+                    let _ = server
+                        .diagnostic_impl(tower_lsp_server::ls_types::DocumentDiagnosticParams {
+                            text_document,
+                            identifier: None,
+                            previous_result_id: None,
+                            work_done_progress_params: Default::default(),
+                            partial_result_params: Default::default(),
+                        })
+                        .await;
+                }
+            }
+            start.elapsed()
+        };
+        let one = waited(1).await;
+        assert!(
+            one >= std::time::Duration::from_secs(1),
+            "one region waits for its attempt: {one:?}"
+        );
+        let three = waited(3).await;
+        assert!(
+            three < one + std::time::Duration::from_secs(1),
+            "one region {one:?}, three {three:?}"
+        );
+    }
 
     #[tokio::test]
     async fn document_color_rejects_unsettled_queries_during_reload() {

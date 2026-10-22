@@ -122,6 +122,34 @@ pub(crate) enum MethodGate {
     Unprepared,
 }
 
+/// Start the prepare attempts of every region `regions` names (of a host in
+/// `host_language`), without waiting: a request that then waits for each
+/// region's context in turn waits about the slowest attempt, not one after
+/// another, its waits sharing the attempts already running.
+pub(crate) fn start_prepare_attempts<'a>(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    regions: impl IntoIterator<Item = (&'a Url, &'a crate::language::injection::ResolvedInjection)>,
+) {
+    for (host_uri, resolved) in regions {
+        let Some(target) = bridge.prepare_target(host_language, &resolved.injection_language)
+        else {
+            continue;
+        };
+        let _ = bridge.prepared_document_now_for_request(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri,
+                host_language,
+                injection_language: &resolved.injection_language,
+                region_id: &resolved.region.region_id,
+                virtual_text: &resolved.virtual_content,
+                gaps: &resolved.gaps,
+            },
+        );
+    }
+}
+
 /// Present `ctx`'s virtual document as downstream servers see it, waiting for
 /// the prepare peer when the (host, injection) pair has one: the context's
 /// virtual content becomes the prepared text and its fan-out translates
