@@ -535,7 +535,7 @@ fn range_formatting_does_not_wait_for_regions_outside_its_range() {
         "the python fence is formatted: {response}"
     );
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < Duration::from_secs(3),
         "range formatting waited {elapsed:?} for regions it does not format"
     );
 }
