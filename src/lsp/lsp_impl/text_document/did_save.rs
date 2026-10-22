@@ -179,6 +179,18 @@ impl Kakehashi {
                 }
                 let injections =
                     crate::lsp::lsp_impl::coordinator::sendable_injections(prepares, injections);
+                // This save reaches the regions sent now: an earlier one of
+                // this version they missed while held is not owed them too.
+                if prepares {
+                    self.bridge.settle_held_save(
+                        uri,
+                        saved_incarnation,
+                        saved_content_version,
+                        injections
+                            .iter()
+                            .map(|injection| injection.region_id.as_str()),
+                    );
+                }
                 pool.sync_and_forward_did_save_to_virtual_docs(uri, saved_incarnation, &injections)
                     .await;
             }
@@ -370,6 +382,121 @@ mod tests {
                 .prepared,
             "the save holds the region on the saved text"
         );
+    }
+
+    /// A later save of the same version that reaches a region once held
+    /// (its answer in since) settles the save that region missed: the
+    /// resync does not forward that one to it again.
+    #[tokio::test]
+    async fn a_later_save_reaching_a_region_settles_what_it_missed() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = LspService::new(|client| {
+            Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        server
+            .bridge
+            .prepare_settings_changed(&Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "peer".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///saved.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let (incarnation, content_version) = {
+            let document = server.documents.get(&uri).unwrap();
+            (document.incarnation(), document.content_version())
+        };
+
+        server
+            .forward_virtual_did_save_for_saved_version(&pool, &uri, incarnation, content_version)
+            .await;
+        let held = server
+            .bridge
+            .take_held_save(&uri)
+            .expect("the held region misses the save");
+        let region_id = held.region_ids.iter().next().unwrap().clone();
+        server.bridge.hold_save(
+            &uri,
+            held.incarnation,
+            held.content_version,
+            held.region_ids,
+        );
+        // Its answer lands: the region is no longer held.
+        let region = {
+            let tree = parser.parse(text, None).unwrap();
+            let query = server.language.injection_query("rust").unwrap();
+            crate::language::injection::InjectionResolver::resolve_all(
+                &server.language,
+                server.bridge.node_tracker(),
+                &uri,
+                &tree,
+                text,
+                &query,
+                incarnation,
+            )
+            .remove(0)
+        };
+        assert_eq!(region.region.region_id, region_id);
+        let target = server.bridge.prepare_target("rust", "rust").unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &uri,
+                host_language: "rust",
+                injection_language: "rust",
+                region_id: &region_id,
+                virtual_text: &region.virtual_content,
+                gaps: &[],
+            },
+            crate::lsp::bridge::PrepareAnswer::AsIs,
+            true,
+        );
+        assert!(
+            !server
+                .bridge
+                .prepare_region(&uri, "rust", &region_id)
+                .prepared
+        );
+
+        server
+            .forward_virtual_did_save_for_saved_version(&pool, &uri, incarnation, content_version)
+            .await;
+
+        assert_eq!(server.bridge.take_held_save(&uri), None);
     }
 
     #[tokio::test(start_paused = true)]

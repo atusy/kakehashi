@@ -624,6 +624,35 @@ impl super::BridgeCoordinator {
         held.region_ids.extend(region_ids);
     }
 
+    /// A save of `host_uri` at `(incarnation, content_version)` was
+    /// forwarded to these regions: they no longer miss an earlier save of
+    /// that same version, so the resync does not forward it to them again.
+    pub(crate) fn settle_held_save<'a>(
+        &self,
+        host_uri: &Url,
+        incarnation: u64,
+        content_version: u64,
+        region_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let Some(layer) = &self.prepare else {
+            return;
+        };
+        let settled = layer.held_saves.get_mut(host_uri).is_some_and(|mut held| {
+            if (held.incarnation, held.content_version) != (incarnation, content_version) {
+                return false;
+            }
+            for region_id in region_ids {
+                held.region_ids.remove(region_id);
+            }
+            held.region_ids.is_empty()
+        });
+        if settled {
+            layer
+                .held_saves
+                .remove_if(host_uri, |_, held| held.region_ids.is_empty());
+        }
+    }
+
     /// Take the save `host_uri`'s held regions missed, if any.
     pub(crate) fn take_held_save(&self, host_uri: &Url) -> Option<HeldSave> {
         self.prepare
@@ -1147,6 +1176,16 @@ mod tests {
         coordinator.hold_save(&host, 1, 2, ids(&["a"]));
         coordinator.hold_save(&host, 1, 3, ids(&["c"]));
         assert_eq!(coordinator.take_held_save(&host), Some(held(1, 3, &["c"])));
+
+        // A later save of the same version reaching some of them settles
+        // theirs; one of another version settles none.
+        coordinator.hold_save(&host, 1, 2, ids(&["a", "b"]));
+        coordinator.settle_held_save(&host, 1, 3, ["a", "b"]);
+        coordinator.settle_held_save(&host, 1, 2, ["a", "z"]);
+        assert_eq!(coordinator.take_held_save(&host), Some(held(1, 2, &["b"])));
+        coordinator.hold_save(&host, 1, 2, ids(&["b"]));
+        coordinator.settle_held_save(&host, 1, 2, ["b"]);
+        assert_eq!(coordinator.take_held_save(&host), None);
 
         coordinator.hold_save(&host, 1, 3, ids(&["c"]));
         coordinator.forget_prepared_host(&host);
