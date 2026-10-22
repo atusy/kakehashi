@@ -423,6 +423,12 @@ a hook per kind of change.
   a prepared text (right after its pair lost its peer).
 - A save made while a document's answer is pending reaches no server that
   has not started opening the document by the time the answer arrives.
+- A save one connection refuses, because a newer answer reached it first,
+  is owed for the region, not for that connection: the resync the newer
+  answer brings replays it to every server holding the region. A server
+  that already got the save before then gets a second didSave, after the
+  didChange to the newer text, so each didSave still describes the text
+  that server holds.
 - A whole-document request (folding ranges, document links, colors, code
   lenses) waits for each region's attempt in flight. A region still without
   an answer after that is left out of the reply, and nothing refreshes the
