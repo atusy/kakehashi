@@ -2295,7 +2295,7 @@ impl Kakehashi {
     /// gap: between the race's completion and the next request there is no
     /// subscriber; a cancel landing there is only forwarded downstream via the
     /// upstream-request registry.
-    async fn run_layer_race<R>(
+    pub(crate) async fn run_layer_race<R>(
         &self,
         race: impl Future<Output = tower_lsp_server::jsonrpc::Result<Option<R>>>,
     ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
