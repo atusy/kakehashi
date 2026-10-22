@@ -450,18 +450,28 @@ impl LatestText {
         }
     }
 
-    /// Whether recording `content` changes nothing but when it was recorded:
-    /// the same text from the same answer, or any text from an answer taken
-    /// before for the same input (an answer never moves backwards: see
-    /// `PreparedMap::taken_before`). One from a newer answer replaces it,
-    /// however alike in coordinates (the same text prepared again under a
-    /// new epoch): the cache must hand out the answer that stands, not one
-    /// revoked since.
+    /// Whether recording `content` keeps this text: the same text from the
+    /// same answer (recorded again, so only when it was recorded changes),
+    /// or any text from an answer taken before for the same input (which
+    /// changes nothing, not even that: see [`Self::is_older`]). One from a
+    /// newer answer replaces it, however alike in coordinates (the same text
+    /// prepared again under a new epoch): the cache must hand out the answer
+    /// that stands, not one revoked since.
     fn is(&self, content: SentText<'_>) -> bool {
         let held = self.as_sent();
         super::protocol::PreparedMap::taken_before(content.map, held.map)
             || (held.text == content.text
                 && super::protocol::PreparedMap::same_answer(held.map, content.map))
+    }
+
+    /// Whether `content` comes from an answer taken before this one's for
+    /// the same input (an answer never moves backwards: see
+    /// `PreparedMap::taken_before`). Recording it is not recording this
+    /// text again: a lazy open weighs when the cache was recorded against
+    /// when a request's input was taken, and a late older answer would make
+    /// this text look newer than a later input's.
+    fn is_older(&self, content: SentText<'_>) -> bool {
+        super::protocol::PreparedMap::taken_before(content.map, self.as_sent().map)
     }
 }
 
@@ -3171,6 +3181,7 @@ impl LanguageServerPool {
             Some(regions) => match regions.get(region_id).filter(|cached| cached.is(content)) {
                 Some(cached) => match cached.value() {
                     LatestText::Text(_) => return,
+                    held @ LatestText::Stamped(_) if held.is_older(content) => {}
                     LatestText::Stamped(cached) => cached
                         .recorded
                         .store(stamp(), std::sync::atomic::Ordering::Relaxed),
@@ -10332,6 +10343,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened_text(&mut rx), "x = 2");
+    }
+
+    /// Nor does the older answer make the newer one's text look recorded
+    /// since: a request on an answer for a later input, taken after the
+    /// newer text was recorded, opens with its own text, not the cache.
+    #[tokio::test]
+    async fn an_older_answer_leaves_when_the_cache_was_recorded() {
+        let pool = LanguageServerPool::preparing();
+        let host_uri = Url::parse("file:///test/lazy-open-older-stamp.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let key = ConnectionKey::for_server("lua");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        let older = answered_map(&pool, &host_uri, 1);
+        let newer = answered_map(&pool, &host_uri, 1);
+        let record = |text, map| {
+            pool.record_latest_virtual_content(
+                &host_uri,
+                1,
+                "lua",
+                TEST_ULID_LUA_0,
+                SentText {
+                    text,
+                    map: Some(map),
+                },
+            )
+        };
+        record("x = 2", &newer);
+        let later = answered_map(&pool, &host_uri, 2);
+        record("x = 1", &older);
+        let (mut sender, mut rx) = tokio::sync::mpsc::channel::<OutboundMessage>(4);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            SentText {
+                text: "x = 3",
+                map: Some(&later),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened_text(&mut rx), "x = 3");
     }
 
     /// A resolve's note of the text its connection held: unchanged until
