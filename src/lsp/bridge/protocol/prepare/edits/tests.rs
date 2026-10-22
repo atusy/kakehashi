@@ -843,6 +843,37 @@ fn a_line_created_where_the_indent_removed_differs_is_refused() {
 }
 
 #[test]
+fn blank_lines_created_where_the_indent_removed_differs_map() {
+    let virtual_text = "  a\n    b\n";
+    let map = prepare(
+        virtual_text,
+        json!([
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 4}}, "newText": ""}
+        ]),
+    );
+    // A blank line needs no indentation, and the existing line after it
+    // keeps its own.
+    for blank in [edit((1, 0), (1, 0), "\n"), edit((0, 1), (0, 1), "\n")] {
+        let inserted = map.map_one_with_extent(&blank).unwrap();
+        assert_eq!(
+            apply_to(virtual_text, &[inserted]),
+            "  a\n\n    b\n",
+            "{blank:?}"
+        );
+    }
+    // A created line of text still has no single right indentation.
+    for text in [
+        edit((1, 0), (1, 0), "x\n"),
+        edit((1, 0), (1, 0), "x\ny\n"),
+        edit((0, 1), (0, 1), "\nc"),
+        edit((1, 0), (1, 0), "\nx\n"),
+    ] {
+        assert_eq!(map.map_one_with_extent(&text), None, "{text:?}");
+    }
+}
+
+#[test]
 fn inserted_blank_lines_carry_no_indent() {
     let imports = "  import os\n  x = 1\n";
     let map = dedent_by_two(imports);

@@ -52,8 +52,8 @@ impl PreparedMap {
     /// `None` — refuse the set — when an edit is reversed, reaches a line
     /// past P's last, edits overlap in P or once mapped (or touch where
     /// either's text bears on the other), an edit reaches into a gap, a line
-    /// created in content has no single indentation to regain, or the host
-    /// text would not survive.
+    /// of text created in content has no single indentation to regain, or
+    /// the host text would not survive.
     ///
     /// The host's own text, gaps and edge lines, is always kept; but on a
     /// map with gaps the indentation lines regain is not yet exact in some
@@ -540,8 +540,10 @@ impl PreparedMap {
             FirstIndent::Exact(indent) | FirstIndent::Existing(indent) => indent,
             FirstIndent::Uniform => uniform()?,
         };
-        let line_indent = if breaks_line { uniform()? } else { "" };
-        let mut output = String::with_capacity(text.len() + first_indent.len() + line_indent.len());
+        // Only a new line starting with text needs the segment's indent: a
+        // blank one, or one joining the existing line, does not.
+        let mut line_indent = None;
+        let mut output = String::with_capacity(text.len() + first_indent.len());
         output.push_str(first_indent);
         // The text after the last line break joins the existing line the
         // edit ends before (when one follows): that line's own indent, not
@@ -566,7 +568,13 @@ impl PreparedMap {
                     output.push_str(joined)
                 }
                 // A new line starting with text (not another break).
-                (next, _, _) if begins_line(next.or(following)) => output.push_str(line_indent),
+                (next, _, _) if begins_line(next.or(following)) => {
+                    let indent = match line_indent {
+                        Some(indent) => indent,
+                        None => *line_indent.insert(uniform()?),
+                    };
+                    output.push_str(indent)
+                }
                 _ => {}
             }
         }

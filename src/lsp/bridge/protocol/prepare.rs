@@ -749,8 +749,8 @@ struct Run {
 struct SegmentIndent {
     virtual_range: Range<usize>,
     /// `Some(indent)` when every deletion in the segment removed the same
-    /// text (a dedent); `None` when they differ, so a new line has no single
-    /// right indentation. Indentation removed from whitespace-only lines
+    /// text (a dedent); `None` when they differ, so a new line of text has no
+    /// single right indentation (a blank one needs none). Indentation removed from whitespace-only lines
     /// counts only in a segment of whitespace alone (a blank line says
     /// nothing of the content's indent), and the document's deleted
     /// indentation-only last line (the closing indent) only there with no
