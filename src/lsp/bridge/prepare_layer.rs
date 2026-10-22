@@ -47,6 +47,10 @@ pub(crate) struct PrepareLayer {
     /// again (see `prepare_target`): where an epoch move can land.
     #[cfg(test)]
     target_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Run between a settings change's epoch move and its clearing of the
+    /// start failures: where an attempt from before the change can land.
+    #[cfg(test)]
+    settings_moving: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// A save that reached a host while some of its virtual documents were held
@@ -75,6 +79,8 @@ impl PrepareLayer {
             held_saves: DashMap::new(),
             #[cfg(test)]
             target_read: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            settings_moving: std::sync::Mutex::new(None),
         }
     }
 }
@@ -100,8 +106,22 @@ impl PrepareLayer {
         self.warned_strategy.clear();
         // After the settings are in: a target resolved under the epoch read
         // before this move asks nothing (see `BridgeCoordinator::prepare_target`).
-        pool.forget_prepare_start_failures(None);
         pool.advance_prepare_epoch();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .settings_moving
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            hook();
+        }
+        // After the move: an attempt from before it that takes its
+        // clearings after this is no longer admitted, so records nothing,
+        // and one that took them before is refused its record, or has it
+        // cleared here. A failure the new epoch's attempts passed over
+        // meanwhile is cleared too, moving the epoch again.
+        pool.forget_prepare_start_failures(None);
     }
 }
 
@@ -726,6 +746,55 @@ mod tests {
         }
         let target = coordinator.prepare_target("rust", "rust").unwrap();
         assert_eq!(target.epoch, pool.prepare_epoch());
+    }
+
+    /// A settings change leaves no start failure recorded under the old
+    /// settings: an attempt from before it, failing to start its candidate
+    /// as the change lands, records nothing the new settings' attempts
+    /// would pass the candidate over for.
+    #[test]
+    fn a_start_failure_under_the_old_settings_does_not_outlive_their_change() {
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let settings = |command: &str| {
+            let mut config = crate::lsp::bridge::test_helpers::devnull_config_for_language("rust");
+            config.cmd = Some(vec![command.to_string()]);
+            Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [("peer".to_string(), config)].into_iter().collect(),
+                ..Default::default()
+            })
+        };
+        coordinator.prepare_settings_changed(&settings("old"));
+        let host = Url::parse("file:///test/start.md").unwrap();
+        let old_epoch = pool.prepare_epoch();
+        {
+            let pool = Arc::clone(&pool);
+            let host = host.clone();
+            // An attempt under the old settings whose candidate failed to
+            // start, as `run` passes it over: its clearings read before it
+            // acquired, then recorded while it is still admitted.
+            *coordinator
+                .prepare
+                .as_ref()
+                .unwrap()
+                .settings_moving
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                let cleared = pool.prepare_start_failures_cleared("peer", &host);
+                if pool.prepare_epoch() == old_epoch {
+                    pool.record_prepare_start_failure("peer", &host, cleared);
+                }
+            }));
+        }
+        coordinator.prepare_settings_changed(&settings("new"));
+        assert!(
+            !pool.prepare_start_failed("peer", &host),
+            "the new settings' attempts would pass the candidate over"
+        );
     }
 
     #[test]
