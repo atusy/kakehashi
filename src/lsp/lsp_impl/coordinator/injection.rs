@@ -859,14 +859,10 @@ impl InjectionCoordinator {
                 .filter(|injection| held.region_ids.contains(&injection.region_id))
                 .cloned()
                 .collect();
-            // Owed still: the regions held again, and those sent now until
-            // their save is forwarded (see `forward_did_save`).
-            held.region_ids.retain(|region_id| {
-                still_held.contains(region_id)
-                    || sent
-                        .iter()
-                        .any(|injection| &injection.region_id == region_id)
-            });
+            // Owed still: the regions held again (and those sent now whose
+            // save is refused: see `forward_did_save`).
+            held.region_ids
+                .retain(|region_id| still_held.contains(region_id));
             if !held.region_ids.is_empty() {
                 self.bridge
                     .hold_save(uri, held.incarnation, held.content_version, held.region_ids);
@@ -875,7 +871,7 @@ impl InjectionCoordinator {
                 // After the didChange above, which sent their text. Fire and
                 // forget like any didSave forward: the debt is the save the
                 // held regions missed, not its delivery — but one refused for
-                // an answer superseded or revoked since stays owed.
+                // an answer superseded or revoked since is owed again.
                 self.bridge
                     .forward_did_save(uri, incarnation, content_version, &sent)
                     .await;
