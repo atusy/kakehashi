@@ -48,15 +48,6 @@ impl Kakehashi {
             if !self.host_incarnation_is_current(&uri, envelope.incarnation) {
                 return Ok(params);
             }
-            // An item minted from a prepared document never resolves (see
-            // `completion_geometry_matches`). It is refused here, before a
-            // connection, a parse wait or the edit lock, which a client
-            // resolving on every selection move would otherwise pay each
-            // time; the item goes back with its envelope kept, as every later
-            // refusal returns it.
-            if envelope.offset.prepared {
-                return Ok(params);
-            }
         }
         let unresolved = envelope.as_ref().map(|_| params.clone());
         let settings = self.settings_manager.load_settings();
@@ -175,9 +166,19 @@ impl Kakehashi {
 
 impl Kakehashi {
     /// The region a completion item resolves through, rebuilt from the live
-    /// parse; `None` once it may be prepared: its text as is describes
-    /// nothing a prepared region's servers hold (see
-    /// `resolve_region_offset`), and syncing it would replace their text.
+    /// parse; `None` unless its servers hold the kind of text the item was
+    /// minted from.
+    ///
+    /// - An item minted as is: `None` once the region may be prepared. Its
+    ///   text as is describes nothing a prepared region's servers hold (see
+    ///   `resolve_region_offset`), and syncing it would replace their text.
+    /// - An item minted from a prepared document: always. Nothing is synced
+    ///   for it (the pool sends its resolve only to a server holding the
+    ///   text prepared from the region's current one, see
+    ///   `LanguageServerPool::queue_if_holding_text_prepared_from`), and
+    ///   nothing its answer says of positions is read. What the lifecycle
+    ///   pass knows of the region is not asked: a request may have opened
+    ///   the document with its prepared text before the pass recorded it.
     fn completion_resolve_region(
         &self,
         host_url: &Url,
@@ -190,12 +191,13 @@ impl Kakehashi {
             host_url,
             &envelope.region_id,
         )?;
-        (!self.bridge.region_coordinates_may_be_prepared(
-            host_url,
-            &region.injection_language,
-            &envelope.region_id,
-        ))
-        .then_some(region)
+        let resolvable = envelope.offset.prepared
+            || !self.bridge.region_coordinates_may_be_prepared(
+                host_url,
+                &region.injection_language,
+                &envelope.region_id,
+            );
+        resolvable.then_some(region)
     }
 }
 
@@ -207,7 +209,6 @@ fn completion_geometry_matches(
 ) -> bool {
     let produced_at = RegionOffset::from(&envelope.offset);
     !envelope.region_id.is_empty()
-        && !envelope.offset.prepared
         && contiguous
         // The start identifies the region; the per-line columns below it
         // grow with the region and are read live for translation.
@@ -325,6 +326,12 @@ mod tests {
             true,
         );
         assert!(server.completion_resolve_region(&uri, &envelope).is_none());
+
+        // One minted from the prepared document is: nothing is synced for
+        // it, and the pool sends its resolve only to a server holding the
+        // prepared text.
+        envelope.offset.prepared = true;
+        assert!(server.completion_resolve_region(&uri, &envelope).is_some());
     }
 
     #[test]
@@ -339,6 +346,15 @@ mod tests {
             "lua"
         ));
         assert!(!completion_geometry_matches(&region, &offset, false, "lua"));
+        let mut prepared = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        prepared.offset.prepared = true;
+        assert!(
+            completion_geometry_matches(&prepared, &offset, true, "lua"),
+            "an item minted from a prepared document is held to the same region"
+        );
+        assert!(!completion_geometry_matches(
+            &prepared, &offset, false, "lua"
+        ));
         let moved = RegionOffset::with_per_line_offsets(4, vec![2]);
         assert!(
             !completion_geometry_matches(&region, &moved, true, "lua"),

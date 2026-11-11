@@ -2851,6 +2851,43 @@ impl LanguageServerPool {
                     .held)
     }
 
+    /// Queue a request to `connection_key` only while it holds the text a
+    /// peer prepared from `virtual_text`, the current text of
+    /// `virtual_uri`'s region (see `Presentation`): what a resolve of an
+    /// item minted from a prepared document is answered from, with nothing
+    /// sent to the document first. The text held is checked again as the
+    /// request is queued, under the lock every send records under (see
+    /// `DocumentTracker::queue_if_holding`). `None`, with nothing queued,
+    /// when the connection holds another text (the one prepared before an
+    /// edit, one as is, none), or the region's peer failed its input.
+    pub(in crate::lsp::bridge) fn queue_if_holding_text_prepared_from<R>(
+        &self,
+        host_uri: &Url,
+        virtual_uri: &VirtualDocumentUri,
+        connection_key: &ConnectionKey,
+        virtual_text: &str,
+        queue: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let uri = virtual_uri.to_uri_string();
+        let failed = self
+            .region_admission(host_uri, virtual_uri.language(), virtual_uri.region_id())
+            .failed;
+        let Presentation::Prepared(map) = self.document_tracker.presentation(
+            &uri,
+            connection_key,
+            Observed::Now,
+            RegionPrepare {
+                prepared: true,
+                failed,
+            },
+            virtual_text,
+        ) else {
+            return None;
+        };
+        self.document_tracker
+            .queue_if_holding(&uri, connection_key, Some(&map), failed, queue)
+    }
+
     async fn ensure_document_opened_with_content<S: message_sender::MessageSender>(
         &self,
         sender: &mut S,

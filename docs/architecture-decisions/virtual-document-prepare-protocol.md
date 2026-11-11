@@ -232,6 +232,11 @@ nor does a call or type hierarchy item minted from one answer its
 follow-ups (`callHierarchy/incomingCalls`, `outgoingCalls`,
 `typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
 not carried.
+A completion item's resolve is the exception for what holds no position: it
+is forwarded while the item's server holds the text prepared from the
+region's current one, the item going without its edits, and only the
+`documentation` and `detail` of the answer are taken. An edit the server
+adds on resolve (an auto-import) is not.
 
 ### Edits
 
@@ -494,6 +499,9 @@ latest the lifecycle pass recorded.
   syncs its document's text before resolving, under the host's edit lock
   so no newer text can be sent meanwhile, and only for an unprepared
   document: never over a prepared text or a document held for its peer.
+  An item minted from a prepared document resolves without a sync: its
+  request is queued only while its server holds the text prepared from the
+  region's current one, checked as any request's text is.
 - **A push follows the text its connection held when kakehashi read it.**
   The push is stamped as it is read, before it waits to be published.
   Where preparation is involved (by the rule above), it is placed through
@@ -641,7 +649,7 @@ a hook per kind of change.
   presentations (code actions, rename, formatting and the others listed in
   Coordinates) and inbound `workspace/applyEdit` are not available on
   prepared documents; completion items there are snippets only as literal
-  text, and are not resolved.
+  text, and resolve only their `documentation` and `detail`.
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
@@ -651,7 +659,9 @@ a hook per kind of change.
   makes a document prepared; restricting it takes `priorities = []` where
   it should not apply.
 - `*/resolve` for items from prepared documents is refused (stale), as are
-  call and type hierarchy follow-ups for their items.
+  call and type hierarchy follow-ups for their items. A completion item
+  resolves its `documentation` and `detail` only: edits its server defers
+  to resolve, as the editor's `resolveSupport` lets it, are lost.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
 - An interpolation with nothing injected before it on its host line takes
