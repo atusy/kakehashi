@@ -2796,6 +2796,67 @@ mod tests {
         );
     }
 
+    /// An answer is current, at once, while the host is still the revision
+    /// its request read and its map is unrevoked, whatever the lifecycle
+    /// pass is doing with the region meanwhile: its edits were mapped
+    /// through the request's own map for the request's own text, which the
+    /// host still is.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_is_current_while_the_host_is_the_revision_its_request_read() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let prepare = |text: &str| {
+            let answer = serde_json::from_value(serde_json::json!({"segments": [{
+                "type": "content", "changes": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
+                    "newText": ""
+                }]
+            }]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let prepared = prepare("  red\n");
+        for case in ["unsettled", "held", "re-prepared", "untracked"] {
+            let pool = crate::lsp::bridge::LanguageServerPool::preparing();
+            pool.prepare_failures_for_test();
+            let host = url::Url::parse("file:///test/stamp.md").unwrap();
+            let tracker = crate::language::NodeTracker::new();
+            tracker.open_incarnation(&host, 1);
+            let region = tracker
+                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
+                .unwrap()
+                .to_string();
+            pool.open_host_incarnation(&host, 1).await;
+            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
+            let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
+            let untracked = crate::language::NodeTracker::new();
+            let tracker = match case {
+                // The edit the request read, its pass still running.
+                "unsettled" => {
+                    pool.note_host_edited(&host, 1, 1);
+                    &tracker
+                }
+                // Asked again under a new epoch, the answer pending.
+                "held" => {
+                    pool.hold_latest_virtual_content(&host, 1, "lua", &region);
+                    &tracker
+                }
+                // Answered anew in other coordinates, the host unedited.
+                "re-prepared" => {
+                    let other = prepare("  blue\n");
+                    pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &other);
+                    &tracker
+                }
+                // The region minted anew by a reparse of the same text.
+                _ => &untracked,
+            };
+            let start = tokio::time::Instant::now();
+            let verdict =
+                sources_verdict(&pool, tracker, || Some(1), std::iter::once(&source)).await;
+            assert_eq!(verdict, Verdict::Current, "{case}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{case}");
+        }
+    }
+
     /// Read at once, an answer may still be kept while current or settling
     /// (it would be waited on), and may not once moved or stale.
     #[tokio::test]
