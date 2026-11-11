@@ -2884,6 +2884,65 @@ mod tests {
         ));
     }
 
+    /// A server that publishes only what changed sends nothing after an
+    /// edit its diagnostics stay the same through: the push it sent before
+    /// is all there will be. It keeps placing, through the map of the text
+    /// it was read under, however many texts are sent since, until a push
+    /// read under a newer text takes its place.
+    #[test]
+    fn a_push_outlives_the_prepared_text_it_was_read_under() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let prepared = RegionPrepare {
+            prepared: true,
+            failed: false,
+        };
+        let send = |text: &str, version| {
+            let map = prepared_text(text);
+            tracker.record_sent_for_test(
+                &virtual_uri,
+                &conn,
+                SentText {
+                    text,
+                    map: Some(&map),
+                },
+                version,
+            );
+            map
+        };
+        let placed_through = |observed, virtual_text: &str, map: &Arc<PreparedMap>| match tracker
+            .presentation(&uri, &conn, observed, prepared, virtual_text)
+        {
+            Presentation::Prepared(placed) => Arc::ptr_eq(&placed, map),
+            _ => false,
+        };
+
+        let first = send("a\nb", 1);
+        let pushed = tracker.observe(&uri, &conn, 0, Some(1));
+        assert!(placed_through(pushed, "a\nb", &first));
+        // The region was edited, and its answer is still awaited.
+        assert!(placed_through(pushed, "a\nc", &first));
+        // The new text is sent, then another.
+        send("a\nc", 2);
+        assert!(placed_through(pushed, "a\nc", &first));
+        let third = send("a\nd", 3);
+        assert!(placed_through(pushed, "a\nd", &first));
+
+        // A push read under the newest text places through that one, and
+        // the texts after it keep it instead.
+        let newer = tracker.observe(&uri, &conn, 0, Some(3));
+        assert!(placed_through(newer, "a\nd", &third));
+        send("a\ne", 4);
+        assert!(placed_through(newer, "a\ne", &third));
+        assert!(matches!(
+            tracker.presentation(&uri, &conn, pushed, prepared, "a\ne"),
+            Presentation::Unavailable
+        ));
+    }
+
     #[test]
     fn coordinates_from_a_prepared_text_place_nowhere_once_it_is_replaced() {
         let tracker = DocumentTracker::new();

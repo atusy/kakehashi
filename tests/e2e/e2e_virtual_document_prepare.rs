@@ -690,6 +690,132 @@ fn a_pushed_diagnostic_places_through_the_text_its_server_held() {
     );
 }
 
+/// The `echo-document` diagnostics of the last publish for `uri` among
+/// those arriving within `window`; `None` when none arrives.
+fn last_published_echo_diagnostics(
+    client: &mut LspClient,
+    uri: &str,
+    window: Duration,
+) -> Option<Vec<Value>> {
+    let deadline = Instant::now() + window;
+    let mut last = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(params) =
+            client.wait_for_notification("textDocument/publishDiagnostics", remaining)
+        else {
+            return last;
+        };
+        if params["uri"] == uri {
+            last = Some(
+                params["diagnostics"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|d| d["source"] == "echo-document")
+                    .cloned()
+                    .collect(),
+            );
+        }
+    }
+}
+
+/// A server that publishes only when its diagnostics change stays silent
+/// after an edit that leaves them as they were: one elsewhere in the region
+/// (`edited`, which the server is sent), or one above it (which it is not).
+/// The diagnostic it pushed before must stay on screen, on `line` now, as it
+/// does for a region sent as is: nothing will ever publish it again.
+fn a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(
+    prepared: bool,
+    edited: &str,
+    line: u32,
+) {
+    let (mut client, dir) = Setup {
+        echo: "echo-document-push-changes",
+        prepare_priorities: if prepared { json!(["peer"]) } else { json!([]) },
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/push-silent.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  local y = 2\n```\n";
+    open(&mut client, uri, text);
+    // The peer dedents the line the diagnostic spans and carries.
+    let (message, start) = if prepared {
+        ("local x = 1", 2)
+    } else {
+        ("  local x = 1", 0)
+    };
+    let range = |line: u32| {
+        json!({
+            "start": { "line": line, "character": start },
+            "end": { "line": line, "character": 13 }
+        })
+    };
+    let diagnostic = wait_for_echo_diagnostic(&mut client, uri, message);
+    assert_eq!(diagnostic["range"], range(3));
+
+    change(&mut client, uri, 2, edited);
+    let mut published = None;
+    if edited.contains("local y = 2") {
+        // The region only moved: no server is sent anything.
+    } else {
+        // Both mocks (the peer is bridged for lua too) log the change they
+        // are sent; the echo mock finds its first-line diagnostic unchanged
+        // and publishes nothing.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let wire_log = dir.path().join("wire.log");
+        while std::fs::read_to_string(&wire_log)
+            .expect("wire log")
+            .matches("textDocument/didChange\t")
+            .count()
+            < 2
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the edit never reached the mocks"
+            );
+            published =
+                last_published_echo_diagnostics(&mut client, uri, Duration::from_millis(50))
+                    .or(published);
+        }
+    }
+    // Past the publish debounce: whatever the edit publishes is in by now.
+    published =
+        last_published_echo_diagnostics(&mut client, uri, Duration::from_secs(2)).or(published);
+    let published = published.unwrap_or_else(|| {
+        // Nothing published keeps what the editor already shows, which is
+        // right only where the diagnostic did not move.
+        assert_eq!(line, 3, "the moved diagnostic was not published again");
+        vec![diagnostic.clone()]
+    });
+    assert_eq!(
+        published
+            .iter()
+            .map(|diagnostic| (&diagnostic["message"], &diagnostic["range"]))
+            .collect::<Vec<_>>(),
+        vec![(&json!(message), &range(line))],
+    );
+}
+
+const EDITED_INSIDE: &str = "# t\n\n```lua\n  local x = 1\n  local y = 3\n```\n";
+const EDITED_ABOVE: &str = "# t\n\nmore\n\n```lua\n  local x = 1\n  local y = 2\n```\n";
+
+#[test]
+fn a_pushed_diagnostic_outlives_an_edit_inside_its_region_sent_as_is() {
+    a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(false, EDITED_INSIDE, 3);
+}
+
+#[test]
+fn a_pushed_diagnostic_outlives_an_edit_inside_its_prepared_region() {
+    a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(true, EDITED_INSIDE, 3);
+}
+
+#[test]
+fn a_pushed_diagnostic_follows_its_prepared_region_below_an_edit() {
+    a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(true, EDITED_ABOVE, 5);
+}
+
 fn pull_capabilities() -> Value {
     json!({
         "textDocument": { "diagnostic": { "dynamicRegistration": false } },

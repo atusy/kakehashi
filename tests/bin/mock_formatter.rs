@@ -32,6 +32,10 @@
 //!   with save: hover and the save hooks as `echo-document`, and instead of
 //!   pull diagnostics it pushes the first-line diagnostic on every
 //!   didOpen/didChange.
+//! - `echo-document-push-changes` — as `echo-document-push`, but its
+//!   diagnostic carries the first line only, and it publishes only when the
+//!   set differs from the one it last published for the document: a server
+//!   that stays silent after an edit its diagnostics do not change with.
 //! - `prepare-peer` — advertises
 //!   `experimental.kakehashi.virtualDocumentPrepare` and answers
 //!   `kakehashi/virtualDocument/prepare`: content dedented by its common
@@ -254,6 +258,9 @@ fn main() {
     let stdout = std::io::stdout();
     let mut writer = stdout.lock();
     let mut documents: HashMap<String, String> = HashMap::new();
+    // `echo-document-push-changes`: the diagnostics last published per
+    // document.
+    let mut last_pushed: HashMap<String, Value> = HashMap::new();
     // `workspace-folders` mode: every folder URI this server has been told
     // about, via `initialize` params and `workspace/didChangeWorkspaceFolders`.
     let mut workspace_folders: Vec<String> = Vec::new();
@@ -349,7 +356,7 @@ fn main() {
                         "textDocumentSync": { "openClose": true, "change": 1 },
                         "experimental": { "kakehashi": { "virtualDocumentPrepare": true } },
                     }),
-                    "echo-document-push" => json!({
+                    "echo-document-push" | "echo-document-push-changes" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": { "openClose": true, "change": 1, "save": true },
                     }),
@@ -705,6 +712,14 @@ fn main() {
                             echo_document_diagnostics(uri, text),
                         );
                     }
+                    if mode == "echo-document-push-changes" {
+                        let first_line = text.lines().next().unwrap_or("");
+                        let diagnostics = echo_document_diagnostics(uri, first_line);
+                        if last_pushed.get(uri) != Some(&diagnostics) {
+                            last_pushed.insert(uri.to_string(), diagnostics.clone());
+                            notify(&mut writer, "textDocument/publishDiagnostics", diagnostics);
+                        }
+                    }
                     // The `-reopen-delayed-` resolvers answer their parked
                     // reply on the reopened lifetime's own `didOpen`: the
                     // upstream has processed the close and the reopen by the
@@ -821,6 +836,14 @@ fn main() {
                             echo_document_diagnostics(uri, text),
                         );
                     }
+                    if mode == "echo-document-push-changes" {
+                        let first_line = text.lines().next().unwrap_or("");
+                        let diagnostics = echo_document_diagnostics(uri, first_line);
+                        if last_pushed.get(uri) != Some(&diagnostics) {
+                            last_pushed.insert(uri.to_string(), diagnostics.clone());
+                            notify(&mut writer, "textDocument/publishDiagnostics", diagnostics);
+                        }
+                    }
                     // `diagnostics-push`: a follow-up push with an EMPTY list clears
                     // this source's contribution (#427).
                     if mode == "diagnostics-push" {
@@ -936,7 +959,10 @@ fn main() {
                     .as_deref()
                     .and_then(|uri| documents.get(uri))
                     .cloned();
-                if mode == "echo-document" || mode == "echo-document-push" {
+                if matches!(
+                    mode.as_str(),
+                    "echo-document" | "echo-document-push" | "echo-document-push-changes"
+                ) {
                     // Announce the save with the text this server holds.
                     notify(
                         &mut writer,
@@ -1048,14 +1074,17 @@ fn main() {
                         }),
                     );
                 }
-                let echoed =
-                    matches!(mode.as_str(), "echo-document" | "echo-document-push").then(|| {
-                        message
-                            .pointer("/params/textDocument/uri")
-                            .and_then(Value::as_str)
-                            .and_then(|uri| documents.get(uri))
-                            .cloned()
-                    });
+                let echoed = matches!(
+                    mode.as_str(),
+                    "echo-document" | "echo-document-push" | "echo-document-push-changes"
+                )
+                .then(|| {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .cloned()
+                });
                 let result = if let Some(text) = echoed {
                     // The text this server holds, and the hovered line's
                     // extent in ITS coordinates: a test can then prove both
