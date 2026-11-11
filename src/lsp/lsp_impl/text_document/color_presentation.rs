@@ -4,6 +4,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Color, ColorPresentation, ColorPresentationParams, Range, Uri};
 
 use super::super::Kakehashi;
+use crate::error::LockResultExt;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
@@ -298,7 +299,7 @@ impl PassedOver {
             let mut kept = self
                 .kept
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .recover_poison("PassedOver::answers (color presentation answer kept aside)");
             if kept.is_none() {
                 *kept = Some(answer.clone());
                 // A permit stored: the wait never misses it.
@@ -363,7 +364,7 @@ impl PassedOver {
     fn has_kept(&self) -> bool {
         self.kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("PassedOver::has_kept (color presentation answer kept aside)")
             .is_some()
     }
 
@@ -380,7 +381,7 @@ impl PassedOver {
         let kept = self
             .kept
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("PassedOver::settled (color presentation answer kept aside)")
             .clone();
         match kept {
             Some(kept) => {
@@ -770,5 +771,21 @@ mod tests {
             ),
             ["host"]
         );
+    }
+
+    /// A panic while the answer kept aside was held poisons its lock; the
+    /// race still reads it (recovered with a `kakehashi::lock_recovery`
+    /// warning) instead of panicking in turn.
+    #[test]
+    fn a_poisoned_kept_answer_is_still_read() {
+        let passed_over = std::sync::Arc::new(PassedOver::default());
+        let poisoner = std::sync::Arc::clone(&passed_over);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.kept.lock().unwrap();
+            panic!("poison the kept answer");
+        })
+        .join();
+        assert!(passed_over.kept.is_poisoned());
+        assert!(!passed_over.has_kept());
     }
 }
