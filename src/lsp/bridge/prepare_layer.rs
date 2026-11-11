@@ -16,6 +16,8 @@ use super::prepare_registry::{
     PrepareInput, PrepareLookup, PrepareMiss, PrepareRegistry, Resync, ResyncCause,
 };
 use crate::config::WorkspaceSettings;
+#[cfg(test)]
+use crate::error::LockResultExt;
 use crate::text::terminal::escape_terminal_controls;
 
 /// A pair's candidates, `None` for a pair with none.
@@ -111,7 +113,7 @@ impl PrepareLayer {
         if let Some(hook) = self
             .settings_moving
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("PrepareLayer::settings_changed")
             .take()
         {
             hook();
@@ -150,7 +152,7 @@ impl super::BridgeCoordinator {
             if let Some(hook) = layer
                 .target_read
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recover_poison("BridgeCoordinator::prepare_target")
                 .take()
             {
                 hook();

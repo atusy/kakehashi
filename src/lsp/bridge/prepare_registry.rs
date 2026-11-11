@@ -51,6 +51,7 @@ use super::protocol::{
     PrepareHostTextDocument, PrepareParams, PrepareTextDocument, PreparedDocument,
     VirtualDocumentUri, VirtualLayout, apply_prepare_result_at,
 };
+use crate::error::LockResultExt;
 use crate::language::injection::VirtualGap;
 use crate::lsp::bridge::pool::RegionPrepare;
 use crate::text::terminal::escape_terminal_controls;
@@ -256,7 +257,7 @@ impl Cell {
     fn backing_off(&self) -> bool {
         self.retry_at
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("prepare_registry::Cell::backing_off")
             .is_some_and(|retry_at| Instant::now() < retry_at)
     }
 }
@@ -745,7 +746,7 @@ impl PrepareRegistry {
     pub(crate) fn take_resync_rx(&self) -> Option<UnboundedReceiver<Resync>> {
         self.resync_rx
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("PrepareRegistry::take_resync_rx")
             .take()
     }
 
@@ -865,7 +866,7 @@ impl PrepareRegistry {
         let cached = *self
             .prepared_scan
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison("PrepareRegistry::any_region_prepared");
         if let Some((scanned_epoch, scanned_changes, prepared)) = cached
             && (scanned_epoch, scanned_changes) == (epoch, changes)
         {
@@ -881,7 +882,8 @@ impl PrepareRegistry {
         *self
             .prepared_scan
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((epoch, changes, prepared));
+            .recover_poison("PrepareRegistry::any_region_prepared") =
+            Some((epoch, changes, prepared));
         prepared
     }
 
@@ -1070,7 +1072,7 @@ impl PrepareRegistry {
         if let Some(hook) = self
             .slot_checked
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("PrepareRegistry::slot")
             .take()
         {
             hook();
@@ -1222,7 +1224,7 @@ impl PrepareRegistry {
                 #[cfg(test)]
                 cell.versions
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recover_poison("PrepareRegistry::start")
                     .push(version);
                 version
             };
@@ -1268,8 +1270,7 @@ impl PrepareRegistry {
                     *cell
                         .retry_at
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(Instant::now() + delay);
+                        .recover_poison("PrepareRegistry::start") = Some(Instant::now() + delay);
                     // Nothing else would look the document up again before
                     // the next edit: sync the host once the backoff ends,
                     // unless newer text (or a newer epoch) has taken over by
@@ -1629,6 +1630,34 @@ mod tests {
     use super::*;
     use crate::config::settings::BridgeServerConfig;
     use crate::lsp::bridge::pool::ConnectionKey;
+
+    /// A panic while one of the registry's locks was held does not take
+    /// every later reader down with it: the lock is recovered (with a
+    /// warning), and what it guards is read and written as before.
+    #[test]
+    fn a_poisoned_lock_is_recovered() {
+        fn poison<T: Send>(lock: &std::sync::Mutex<T>) {
+            std::thread::scope(|scope| {
+                let _ = scope
+                    .spawn(|| {
+                        let _guard = lock.lock().unwrap();
+                        panic!("intentional panic to poison the lock");
+                    })
+                    .join();
+            });
+            assert!(lock.is_poisoned());
+        }
+
+        let cell = Cell::new(0, 0);
+        poison(&cell.retry_at);
+        assert!(!cell.backing_off());
+
+        let registry = PrepareRegistry::default();
+        poison(&registry.prepared_scan);
+        assert!(!registry.any_region_prepared(0));
+        poison(&registry.resync_rx);
+        assert!(registry.take_resync_rx().is_some());
+    }
 
     /// A host closed while one of its regions is looked up keeps nothing:
     /// the close's sweep may run before the region goes in, and the lookup
