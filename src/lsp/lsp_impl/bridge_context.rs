@@ -746,6 +746,15 @@ impl<T: Clone> StaleAnswerFallback<T> {
         false
     }
 
+    /// Whether the race passed an answer over: what it then chose, if
+    /// anything, stands in for that one.
+    pub(crate) fn passed_over(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
     /// The race's `result`, or, when it found no answer (nothing, or only
     /// a layer's error, which the answer passed over would have
     /// outranked), the answer kept aside. A cancel stays a cancel.

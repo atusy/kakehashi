@@ -27,7 +27,11 @@ impl Kakehashi {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token);
+        // Before any layer reads the host's text: the text the virt
+        // layer's answer is made on (see `Sourced::from_region`), and the
+        // one another layer's must still be for to stand in for it (below).
+        let revision = self.prepared_request_revision(&lsp_uri);
+        let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token, revision);
         let native = async {
             let edit = self
                 .native_bindings_answer(&lsp_uri, position, |ctx| {
@@ -65,6 +69,7 @@ impl Kakehashi {
                 },
             )
             .await;
+        let stands_in = passed_over.passed_over();
         let answer = passed_over.or_kept(answer)?;
         // The final answer chosen: its edits checked once more against the
         // host text, which may have moved while it was held. A rename comes
@@ -77,6 +82,28 @@ impl Kakehashi {
         let Some(sourced) = answer else {
             return Ok(None);
         };
+        // Another layer's rename chosen where a prepared one was passed
+        // over stands in for it only while the host is still the text the
+        // request read (neither edited nor closed and reopened), as a
+        // formatting answer's stand-in does: read for the text the host
+        // moved from, its edits are as misplaced as the ones passed over.
+        // The final check below would not tell: it judges only an answer
+        // mapped through a prepared document.
+        if stands_in
+            && !sourced.is_prepared()
+            && !(revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision)
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "rename result for {} dropped: the host text moved since the request read it",
+                lsp_uri.as_str()
+            );
+            let mut error = crate::error::content_modified_error();
+            error.message =
+                "kakehashi: rename result dropped: the host text moved since the request read it"
+                    .into();
+            return Err(error);
+        }
         match self
             .settled_answer(&lsp_uri, sourced, "rename", log::Level::Warn)
             .await
@@ -97,9 +124,8 @@ impl Kakehashi {
         position: Position,
         new_name: &str,
         client_progress_token: Option<NumberOrString>,
+        revision: Option<crate::lsp::bridge::HostRevision>,
     ) -> Result<Option<Sourced<WorkspaceEdit>>> {
-        // Before the text is read: see `Sourced::from_region`.
-        let revision = self.prepared_request_revision(lsp_uri);
         let Some(mut ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await

@@ -1163,6 +1163,48 @@ fn a_rename_the_host_moved_under_is_not_answered_by_the_host_layer() {
 }
 
 #[test]
+fn a_host_layer_rename_no_prepared_answer_was_passed_over_for_still_answers() {
+    // Outside the region only the host layer renames: nothing prepared
+    // was passed over for its answer, which is returned as on any
+    // document, the host edited while the request was out or not.
+    let (mut client, dir) = Setup {
+        rename_after_release: true,
+        host_echo: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/rename-host-only.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 0, "character": 2 },
+        "newName": "y"
+    });
+    let id = client.send_request_async("textDocument/rename", request);
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/rename\t"))
+    {
+        assert!(Instant::now() < until, "rename request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("{text}\nmore\n"));
+    hover(&mut client, uri, 3, 4);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(
+        response["result"]["changes"][uri][0]["newText"], "renamed",
+        "{response}"
+    );
+}
+
+#[test]
 fn a_rename_its_map_refuses_is_answered_as_an_error() {
     // The echo mock answers an edit past the document's end, which the
     // map refuses, and no other server or layer renames: the editor is

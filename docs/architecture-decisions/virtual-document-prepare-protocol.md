@@ -554,7 +554,11 @@ until asked again), and prepareRename and linked editing ranges answer
 nothing. Under a cross-layer `preferred`, a rename's,
 prepareRename's or linked editing ranges' virt answer already moved or
 stale as the race decides is likewise no answer of its layer: the host
-layer's wins. Code actions, prepareRename and linked editing ranges
+layer's wins. A rename's does so only while the host is still the text
+the request read (neither edited nor closed and reopened), as a
+formatting answer's stand-in does (below): read for the text the host
+moved from, its edits would be as misplaced as the ones passed over, and
+the rename is answered `ContentModified`. Code actions, prepareRename and linked editing ranges
 wait, as formatting does (below), while the host's last edit settles or a
 region's hold clears: an editor may ask them once right after an edit
 elsewhere (Neovim asks code actions once per keypress), and an answer
