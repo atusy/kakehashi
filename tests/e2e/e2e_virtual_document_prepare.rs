@@ -775,8 +775,9 @@ fn formatting_params(method: &str, uri: &str) -> Value {
 
 /// A formatting answer mapped through a prepared document is checked once
 /// more as the final answer is chosen: while the host layer still ran, the
-/// host was edited, and the whole answer is dropped, without an error.
-/// Without the edit, the same request answers with the virt edits.
+/// host was edited, and the whole answer is dropped. The request then
+/// answers `ContentModified`, not `null`, which would read as nothing to
+/// format. Without the edit, the same request answers with the virt edits.
 #[test]
 fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
     let text = "# t\n\n```lua\n  local x = 1; local y = 2\n```\n";
@@ -840,14 +841,17 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
         hover(&mut client, uri, 0, 0);
         std::fs::write(dir.path().join("release"), "").expect("release the host layer");
         let response = client.receive_response_for_id_public(id);
-        assert!(
-            response.get("error").is_none(),
-            "{strategy} {method}: {response}"
+        // Dropped whole: neither some layer's edits nor an empty list, and
+        // not `null` either, which the client could not tell from a
+        // document already formatted.
+        assert_eq!(
+            response["error"]["code"], -32801,
+            "{strategy} {method}, edited: {response}"
         );
-        // Dropped whole: no answer at all, not an empty list some layer
-        // gave.
         assert!(
-            response["result"].is_null(),
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("moved")),
             "{strategy} {method}, edited: {response}"
         );
     }
