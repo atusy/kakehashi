@@ -1641,7 +1641,7 @@ fn push_stripped_gap(output: &str, gaps: &mut GapLog, host_text: &str) {
 
 /// [`build_combined_virtual_content_recording`], recording the gaps.
 #[cfg(test)]
-fn build_combined_virtual_content(
+pub(crate) fn build_combined_virtual_content(
     text: &str,
     span: Range<usize>,
     included: &[Range<usize>],

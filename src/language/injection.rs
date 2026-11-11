@@ -24,6 +24,10 @@ pub(crate) use content::{
 };
 #[cfg(test)]
 pub(crate) use discovery::assert_discovery_matches_reference;
+// Exposed for the prepare protocol's tests, which check what a peer reads
+// off a request against the document discovery builds.
+#[cfg(test)]
+pub(crate) use discovery::build_combined_virtual_content;
 pub(crate) use discovery::{
     CacheableInjectionRegion, InjectionRegionInfo, InjectionResolver, REGION_IDENTITY_LAYER_BASE,
     RegionBoundary, ResolvedInjection, VirtualGap, collect_all_injections,

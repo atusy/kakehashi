@@ -1787,6 +1787,125 @@ mod tests {
         );
     }
 
+    /// What a gap's host text stands as in the virtual document, read off
+    /// the request alone, as the protocol document tells a peer to: spaces
+    /// for the text up to its first line break (one per UTF-16 code unit)
+    /// when the gap continues a line of content, nothing for it when the gap
+    /// opens a line, then its line breaks, and nothing for the text after
+    /// one.
+    fn stands_for(host_text: &str, continues_a_line: bool) -> String {
+        let first_break = host_text.find(['\n', '\r']).unwrap_or(host_text.len());
+        let mut virtual_text = String::new();
+        if continues_a_line {
+            for character in host_text[..first_break].chars() {
+                virtual_text.extend(std::iter::repeat_n(' ', character.len_utf16()));
+            }
+        }
+        virtual_text.extend(
+            host_text[first_break..]
+                .chars()
+                .filter(|character| matches!(character, '\n' | '\r')),
+        );
+        virtual_text
+    }
+
+    /// The virtual document as a peer spells it from a request's segments.
+    fn spelled(segments: &[Segment]) -> Vec<String> {
+        let mut texts: Vec<String> = Vec::with_capacity(segments.len());
+        for (index, segment) in segments.iter().enumerate() {
+            let text = match segment.kind {
+                SegmentKind::Content => segment.text.clone(),
+                SegmentKind::Gap => {
+                    let continues_a_line = index > 0
+                        && segments[index - 1].kind == SegmentKind::Content
+                        && !segments[index - 1].text.ends_with(['\n', '\r']);
+                    stands_for(&segment.text, continues_a_line)
+                }
+            };
+            texts.push(text);
+        }
+        texts
+    }
+
+    /// A peer never sees the virtual document, only the segments, and the
+    /// answer it may give is checked against the virtual document's lines:
+    /// where content starts a line, where a line is blank. So the segments
+    /// must spell the document by a rule a peer can apply -- the one the
+    /// protocol document states (see `stands_for`). Checked for every host
+    /// text over a small alphabet (line breaks of each kind, a character two
+    /// UTF-16 code units wide), every choice of injected characters, and a
+    /// span either the whole text or from the first injected character to the
+    /// last.
+    ///
+    /// One document is spelled apart: a span cut between a CR and its LF
+    /// shows that CR, its last character, as a space (no line ends there).
+    /// It stands in a gap ending the document, with nothing after it for a
+    /// rule to be read against.
+    #[test]
+    fn the_segments_spell_the_virtual_document() {
+        use crate::language::injection::build_combined_virtual_content;
+        let alphabet = ['a', ' ', '\n', '\r', '\u{1D4D0}'];
+        let mut checked = 0;
+        let mut cut_crs = 0;
+        for length in 0..=5u32 {
+            for code in 0..alphabet.len().pow(length) {
+                let characters: Vec<char> = (0..length)
+                    .map(|place| alphabet[code / alphabet.len().pow(place) % alphabet.len()])
+                    .collect();
+                let text: String = characters.iter().collect();
+                let starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+                for injected in 0..1u32 << length {
+                    // Runs of injected characters, as byte ranges.
+                    let mut included: Vec<Range<usize>> = Vec::new();
+                    for (place, (&start, character)) in starts.iter().zip(&characters).enumerate() {
+                        if injected >> place & 1 == 0 {
+                            continue;
+                        }
+                        let end = start + character.len_utf8();
+                        match included.last_mut() {
+                            Some(last) if last.end == start => last.end = end,
+                            _ => included.push(start..end),
+                        }
+                    }
+                    let injected_span = included
+                        .first()
+                        .zip(included.last())
+                        .map(|(first, last)| first.start..last.end);
+                    for span in std::iter::once(0..text.len()).chain(injected_span) {
+                        let (virtual_text, _, gaps) =
+                            build_combined_virtual_content(&text, span.clone(), &included);
+                        let layout = VirtualLayout::from_gaps(&virtual_text, &gaps);
+                        let spelled = spelled(layout.segments());
+                        let actual: Vec<&str> = layout
+                            .segments()
+                            .iter()
+                            .map(|segment| &virtual_text[segment.virtual_range.clone()])
+                            .collect();
+                        checked += 1;
+                        if spelled == actual {
+                            continue;
+                        }
+                        let cut_cr = text[span.end..].starts_with('\n')
+                            && layout
+                                .segments()
+                                .last()
+                                .is_some_and(|last| last.kind == SegmentKind::Gap)
+                            && spelled[..spelled.len() - 1] == actual[..actual.len() - 1]
+                            && spelled.last().and_then(|last| last.strip_suffix('\r'))
+                                == actual.last().and_then(|last| last.strip_suffix(' '));
+                        assert!(
+                            cut_cr,
+                            "{text:?} injecting {included:?} over {span:?}: spelled {spelled:?}, the virtual document holds {actual:?}"
+                        );
+                        cut_crs += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
+        assert!(cut_crs > 0);
+    }
+
     #[test]
     fn error_responses_are_final_unless_retryable() {
         let kind = |code: i64| {
