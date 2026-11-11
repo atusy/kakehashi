@@ -483,8 +483,9 @@ lazy action from a prepared document is resolved through the map its
 server holds when it is picked, only while it holds the very text the
 action was listed on: its envelope records that text's generation (not the
 map); the reply must be computed on that text (noted, with the map, as the
-resolve is queued, and unchanged as it answers), and the final check below
-must hold for the region. Otherwise the action comes back unresolved. For
+resolve is queued, and unchanged as it answers), the host still the
+revision the action was listed on, and the map not revoked since.
+Otherwise the action comes back unresolved. For
 an editor that cannot resolve actions, they are resolved within the list
 request, through its map, the same way. An action whose edit the map
 refuses comes back disabled, for an editor that shows disabled actions
@@ -499,121 +500,86 @@ versioned edit naming another version than the one its connection was
 sent. Decided at once, never waited on: refused, the server is answered
 `applied: false` with the reason, and the editor is never asked.
 
-An answer's edits are mapped only while they would land where the server
-meant them. This is read where an answer is chosen, not as each reply
+An answer's edits are kept only while they land where the server meant
+them. A reply is mapped through its request's own map, for its request's
+own text, into host coordinates of that text, whatever happened since. So
+its edits land where they were mapped exactly while the host is still the
+revision the request read, and one rule judges every answer mapped
+through a prepared document:
+
+- **current**: the host's lifetime and content version are the ones read
+  before the request's text was, and the map is not revoked — kept;
+- **moved**: the host was edited since (anywhere: an edit above the region
+  moves the host coordinates its edits were translated to, though the
+  region's text and map stay the same), closed, or reopened — dropped;
+- **stale**: the host unmoved, the peer failed the request's input since
+  (see Failure; a reply arriving after that is refused whole, and one the
+  failure lands under keeps no edit) — dropped.
+
+Nothing else is read, and nothing is waited for. What the lifecycle pass
+does with the region meanwhile changes neither the host text nor the text
+the answer was made on: the edit the request read not synced to the
+servers yet, the region asked again under a new epoch, answered in other
+coordinates or sent as is, a hold for a pending answer, the region minted
+anew by a reparse. The revision is read before the request's text, so it
+is never newer than the text answered: equal to the host's when the answer
+is chosen, it is that text's. A request whose text was resolved after an
+edit it did not read is dropped as moved though its text is the host's;
+the editor asks again.
+
+The verdict is read where an answer is chosen, not as each reply
 arrives: the servers' fan-in or the layer race can hold an answer while
-the host moves, and a reply refused on arrival would count as no answer,
-so a server ranked below it whose reply came once the host settled (with
-the region's content unchanged, after an edit to another fence or a hold
-clearing) would win against the configured order. A reply is mapped
-through its request's map whatever happened since. Completion, and color
-presentations under the `preferred` strategy, read it as the layer race
-decides on the injected layer's answer: a stale one is no answer of that
-layer, and the race falls through to the host layer's (waited for if
-still running), a stale incomplete completion list still asking to
-re-query; they read it once more as they return the answer, with no await
-since the race decided. Under `concatenated`, color presentations read it
-once, after every layer answered: a stale prepared part is dropped from
-the merged answer, the host layer's part kept while the host is still the
-text the request read. Inlay hints read it only
-once the answer is chosen: a stale answer's hints stay shown without
-their edits, which keeps more than the host layer's answer would give.
-The answer is checked against:
+the host moves, and a reply refused on arrival would count as its server
+failing, and a server ranked below it would win against the configured
+order. It is read as the layers' race decides, and once more as the
+answer goes out, after the last await.
 
-- the host was edited since the request's text was read (anywhere: an
-  edit above the region moves the host coordinates its edits were
-  translated to, though the region's text and map stay the same) —
-  dropped, when the final answer is chosen;
-- the region is no longer live (no longer tracked under the host
-  lifetime the request's content version was read under, as it was when
-  the answer was made: deleted, invalidated by an edit over it, its host
-  closed or reopened, before or after the request's text was read) —
-  dropped;
-- the host's last edit has not been settled yet (its parse or lifecycle
-  pass still running, so the recorded text may predate it), or the
-  host's newer text waits for its prepare answer — dropped, but for the
-  formatting methods, renames, color presentations, code actions,
-  linked editing ranges and prepareRename, which wait for that to clear
-  (see below);
-- the peer failed the request's input (see Failure; a reply arriving
-  after that is refused whole, and one the failure lands under keeps no
-  edit) — dropped;
-- live, and nothing recorded for the region yet (opened, no pass has
-  recorded its text) — kept;
-- recorded with the request's very text in the very same coordinates —
-  kept;
-- anything else recorded (typed on, re-indented, or, with the host
-  unedited, sent as is or answered anew after an epoch move, or the
-  region rerouted to another language) — dropped.
+What a dropped answer gives way to is the same for every method:
 
-Dropped, completion answers nothing (an empty incomplete list when it
-asked to re-query), color presentations answer nothing, inlay hints
-stay shown without their edits, code actions answer without the stale
-region's actions (the host layer's and other regions' stay when
-concatenated; under a cross-layer `preferred` a virt answer already
-moved or stale as the layers' race decides is no answer of its layer, and
-the race falls through to the host layer's, while one chosen and then
-dropped — settling as the race decided, or moved since — leaves none
-until asked again), and prepareRename and linked editing ranges answer
-nothing. Under a cross-layer `preferred`, a rename's,
-prepareRename's or linked editing ranges' virt answer already moved or
-stale as the race decides is likewise no answer of its layer: the host
-layer's wins. A rename's does so only while the host is still the text
-the request read (neither edited nor closed and reopened), as a
-formatting answer's stand-in does (below): read for the text the host
-moved from, its edits would be as misplaced as the ones passed over, and
-the rename is answered `ContentModified`. Code actions, prepareRename and linked editing ranges
-wait, as formatting does (below), while the host's last edit settles or a
-region's hold clears: an editor may ask them once right after an edit
-elsewhere (Neovim asks code actions once per keypress), and an answer
-dropped only for that would be asked again only on the next keypress.
-Completion and inlay hints, asked again as the caret moves, do not wait.
-A rename comes once per action, like formatting: it waits as formatting
-does, and dropped, it is answered as `ContentModified` rather than as
-nothing to rename: an editor that shows the error lets the user rename
-again; how it is shown is the client's (VS Code's language client reads
-it as no result, as it would `null`), and none retries it on its own
-unless it lists the method to.
-A prepareRename range is judged as code actions are (waiting while the
-host's last edit settles, none once moved or stale). Formatting reads whether the host moved
-under its answer only when the final answer is chosen, not as each reply
-arrives: refused there, a reply would count as its server failing, and the
-fan-in would fall through to a server ranked below it whose reply came
-once the host settled. Nor do formatting, renames and color presentations drop an answer for the host's
-last edit not having settled yet, or a region held for its prepare answer:
-formatting, range and on-type formatting and renames each come once per
-action (an on-type trigger, a save, a rename), and a color presentation once per picker
-interaction, so an answer dropped for that would not be asked again. The final check waits, as a request waits for its text (up to the
-prepare timeout), until the edit settles and the hold clears, then judges
-the answer as above; the host edited meanwhile, it is dropped at once as
-moved, and once nothing is left to settle or clear, an answer still not
-current (its region re-prepared to other coordinates, no longer tracked,
-its host reopened, its map revoked) is dropped at once as stale; one that
-never settles is dropped when the wait ends. The warning says which.
-Dropped (moved, stale or unsettled), the whole answer is dropped (the host's own formatter's edits and
-those of regions still current too) and the request is counted failed, so
-`kakehashi format` exits 2 and writes nothing. To an editor, each of the
-three formatting methods then answers `ContentModified` (-32801), the
-error LSP provides for a result a change made invalid, its message saying
-which verdict dropped the answer: `null` would read as nothing to format,
-and the action would be lost without a word. Under the
-`preferred` strategy, an answer of any of the three formatting methods
-dropped as stale or unsettled gives way to the host layer's answer when that layer is in the race
-(waited for if still running) and the host is still the text the request
-read (not edited, nor closed and reopened): read for that text, it lost
-only to the answer dropped, so it answers (an empty answer, already
-formatted, too) and the request is not counted failed. Dropped as moved, nothing stands in: the host layer's edits were
-read for the text the host moved from too. Color presentations hold the
-same rule for an answer the race passed over while it settled: the host
-layer's answer stands in for it, dropped as it settles, only while the
-host is still the text the request read. A reply its map
-refuses counts as that server failing, as any failed reply does:
-`kakehashi format` exits 2 when no other server formats the region.
-On-type formatting is the exception in what it logs: an answer refused
-(no answer), or dropped at the final check with nothing standing in
-(`ContentModified`, as above), is logged at debug, so that trigger
-keystrokes do not warn the user each time. An answer its map refuses
-stays `null` for every method: asking again would be refused again.
+- As the layers' race decides, a prepared answer no longer current is no
+  answer of its layer: the race goes on to the next layer's (waited for
+  if still running).
+- Another layer's answer chosen after that stands in only while the host
+  is still the revision the request began on (neither edited nor closed
+  and reopened): read for the text the host moved from, its edits would
+  be as misplaced as the ones passed over. So a host layer's answer
+  stands in for a stale prepared one, never for a moved one.
+- With nothing standing in, the request is answered `ContentModified`
+  (-32801), the error LSP provides for a result a change made invalid,
+  its message saying which verdict dropped the answer. `null` or `[]`
+  would read as nothing to format, rename or offer, and the action would
+  be lost without a word. How the error is shown is the client's (VS
+  Code's language client reads it as no result, as it would `null`), and
+  none retries on its own unless it lists the method to.
+
+Rename, prepareRename, linked editing ranges, code actions, color
+presentations and the three formatting methods follow it. Where an answer
+is made of parts (code actions' regions, color presentations and code
+actions under `concatenated`, formatting's regions):
+
+- moved, every part goes, the host layer's too: the host is one text;
+- stale, a code action or color part goes alone and the others stay;
+  none left, the answer is dropped as stale;
+- a formatting answer goes whole when any region it carries edits for is
+  not current (later layers formatted the text those edits made), and the
+  request is counted failed, so `kakehashi format` exits 2 and writes
+  nothing, unless the host layer's answer stands in (an empty one,
+  already formatted, too).
+
+Completion and inlay hints are judged by the same verdict but are asked
+again as the caret moves, so a dropped answer is no error: completion
+falls through to the host layer's answer or answers nothing (an empty
+incomplete list when a server asked to re-query), and inlay hints stay
+shown without their edits, which keeps more than the host layer's answer
+would give.
+
+A reply its map refuses counts as that server failing, as any failed
+reply does: `kakehashi format` exits 2 when no other server formats the
+region. An answer its map refuses stays `null` for the formatting
+methods and is an error for a rename (above): asking again would be
+refused again. On-type formatting is the exception in what it logs: an
+answer refused, or dropped with nothing standing in, is logged at debug,
+so that trigger keystrokes do not warn the user each time.
 
 Formatting outcomes follow one rule, the one `kakehashi format` counts by.
 An answer, an empty one (already formatted) included, is a success. A
@@ -637,16 +603,13 @@ dropped, not kept stale. How an edit maps back depends on the whole text
 — which lines are blank, what an inserted line joins, which indentation
 a created line regains — so no text but the request's is known to place
 it as the server meant, and a stale edit could land in indentation the
-host has and P never showed. Completion answers dropped this way come back
-as an empty incomplete list, which the client asks again for, and inlay
-hints stay shown with only their edits stripped: the answer for the latest
-text still arrives, the cost availability (an answer within a keystroke's
-parse and prepare round-trip), never a misplaced edit; code actions,
-prepareRename and linked editing ranges likewise, though they first wait for the host's last
-edit to settle (see above). Color presentations are asked once per picker
-interaction, and the formatting methods and renames once per action: they
-wait for the host to settle instead, as the final check described above
-does.
+host has and P never showed. The answer for the latest text still
+arrives when asked again: the cost is availability within a keystroke's
+round-trip. The check narrows the window in which an edit made for an
+older text goes out, to the one every LSP answer has: an edit the editor
+sent that kakehashi has not applied yet. It does not close it, and
+host-ward edits carry no document version (`version: null`) for the
+editor to check against.
 
 A color presentation without a `textEdit` replaces the request range with
 its label; on a prepared document that edit is made explicit and mapped
@@ -837,6 +800,15 @@ latest the lifecycle pass recorded.
   An item minted from a prepared document resolves without a sync: its
   request is queued only while its server holds the text prepared from the
   region's current one, checked as any request's text is.
+- **An answer's edits go out only into the host revision its request
+  read.** They are mapped through the request's own map for the request's
+  own text, so they land where they were mapped while the host's lifetime
+  and content version are the ones read before that text, and the map is
+  not revoked. That is the whole check, read where the answer is chosen:
+  it reads nothing the lifecycle pass writes, so it waits for nothing, and
+  no method judges an answer otherwise. An answer given way to is replaced
+  by another layer's only on an unmoved host, and by `ContentModified`
+  otherwise (see Workspace Edits).
 - **A push follows the text its connection held when kakehashi read it.**
   The push is stamped as it is read, before it waits to be published.
   Where preparation is involved (by the rule above), it is placed through
@@ -1103,14 +1075,22 @@ editors keep a snippet as is.
   Request).
 - A request issued right after an edit waits for the new prepared text to
   reach its server, and fails if a newer edit supersedes it first: as soon
-  as its server is sent another text instead. Only a text sent while the
-  request waits tells: one its server held already may be the text before
-  the request's own, or, after an undo, an answer given later for the text
-  the undo left. So a superseded request that starts waiting after the
-  newer text was sent (its own answer came late) waits five seconds for
-  nothing, unless the editor cancels it. A request on an unprepared
-  document waits the same way while its server still holds a prepared text
-  (right after its pair lost its peer).
+  as the host is edited past the revision the request's text was read at
+  (the lifecycle pass sends only the host's current text, so the request's
+  is not coming, whether the newer one was sent before the wait began or
+  not yet), or as its server is sent another text instead. A request built
+  without a revision (diagnostics, document symbols and other
+  whole-document paths) is told only by a text sent while it waits: one
+  its server held already may be the text before the request's own, or,
+  after an undo, an answer given later for the text the undo left. Such a
+  request, superseded before it started waiting, waits five seconds for
+  nothing. A request on an unprepared document waits the same way while
+  its server still holds a prepared text (right after its pair lost its
+  peer).
+- An answer mapped through a prepared document is dropped once the host
+  moved under it, where an unprepared document's would go out stale; the
+  methods that come once per action then answer `ContentModified`, which
+  an editor may show as an error (see Workspace Edits).
 - A save made while a document's answer is pending reaches no server that
   has not started opening the document by the time the answer arrives.
 - A save one connection refuses, because a newer answer reached it first,
