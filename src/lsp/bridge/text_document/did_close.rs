@@ -1,7 +1,8 @@
 //! didClose notification handling for bridge connections.
 //!
-//! Cleans up when host documents are closed, when regions are invalidated or
-//! change language, and when settings stop selecting a server for a region.
+//! Cleans up when host documents are closed, when regions are invalidated,
+//! change language or are gone from the reparsed tree, and when settings stop
+//! selecting a server for a region.
 //! Notifications are queued via the channel-based writer task (ls-bridge-message-ordering) for
 //! FIFO ordering.
 
@@ -294,6 +295,42 @@ impl LanguageServerPool {
             self.close_single_virtual_doc(&doc).await;
         }
         replaced_regions
+    }
+
+    /// Close the host's virtual documents whose region is not among
+    /// `live_regions`, the regions the current tree has, returning the region
+    /// ids closed.
+    ///
+    /// Derived, not remembered: [`Self::close_invalidated_docs`] closes what an
+    /// edit is known to end, but a region's identity across an edit is a
+    /// prediction of where its node lands, and the reparsed tree decides. A
+    /// node that grew at its end, or one a whole-document replacement moved,
+    /// is minted under a new id while the old id stays tracked — no edit ever
+    /// names it, so only asking every open document "does your region still
+    /// exist?" finds it.
+    ///
+    /// A formatting scratch document is left to its pipeline, which closes it
+    /// whatever became of the region it was copied from.
+    pub(crate) async fn close_orphaned_docs(
+        &self,
+        host_uri: &Url,
+        live_regions: &std::collections::HashSet<&str>,
+    ) -> std::collections::HashSet<String> {
+        let to_close = self
+            .take_host_virtual_docs_where(host_uri, |doc| {
+                let region_id = doc.virtual_uri.region_id();
+                !live_regions.contains(region_id)
+                    && !region_id.contains(VirtualDocumentUri::SCRATCH_ID_MARKER)
+            })
+            .await;
+        let orphaned = to_close
+            .iter()
+            .map(|doc| doc.virtual_uri.region_id().to_string())
+            .collect();
+        for doc in to_close {
+            self.close_single_virtual_doc(&doc).await;
+        }
+        orphaned
     }
 
     /// Close the host's virtual documents whose connection's server is no

@@ -1343,6 +1343,21 @@ impl BridgeCoordinator {
         self.pool.close_replaced_docs(uri, injections).await
     }
 
+    /// Close the host's virtual documents whose region is not one of
+    /// `injections`, the regions the current tree has, and return the region
+    /// ids closed.
+    pub(crate) async fn close_orphaned_docs(
+        &self,
+        uri: &Url,
+        injections: &[BridgeInjection],
+    ) -> std::collections::HashSet<String> {
+        let live_regions = injections
+            .iter()
+            .map(|injection| injection.region_id.as_str())
+            .collect();
+        self.pool.close_orphaned_docs(uri, &live_regions).await
+    }
+
     /// Close the host's virtual documents whose server current settings no
     /// longer select for them — the host's bridge filter turned the injection
     /// language off, or the server stopped being a candidate for it — and

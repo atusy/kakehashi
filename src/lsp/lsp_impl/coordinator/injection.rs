@@ -165,6 +165,27 @@ impl InjectionCoordinator {
         }
     }
 
+    /// Close the virtual documents of regions the current tree no longer has,
+    /// and evict their diagnostic slots.
+    ///
+    /// [`Self::close_invalidated_virtual_docs`] acts on the edit, before the
+    /// reparse, and closes the regions whose START the edit touched. Every
+    /// other region keeps its id only if the reparsed node lands where the
+    /// tracker predicted; one that does not is minted anew, and its old id is
+    /// named by no edit. `injections` is what the current tree has, so every
+    /// open document outside it belongs to such a region. Like the replaced-
+    /// language close it sits after `cancel_eager_open`, so an older pass's
+    /// eager task cannot reopen what this closes.
+    ///
+    /// Eviction follows the tracker removal for the reason given there, and
+    /// needs no publish: the merge skips a region with no current offset.
+    async fn close_orphaned_virtual_docs(&self, uri: &Url, injections: &[BridgeInjection]) {
+        for region_id in self.bridge.close_orphaned_docs(uri, injections).await {
+            self.diagnostics
+                .evict_source(uri, &DiagnosticSource::Region(region_id));
+        }
+    }
+
     /// Close the virtual documents current settings no longer route to their
     /// server, and take their pushed diagnostics out of the editor (#917).
     ///
@@ -469,6 +490,9 @@ impl InjectionCoordinator {
         // leave the host without regions in the same stroke (a replaced
         // injections query), which no edit-driven close would catch.
         self.retract_deselected_docs(uri, &host_language).await;
+        // Also before the empty-regions return: the last region can go the
+        // same way.
+        self.close_orphaned_virtual_docs(uri, &injections).await;
         if injections.is_empty() {
             return true;
         }
