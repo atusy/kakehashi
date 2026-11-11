@@ -2992,6 +2992,49 @@ mod tests {
         ));
     }
 
+    /// The same prepared text held again under another map (its block was
+    /// re-indented, say) reaches no server, so none publishes again: the
+    /// push read under it follows the newer map, and keeps to it once
+    /// another text is sent. Translated once, as it arrived, it would stay
+    /// where the first map put it.
+    #[test]
+    fn a_push_places_through_the_map_its_text_was_last_held_with() {
+        let tracker = DocumentTracker::new();
+        let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let uri = virtual_uri.to_uri_string();
+        let conn = ConnectionKey::for_server("lua");
+        let send = |text: &str, map: &Arc<PreparedMap>| {
+            tracker.record_sent_for_test(
+                &virtual_uri,
+                &conn,
+                SentText {
+                    text,
+                    map: Some(map),
+                },
+                1,
+            );
+        };
+        let placed_through = |observed, map: &Arc<PreparedMap>| match tracker.presentation(
+            &uri,
+            &conn,
+            observed,
+            RegionPrepare::default(),
+            "a",
+        ) {
+            Presentation::Prepared(placed) => Arc::ptr_eq(&placed, map),
+            _ => false,
+        };
+        let (first, second) = (prepared_text("a"), prepared_text("a"));
+        send("a", &first);
+        let pushed = tracker.observe(&uri, &conn, 0, Some(1));
+        assert!(placed_through(pushed, &first));
+        send("a", &second);
+        assert!(placed_through(pushed, &second));
+        send("b", &prepared_text("b"));
+        assert!(placed_through(pushed, &second));
+    }
+
     #[test]
     fn only_a_push_read_under_a_prepared_text_places_once_it_is_replaced() {
         let tracker = DocumentTracker::new();
