@@ -901,6 +901,17 @@ impl PreparedMap {
         empty_run(&self.runs, prepared, |kind| kind == RunKind::Deleted)
     }
 
+    /// Whether the peer left the document as it is: it answered `null`, or
+    /// an answer changing nothing, on a document without gaps. P is then V,
+    /// each position its own: nothing was removed for an edit to regain.
+    /// The map still stands for the document having gone through the peer
+    /// (its text is held and waited for as a prepared one). A document with
+    /// gaps is never one, even with every gap kept: a position inside a gap
+    /// is still no place of its own.
+    pub(crate) fn changes_nothing(&self) -> bool {
+        self.runs.iter().all(|run| run.kind == RunKind::Identity)
+    }
+
     /// Whether `a` and `b` translate alike: built from the same texts with
     /// the same runs (the maps' equality), whichever answers they came from.
     /// What decides whether a server holding one needs the other's text sent

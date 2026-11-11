@@ -361,6 +361,13 @@ mapping back before the gap: for either, no presentation is returned.
 Additional edits refused with the main edit are dropped, the main edit kept
 as it maps alone.
 
+A document the peer left as it is — it answered `null`, or an answer
+changing nothing, and the document has no gap — has P for V: nothing was
+removed that an edit could regain, and its server sees the caret where
+it is. Its completion items go as a document as is sends them, snippets
+and line-breaking edits included; the rules that follow are for a
+document the peer changed.
+
 Completion keeps to what the client inserts where it asked:
 
 - A caret inside indentation or blank lines the peer removed (or from
@@ -654,6 +661,10 @@ a hook per kind of change.
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
   unsent, so servers may see unprepared text until it is up.
+- A document the peer leaves as it is costs less than one it changes,
+  not nothing: it waits for the peer's answer like any other, and what
+  is listed from it resolves as from a prepared document. Only its
+  completion items go as a document as is sends them (see Edits).
 - A peer bridged for every language (`"*"`) prepares every injection it
   can under the default `priorities`, and declining with `null` still
   makes a document prepared; restricting it takes `priorities = []` where

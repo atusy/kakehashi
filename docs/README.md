@@ -963,6 +963,8 @@ document. Items listed from a prepared document are not resolved further:
 `*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
 calls, supertypes and subtypes), return nothing more. A document the server fails to prepare is not sent downstream at
 all; answer `null` to keep a document unchanged.
+A document left unchanged is still asked about and waited for, but its
+completion items come as from a document never prepared, snippets included.
 
 ### Configuration Files
 

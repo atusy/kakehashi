@@ -214,7 +214,8 @@ fn transform_completion_response_to_host(
 /// Transform textEdit range in a single completion item to host coordinates.
 ///
 /// Handles both TextEdit format and InsertReplaceEdit format. Also transforms
-/// additionalTextEdits if present. On a prepared document the edits go
+/// additionalTextEdits if present. On a prepared document (one the peer
+/// changed: see `PreparedMap::changes_nothing`) the edits go
 /// through its map (`translate_virtual_main_and_additional_edits_to_host`),
 /// their text re-indented, and the item may be given `insertTextMode: asIs`
 /// (see `ClientInsertMode`). A literal snippet there is sent as plain text,
@@ -242,7 +243,14 @@ pub(super) fn transform_completion_item(
     request_host_position: Option<Position>,
     insert_mode: ClientInsertMode,
 ) -> bool {
-    if offset.prepared().is_some() {
+    // A document the peer left as it is has no indentation for an edit to
+    // regain, and no place the server saw the caret but where it is: its
+    // items go as a document as is sends them, snippets and line-breaking
+    // edits included.
+    if offset
+        .prepared()
+        .is_some_and(|prepared| !prepared.changes_nothing())
+    {
         transform_prepared_completion_item(
             item,
             offset,
