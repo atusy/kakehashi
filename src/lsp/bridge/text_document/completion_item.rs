@@ -680,6 +680,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         offset,
         region_end: envelope.region_end,
         host_layer: envelope.host_layer,
+        listed_on: envelope.listed_on,
     };
     let inner = item.data.take();
     item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
@@ -711,13 +712,19 @@ mod tests {
             },
             region_end: Some((9, 0)),
             host_layer: false,
+            listed_on: None,
         }
     }
 
     #[test]
     fn a_refused_resolve_keeps_the_prepared_mark() {
+        use crate::lsp::bridge::text_document::completion::ListedOn;
         let mut envelope = test_envelope();
         envelope.offset.prepared = true;
+        envelope.listed_on = Some(ListedOn {
+            content_version: 7,
+            generation: 12,
+        });
         let mut item = CompletionItem {
             label: "x".to_string(),
             data: Some(json!({"resolve_id": 99})),
@@ -726,6 +733,8 @@ mod tests {
         re_envelope_item(&mut item, &envelope);
         let back = extract_envelope(&item).expect("re-enveloped");
         assert!(back.offset.prepared);
+        // With what it was listed on: a later resolve still reads it.
+        assert_eq!(back.listed_on, envelope.listed_on);
         // As is, the envelope is written as before.
         let mut item = CompletionItem {
             label: "x".to_string(),
@@ -736,6 +745,7 @@ mod tests {
         let back = extract_envelope(&item).expect("re-enveloped");
         assert!(!back.offset.prepared);
         assert_eq!(back.offset.line_column_offsets, Some(vec![0]));
+        assert!(item.data.unwrap()[ENVELOPE_KEY].get("listed_on").is_none());
     }
 
     #[cfg(unix)]
@@ -1428,6 +1438,7 @@ mod tests {
             },
             region_end: Some((9, 0)),
             host_layer: false,
+            listed_on: None,
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
