@@ -213,12 +213,11 @@ impl PreparedMap {
 
     /// Whether a line of the content (not whitespace alone, nor starting in
     /// a gap's text) lost other indentation than its segment's uniform one:
-    /// the peer left it alone, or removed another indent. A formatting
-    /// answer rewrites lines wholesale, and which of its lines is which old
-    /// one, and so which indent each regains, only a pairing reads; with
-    /// every line regaining the one uniform indent, no reading decides any
-    /// indent. Edits keeping their extents state where they go, and are not
-    /// so refused.
+    /// the peer left it alone, or removed another indent. Every line a
+    /// formatting answer writes regains the one uniform indent (see
+    /// [`Self::map_lines`]), which such a region does not have: a line
+    /// left alike would keep its own, and one rewritten lose it. Edits
+    /// keeping their extents state where they go, and are not so refused.
     fn dedents_unevenly(&self) -> bool {
         lines_with_breaks(&self.prepared_lines.text).any(|(start, line)| {
             if line.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
@@ -656,7 +655,6 @@ impl PreparedMap {
                 ranges[index].clone(),
                 &edits[index].new_text,
                 following,
-                false,
             )?);
         }
         let mapped: Vec<(Range<usize>, String)> = mapped
@@ -854,7 +852,7 @@ impl PreparedMap {
             let new = new_of(&unit);
             if !unit.lines {
                 let following = prepared[unit.old.end..].chars().next();
-                mapped.push(self.hunk_to_virtual(unit.old, &edited[new], following, false)?);
+                mapped.push(self.hunk_to_virtual(unit.old, &edited[new], following)?);
                 continue;
             }
             if prepared[unit.old.clone()] == edited[new.clone()] {
@@ -906,11 +904,9 @@ impl PreparedMap {
     fn mapped_edits_keep_host_text(&self, mapped: &[(Range<usize>, String)]) -> bool {
         let virtual_text = &self.virtual_lines.text;
         // Edits apart in P map apart (touching ones are refused or keep
-        // their order, see `map_edits`), but stretches of a formatting
-        // answer that touch in P can overlap once mapped, each regaining an
-        // indent the other claims (see `map_formatting_within`): this check
-        // refuses those, and every later read of the sorted set relies on
-        // it.
+        // their order, see `map_edits`), and the changes rewritten lines
+        // map to are apart as they are made (see `map_lines`). Checked all
+        // the same: every later read of the sorted set relies on it.
         let mut sorted: Vec<&(Range<usize>, String)> = mapped.iter().collect();
         sorted.sort_by_key(|(range, _)| (range.start, range.end));
         if sorted
@@ -1033,16 +1029,14 @@ impl PreparedMap {
         true
     }
 
-    /// Map the replacement of P's `old` bytes by `new_text` onto V.
-    /// `following` is the character after the replacement in P;
-    /// `whole_answer` tells a stretch of a formatting answer from an edit
-    /// keeping its extent.
+    /// Map the replacement of P's `old` bytes by `new_text`, an edit
+    /// keeping its extent, onto V. `following` is the character after the
+    /// replacement in P.
     fn hunk_to_virtual(
         &self,
         old: Range<usize>,
         new_text: &str,
         following: Option<char>,
-        whole_answer: bool,
     ) -> Option<(Range<usize>, String)> {
         if self.hunk_reaches_into_gap(&old) {
             return None;
@@ -1179,26 +1173,9 @@ impl PreparedMap {
                 .take_while(|run| run.virtual_.end == virtual_start)
                 .any(|run| run.kind == RunKind::Gap && !run.prepared.is_empty())
         };
-        // Text a formatting answer writes over a whole blank line, other
-        // than after the whitespace the peer kept on it, is a line of the
-        // content in its place: that line's whitespace was never an indent
-        // (a line the peer emptied, an empty line), or the text is not
-        // written after it. (Edits that keep their extents state where they
-        // go, and are placed as before.)
-        let blank_line_text_in_place = whole_answer && whole_lines && {
-            let line_end = prepared[old.start..]
-                .find(['\n', '\r'])
-                .map_or(prepared.len(), |end| old.start + end);
-            let kept = &prepared[old.start..line_end];
-            let first = new_text.split(['\n', '\r']).next().unwrap_or_default();
-            kept.trim_matches([' ', '\t']).is_empty()
-                && !first.trim_matches([' ', '\t']).is_empty()
-                && (kept.is_empty() || !first.starts_with(kept))
-        };
         let first = first_indent(&EdgeShape {
             whole_lines,
             lines_before_own_indent,
-            blank_line_text_in_place,
             start_indent: start_indent.map(|run| &virtual_text[run.virtual_.clone()]),
             blank_at_start: blank_at_start.is_some(),
             end_line_indent,
@@ -1360,9 +1337,6 @@ struct EdgeShape<'a> {
     /// Lines inserted at a line start whose removed indent is not the
     /// content's: lines of the content, going before that indent.
     lines_before_own_indent: bool,
-    /// Text written over a whole blank line, other than after the whitespace
-    /// the peer kept on it: a line of the content in its place.
-    blank_line_text_in_place: bool,
     /// The removed indent the change starts before, covering it.
     start_indent: Option<&'a str>,
     /// That indent is a blank line's the peer emptied, not the content's.
@@ -1399,7 +1373,6 @@ fn first_indent<'a>(shape: &EdgeShape<'a>) -> FirstIndent<'a> {
     }
     match shape.start_indent {
         _ if shape.lines_before_own_indent => FirstIndent::Uniform,
-        _ if shape.blank_line_text_in_place => FirstIndent::Uniform,
         // Whole lines deleted before an existing line, or replaced by text
         // without a line break before a non-blank one: what remains is that
         // line, which keeps its own indent (deleting a line must not
