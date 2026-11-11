@@ -5152,7 +5152,16 @@ mod formatting_reference {
         prop_assert_eq!(apply(&prepared, edits), formatted);
         let mut counted = tally.get();
         let wants = wanted(document, formatted);
-        let Some(mapped) = map.map_formatting(edits, budget).ok() else {
+        let mapped = map.map_formatting(edits, budget).ok();
+        // The work decides how small the edits are, never a refusal.
+        prop_assert_eq!(
+            map.map_formatting(edits, 0).is_ok(),
+            mapped.is_some(),
+            "{:?} on {:?} with no work",
+            edits,
+            document.virtual_text
+        );
+        let Some(mapped) = mapped else {
             // Refused: a peer dedenting unevenly (whatever the answer
             // changes), or an answer the host cannot take.
             counted.refused += 1;
@@ -5318,12 +5327,10 @@ mod formatting_reference {
 
     #[test]
     fn answers_map_alike_with_no_work_at_all() {
-        // Out of work nothing is refused: the changes are only coarser.
-        let (precise, coarse) = (check(FORMATTING_DIFF_BUDGET, 1000), check(0, 1000));
-        assert_eq!(
-            (precise.mapped, precise.changing, precise.refused),
-            (coarse.mapped, coarse.changing, coarse.refused)
-        );
+        // Out of work the changes are only coarser: the host reads as the
+        // edited text all the same (and nothing more is refused, which
+        // every case of the runs with work checks).
+        let coarse = check(0, 1000);
         assert!(coarse.changing > property_floor(450, 1000), "{coarse:?}");
     }
 
