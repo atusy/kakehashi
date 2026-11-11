@@ -723,6 +723,10 @@ pub(crate) struct DocumentRequestContext {
     /// the prepared document downstream servers see (see
     /// [`prepare_request_context`]).
     pub(crate) prepared: Option<std::sync::Arc<crate::lsp::bridge::PreparedMap>>,
+    /// The host's lifetime and content version `resolved` was read at, when
+    /// the producing path has them: a request waiting for its servers to
+    /// hold this text gives up at once when the host moved past it.
+    pub(crate) host_revision: Option<crate::lsp::bridge::HostRevision>,
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -1839,6 +1843,10 @@ impl Kakehashi {
 
         let ctx = DocumentRequestContext {
             prepared: None,
+            host_revision: Some(crate::lsp::bridge::HostRevision {
+                incarnation: preamble.incarnation,
+                content_version: preamble.content_version,
+            }),
             uri: preamble.uri,
             resolved: preamble.resolved,
             region_end: Some(preamble.region_end),
@@ -2673,6 +2681,7 @@ mod tests {
         let (map, _) = revocable_map();
         let ctx = DocumentRequestContext {
             prepared: Some(std::sync::Arc::clone(&map)),
+            host_revision: None,
             uri: Url::parse("file:///test/reopened-mid-request.md").unwrap(),
             resolved: crate::language::injection::ResolvedInjection {
                 region: crate::language::injection::CacheableInjectionRegion {
@@ -2719,6 +2728,7 @@ mod tests {
         // An unprepared region's answer carries no map: nothing is read.
         let unprepared = DocumentRequestContext {
             prepared: None,
+            host_revision: None,
             ..ctx
         };
         assert!(Sourced::from_region(&unprepared, (), None).still_current(|| unreachable!()));
@@ -2846,6 +2856,7 @@ mod tests {
 
         let ctx = || DocumentRequestContext {
             prepared: None,
+            host_revision: None,
             uri: uri.clone(),
             resolved: resolved.clone(),
             region_end: None,
@@ -2931,6 +2942,7 @@ mod tests {
     ) -> DocumentRequestContext {
         DocumentRequestContext {
             prepared: None,
+            host_revision: None,
             uri: uri.clone(),
             resolved: resolved.clone(),
             region_end: None,

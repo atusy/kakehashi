@@ -417,6 +417,10 @@ impl Kakehashi {
             }
             let region_ctx = DocumentRequestContext {
                 prepared: None,
+                host_revision: Some(crate::lsp::bridge::HostRevision {
+                    incarnation: snapshot.incarnation(),
+                    content_version: snapshot.content_version(),
+                }),
                 uri: uri.clone(),
                 resolved: resolved.clone(),
                 region_end: None,
@@ -1326,6 +1330,7 @@ async fn dispatch_concatenated_formatting(
     // A prepared document's servers format its prepared text (the context's
     // virtual content): the result goes back through its map (see
     // `prepared_pipeline_edits`).
+    let offset = offset.read_at(region_ctx.host_revision);
     let offset = match &region_ctx.prepared {
         Some(map) => offset.with_prepared(Arc::clone(map)),
         None => offset,

@@ -290,6 +290,10 @@ impl Kakehashi {
                 }
                 let region_ctx = DocumentRequestContext {
                     prepared: None,
+                    host_revision: Some(crate::lsp::bridge::HostRevision {
+                        incarnation: snapshot.incarnation(),
+                        content_version: snapshot.content_version(),
+                    }),
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,

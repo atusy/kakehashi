@@ -255,6 +255,7 @@ mod tests {
     fn virt_ctx_for_server(server: &str) -> DocumentRequestContext {
         DocumentRequestContext {
             prepared: None,
+            host_revision: None,
             uri: Url::parse("file:///t.md").unwrap(),
             resolved: ResolvedInjection {
                 region: CacheableInjectionRegion {

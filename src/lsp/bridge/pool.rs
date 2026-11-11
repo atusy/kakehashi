@@ -3553,6 +3553,21 @@ impl LanguageServerPool {
         {
             host.edited.fetch_max(content_version, Ordering::AcqRel);
         }
+        // A request waiting for the text before this edit gives up now.
+        self.wake_request_text_waiters();
+    }
+
+    /// Whether `host_uri` is no longer at `revision`, the one a request read
+    /// its text at: edited past it (see [`Self::note_host_edited`]), or
+    /// open under another lifetime. A host this pool keeps nothing for
+    /// (closed, or never opened here) has not moved, for all it knows.
+    pub(crate) fn host_moved_past(&self, host_uri: &Url, revision: super::HostRevision) -> bool {
+        self.latest_virtual_contents
+            .get(host_uri)
+            .is_some_and(|host| {
+                host.incarnation != revision.incarnation
+                    || host.edited.load(Ordering::Acquire) > revision.content_version
+            })
     }
 
     /// Note that a lifecycle pass that looked finished publishing

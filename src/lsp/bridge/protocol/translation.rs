@@ -29,7 +29,7 @@ use super::prepare::{Bias, EditMode, FormattingRefusal, PreparedMap};
 /// (`kakehashi/virtualDocument/prepare`), `prepared` maps between it and the
 /// virtual document. `line`/`columns` always describe the virtual document,
 /// so the translation functions below compose prepared ↔ virtual ↔ host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
     line: u32,
@@ -39,7 +39,22 @@ pub(crate) struct RegionOffset {
     /// Prepared ↔ virtual coordinates, when downstream servers hold a
     /// prepared document.
     prepared: Option<Arc<PreparedMap>>,
+    /// The host's lifetime and content version the region's text was read
+    /// at, when its request knows: what a wait for that text to be held is
+    /// given up on once the host moved past it (see
+    /// `LanguageServerPool::wait_for_request_text`).
+    host_revision: Option<crate::lsp::bridge::HostRevision>,
 }
+
+/// Equal as coordinates: the revision the text was read at names no
+/// coordinate, and an offset rebuilt from an envelope carries none.
+impl PartialEq for RegionOffset {
+    fn eq(&self, other: &Self) -> bool {
+        self.line == other.line && self.columns == other.columns && self.prepared == other.prepared
+    }
+}
+
+impl Eq for RegionOffset {}
 
 impl RegionOffset {
     /// Construct a `RegionOffset` with a single column offset (non-blockquote case).
@@ -48,6 +63,7 @@ impl RegionOffset {
             line,
             columns: vec![column],
             prepared: None,
+            host_revision: None,
         }
     }
 
@@ -57,6 +73,7 @@ impl RegionOffset {
             line,
             columns,
             prepared: None,
+            host_revision: None,
         }
     }
 
@@ -64,6 +81,17 @@ impl RegionOffset {
     pub(crate) fn with_prepared(mut self, prepared: Arc<PreparedMap>) -> Self {
         self.prepared = Some(prepared);
         self
+    }
+
+    /// Note the host revision the region's text was read at.
+    pub(crate) fn read_at(mut self, revision: Option<crate::lsp::bridge::HostRevision>) -> Self {
+        self.host_revision = revision;
+        self
+    }
+
+    /// The host revision the region's text was read at, when known.
+    pub(crate) fn host_revision(&self) -> Option<crate::lsp::bridge::HostRevision> {
+        self.host_revision
     }
 
     /// The prepared ↔ virtual map, when downstream servers hold a prepared

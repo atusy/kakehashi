@@ -181,6 +181,7 @@ impl Kakehashi {
                 );
                 let region_ctx = DocumentRequestContext {
                     prepared: None,
+                    host_revision: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
