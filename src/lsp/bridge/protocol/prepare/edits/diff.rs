@@ -2,7 +2,7 @@
 //! may do rather than by time: the same answer is accepted or refused alike
 //! on any machine, under any load.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
 use std::ops::Range;
 
@@ -178,111 +178,6 @@ fn myers_core<T: PartialEq>(a: &[T], b: &[T], work: &mut Work) -> Option<Vec<(us
     }
     pairs.reverse();
     Some(pairs)
-}
-
-/// Pairs of `a` and `b` alike, in order, by patience: elements found once in
-/// each anchor the rest (a longest increasing run of them), the stretches
-/// between anchors paired the same way in turn, and a stretch with no such
-/// element paired by [`myers_pairs`] when `fall_back` (among the elements
-/// found as many times on each side), left unpaired otherwise; `None` when
-/// `work` runs out.
-pub(super) fn patience_pairs<T: Eq + Hash>(
-    a: &[T],
-    b: &[T],
-    fall_back: bool,
-    work: &mut Work,
-) -> Option<Vec<(usize, usize)>> {
-    let mut pairs = Vec::new();
-    let mut stack = vec![(0..a.len(), 0..b.len())];
-    while let Some((old, new)) = stack.pop() {
-        if old.is_empty() || new.is_empty() {
-            continue;
-        }
-        work.spend(old.len() + new.len())?;
-        let mut counts: HashMap<&T, (usize, usize, usize)> = HashMap::new();
-        for at in old.clone() {
-            let entry = counts.entry(&a[at]).or_insert((0, 0, at));
-            entry.0 += 1;
-            entry.2 = at;
-        }
-        for at in new.clone() {
-            if let Some(entry) = counts.get_mut(&b[at]) {
-                entry.1 += 1;
-            }
-        }
-        // Unique in both: (position in a, position in b), by position in a.
-        let mut unique: Vec<(usize, usize)> = new
-            .clone()
-            .filter_map(|at| {
-                counts
-                    .get(&b[at])
-                    .filter(|&&(in_a, in_b, _)| in_a == 1 && in_b == 1)
-                    .map(|&(_, _, old_at)| (old_at, at))
-            })
-            .collect();
-        if unique.is_empty() {
-            if !fall_back {
-                continue;
-            }
-            // Only elements found as many times on each side: of one found
-            // more often on one side, which is which no order tells.
-            let balanced = |at: &usize, side: &[T]| {
-                counts
-                    .get(&side[*at])
-                    .is_some_and(|&(in_a, in_b, _)| in_a == in_b)
-            };
-            let kept_a: Vec<usize> = old.clone().filter(|at| balanced(at, a)).collect();
-            let kept_b: Vec<usize> = new.clone().filter(|at| balanced(at, b)).collect();
-            let (search_a, search_b): (Vec<&T>, Vec<&T>) = (
-                kept_a.iter().map(|&at| &a[at]).collect(),
-                kept_b.iter().map(|&at| &b[at]).collect(),
-            );
-            for (old_at, new_at) in myers_pairs(&search_a, &search_b, work)? {
-                pairs.push((kept_a[old_at], kept_b[new_at]));
-            }
-            continue;
-        }
-        unique.sort_unstable();
-        let anchors = longest_increasing(&unique, work)?;
-        // Recurse into the stretches between anchors.
-        let (mut old_at, mut new_at) = (old.start, new.start);
-        for &(anchor_old, anchor_new) in &anchors {
-            stack.push((old_at..anchor_old, new_at..anchor_new));
-            pairs.push((anchor_old, anchor_new));
-            (old_at, new_at) = (anchor_old + 1, anchor_new + 1);
-        }
-        stack.push((old_at..old.end, new_at..new.end));
-    }
-    pairs.sort_unstable();
-    Some(pairs)
-}
-
-/// The longest run of `pairs` (sorted by their first) increasing in their
-/// second.
-fn longest_increasing(pairs: &[(usize, usize)], work: &mut Work) -> Option<Vec<(usize, usize)>> {
-    // tails[l]: index into `pairs` of the smallest end of a run of l + 1.
-    let mut tails: Vec<usize> = Vec::new();
-    let mut previous = vec![usize::MAX; pairs.len()];
-    for (index, &(_, second)) in pairs.iter().enumerate() {
-        let length = tails.partition_point(|&tail| pairs[tail].1 < second);
-        work.spend(tails.len().max(1).ilog2() as usize + 1)?;
-        if length > 0 {
-            previous[index] = tails[length - 1];
-        }
-        if length == tails.len() {
-            tails.push(index);
-        } else {
-            tails[length] = index;
-        }
-    }
-    let mut run = Vec::with_capacity(tails.len());
-    let mut at = tails.last().copied();
-    while let Some(index) = at {
-        run.push(pairs[index]);
-        at = (previous[index] != usize::MAX).then(|| previous[index]);
-    }
-    run.reverse();
-    Some(run)
 }
 
 /// The stretches the characters `new` differ from those of `old` in, as
@@ -486,12 +381,6 @@ mod tests {
         );
         assert!(myers_pairs(&a, &b, &mut Work::new(66)).is_some());
         assert_eq!(myers_pairs(&a, &b, &mut Work::new(65)), None);
-        let (a, b) = (
-            ["a", "x", "b", "c", "x", "d"],
-            ["a", "b", "x", "c", "d", "x"],
-        );
-        assert!(patience_pairs(&a, &b, true, &mut Work::new(18)).is_some());
-        assert_eq!(patience_pairs(&a, &b, true, &mut Work::new(17)), None);
     }
 
     #[test]
@@ -552,13 +441,5 @@ mod tests {
         }
         rebuilt.extend(&old[at..]);
         assert_eq!(rebuilt, new.iter().collect::<String>());
-    }
-
-    #[test]
-    fn patience_anchors_unique_elements_then_fills_between() {
-        let a = ["x", "}", "y", "}", "z"];
-        let b = ["x", "}", "w", "}", "z"];
-        let found = patience_pairs(&a, &b, true, &mut Work::new(usize::MAX)).unwrap();
-        assert_eq!(found, vec![(0, 0), (1, 1), (3, 3), (4, 4)]);
     }
 }

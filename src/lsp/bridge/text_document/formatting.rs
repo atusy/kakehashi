@@ -2340,9 +2340,9 @@ mod tests {
             );
         }
         {
-            // Lines reordered across CRLF and emptied whitespace lines; those
-            // blank lines read as rewritten empty (their whitespace, which
-            // the peer removed, is not told apart by the answer).
+            // Lines rewritten across CRLF and emptied whitespace lines; the
+            // answer leaves those blank lines alike, and they keep the
+            // whitespace the host holds on them.
             let virtual_content: &str = &serde_json::from_str::<String>("\"\\tcall(\\ud835\\udcb3, '\\u00e9')\\r\\n \\n\\t \\r\\n\\t\\n\\treturn x\\r\\n\\treturn x\\r\\n\\t \\n\\t    }\\r\\n\\t    let y = f x;\\r\\n\\t\\r\\n\"").unwrap();
             let offset = prepared_offset(virtual_content, 0, serde_json::from_str("[{\"range\": {\"start\": {\"line\": 0, \"character\": 0}, \"end\": {\"line\": 0, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 1, \"character\": 0}, \"end\": {\"line\": 1, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 2, \"character\": 0}, \"end\": {\"line\": 2, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 3, \"character\": 0}, \"end\": {\"line\": 3, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 4, \"character\": 0}, \"end\": {\"line\": 4, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 5, \"character\": 0}, \"end\": {\"line\": 5, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 6, \"character\": 0}, \"end\": {\"line\": 6, \"character\": 2}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 7, \"character\": 0}, \"end\": {\"line\": 7, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 8, \"character\": 0}, \"end\": {\"line\": 8, \"character\": 1}}, \"newText\": \"\"}, {\"range\": {\"start\": {\"line\": 9, \"character\": 0}, \"end\": {\"line\": 9, \"character\": 1}}, \"newText\": \"\"}]").unwrap());
             let prepared = offset.prepared().unwrap().prepared_text().to_string();
@@ -2357,7 +2357,7 @@ mod tests {
             assert_eq!(
                 got.map(|edits| crate::text::edit::apply_text_edits(virtual_content, &edits))
                     .unwrap(),
-                "\t  }\r\n\n\r\n\n\treturn xss\r\n\treturn xss\r\n\n\tcall(\u{1D4B3}, '\u{e9}')\r\n\t  let y = f xss;\r\n",
+                "\t  }\r\n \n\t \r\n\t\n\treturn xss\r\n\treturn xss\r\n\t \n\tcall(\u{1D4B3}, '\u{e9}')\r\n\t  let y = f xss;\r\n",
                 "t1"
             );
         }
@@ -2597,21 +2597,12 @@ mod tests {
 
     #[test]
     fn a_refused_answer_names_where_and_why_once() {
-        // Text rewritten past any likeness, in a region of 20,000
-        // characters: the diff runs out of work.
-        let mut seed = 7u64;
-        let mut text = |length: usize| -> String {
-            (0..length)
-                .map(|_| {
-                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    char::from(b'a' + (seed >> 60) as u8 % 4)
-                })
-                .collect()
-        };
-        let (old, new) = (text(20_000), text(20_000));
-        let virtual_content = format!("  {old}\n");
+        // A region whose peer dedented one line and left the other alone:
+        // an answer changing it is refused.
+        let virtual_content = "  a\nb\n";
+        let new = "A\nb";
         let offset = prepared_offset(
-            &virtual_content,
+            virtual_content,
             0,
             json!([{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}]),
         );
@@ -2624,7 +2615,7 @@ mod tests {
         };
         let response = || {
             json!({ "jsonrpc": "2.0", "id": 1, "result": [{
-                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 1, "character": 0 } },
+                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 0 } },
                 "newText": format!("{new}\n")
             }]})
         };
@@ -2634,7 +2625,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("file:///refused.md"), "{message}");
         assert!(message.contains("file:///region.lua"), "{message}");
-        assert!(message.contains("ran out of work"), "{message}");
+        assert!(message.contains("cannot be mapped back"), "{message}");
         // On type: no answer (not an empty one, which would win the
         // fan-in), not a failure warned on every keystroke.
         assert_eq!(
