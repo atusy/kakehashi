@@ -23,6 +23,11 @@
 //!   it received via `didOpen`. Used by `tests/e2e/e2e_host_bridge.rs` to prove
 //!   the host bridge forwards the real client URI and returns the response
 //!   verbatim (host-document-bridge).
+//! - `open-documents` — advertises `hoverProvider`; answers hover on a
+//!   document it holds with a JSON string naming that document's text and
+//!   every URI it holds open (`{"text": .., "open": [..]}`). Used by
+//!   `tests/e2e/e2e_reminted_region_close.rs` to prove a region an edit mints
+//!   anew does not leave its old virtual document open beside the new one.
 //! - `options-echo` — advertises `documentFormattingProvider`; replaces the
 //!   text with a line echoing the received `FormattingOptions` (`tabSize`,
 //!   `insertSpaces`), so tests can assert the options a client sent actually
@@ -320,6 +325,10 @@ fn main() {
                     }),
                     "definition" => json!({
                         "definitionProvider": true,
+                        "hoverProvider": true,
+                        "textDocumentSync": 1
+                    }),
+                    "open-documents" => json!({
                         "hoverProvider": true,
                         "textDocumentSync": 1
                     }),
@@ -947,6 +956,20 @@ fn main() {
                     json!({ "contents": observation.to_string() })
                 } else if mode == "diagnostics-refresh-prefetch-disabled" {
                     json!({ "contents": format!("diagnostic-requests:{diagnostic_generation}") })
+                } else if mode == "open-documents" {
+                    // Everything this process holds open, beside the asked
+                    // document's own text: a document the bridge forgot to
+                    // close shows as a second URI.
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| documents.get(uri))
+                        .map(|text| {
+                            let mut open: Vec<&String> = documents.keys().collect();
+                            open.sort();
+                            json!({ "contents": json!({ "text": text, "open": open }).to_string() })
+                        })
+                        .unwrap_or(Value::Null)
                 } else if mode.starts_with("will-save") {
                     // Report the recorded willSave/didSave state as a JSON string
                     // so the test can prove the notifications reached this server

@@ -2319,6 +2319,116 @@ mod tests {
         );
     }
 
+    /// The tree says which regions exist. An edit can leave the identity
+    /// tracker predicting a region where the reparsed tree has none (the node
+    /// grew at its end, or the text diff placed it elsewhere), so the region
+    /// is minted under a new id and the document opened under the old id has
+    /// nothing left to close it but this pass.
+    #[tokio::test]
+    async fn injection_pass_closes_documents_of_regions_the_tree_no_longer_has() {
+        use crate::lsp::bridge::{
+            ConnectionKey, ConnectionState, VirtualDocumentUri, test_helpers,
+        };
+
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal (string_content) @injection.content)
+                    (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = Url::parse("file:///orphaned-region.rs").unwrap();
+        let text = r#"fn main() { let a = "live"; }"#;
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let coordinator = server.injection_coordinator();
+        let live = coordinator.resolve_injection_data(&uri, "rust").unwrap();
+        assert_eq!(live.len(), 1);
+
+        let pool = server.bridge.pool();
+        pool.open_host_incarnation(&uri, incarnation).await;
+        let key = ConnectionKey::for_server("test");
+        pool.insert_connection(
+            test_helpers::create_handle_with_state(ConnectionState::Ready).await,
+        )
+        .await;
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: std::collections::HashMap::from([(
+                    "test".into(),
+                    crate::config::settings::BridgeServerConfig {
+                        cmd: Some(vec!["sh".into(), "-c".into(), "cat > /dev/null".into()]),
+                        languages: Some(vec!["rust".into()]),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+        let host_uri = crate::lsp::lsp_impl::url_to_uri(&uri).unwrap();
+        let virtual_uri = |region_id: &str| VirtualDocumentUri::new(&host_uri, "rust", region_id);
+        let live_doc = virtual_uri(&live[0].region_id);
+        let orphaned_doc = virtual_uri(&ulid::Ulid::generate().to_string());
+        // A formatting step's throwaway document belongs to its pipeline.
+        let scratch_doc = virtual_uri(&format!(
+            "{}{}0-0",
+            live[0].region_id,
+            VirtualDocumentUri::SCRATCH_ID_MARKER
+        ));
+        let (mut sender, mut received) = tokio::sync::mpsc::channel(8);
+        for doc in [&live_doc, &orphaned_doc, &scratch_doc] {
+            pool.ensure_document_opened_from_snapshot(&mut sender, &uri, doc, "live", &key)
+                .await
+                .unwrap();
+            received.recv().await.unwrap();
+        }
+        let orphaned_slot =
+            crate::lsp::diagnostic_cache::DiagnosticSource::Region(orphaned_doc.region_id().into());
+        server.diagnostics.record(
+            &uri,
+            orphaned_slot.clone(),
+            "test".into(),
+            None,
+            vec![tower_lsp_server::ls_types::Diagnostic::default()],
+        );
+
+        coordinator
+            .process_injections_after_lifecycle_lock(&uri, false, None, async {})
+            .await;
+
+        assert!(
+            !pool.is_document_opened_on_connection(&orphaned_doc, &key),
+            "a region the tree no longer has must not stay open downstream"
+        );
+        assert!(
+            !server
+                .diagnostics
+                .snapshot(&uri)
+                .contains_key(&orphaned_slot),
+            "nor keep its pushed diagnostics"
+        );
+        assert!(pool.is_document_opened_on_connection(&live_doc, &key));
+        assert!(pool.is_document_opened_on_connection(&scratch_doc, &key));
+    }
+
     #[rstest::rstest]
     #[case::completed_reload(false)]
     #[case::reload_in_progress(true)]
