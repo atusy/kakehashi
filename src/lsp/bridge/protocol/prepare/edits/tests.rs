@@ -5233,6 +5233,148 @@ mod formatting_reference {
         ))
     }
 
+    /// A line the host must hold once an answer is mapped.
+    #[derive(Debug)]
+    enum Want {
+        /// These characters, its line break included.
+        Line(String),
+        /// A whitespace-only line: as the answer wrote it (after the
+        /// content's indentation unless empty), or as V holds a line of P
+        /// that reads alike (which line of P a whitespace-only line is, no
+        /// text tells).
+        Blank { written: String, line_break: String },
+    }
+
+    /// What the host must hold once an answer turning P into `formatted` is
+    /// mapped, read off the texts alone (no map, no diff, no pairing of
+    /// lines): the host's leading lines, every line of `formatted` (one
+    /// holding text after the content's indentation), then the host's
+    /// closing. Also whether the map may refuse instead: an empty first
+    /// line written anew would fuse its LF with the leading lines' CR,
+    /// where the same line left alone keeps the host's whitespace between
+    /// them. `None` when the host cannot take the answer at all: text
+    /// before closing lines that would no longer start a line, or a CR and
+    /// an LF the answer and the host's own lines would fuse.
+    fn wanted(document: &Document, formatted: &str) -> Option<(Vec<Want>, bool)> {
+        let pieces = |text: &str| -> Vec<String> {
+            let starts = line_starts(text);
+            (0..starts.len())
+                .map(|line| {
+                    let next = starts.get(line + 1).copied().unwrap_or(text.len());
+                    text[starts[line]..next].to_string()
+                })
+                .collect()
+        };
+        let mut wants = Vec::new();
+        let mut leading = pieces(&document.leading);
+        leading.pop();
+        wants.extend(leading.into_iter().map(Want::Line));
+        let starts = line_starts(formatted);
+        for line in 0..starts.len() {
+            let end = content_end(formatted, &starts, line);
+            let next = starts.get(line + 1).copied().unwrap_or(formatted.len());
+            let (content, line_break) = (&formatted[starts[line]..end], &formatted[end..next]);
+            let blank = content.trim_matches([' ', '\t']).is_empty();
+            if line + 1 == starts.len() && content.is_empty() {
+                // The answer ends with a line break (or holds nothing): the
+                // host's closing follows as it was.
+                let closing = if document.indent_only_last_line {
+                    document.last_line_indent.to_string()
+                } else {
+                    document.closing.clone()
+                };
+                wants.extend(pieces(&closing).into_iter().map(Want::Line));
+            } else if line + 1 == starts.len() && !document.closing.is_empty() {
+                // A last line with no line break: the closing lines would
+                // no longer start a line.
+                return None;
+            } else if blank {
+                wants.push(Want::Blank {
+                    written: content.to_string(),
+                    line_break: line_break.to_string(),
+                });
+            } else {
+                // (Written last with no line break, it takes the place of
+                // the indentation-only last line.)
+                wants.push(Want::Line(format!(
+                    "{}{content}{line_break}",
+                    document.uniform
+                )));
+            }
+        }
+        let mut may_refuse = false;
+        for pair in wants.windows(2) {
+            let ends_with_cr = match &pair[0] {
+                Want::Line(text) => text.ends_with('\r'),
+                Want::Blank { line_break, .. } => line_break == "\r",
+            };
+            match &pair[1] {
+                Want::Line(text) if ends_with_cr && text.starts_with('\n') => return None,
+                Want::Blank {
+                    written,
+                    line_break,
+                } if ends_with_cr && written.is_empty() && line_break.starts_with('\n') => {
+                    may_refuse = true;
+                }
+                _ => {}
+            }
+        }
+        Some((wants, may_refuse))
+    }
+
+    /// Why `got` is not what `wants` asks of the host, if it is not. A
+    /// whitespace-only line may hold what the answer wrote, or what V holds
+    /// on a line P shows alike to it.
+    fn unwanted(document: &Document, prepared: &str, wants: &[Want], got: &str) -> Option<String> {
+        let lines = |text: &str| -> Vec<(String, String)> {
+            let starts = line_starts(text);
+            (0..starts.len())
+                .map(|line| {
+                    let end = content_end(text, &starts, line);
+                    let next = starts.get(line + 1).copied().unwrap_or(text.len());
+                    (
+                        text[starts[line]..end].to_string(),
+                        text[end..next].to_string(),
+                    )
+                })
+                .collect()
+        };
+        let got_lines = lines(got);
+        if got_lines.len() != wants.len() {
+            return Some(format!("{} lines, not {}", got_lines.len(), wants.len()));
+        }
+        let prepared_lines = lines(prepared);
+        let virtual_lines = lines(&document.virtual_text[document.leading.len()..]);
+        for (at, ((content, line_break), want)) in got_lines.iter().zip(wants).enumerate() {
+            let as_wanted = match want {
+                Want::Line(text) => *text == format!("{content}{line_break}"),
+                Want::Blank {
+                    written,
+                    line_break: wanted_break,
+                } => {
+                    let indented = if written.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}{written}", document.uniform)
+                    };
+                    line_break == wanted_break
+                        && (*content == indented
+                            || prepared_lines
+                                .iter()
+                                .zip(&virtual_lines)
+                                .any(|((old, _), (held, _))| old == written && held == content))
+                }
+            };
+            if !as_wanted {
+                return Some(format!(
+                    "line {at} is {:?}, not {want:?}",
+                    format!("{content}{line_break}")
+                ));
+            }
+        }
+        None
+    }
+
     /// `output` with two lines of text the formatter left as they were,
     /// the content's indent removed from both, swapped (as sorting imports
     /// does) when `shuffle` says, each keeping its own line break. (A line
@@ -5436,6 +5578,36 @@ mod formatting_reference {
                         changing.set(changing.get() + 1);
                     }
                     let got = apply(&document.virtual_text, &mapped);
+                    // Whatever the map reads the answer as, the host then
+                    // reads as the edited P does (see `wanted`). Left out:
+                    // a peer dedenting unevenly (an answer changing nothing
+                    // maps there, and no one indentation is the content's),
+                    // and a last line written with no line break onto the
+                    // indentation-only last line, which keeps that line's
+                    // own indent rather than regain the content's.
+                    let on_the_last_line = document.indent_only_last_line
+                        && !formatted.is_empty()
+                        && !formatted.ends_with(['\n', '\r']);
+                    if !on_the_last_line && !uneven {
+                        let wants = wanted(&document, &formatted);
+                        prop_assert!(
+                            wants.is_some(),
+                            "{:?} mapped on {:?}, which cannot take it",
+                            edits,
+                            document.virtual_text
+                        );
+                        let (wants, _) = wants.unwrap();
+                        let unwanted = unwanted(&document, &prepared, &wants, &got);
+                        prop_assert!(
+                            unwanted.is_none(),
+                            "{:?} on {:?} (P {:?}) gives {:?}: {}",
+                            edits,
+                            document.virtual_text,
+                            prepared,
+                            got,
+                            unwanted.unwrap_or_default()
+                        );
+                    }
                     let copies = lines.iter().enumerate().any(|(at, line)| {
                         matches!(line, Line::Content { body, .. } if *body >= BODIES.len()
                             && lines[at + 1..].iter().any(|other| {
