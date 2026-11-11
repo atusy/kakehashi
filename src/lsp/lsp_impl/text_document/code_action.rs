@@ -30,6 +30,7 @@ use super::super::Kakehashi;
 use super::super::bridge_context::{RangeRequestContext, Sourced};
 use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
+use crate::error::LockResultExt;
 use crate::lsp::aggregation::server::{
     FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred, preferred_among,
@@ -117,7 +118,7 @@ impl RefusedActionsFallback {
         let mut kept = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison("RefusedActionsFallback::answers");
         if kept.is_none()
             && parts.iter().any(|(actions, _)| !actions.is_empty())
             && parts.iter().all(|(actions, source)| {
@@ -144,7 +145,7 @@ impl RefusedActionsFallback {
         let kept = self
             .0
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison("RefusedActionsFallback::or_kept");
         match (result, kept) {
             (Ok(None), Some(parts)) => (Ok(Some(parts)), None),
             (Err(error), Some(parts))
@@ -825,7 +826,7 @@ impl Kakehashi {
                             && !actions_answer(actions, true)
                         {
                             kept.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .recover_poison("code action: refused answers kept aside")
                                 .push((server_name, actions.clone()));
                         }
                         answer
@@ -843,7 +844,7 @@ impl Kakehashi {
                     let arrived = std::mem::take(
                         &mut *passed_over
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                            .recover_poison("code action: refused answers passed over"),
                     );
                     if let Some(actions) = preferred_among(&ctx.document, arrived) {
                         return Ok(Some(actions));
@@ -1268,6 +1269,52 @@ mod tests {
             &vec![(action("as is"), None)],
             |_| unreachable!()
         ));
+    }
+
+    /// Its lock poisoned, the refused fallback still keeps the refused
+    /// actions and hands them back.
+    #[test]
+    fn a_poisoned_refused_actions_fallback_still_keeps_and_hands_back() {
+        let fallback = std::sync::Arc::new(RefusedActionsFallback::default());
+        let poisoner = std::sync::Arc::clone(&fallback);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+        assert!(fallback.0.is_poisoned());
+
+        let host_uri = url::Url::parse("file:///test/poisoned.md").unwrap();
+        let map = crate::lsp::bridge::apply_prepare_result(
+            "a",
+            &crate::lsp::bridge::VirtualLayout::single("a"),
+            None,
+        )
+        .unwrap()
+        .map;
+        let refused: ActionParts = vec![(
+            vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: "refused".into(),
+                disabled: Some(crate::lsp::bridge::prepared_map_refusal_for_test()),
+                ..Default::default()
+            })],
+            Some(Sourced::prepared_for_test(
+                (),
+                &host_uri,
+                "lua",
+                "r",
+                &map,
+                1,
+                0,
+            )),
+        )];
+        assert!(!fallback.answers(&refused, |_| true));
+        let fallback = std::sync::Arc::try_unwrap(fallback)
+            .ok()
+            .expect("the poisoning thread is gone");
+        let (result, displaced) = fallback.or_kept(Ok(None));
+        assert_eq!(result.unwrap().map(|parts| parts.len()), Some(1));
+        assert!(displaced.is_none());
     }
 
     /// Under a cross-layer `preferred`, a prepared region's answer of only

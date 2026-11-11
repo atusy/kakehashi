@@ -14,6 +14,7 @@ use crate::config::settings::{
     AggregationStrategy, BridgeLanguageConfig, LayerSource, ResolvedAggregationConfig,
     ResolvedLayerConfig,
 };
+use crate::error::LockResultExt;
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId, workspace_edit_has_effect};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
@@ -736,10 +737,7 @@ impl<T: Clone> StaleAnswerFallback<T> {
         if layer_answers(sourced, &has_result, may_keep) {
             return true;
         }
-        let mut kept = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut kept = self.0.lock().recover_poison("StaleAnswerFallback::answers");
         if kept.is_none() {
             *kept = Some(sourced.clone());
         }
@@ -751,7 +749,7 @@ impl<T: Clone> StaleAnswerFallback<T> {
     pub(crate) fn passed_over(&self) -> bool {
         self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recover_poison("StaleAnswerFallback::passed_over")
             .is_some()
     }
 
@@ -765,7 +763,7 @@ impl<T: Clone> StaleAnswerFallback<T> {
         let kept = self
             .0
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .recover_poison("StaleAnswerFallback::or_kept");
         match (result, kept) {
             (Ok(None), Some(kept)) => Ok(Some(kept)),
             (Err(error), Some(kept))
@@ -2767,6 +2765,36 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// Its lock poisoned, the stale fallback still keeps the answer passed
+    /// over and hands it back.
+    #[test]
+    fn a_poisoned_stale_answer_fallback_still_keeps_and_hands_back() {
+        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+        let fallback = std::sync::Arc::new(StaleAnswerFallback::<u8>::default());
+        let poisoner = std::sync::Arc::clone(&fallback);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+        assert!(fallback.0.is_poisoned());
+
+        let host = url::Url::parse("file:///test/poisoned.md").unwrap();
+        let map = apply_prepare_result("a", &VirtualLayout::single("a"), None)
+            .unwrap()
+            .map;
+        let sourced = Sourced::prepared_for_test(7u8, &host, "lua", "r", &map, 1, 0);
+        assert!(!fallback.answers(&sourced, |_| true, |_| false));
+        assert!(fallback.passed_over());
+        let fallback = std::sync::Arc::try_unwrap(fallback)
+            .ok()
+            .expect("the poisoning thread is gone");
+        assert_eq!(
+            fallback.or_kept(Ok(None)).unwrap().map(|kept| kept.value),
+            Some(7)
+        );
+    }
 
     /// Read at once, an answer may still be kept while current or settling
     /// (it would be waited on), and may not once moved or stale.
