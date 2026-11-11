@@ -1023,6 +1023,153 @@ mod tests {
         closer.await.unwrap();
     }
 
+    /// A request whose text a newer edit superseded stops waiting as soon as
+    /// its connection is sent another text: the lifecycle pass sends a
+    /// host's texts in the order of its edits, so the one the request was
+    /// built for is not coming. A request built as is, waiting for its
+    /// connection to drop a prepared text, likewise.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_request_fails_as_soon_as_another_text_supersedes_its_own() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let prepare = |virtual_text: &str| {
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(dedent_answer()),
+            )
+            .unwrap()
+        };
+        // Off any polling tick.
+        let delay = std::time::Duration::from_millis(2_503);
+        for built_as_is in [false, true] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let host_uri = Url::parse("file:///test/superseded.md").unwrap();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                "lua",
+                TEST_ULID_LUA_0,
+            );
+            let uri = virtual_uri.to_uri_string();
+            let key = ConnectionKey::for_server("lua");
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            // What the connection holds as the request arrives: the text
+            // before the one it was built for.
+            let before = prepare("  a");
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &before.text,
+                    map: Some(&before.map),
+                },
+            );
+            let offset = if built_as_is {
+                RegionOffset::new(0, 0)
+            } else {
+                RegionOffset::new(0, 0).with_prepared(prepare("  b").map)
+            };
+            // The next edit's text is sent instead.
+            let sender = {
+                let pool = Arc::clone(&pool);
+                let virtual_uri = virtual_uri.clone();
+                let key = key.clone();
+                let newer = prepare("  c");
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    pool.record_sent_for_test(
+                        &virtual_uri,
+                        &key,
+                        SentText {
+                            text: &newer.text,
+                            map: Some(&newer.map),
+                        },
+                    );
+                })
+            };
+            let started = tokio::time::Instant::now();
+            assert!(
+                pool.wait_for_request_text(&uri, &key, &offset, || false)
+                    .await
+                    .is_err(),
+                "built as is: {built_as_is}"
+            );
+            assert_eq!(started.elapsed(), delay, "built as is: {built_as_is}");
+            sender.await.unwrap();
+        }
+    }
+
+    /// A text the connection already held as the request arrived says
+    /// nothing of the request's own, however new its answer: after an undo,
+    /// a request is built on an answer given before the one its connection
+    /// still holds, and the lifecycle pass sends that text again. The
+    /// request waits for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_built_on_an_earlier_answer_waits_for_its_text_to_be_sent_again() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let prepare = |virtual_text: &str| {
+            apply_prepare_result(
+                virtual_text,
+                &VirtualLayout::single(virtual_text),
+                Some(dedent_answer()),
+            )
+            .unwrap()
+        };
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let host_uri = Url::parse("file:///test/undo.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            TEST_ULID_LUA_0,
+        );
+        let uri = virtual_uri.to_uri_string();
+        let key = ConnectionKey::for_server("lua");
+        pool.register_opened_document(&host_uri, &virtual_uri, &key)
+            .await;
+        // Answered first, sent, then replaced by the edit's text.
+        let undone = prepare("  a");
+        let edited = prepare("  b");
+        assert!(undone.map.built() < edited.map.built());
+        for text in [&undone, &edited] {
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &text.text,
+                    map: Some(&text.map),
+                },
+            );
+        }
+        // The undo: the request is built on the first answer again.
+        let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&undone.map));
+        // Off any polling tick.
+        let delay = std::time::Duration::from_millis(2_503);
+        let sender = {
+            let pool = Arc::clone(&pool);
+            let virtual_uri = virtual_uri.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &undone.text,
+                        map: Some(&undone.map),
+                    },
+                );
+            })
+        };
+        let started = tokio::time::Instant::now();
+        assert!(
+            pool.wait_for_request_text(&uri, &key, &offset, || false)
+                .await
+                .is_ok()
+        );
+        assert_eq!(started.elapsed(), delay);
+        sender.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_waiting_request_goes_on_as_soon_as_its_text_is_held_under_its_map() {
         use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
