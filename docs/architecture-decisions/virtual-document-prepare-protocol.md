@@ -378,7 +378,14 @@ Completion keeps to what the client inserts where it asked:
   main edit to be checked with.
 - A mapped multi-line edit already regained the removed indentation: the
   item asks a client that supports it to insert as is, and is dropped for
-  one that always adjusts indentation.
+  one that always adjusts indentation. An edit the client would have
+  adjusted — the item asks for `adjustIndentation`, or names no mode and
+  the client declares that its default (`completion.insertTextMode`) — was
+  written to get the indentation of the line it starts on, up to its
+  start, on every line below: it is given that over P before it maps
+  back, so the lines end up with what P shows of that indentation after
+  what the peer removed. A client declaring no default is taken to insert
+  as is.
 - An incomplete list without items (the server's own, or one whose every
   item did not map back) is no result: it would win over another server's
   items. Its ask to re-query still stands when the server ranks above the

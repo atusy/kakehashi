@@ -989,6 +989,19 @@ impl PreparedMap {
         self.prepared_lines.position(mapped)
     }
 
+    /// The spaces and tabs opening `position`'s line in P, up to `position`:
+    /// what a client adjusting indentation gives the lines an edit starting
+    /// there inserts below it. Empty when P has no such position.
+    pub(crate) fn prepared_indent_before(&self, position: Position) -> &str {
+        let lines = &self.prepared_lines;
+        let line_start = lines.offset_strict(Position::new(position.line, 0));
+        let (Some(start), Some(end)) = (line_start, lines.offset_strict(position)) else {
+            return "";
+        };
+        let before = &lines.text[start..end];
+        &before[..before.len() - before.trim_start_matches([' ', '\t']).len()]
+    }
+
     /// Whether a V position sits on the blank lines the peer deleted from
     /// the document's edges (starts included): those lines are not in P at
     /// all, so a request there would be answered for another line.

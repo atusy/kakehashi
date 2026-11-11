@@ -412,6 +412,26 @@ fn transform_prepared_completion_item(
         request_host_position
             .is_none_or(|position| range.start <= position && position <= range.end)
     };
+    // A multi-line edit the client would have adjusted was written for it
+    // to give the lines below the first the indentation of the line the
+    // edit starts on, up to its start. It goes out to be inserted as is
+    // (below), so it gets that here, over P, before it maps back: the lines
+    // then regain what the peer removed in front of it.
+    if insert_mode.adjusts(item.insert_text_mode)
+        && let Some(prepared) = offset.prepared()
+        && let Some((start, new_text)) = match &mut item.text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => Some((edit.range.start, &mut edit.new_text)),
+            Some(CompletionTextEdit::InsertAndReplace(edit)) => {
+                Some((edit.insert.start, &mut edit.new_text))
+            }
+            None => None,
+        }
+    {
+        let indent = prepared.prepared_indent_before(start);
+        if !indent.is_empty() && new_text.contains(['\n', '\r']) {
+            *new_text = indent_lines_below_the_first(new_text, indent);
+        }
+    }
     // Transform text_edit if present, and the additional edits with it, as
     // the one set the client applies, through each range it may apply the
     // primary with.
@@ -485,7 +505,7 @@ fn transform_prepared_completion_item(
         };
         if new_text.contains(['\n', '\r']) {
             match insert_mode {
-                ClientInsertMode::AsIsSettable => {
+                ClientInsertMode::AsIsSettable | ClientInsertMode::AdjustsUnlessAsIs => {
                     item.insert_text_mode = Some(InsertTextMode::AS_IS);
                 }
                 ClientInsertMode::AdjustsIndentation => return false,
@@ -639,6 +659,21 @@ fn translate_insert_replace_edit_to_host(
     Some(kept)
 }
 
+/// `text` with `indent` opening every line below its first, as a client
+/// adjusting indentation inserts it.
+fn indent_lines_below_the_first(text: &str, indent: &str) -> String {
+    let mut indented = String::with_capacity(text.len() + indent.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(['\n', '\r']) {
+        let end = at + if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        indented.push_str(&rest[..end]);
+        indented.push_str(indent);
+        rest = &rest[end..];
+    }
+    indented.push_str(rest);
+    indented
+}
+
 /// How the client inserts a completion's multi-line text (LSP
 /// `insertTextMode`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -646,8 +681,12 @@ pub(super) enum ClientInsertMode {
     /// As is, by default, with no way to tell it otherwise declared.
     #[default]
     AsIs,
-    /// It honors an item's `insertTextMode: asIs`.
+    /// It honors an item's `insertTextMode: asIs`, and does not declare
+    /// adjusting the indentation its default.
     AsIsSettable,
+    /// It adjusts the indentation by default, and honors an item's
+    /// `insertTextMode: asIs`.
+    AdjustsUnlessAsIs,
     /// It adjusts the indentation by default, and an item cannot tell it not
     /// to.
     AdjustsIndentation,
@@ -666,15 +705,23 @@ impl ClientInsertMode {
             .and_then(|completion| completion.completion_item.as_ref())
             .and_then(|item| item.insert_text_mode_support.as_ref())
             .is_some_and(|support| support.value_set.contains(&InsertTextMode::AS_IS));
-        if settable {
-            Self::AsIsSettable
-        } else if completion
+        let adjusts = completion
             .and_then(|completion| completion.insert_text_mode)
-            .is_some_and(|mode| mode == InsertTextMode::ADJUST_INDENTATION)
-        {
-            Self::AdjustsIndentation
-        } else {
-            Self::AsIs
+            .is_some_and(|mode| mode == InsertTextMode::ADJUST_INDENTATION);
+        match (settable, adjusts) {
+            (true, true) => Self::AdjustsUnlessAsIs,
+            (true, false) => Self::AsIsSettable,
+            (false, true) => Self::AdjustsIndentation,
+            (false, false) => Self::AsIs,
+        }
+    }
+
+    /// Whether the client would adjust the indentation of an item naming
+    /// `mode` (none: its default), were the item sent as it came.
+    fn adjusts(self, mode: Option<tower_lsp_server::ls_types::InsertTextMode>) -> bool {
+        match mode {
+            Some(mode) => mode == tower_lsp_server::ls_types::InsertTextMode::ADJUST_INDENTATION,
+            None => matches!(self, Self::AdjustsUnlessAsIs | Self::AdjustsIndentation),
         }
     }
 }
@@ -1268,6 +1315,11 @@ mod tests {
         true,
         Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
     )]
+    #[case::adjusting_unless_told(
+        ClientInsertMode::AdjustsUnlessAsIs,
+        true,
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
     #[case::adjusting(ClientInsertMode::AdjustsIndentation, false, None)]
     #[case::as_is(ClientInsertMode::AsIs, true, None)]
     fn a_prepared_multi_line_edit_is_inserted_as_is(
@@ -1480,6 +1532,15 @@ mod tests {
                 }}})
             ))),
             ClientInsertMode::AsIsSettable
+        );
+        assert_eq!(
+            ClientInsertMode::from_capabilities(Some(&caps(
+                json!({"textDocument": {"completion": {
+                    "insertTextMode": 2,
+                    "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+                }}})
+            ))),
+            ClientInsertMode::AdjustsUnlessAsIs
         );
         assert_eq!(
             ClientInsertMode::from_capabilities(Some(&caps(
