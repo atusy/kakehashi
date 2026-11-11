@@ -1133,6 +1133,92 @@ mod tests {
     /// A pair's candidates resolve once per settings: every caller gets the
     /// same launch configs (answers are keyed by their identity), and only
     /// other settings resolve them again.
+    /// A pair has no target, so nothing of it waits for a server's
+    /// handshake, until its prepare `priorities` name a candidate — under
+    /// the shipped defaults (whose `"_"` method entry says `["*"]`) and
+    /// with no `languages` at all alike, even with a bridged server that
+    /// advertises the request.
+    #[test]
+    fn a_pair_has_no_target_until_its_prepare_priorities_name_a_server() {
+        use crate::config::settings::{AggregationConfig, BridgeLanguageConfig, LanguageSettings};
+
+        let pool = Arc::new(LanguageServerPool::preparing());
+        let coordinator = BridgeCoordinator::with_cancel_forwarder(
+            Arc::clone(&pool),
+            CancelForwarder::new(Arc::clone(&pool)),
+        );
+        let settings = |languages| {
+            Arc::new(crate::config::WorkspaceSettings {
+                auto_install: false,
+                languages,
+                language_servers: [(
+                    "peer".to_string(),
+                    super::super::pool::test_helpers::devnull_config_for_language("lua"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            })
+        };
+        let shipped = || crate::config::defaults::default_settings().languages;
+        let naming = |priorities: &[&str]| {
+            let mut languages = shipped();
+            languages.insert(
+                "markdown".to_string(),
+                LanguageSettings {
+                    bridge: Some(
+                        [(
+                            "lua".to_string(),
+                            BridgeLanguageConfig {
+                                enabled: Some(true),
+                                aggregation: Some(
+                                    [(
+                                        super::super::protocol::PREPARE_METHOD.to_string(),
+                                        AggregationConfig {
+                                            priorities: Some(
+                                                priorities
+                                                    .iter()
+                                                    .map(|name| name.to_string())
+                                                    .collect(),
+                                            ),
+                                            ..Default::default()
+                                        },
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                    ..Default::default()
+                },
+            );
+            languages
+        };
+        pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
+
+        coordinator.prepare_settings_changed(&settings(shipped()));
+        assert!(
+            coordinator.prepare_target("markdown", "lua").is_none(),
+            "the shipped defaults name no peer"
+        );
+        coordinator.prepare_settings_changed(&settings(Default::default()));
+        assert!(
+            coordinator.prepare_target("markdown", "lua").is_none(),
+            "nor does a host with no settings"
+        );
+
+        for priorities in [["peer"], ["*"]] {
+            coordinator.prepare_settings_changed(&settings(naming(&priorities)));
+            let target = coordinator
+                .prepare_target("markdown", "lua")
+                .unwrap_or_else(|| panic!("{priorities:?} names the peer"));
+            assert_eq!(target.candidates[0].server_name, "peer");
+        }
+    }
+
     #[test]
     fn a_pairs_candidates_resolve_once_per_settings() {
         let pool = Arc::new(LanguageServerPool::preparing());

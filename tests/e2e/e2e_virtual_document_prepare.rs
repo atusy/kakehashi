@@ -39,8 +39,11 @@ struct Setup {
     unprepared_python: bool,
     /// The editor's capabilities.
     capabilities: Value,
-    /// The prepare method's `priorities` for markdown's lua documents.
+    /// The prepare method's `priorities` for markdown's lua documents;
+    /// `null` writes no entry at the prepare key.
     prepare_priorities: Value,
+    /// The `_` method entry's `priorities` for markdown's lua documents.
+    method_priorities: Value,
     /// Have both mocks log every message they receive to `wire.log` in the
     /// test's directory.
     wire_log: bool,
@@ -57,6 +60,7 @@ impl Default for Setup {
             unprepared_python: false,
             capabilities: json!({}),
             prepare_priorities: json!(["peer"]),
+            method_priorities: json!(["echo"]),
             wire_log: false,
             experimental: true,
         }
@@ -72,9 +76,12 @@ impl Setup {
         // names it, over the `_` method entry that leaves every other method
         // to the echo mock.
         let mut markdown = json!({ "bridge": { "lua": { "aggregation": {
-            "kakehashi/virtualDocument/prepare": { "priorities": self.prepare_priorities },
-            "_": { "priorities": ["echo"] }
+            "_": { "priorities": self.method_priorities }
         } } } });
+        if !self.prepare_priorities.is_null() {
+            markdown["bridge"]["lua"]["aggregation"]["kakehashi/virtualDocument/prepare"] =
+                json!({ "priorities": self.prepare_priorities });
+        }
         if self.unprepared_python {
             markdown["bridge"]["python"] = json!({});
         }
@@ -565,6 +572,29 @@ fn without_experimental_features_nothing_is_prepared() {
         }),
     );
     assert!(!response["result"].is_null(), "{response}");
+    let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
+    assert!(log.contains("textDocument/didOpen\t"), "{log}");
+    assert!(!log.contains("kakehashi/virtualDocument/prepare"), "{log}");
+}
+
+#[test]
+fn a_peer_the_prepare_priorities_do_not_name_is_never_asked() {
+    // Experimental features are on, and the peer advertises the request and
+    // is listed beside the echo mock for every other method — but nothing is
+    // written at the prepare key, which does not read the `_` entry: the
+    // document goes as is, held for no server's handshake.
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        prepare_priorities: Value::Null,
+        method_priorities: json!(["echo", "peer"]),
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/unnamed.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "  local x = 1\n");
     let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
     assert!(log.contains("textDocument/didOpen\t"), "{log}");
     assert!(!log.contains("kakehashi/virtualDocument/prepare"), "{log}");
