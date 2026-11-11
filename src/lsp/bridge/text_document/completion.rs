@@ -1516,6 +1516,81 @@ mod tests {
         );
     }
 
+    /// A document the peer left as it is -- it answered `null`, or an
+    /// answer changing nothing -- is still held as a prepared one, but its
+    /// text is the virtual document's: nothing was removed for an edit to
+    /// regain, so its items go as a document as is sends them. A peer
+    /// bridged for every language declines most documents, and each would
+    /// otherwise lose its snippets and multi-line items to rules that guard
+    /// an indentation it does not have.
+    #[rstest]
+    #[case::declined(None)]
+    #[case::answered_unchanged(Some(json!({"segments": [{"type": "content"}]})))]
+    fn an_item_on_a_document_the_peer_left_as_it_is_goes_as_from_one_as_is(
+        #[case] answer: Option<serde_json::Value>,
+    ) {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "if x:\n  pass\n";
+        let map = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            answer.map(|answer| serde_json::from_value(answer).unwrap()),
+        )
+        .unwrap()
+        .map;
+        let left_as_it_is = RegionOffset::new(10, 0).with_prepared(map);
+        let items = [
+            // A snippet breaking a line, asking to be adjusted, its range
+            // short of the caret.
+            json!({
+                "label": "if",
+                "insertTextMode": 2,
+                "insertTextFormat": 2,
+                "textEdit": {
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 3}},
+                    "newText": "if ${1:x}:\n  pass"
+                }
+            }),
+            // Lines inserted at the caret, with an edit of their own beside.
+            json!({
+                "label": "for",
+                "insertText": "for x in y:\n\tpass",
+                "additionalTextEdits": [{
+                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                    "newText": "import y\n"
+                }]
+            }),
+            // A snippet inserted at the caret, with a choice and a variable.
+            json!({
+                "label": "s",
+                "insertTextFormat": 2,
+                "insertText": "${1|a,b|} $TM_FILENAME$0"
+            }),
+        ];
+        for insert_mode in [
+            ClientInsertMode::AsIsSettable,
+            ClientInsertMode::AdjustsIndentation,
+            ClientInsertMode::AsIs,
+        ] {
+            for completed in &items {
+                let transform = |offset: &RegionOffset| {
+                    let mut completed = item(completed.clone());
+                    let kept = transform_completion_item(
+                        &mut completed,
+                        offset,
+                        Position::new(12, 0),
+                        Some(Position::new(11, 2)),
+                        insert_mode,
+                    );
+                    (kept, completed)
+                };
+                let as_is = transform(&RegionOffset::new(10, 0));
+                assert!(as_is.0, "{completed}");
+                assert_eq!(transform(&left_as_it_is), as_is, "{insert_mode:?}");
+            }
+        }
+    }
+
     #[test]
     fn the_client_insert_mode_follows_its_capabilities() {
         let caps = |value: serde_json::Value| -> tower_lsp_server::ls_types::ClientCapabilities {

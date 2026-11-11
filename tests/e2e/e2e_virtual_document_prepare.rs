@@ -398,6 +398,29 @@ fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
 }
 
 #[test]
+fn a_document_the_peer_left_as_it_is_completes_as_one_never_prepared() {
+    // Nothing for the peer to remove: no indentation, no blank edge line.
+    // The document still goes through it, but its text is the virtual
+    // document's own, so the snippet a prepared document drops (above)
+    // comes back, still the snippet its server sent.
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/left-as-it-is.md";
+    let text = "# t\n\n```lua\nlocal SNIPPETS = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 7 } }),
+    );
+    let items = result_items(&response);
+    assert_eq!(items.len(), 1, "{response}");
+    assert_eq!(items[0]["label"], "s");
+    assert_eq!(items[0]["insertTextFormat"], 2);
+    let inserted = items[0]["insertText"].as_str().unwrap_or_default();
+    assert!(inserted.starts_with("s$"), "{response}");
+}
+
+#[test]
 fn formatting_is_not_offered_on_a_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/format.md";
