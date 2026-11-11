@@ -165,8 +165,9 @@ impl Setup {
         }
         if self.host_echo {
             markdown["bridge"]["_self"] = json!({ "enabled": true });
-            // Hovers stay with the injected layer: a test's hover is then
-            // answered while the host mock holds a rename back.
+            // Hovers stay with the injected layer: a test's hover outside
+            // every bridged region is then answered, by no server, while
+            // the host mock holds a rename back.
             markdown["layers"] = json!({ "aggregation": {
                 "textDocument/hover": { "priorities": ["virt"] }
             } });
@@ -1195,7 +1196,12 @@ fn a_host_layer_rename_no_prepared_answer_was_passed_over_for_still_answers() {
         std::thread::sleep(Duration::from_millis(20));
     }
     change(&mut client, uri, 2, &format!("{text}\nmore\n"));
-    hover(&mut client, uri, 3, 4);
+    // Answered once the edit is in, by no server: a request into the
+    // region would need the host's lifecycle lock, which the rename the
+    // host mock holds back keeps shared until it is answered. An open
+    // still owed to the region (the peer's, under load) queues for it
+    // exclusively, and every request behind it waits for the rename.
+    hover(&mut client, uri, 0, 0);
     std::fs::write(dir.path().join("release"), "").expect("release");
     let response = client.receive_response_for_id_public(id);
     assert_eq!(
