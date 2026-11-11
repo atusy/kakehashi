@@ -256,6 +256,7 @@ More text
 - **Injection restructuring churn**: a changed language, depth, or included-range geometry that no longer matches the shifted tree scope makes held IDs resolve to `null`; clients re-acquire them. Edits at a scope boundary also retire its interior IDs.
 - **START edits invalidate**: Editing a code block's opening delimiter invalidates its ID
 - **START shifts outside range**: Nodes whose START shifts due to earlier edits are preserved
+- **Identity is a prediction the tree can overrule**: a key is adjusted from the edit alone, and a lookup after the reparse matches only a node at exactly that key. An insert exactly at a node's END leaves the key unchanged while the reparsed node grows (a line added above a closing code fence), and a whole-document replacement is adjusted from a reconstructed text diff that knows nothing of the new tree. Such a node is minted under a new ID; the old pair stays until `didClose` and is named by no edit. Whatever holds a resource per ID must therefore ask the current tree which IDs exist rather than wait to be told one ended: the bridge closes the virtual documents of regions its injection pass no longer finds
 - **Injection region reordering**: When code blocks are inserted or deleted above tracked injection regions, those regions' container nodes are preserved (START unchanged), but their ordinal position changes. Systems relying on positional region IDs (e.g., `region-0`, `region-1`) must handle URI changes via close/reopen cycles
 
 ### Neutral
