@@ -3375,21 +3375,20 @@ kind = "locals""#;
         );
     }
 
-    /// A pair's documents are held until every prepare candidate has answered
-    /// its handshake, so being a candidate is not something a server falls
-    /// into: with nothing written at the prepare key no server is one. Every
-    /// other method keeps `["*"]`.
+    /// The prepare key is one more method key: with nothing written at it,
+    /// it resolves to `["*"]` — every server bridged for the language is a
+    /// candidate — as any method does.
     #[test]
-    fn prepare_priorities_name_no_server_by_default() {
+    fn prepare_priorities_default_to_every_server() {
         let unconfigured = BridgeLanguageConfig::default();
-        assert!(
+        assert_eq!(
             unconfigured
                 .resolve_aggregation("kakehashi/virtualDocument/prepare")
-                .priorities
-                .is_empty()
+                .priorities,
+            vec![PRIORITIES_WILDCARD.to_string()]
         );
 
-        // Nor does an entry that leaves `priorities` unset name one.
+        // An entry that leaves `priorities` unset resolves the same way.
         let entry_without_priorities = BridgeLanguageConfig {
             enabled: Some(true),
             aggregation: Some(HashMap::from([(
@@ -3397,58 +3396,70 @@ kind = "locals""#;
                 AggregationConfig::default(),
             )])),
         };
-        assert!(
+        assert_eq!(
             entry_without_priorities
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            vec![PRIORITIES_WILDCARD.to_string()]
+        );
+    }
+
+    /// The prepare key inherits the `"_"` method entry like every LSP
+    /// method: an allowlist written there names the prepare candidates too,
+    /// and `[]` there opts the pair out.
+    #[test]
+    fn prepare_priorities_inherit_the_method_wildcard() {
+        let wildcard = |priorities: &[&str]| BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: Some(priorities.iter().map(|name| name.to_string()).collect()),
+                    ..Default::default()
+                },
+            )])),
+        };
+
+        let allowlist = wildcard(&["tsudoi"]);
+        assert_eq!(
+            allowlist
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            allowlist
+                .resolve_aggregation("textDocument/hover")
+                .priorities,
+            "the prepare key reads the wildcard as any method does"
+        );
+        assert_eq!(
+            allowlist
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            &["tsudoi".to_string()]
+        );
+        assert!(
+            wildcard(&[])
                 .resolve_aggregation("kakehashi/virtualDocument/prepare")
                 .priorities
                 .is_empty()
         );
     }
 
-    /// The shipped `aggregation."_"` entry says `priorities = ["*"]`, and a
-    /// user's own names the servers of their LSP methods. Inheriting either
-    /// at the prepare key would make every bridged server a candidate again,
-    /// behind whose handshake the pair's documents wait.
+    /// What is written *at* the prepare key outranks the `"_"` method entry,
+    /// at any language level.
     #[test]
-    fn prepare_priorities_do_not_inherit_the_method_wildcard() {
-        let config = BridgeLanguageConfig {
-            enabled: Some(true),
-            aggregation: Some(HashMap::from([(
-                WILDCARD_KEY.to_string(),
-                AggregationConfig {
-                    priorities: Some(vec![PRIORITIES_WILDCARD.to_string()]),
-                    max_fan_out: Some(1),
-                    ..Default::default()
-                },
-            )])),
+    fn prepare_priorities_written_at_the_prepare_key_outrank_the_wildcard() {
+        let entry = |priorities: &[&str]| AggregationConfig {
+            priorities: Some(priorities.iter().map(|name| name.to_string()).collect()),
+            ..Default::default()
         };
-
-        assert_eq!(
-            config.resolve_aggregation("textDocument/hover").priorities,
-            vec![PRIORITIES_WILDCARD.to_string()],
-            "every other method still inherits the wildcard"
-        );
-        assert!(
-            config
-                .resolve_aggregation("kakehashi/virtualDocument/prepare")
-                .priorities
-                .is_empty(),
-            "the prepare key names no server it was not given"
-        );
-    }
-
-    /// What is written *at* the prepare key governs it, an explicit `["*"]`
-    /// included, at any language level.
-    #[test]
-    fn prepare_priorities_come_from_the_prepare_key_itself() {
         let named = |priorities: &[&str]| {
-            HashMap::from([(
-                "kakehashi/virtualDocument/prepare".to_string(),
-                AggregationConfig {
-                    priorities: Some(priorities.iter().map(|name| name.to_string()).collect()),
-                    ..Default::default()
-                },
-            )])
+            HashMap::from([
+                (WILDCARD_KEY.to_string(), entry(&["lua-ls"])),
+                (
+                    "kakehashi/virtualDocument/prepare".to_string(),
+                    entry(priorities),
+                ),
+            ])
         };
         let config = BridgeLanguageConfig {
             enabled: Some(true),

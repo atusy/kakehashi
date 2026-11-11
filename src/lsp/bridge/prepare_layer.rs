@@ -1129,13 +1129,13 @@ mod tests {
     /// A pair's candidates resolve once per settings: every caller gets the
     /// same launch configs (answers are keyed by their identity), and only
     /// other settings resolve them again.
-    /// A pair has no target, so nothing of it waits for a server's
-    /// handshake, until its prepare `priorities` name a candidate — under
-    /// the shipped defaults (whose `"_"` method entry says `["*"]`) and
-    /// with no `languages` at all alike, even with a bridged server that
-    /// advertises the request.
+    /// With nothing written at the prepare key, every server bridged for
+    /// the language is a candidate — under the shipped defaults (whose `"_"`
+    /// method entry says `["*"]`) and with no `languages` at all alike. A
+    /// pair has no target, so nothing of it waits for a server's handshake,
+    /// only where its `priorities` say `[]`.
     #[test]
-    fn a_pair_has_no_target_until_its_prepare_priorities_name_a_server() {
+    fn a_pair_with_nothing_at_the_prepare_key_has_every_bridged_server_as_candidate() {
         use crate::config::settings::{AggregationConfig, BridgeLanguageConfig, LanguageSettings};
 
         let pool = Arc::new(LanguageServerPool::preparing());
@@ -1195,24 +1195,24 @@ mod tests {
         };
         pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
 
-        coordinator.prepare_settings_changed(&settings(shipped()));
-        assert!(
-            coordinator.prepare_target("markdown", "lua").is_none(),
-            "the shipped defaults name no peer"
-        );
-        coordinator.prepare_settings_changed(&settings(Default::default()));
-        assert!(
-            coordinator.prepare_target("markdown", "lua").is_none(),
-            "nor does a host with no settings"
-        );
-
-        for priorities in [["peer"], ["*"]] {
-            coordinator.prepare_settings_changed(&settings(naming(&priorities)));
+        for (languages, why) in [
+            (shipped(), "the shipped defaults"),
+            (Default::default(), "a host with no settings"),
+            (naming(&["peer"]), "its own name"),
+            (naming(&["*"]), "an explicit wildcard"),
+        ] {
+            coordinator.prepare_settings_changed(&settings(languages));
             let target = coordinator
                 .prepare_target("markdown", "lua")
-                .unwrap_or_else(|| panic!("{priorities:?} names the peer"));
-            assert_eq!(target.candidates[0].server_name, "peer");
+                .unwrap_or_else(|| panic!("{why} make the bridged server a candidate"));
+            assert_eq!(target.candidates[0].server_name, "peer", "{why}");
         }
+
+        coordinator.prepare_settings_changed(&settings(naming(&[])));
+        assert!(
+            coordinator.prepare_target("markdown", "lua").is_none(),
+            "`[]` at the prepare key opts the pair out"
+        );
     }
 
     #[test]

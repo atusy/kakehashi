@@ -578,11 +578,10 @@ fn without_experimental_features_nothing_is_prepared() {
 }
 
 #[test]
-fn a_peer_the_prepare_priorities_do_not_name_is_never_asked() {
-    // Experimental features are on, and the peer advertises the request and
-    // is listed beside the echo mock for every other method — but nothing is
-    // written at the prepare key, which does not read the `_` entry: the
-    // document goes as is, held for no server's handshake.
+fn a_peer_only_the_method_wildcard_names_prepares() {
+    // Nothing is written at the prepare key, so it reads the `_` method
+    // entry like any method: the peer listed there beside the echo mock is
+    // a candidate, and the echo mock holds the text it prepared.
     let (mut client, dir) = Setup {
         wire_log: true,
         prepare_priorities: Value::Null,
@@ -590,7 +589,27 @@ fn a_peer_the_prepare_priorities_do_not_name_is_never_asked() {
         ..Setup::default()
     }
     .start();
-    let uri = "file:///prepare/unnamed.md";
+    let uri = "file:///prepare/inherited.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    let answer = hover_with_retry(&mut client, uri, 3, 4);
+    assert_eq!(hover_text(&answer), "local x = 1\n");
+    let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
+    assert!(log.contains("kakehashi/virtualDocument/prepare"), "{log}");
+}
+
+#[test]
+fn a_method_wildcard_that_leaves_the_peer_out_prepares_nothing() {
+    // The `_` method entry is an allowlist for the prepare key too: the
+    // peer is bridged and advertises the request, but the entry names the
+    // echo mock alone, which does not, so the document goes as is.
+    let (mut client, dir) = Setup {
+        wire_log: true,
+        prepare_priorities: Value::Null,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/left-out.md";
     let text = "# t\n\n```lua\n  local x = 1\n```\n";
     open(&mut client, uri, text);
     let answer = hover_with_retry(&mut client, uri, 3, 4);

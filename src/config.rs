@@ -1554,30 +1554,6 @@ mod strip_inherited_tests {
         );
     }
 
-    /// The prepare key inherits nothing along the method axis either: an
-    /// entry equal to the wildcard's is what names the peer, and dropping it
-    /// as redundant would leave the pair with none.
-    #[test]
-    fn aggregation_map_keeps_a_prepare_entry_matching_the_wildcard() {
-        let wildcard = AggregationConfig {
-            priorities: Some(vec!["tsudoi".to_string()]),
-            ..Default::default()
-        };
-        let inherited = HashMap::from([(WILDCARD_KEY.to_string(), wildcard.clone())]);
-        let current = HashMap::from([
-            (WILDCARD_KEY.to_string(), wildcard.clone()),
-            ("kakehashi/virtualDocument/prepare".to_string(), wildcard),
-        ]);
-
-        let result = strip_inherited_aggregation_map(Some(&inherited), Some(&current)).unwrap();
-        assert_eq!(
-            result
-                .get("kakehashi/virtualDocument/prepare")
-                .and_then(|entry| entry.priorities.as_deref()),
-            Some(["tsudoi".to_string()].as_slice()),
-        );
-    }
-
     #[test]
     fn aggregation_config_strips_matching_priorities() {
         let inherited = AggregationConfig {
