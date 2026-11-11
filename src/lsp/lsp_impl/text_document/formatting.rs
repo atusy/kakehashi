@@ -176,9 +176,7 @@ impl Kakehashi {
                     &layer_cfg.priorities,
                     virt,
                     host,
-                    self.bridge.pool(),
-                    self.bridge.node_tracker(),
-                    || self.host_content_version(&lsp_uri),
+                    || self.prepared_request_revision(&lsp_uri),
                     // Read only by a pool that prepares, the one that refuses.
                     || revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision,
                 )
@@ -267,8 +265,7 @@ impl Kakehashi {
                     &lsp_uri,
                     &virt_sources,
                     &cancel_state.request_error_sink,
-                )
-                .await?;
+                )?;
                 match producers {
                     0 => None,
                     // A single producing layer ran against the original text
@@ -451,9 +448,10 @@ impl Kakehashi {
             let owed = spans.owes(span);
             // Counted toward the final check only once its task returns edits
             // (see `finalize_formatting_edits`).
-            let source = region_ctx.prepared.is_some().then(|| {
-                Sourced::from_region(&region_ctx, (), self.bridge.node_tracker(), revision)
-            });
+            let source = region_ctx
+                .prepared
+                .is_some()
+                .then(|| Sourced::from_region(&region_ctx, (), revision));
             // Decide how this region formats — concatenated pipeline, preferred
             // fan-out, or skip — from its resolved aggregation config. See
             // [`plan_region_format`] for the allowlist rule
@@ -626,9 +624,7 @@ impl Kakehashi {
                     &layer_cfg.priorities,
                     virt,
                     host,
-                    self.bridge.pool(),
-                    self.bridge.node_tracker(),
-                    || self.host_content_version(lsp_uri),
+                    || self.prepared_request_revision(lsp_uri),
                     // Read only by a pool that prepares, the one that refuses.
                     || revision.is_some() && self.prepared_request_revision(lsp_uri) == revision,
                 )
@@ -640,28 +636,26 @@ impl Kakehashi {
     }
 
     /// Whether every prepared region a formatting answer was mapped
-    /// through is still the host's text (see [`Sourced::still_current`]).
-    /// One that is not fails the request — counted in `failure_sink`, for
-    /// the CLI to exit non-zero, and answered `ContentModified` (see
-    /// [`formatting_answer`]) — and the caller drops the whole answer,
-    /// the host layer's edits and those of regions still current too: the
-    /// host moved under the answer, and an edit read for a region no longer
-    /// as it was would land elsewhere.
+    /// through is still current (see [`Sourced::verdict`]): the host the
+    /// revision the request read, each map unrevoked. One that is not
+    /// fails the request — counted in `failure_sink`, for the CLI to exit
+    /// non-zero, and answered `ContentModified` (see
+    /// [`formatting_answer`]) — and the caller drops the whole answer, the
+    /// host layer's edits and those of regions still current too: later
+    /// layers formatted the text those edits made.
     ///
-    /// The host's last edit may not be settled yet, or a region held for
-    /// its prepare answer, though its text is the request's: the answer is
-    /// judged once that clears (see
-    /// [`settled_verdict`](crate::lsp::lsp_impl::bridge_context::settled_verdict)),
-    /// not dropped. A formatting request comes once per action, unlike
-    /// completion's on every keystroke, so an answer dropped for that is
-    /// never asked again.
-    pub(super) async fn formatting_sources_current(
+    /// Judged at once: an answer whose request read the host after its
+    /// last edit is that text's, whether or not the lifecycle pass has
+    /// synced the edit yet. A formatting request comes once per action,
+    /// unlike completion's on every keystroke, so it is never dropped for
+    /// the moment its reply arrived.
+    pub(super) fn formatting_sources_current(
         &self,
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         sources: &[Sourced<()>],
         failure_sink: &RequestErrorSink,
     ) -> Result<()> {
-        let verdict = self.settled_verdict_of(lsp_uri, sources.iter()).await;
+        let verdict = self.verdict_of(lsp_uri, sources.iter());
         if verdict.keeps() {
             return Ok(());
         }
@@ -799,9 +793,7 @@ pub(super) async fn race_formatting_layers(
     priorities: &[LayerSource],
     virt: impl std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
     host: impl std::future::Future<Output = Result<Option<(Vec<TextEdit>, Vec<Sourced<()>>)>>>,
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    tracker: &crate::language::NodeTracker,
-    current_version: impl Fn() -> Option<u64>,
+    now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
     unchanged: impl Fn() -> bool,
 ) -> Result<(Option<Vec<TextEdit>>, Option<Verdict>)> {
     // Shared: the race drops it once a higher layer's answer wins, but that
@@ -819,9 +811,7 @@ pub(super) async fn race_formatting_layers(
     // more against the host text, which may have moved while it was held.
     Ok(preferred_formatting_answer(
         answer,
-        pool,
-        tracker,
-        current_version,
+        now,
         priorities.contains(&LayerSource::Host).then_some(host),
         unchanged,
     )
@@ -833,7 +823,7 @@ pub(super) async fn race_formatting_layers(
 /// text (see [`sources_verdict`]). Returns the edits, and the verdict that
 /// refused the chosen answer, if one did.
 ///
-/// Refused with the host unedited (stale, or not settled in time), the
+/// Refused with the host unedited (stale: a map revoked), the
 /// chosen answer gives way to the host layer's (`host`, when the host
 /// layer is in the race, awaited if still running): read for the same
 /// host text, it lost only to the answer refused. Only while the host is
@@ -845,9 +835,7 @@ pub(super) async fn race_formatting_layers(
 /// then `Some(vec![])`, an answer, not a failure.
 pub(super) async fn preferred_formatting_answer<H>(
     answer: Option<(Vec<TextEdit>, Vec<Sourced<()>>)>,
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    tracker: &crate::language::NodeTracker,
-    current_version: impl Fn() -> Option<u64>,
+    now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
     host: Option<H>,
     unchanged: impl Fn() -> bool,
 ) -> (Option<Vec<TextEdit>>, Option<Verdict>)
@@ -857,7 +845,7 @@ where
     let Some((edits, sources)) = answer else {
         return (None, None);
     };
-    let verdict = sources_verdict(pool, tracker, &current_version, sources.iter()).await;
+    let verdict = sources_verdict(now, sources.iter());
     if verdict.keeps() {
         return (Some(edits), None);
     }
@@ -2509,14 +2497,9 @@ mod tests {
     /// stands in for it. Moved, nothing does: the host's edits were read
     /// for the text it moved from too. Nor once the host reopened, nor
     /// without a host layer in the race.
-    /// A prepared answer, current, recorded for its region of a host at
-    /// content version 1; revoking `Revocation` makes it stale.
-    async fn prepared_stand_in_source() -> (
-        Arc<crate::lsp::bridge::LanguageServerPool>,
-        crate::language::NodeTracker,
-        Sourced<()>,
-        Arc<crate::lsp::bridge::Revocation>,
-    ) {
+    /// A prepared answer whose request read the host at content version
+    /// 1 of lifetime 1; revoking `Revocation` makes it stale.
+    fn prepared_stand_in_source() -> (Sourced<()>, Arc<crate::lsp::bridge::Revocation>) {
         use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
         let answer = serde_json::from_value(serde_json::json!({"segments": [{
             "type": "content", "changes": [{
@@ -2532,21 +2515,15 @@ mod tests {
         Arc::get_mut(&mut prepared.map)
             .unwrap()
             .set_revocation(Arc::clone(&revocation));
-        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-        pool.prepare_failures_for_test();
-        let host = url::Url::parse("file:///test/stand-in.md").unwrap();
-        let tracker = crate::language::NodeTracker::new();
-        tracker.open_incarnation(&host, 1);
-        let region = tracker
-            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-            .unwrap()
-            .to_string();
-        pool.open_host_incarnation(&host, 1).await;
-        pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
-        pool.note_host_edited(&host, 1, 1);
-        pool.note_host_settled(&host, 1, 1);
-        let source = Sourced::prepared_for_test((), &host, "lua", &region, &prepared.map, 1, 1);
-        (pool, tracker, source, revocation)
+        let source = Sourced::prepared_for_test((), &prepared.map, 1, 1);
+        (source, revocation)
+    }
+
+    fn host_at(content_version: u64) -> Option<crate::lsp::bridge::HostRevision> {
+        Some(crate::lsp::bridge::HostRevision {
+            incarnation: 1,
+            content_version,
+        })
     }
 
     /// The race of the formatting layers gives way to the host layer's
@@ -2559,7 +2536,7 @@ mod tests {
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             new_text: text.to_string(),
         };
-        let (pool, tracker, source, revocation) = prepared_stand_in_source().await;
+        let (source, revocation) = prepared_stand_in_source();
         revocation.revoke(u64::MAX);
         let (host_tx, host_rx) = tokio::sync::oneshot::channel::<()>();
         let virt = async {
@@ -2576,9 +2553,7 @@ mod tests {
             &[LayerSource::Virt, LayerSource::Host],
             virt,
             host,
-            &pool,
-            &tracker,
-            || Some(1),
+            || host_at(1),
             || true,
         )
         .await
@@ -2588,7 +2563,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_answer_stands_in_for_a_stale_prepared_one() {
-        use std::sync::atomic::{AtomicU64, Ordering};
         let edit = |text: &str| TextEdit {
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             new_text: text.to_string(),
@@ -2602,12 +2576,10 @@ mod tests {
             "stale, reopened",
             "moved",
         ] {
-            let (pool, tracker, source, revocation) = prepared_stand_in_source().await;
-            let version = AtomicU64::new(1);
-            match case {
-                "moved" => version.store(2, Ordering::SeqCst),
-                "current" => {}
-                _ => revocation.revoke(u64::MAX),
+            let (source, revocation) = prepared_stand_in_source();
+            let version = if case == "moved" { 2 } else { 1 };
+            if case.starts_with("stale") {
+                revocation.revoke(u64::MAX);
             }
             let host_edits = match case {
                 "stale, host already formatted" => Some(Vec::new()),
@@ -2618,9 +2590,7 @@ mod tests {
                 .then_some(async move { Ok(host_edits.map(|edits| (edits, Vec::new()))) });
             let (edits, refused) = preferred_formatting_answer(
                 Some((vec![edit("virt")], vec![source])),
-                &pool,
-                &tracker,
-                || Some(version.load(Ordering::SeqCst)),
+                || host_at(version),
                 host_layer,
                 || case != "stale, reopened",
             )
@@ -2650,7 +2620,7 @@ mod tests {
             range: Range::new(Position::new(0, 0), Position::new(0, 0)),
             new_text: "host".to_string(),
         };
-        for verdict in [Verdict::Moved, Verdict::Stale, Verdict::Unsettled] {
+        for verdict in [Verdict::Moved, Verdict::Stale] {
             let error = formatting_answer(None, Some(verdict)).unwrap_err();
             assert_eq!(
                 error.code,
@@ -2692,19 +2662,8 @@ mod tests {
         )
         .unwrap()
         .map;
-        let host = url::Url::parse("file:///test/sources.md").unwrap();
         let source = || {
-            Some(
-                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
-                    (),
-                    &host,
-                    "lua",
-                    "region",
-                    &map,
-                    1,
-                    0,
-                ),
-            )
+            Some(crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test((), &map, 1, 0))
         };
         let edit = TextEdit {
             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
@@ -2728,22 +2687,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(sources.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_host_settles_once_its_last_edit_settles() {
-        let pool = crate::lsp::bridge::LanguageServerPool::preparing();
-        let host = url::Url::parse("file:///test/settling.md").unwrap();
-        assert!(
-            !pool.host_settling(&host, "lua", "r"),
-            "nothing kept: settled"
-        );
-        pool.open_host_incarnation(&host, 1).await;
-        assert!(!pool.host_settling(&host, "lua", "r"));
-        pool.note_host_edited(&host, 1, 1);
-        assert!(pool.host_settling(&host, "lua", "r"), "edited, not settled");
-        pool.note_host_settled(&host, 1, 1);
-        assert!(!pool.host_settling(&host, "lua", "r"));
     }
 
     fn resolved_region(

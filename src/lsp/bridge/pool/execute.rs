@@ -1376,9 +1376,14 @@ mod tests {
         let hints = request.await.unwrap().unwrap().unwrap();
         assert_eq!(hints.len(), 1, "the hint stays shown");
         assert!(hints[0].text_edits.is_some(), "mapped as it arrives");
-        let sourced = Sourced::prepared_for_test(hints, &uri, "lua", &region, &before.map, 1, 0);
-        // Dropped by the store alone, before the host version is read.
-        assert!(!sourced.still_current(&pool, &tracker, || Some(0)));
+        let sourced = Sourced::prepared_for_test(hints, &before.map, 1, 0);
+        // The typing moved the host past the revision the request read.
+        assert!(!sourced.still_current(|| {
+            Some(crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 1,
+            })
+        }));
     }
 
     /// Typing that changed P as the indentation changed (`  f` to

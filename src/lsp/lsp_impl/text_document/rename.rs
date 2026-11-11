@@ -64,7 +64,7 @@ impl Kakehashi {
                 // layer's is, which the check below drops as ContentModified.
                 |sourced: &Sourced<WorkspaceEdit>| {
                     passed_over.answers(sourced, rename_workspace_edit_has_result, |sourced| {
-                        self.answer_may_keep(&lsp_uri, sourced)
+                        self.sourced_still_current(sourced, &lsp_uri)
                     })
                 },
             )
@@ -104,10 +104,7 @@ impl Kakehashi {
                     .into();
             return Err(error);
         }
-        match self
-            .settled_answer(&lsp_uri, sourced, "rename", log::Level::Warn)
-            .await
-        {
+        match self.final_answer(&lsp_uri, sourced, "rename", log::Level::Warn) {
             Ok(edit) => Ok(Some(edit)),
             Err(verdict) => {
                 let mut error = crate::error::content_modified_error();
@@ -180,9 +177,7 @@ impl Kakehashi {
         .await;
         let edit = result.handle(&self.notifier(), "rename", None, Ok).await?;
         let edit = refused_unless_answered(edit, refused.get().copied())?;
-        Ok(edit.map(|edit| {
-            Sourced::from_region(&ctx.document, edit, self.bridge.node_tracker(), revision)
-        }))
+        Ok(edit.map(|edit| Sourced::from_region(&ctx.document, edit, revision)))
     }
 }
 
@@ -320,7 +315,6 @@ mod tests {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
         use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
         use tower_lsp_server::jsonrpc::{Error, ErrorCode};
-        let host_uri = url::Url::parse("file:///test/rename-race.md").unwrap();
         let map = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -336,7 +330,7 @@ mod tests {
             ..Default::default()
         };
         let walk = |host: Result<Option<Sourced<WorkspaceEdit>>>| {
-            let virt = Sourced::prepared_for_test(edit.clone(), &host_uri, "lua", "r", &map, 1, 0);
+            let virt = Sourced::prepared_for_test(edit.clone(), &map, 1, 0);
             async move {
                 let passed_over =
                     super::super::super::bridge_context::StaleAnswerFallback::default();

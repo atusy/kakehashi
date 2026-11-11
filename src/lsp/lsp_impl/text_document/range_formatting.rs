@@ -333,9 +333,10 @@ impl Kakehashi {
                 }
                 // Counted toward the final check only once its task returns edits
                 // (see `finalize_formatting_edits`).
-                let source = region_ctx.prepared.is_some().then(|| {
-                    Sourced::from_region(&region_ctx, (), self.bridge.node_tracker(), revision)
-                });
+                let source = region_ctx
+                    .prepared
+                    .is_some()
+                    .then(|| Sourced::from_region(&region_ctx, (), revision));
                 // Mint this region's tracked-source token into the shared
                 // aggregator (the per-region map dispatch hands to its winning
                 // downstream).
@@ -466,8 +467,8 @@ impl Kakehashi {
         // what goes on the wire to host-capable servers.
         //
         // The final answer is chosen as whole formatting's is: a prepared one
-        // dropped as stale or unsettled gives way to the host layer's while
-        // the host is unedited, and one dropped with nothing standing in is
+        // dropped as stale gives way to the host layer's while the host is
+        // unedited, and one dropped with nothing standing in is
         // answered `ContentModified`. Nothing is counted: no one-shot run
         // range-formats.
         let (edits, refused) = self

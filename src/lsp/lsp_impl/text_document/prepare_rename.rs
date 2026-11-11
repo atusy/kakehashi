@@ -53,7 +53,7 @@ impl Kakehashi {
                     super::super::bridge_context::layer_answers(
                         sourced,
                         |_| true,
-                        |sourced| self.answer_may_keep(&lsp_uri, sourced),
+                        |sourced| self.sourced_still_current(sourced, &lsp_uri),
                     )
                 },
             )
@@ -67,8 +67,7 @@ impl Kakehashi {
             return Ok(None);
         };
         Ok(self
-            .settled_answer(&lsp_uri, sourced, "prepareRename", log::Level::Debug)
-            .await
+            .final_answer(&lsp_uri, sourced, "prepareRename", log::Level::Debug)
             .ok())
     }
 
@@ -119,9 +118,7 @@ impl Kakehashi {
         let answer = result
             .handle(&self.notifier(), "prepareRename", None, Ok)
             .await?;
-        Ok(answer.map(|answer| {
-            Sourced::from_region(&ctx.document, answer, self.bridge.node_tracker(), revision)
-        }))
+        Ok(answer.map(|answer| Sourced::from_region(&ctx.document, answer, revision)))
     }
 }
 

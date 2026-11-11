@@ -265,14 +265,7 @@ impl Kakehashi {
         if ask {
             requery.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        Ok(response.map(|response| {
-            Sourced::from_region(
-                &ctx.document,
-                response,
-                self.bridge.node_tracker(),
-                revision,
-            )
-        }))
+        Ok(response.map(|response| Sourced::from_region(&ctx.document, response, revision)))
     }
 }
 
@@ -649,7 +642,6 @@ mod tests {
                 }],
             })
         };
-        let host_uri = url::Url::parse("file:///test/race.md").unwrap();
         let map = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -657,17 +649,8 @@ mod tests {
         )
         .unwrap()
         .map;
-        let virt = |is_incomplete| {
-            Sourced::prepared_for_test(
-                list("virt", is_incomplete),
-                &host_uri,
-                "lua",
-                "r",
-                &map,
-                1,
-                0,
-            )
-        };
+        let virt =
+            |is_incomplete| Sourced::prepared_for_test(list("virt", is_incomplete), &map, 1, 0);
         let race = |virt_answer: Sourced<CompletionResponse>, fresh: bool, host_delay_ms: u64| {
             let requery = std::sync::atomic::AtomicBool::new(false);
             let host = async move {

@@ -210,14 +210,7 @@ impl Kakehashi {
         let hints = result
             .handle(&self.notifier(), "inlay hint", None, Ok)
             .await?;
-        Ok(hints.map(|hints| {
-            Sourced::from_region(
-                &ctx.document,
-                hints,
-                self.bridge.node_tracker(),
-                Some(revision),
-            )
-        }))
+        Ok(hints.map(|hints| Sourced::from_region(&ctx.document, hints, Some(revision))))
     }
 
     pub(crate) async fn inlay_hint_resolve_impl(&self, hint: InlayHint) -> Result<InlayHint> {

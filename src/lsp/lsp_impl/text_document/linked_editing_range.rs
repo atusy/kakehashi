@@ -40,7 +40,7 @@ impl Kakehashi {
                     super::super::bridge_context::layer_answers(
                         sourced,
                         |linked| !linked.ranges.is_empty(),
-                        |sourced| self.answer_may_keep(&lsp_uri, sourced),
+                        |sourced| self.sourced_still_current(sourced, &lsp_uri),
                     )
                 },
             )
@@ -54,8 +54,7 @@ impl Kakehashi {
             return Ok(None);
         };
         Ok(self
-            .settled_answer(&lsp_uri, sourced, "linkedEditingRange", log::Level::Debug)
-            .await
+            .final_answer(&lsp_uri, sourced, "linkedEditingRange", log::Level::Debug)
             .ok())
     }
 
@@ -106,9 +105,7 @@ impl Kakehashi {
         let ranges = result
             .handle(&self.notifier(), "linkedEditingRange", None, Ok)
             .await?;
-        Ok(ranges.map(|ranges| {
-            Sourced::from_region(&ctx.document, ranges, self.bridge.node_tracker(), revision)
-        }))
+        Ok(ranges.map(|ranges| Sourced::from_region(&ctx.document, ranges, revision)))
     }
 }
 
