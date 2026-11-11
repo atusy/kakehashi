@@ -26,7 +26,9 @@ impl Kakehashi {
         let lsp_uri = params.text_document.uri;
         let position = params.position;
 
-        let virt = self.prepare_rename_virt_layer(&lsp_uri, position);
+        // Before any layer reads the host's text (see `PreparedRace`).
+        let race = self.prepared_race(&lsp_uri);
+        let virt = self.prepare_rename_virt_layer(&lsp_uri, position, race.revision());
         let native = async {
             let answer = self
                 .native_bindings_answer(&lsp_uri, position, |ctx| {
@@ -49,26 +51,16 @@ impl Kakehashi {
                 // Read as the race decides: a prepared answer moved or stale
                 // is no answer of its layer, and the race falls through to
                 // the next layer's.
-                |sourced: &Sourced<PrepareRenameResponse>| {
-                    super::super::bridge_context::layer_answers(
-                        sourced,
-                        |_| true,
-                        |sourced| self.sourced_still_current(sourced, &lsp_uri),
-                    )
-                },
+                |sourced: &Sourced<PrepareRenameResponse>| race.answers(sourced, |_| true),
             )
-            .await?;
-        // The final answer chosen: a range in host coordinates, checked once
-        // more against the host text, which may have moved while it was held
-        // (text above the region edited, say), by the same check as other
-        // prepared answers (see `sources_verdict`): waited on only while the
-        // host's last edit is settling, a moved or stale answer none at once.
-        let Some(sourced) = answer else {
-            return Ok(None);
-        };
-        Ok(self
-            .final_answer(&lsp_uri, sourced, "prepareRename", log::Level::Debug)
-            .ok())
+            .await;
+        // The final answer chosen (see `PreparedRace::conclude`): a range
+        // in host coordinates, checked once more against the host, which
+        // may have moved while it was held (text above the region edited,
+        // say); another layer's standing in for one passed over only while
+        // the host is still the text the request read. A dropped answer is
+        // `ContentModified`: `null` would say there is nothing here.
+        race.conclude(answer, &lsp_uri, "prepareRename", log::Level::Debug)
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -76,9 +68,8 @@ impl Kakehashi {
         &self,
         lsp_uri: &Uri,
         position: Position,
+        revision: Option<crate::lsp::bridge::HostRevision>,
     ) -> Result<Option<Sourced<PrepareRenameResponse>>> {
-        // Before the text is read: see `Sourced::from_region`.
-        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts(lsp_uri, position, METHOD)
             .await
@@ -127,8 +118,10 @@ mod tests {
     use super::*;
 
     /// Under a cross-layer `preferred`, a prepared answer the race finds
-    /// moved or stale is no answer: the host layer's wins, waited for when
-    /// it is still running. One that may be kept wins as ever.
+    /// stale is no answer: the host layer's stands in, waited for when it
+    /// is still running. One the host moved under leaves none to stand in
+    /// (the host layer's range was read for the text it moved from too):
+    /// `ContentModified`. One still current wins as ever.
     #[tokio::test]
     async fn a_rename_range_that_may_not_be_kept_falls_through_to_the_host_layers() {
         let range = |line: u32| {
@@ -137,20 +130,31 @@ mod tests {
                 Position::new(line, 1),
             ))
         };
-        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+        use crate::lsp::lsp_impl::bridge_context::Verdict;
+        for (verdict, host_delay_ms) in [
+            (Verdict::Current, 0),
+            (Verdict::Stale, 0),
+            (Verdict::Stale, 20),
+            (Verdict::Moved, 0),
+            (Verdict::Moved, 20),
+        ] {
             let won = super::super::super::bridge_context::race_prepared_virt_against_host(
                 range(1),
                 range(2),
                 host_delay_ms,
-                may_keep,
+                verdict,
                 |_| true,
             )
             .await;
-            assert_eq!(
-                won,
-                range(if may_keep { 1 } else { 2 }),
-                "{may_keep} {host_delay_ms}"
-            );
+            match verdict {
+                Verdict::Current => assert_eq!(won.unwrap(), Some(range(1))),
+                Verdict::Stale => assert_eq!(won.unwrap(), Some(range(2)), "{host_delay_ms}"),
+                Verdict::Moved => assert_eq!(
+                    won.unwrap_err().code,
+                    tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801),
+                    "{host_delay_ms}"
+                ),
+            }
         }
     }
 }

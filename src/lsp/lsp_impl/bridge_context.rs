@@ -14,7 +14,6 @@ use crate::config::settings::{
     AggregationStrategy, BridgeLanguageConfig, LayerSource, ResolvedAggregationConfig,
     ResolvedLayerConfig,
 };
-use crate::error::LockResultExt;
 use crate::language::injection::ResolvedInjection;
 use crate::lsp::bridge::{ResolvedServerConfig, UpstreamId, workspace_edit_has_effect};
 use crate::lsp::request_id::{CancelReceiver, CancelSubscriptionGuard, current_upstream_id};
@@ -494,124 +493,225 @@ pub(crate) fn sources_verdict<'a, T: 'a>(
     verdict
 }
 
-/// Whether a layer's answer is one a layers' race may choose: it has a
-/// result (`has_result`), and, mapped through a prepared map, is still
-/// current (`current`, see [`Sourced::still_current`]). One moved or stale
-/// is no answer of its layer, and the race falls through to the next
-/// layer's rather than choosing what the final check drops. Unprepared
-/// answers read nothing.
-pub(crate) fn layer_answers<T>(
-    sourced: &Sourced<T>,
-    has_result: impl FnOnce(&T) -> bool,
-    current: impl FnOnce(&Sourced<T>) -> bool,
-) -> bool {
-    has_result(&sourced.value) && (!sourced.is_prepared() || current(sourced))
+/// One request's read of the host, and what its layers' race did with the
+/// prepared answers it met: the rule by which an answer no longer current
+/// gives way, the same for every method.
+///
+/// - The host's revision is read once as the request begins, before any
+///   layer reads its text ([`Self::revision`], for the virt layer's answers:
+///   see [`Sourced::from_region`]).
+/// - As the race decides, a prepared answer no longer current is no answer
+///   of its layer ([`Self::answers`], [`Self::keeps`]): the race goes on to
+///   the next layer's, and the verdict that passed it over is kept.
+/// - Another layer's answer chosen after one was passed over stands in for
+///   it only while the host is still the revision read
+///   ([`Self::unchanged`]): read for the text the host moved from, its
+///   edits are as misplaced as the ones passed over.
+/// - With nothing to stand in, the request is answered `ContentModified`
+///   ([`Self::conclude`]), not `null`: the answer was lost to a change, and
+///   can be asked again.
+///
+/// Nothing is read for a request that meets no prepared answer, beyond the
+/// first read of the revision, which only a pool that prepares makes.
+pub(crate) struct PreparedRace<N> {
+    now: N,
+    revision: Option<crate::lsp::bridge::HostRevision>,
+    passed_over: std::sync::atomic::AtomicU8,
 }
 
-/// The stale fallback: a prepared answer a layers' race passed over as one
-/// it cannot keep ([`layer_answers`]), kept for when no other layer
-/// answers, so a method that answers a dropped answer otherwise than with
-/// nothing (a rename's `ContentModified`) still does, through its final
-/// check. Unlike code actions' refused fallback, what it keeps is never
-/// returned as it is: the final check drops it.
-pub(crate) struct StaleAnswerFallback<T>(std::sync::Mutex<Option<Sourced<T>>>);
+/// [`PreparedRace::passed_over`], stored: nothing, moved, stale.
+const PASSED_NOTHING: u8 = 0;
+const PASSED_MOVED: u8 = 1;
+const PASSED_STALE: u8 = 2;
 
-impl<T> Default for StaleAnswerFallback<T> {
-    fn default() -> Self {
-        Self(std::sync::Mutex::new(None))
+impl<N: Fn() -> Option<crate::lsp::bridge::HostRevision>> PreparedRace<N> {
+    /// A race over a host whose revision `now` reads: read here, before any
+    /// layer reads the host's text.
+    pub(crate) fn new(now: N) -> Self {
+        let revision = now();
+        Self {
+            now,
+            revision,
+            passed_over: std::sync::atomic::AtomicU8::new(PASSED_NOTHING),
+        }
     }
-}
 
-impl<T: Clone> StaleAnswerFallback<T> {
-    /// [`layer_answers`], keeping aside, once (the race asks in priority
-    /// order: the highest-ranked), an answer with a result it passes over.
-    pub(crate) fn answers(
+    /// The host's revision as the request began.
+    pub(crate) fn revision(&self) -> Option<crate::lsp::bridge::HostRevision> {
+        self.revision
+    }
+
+    /// Whether the host is still the revision the request began on:
+    /// neither edited nor closed and reopened.
+    pub(crate) fn unchanged(&self) -> bool {
+        self.revision.is_some() && (self.now)() == self.revision
+    }
+
+    /// Whether a layer's answer is one the race may choose: it has a result
+    /// (`has_result`) and, mapped through a prepared map, is still current.
+    pub(crate) fn answers<T>(
         &self,
         sourced: &Sourced<T>,
-        has_result: impl Fn(&T) -> bool,
-        current: impl FnOnce(&Sourced<T>) -> bool,
+        has_result: impl FnOnce(&T) -> bool,
     ) -> bool {
-        if !has_result(&sourced.value) {
-            return false;
-        }
-        if layer_answers(sourced, &has_result, current) {
+        has_result(&sourced.value) && self.keeps(std::iter::once(sourced))
+    }
+
+    /// Whether an answer mapped through `sources` is still current (see
+    /// [`sources_verdict`]). One that is not is passed over: noted, the
+    /// first time, with its verdict.
+    pub(crate) fn keeps<'a, T: 'a>(&self, sources: impl Iterator<Item = &'a Sourced<T>>) -> bool {
+        let verdict = sources_verdict(&self.now, sources);
+        if verdict.keeps() {
             return true;
         }
-        let mut kept = self.0.lock().recover_poison("StaleAnswerFallback::answers");
-        if kept.is_none() {
-            *kept = Some(sourced.clone());
-        }
+        let passed = match verdict {
+            Verdict::Moved => PASSED_MOVED,
+            _ => PASSED_STALE,
+        };
+        let _ = self.passed_over.compare_exchange(
+            PASSED_NOTHING,
+            passed,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         false
     }
 
-    /// Whether the race passed an answer over: what it then chose, if
-    /// anything, stands in for that one.
-    pub(crate) fn passed_over(&self) -> bool {
-        self.0
-            .lock()
-            .recover_poison("StaleAnswerFallback::passed_over")
-            .is_some()
+    /// The verdict of the first prepared answer the race passed over, if
+    /// it passed one over.
+    pub(crate) fn passed_over(&self) -> Option<Verdict> {
+        match self.passed_over.load(std::sync::atomic::Ordering::Relaxed) {
+            PASSED_NOTHING => None,
+            PASSED_MOVED => Some(Verdict::Moved),
+            _ => Some(Verdict::Stale),
+        }
     }
 
-    /// The race's `result`, or, when it found no answer (nothing, or only
-    /// a layer's error, which the answer passed over would have
-    /// outranked), the answer kept aside. A cancel stays a cancel.
-    pub(crate) fn or_kept(
-        self,
+    /// What stops an answer that came through no prepared map from being
+    /// the request's: nothing, unless it stands in for a prepared answer
+    /// passed over and the host is no longer the revision read.
+    pub(crate) fn stand_in_dropped(&self) -> Option<Verdict> {
+        (self.passed_over().is_some() && !self.unchanged()).then_some(Verdict::Moved)
+    }
+
+    /// The request's answer, from the race's `result`: its value, or
+    /// `ContentModified` saying why it was dropped (logged at `level` as
+    /// `{method}`'s result dropped).
+    ///
+    /// - A prepared answer chosen is judged once more, after the last
+    ///   await.
+    /// - Another layer's stands in for one passed over only on an unchanged
+    ///   host ([`Self::stand_in_dropped`]).
+    /// - No answer (nothing, or a layer's error, which the answer passed
+    ///   over would have outranked) where one was passed over is dropped by
+    ///   that one's verdict.
+    /// - A cancel stays a cancel, and with nothing passed over the result
+    ///   goes out as it came.
+    pub(crate) fn conclude<T>(
+        &self,
         result: tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>>,
-    ) -> tower_lsp_server::jsonrpc::Result<Option<Sourced<T>>> {
-        let kept = self
-            .0
-            .into_inner()
-            .recover_poison("StaleAnswerFallback::or_kept");
-        match (result, kept) {
-            (Ok(None), Some(kept)) => Ok(Some(kept)),
-            (Err(error), Some(kept))
-                if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+        uri: &Uri,
+        method: &str,
+        level: log::Level,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<T>> {
+        let passed_over = self.passed_over();
+        let answer = match result {
+            Ok(answer) => answer,
+            Err(error)
+                if passed_over.is_none()
+                    || error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
             {
-                Ok(Some(kept))
+                return Err(error);
             }
-            (result, _) => result,
+            Err(_) => None,
+        };
+        let dropped = match &answer {
+            Some(sourced) if sourced.is_prepared() => {
+                Some(sourced.verdict((self.now)())).filter(|verdict| !verdict.keeps())
+            }
+            Some(_) => self.stand_in_dropped(),
+            None => passed_over,
+        };
+        match dropped {
+            Some(verdict) => Err(dropped_answer_error(uri, method, verdict, level)),
+            None => Ok(answer.map(|sourced| sourced.value)),
         }
     }
 }
 
-/// A `preferred` race over [virt, host] whose virt layer answers `virt`,
-/// prepared, at once, and whose host layer answers `host` after
-/// `host_delay_ms`, the virt answer read as `current` says: which value
-/// won, for a method's race test.
+/// The `ContentModified` (-32801) a `method` answer dropped at its final
+/// check is answered with, its message saying why, logged at `level`.
+/// `null` would read as nothing to do, though the answer was lost to a
+/// change and can be asked again.
+pub(crate) fn dropped_answer_error(
+    uri: &Uri,
+    method: &str,
+    verdict: Verdict,
+    level: log::Level,
+) -> tower_lsp_server::jsonrpc::Error {
+    log::log!(
+        target: "kakehashi::bridge",
+        level,
+        "{method} result for {} dropped: {verdict}",
+        uri.as_str()
+    );
+    let mut error = crate::error::content_modified_error();
+    error.message = format!("kakehashi: {method} result dropped: {verdict}").into();
+    error
+}
+
+/// A `preferred` race over [virt, host] as a handler runs it through a
+/// [`PreparedRace`]: the virt layer answers `virt`, prepared, at once, the
+/// host layer answers `host` after `host_delay_ms`, and by the time the
+/// race decides the virt answer reads as `verdict`. The request's answer,
+/// for a method's race test.
 #[cfg(test)]
 pub(crate) async fn race_prepared_virt_against_host<T>(
     virt: T,
     host: T,
     host_delay_ms: u64,
-    current: bool,
+    verdict: Verdict,
     has_result: impl Fn(&T) -> bool,
-) -> T {
+) -> tower_lsp_server::jsonrpc::Result<Option<T>> {
     use crate::config::settings::LayerSource::{Host, Native, Virt};
-    let map = crate::lsp::bridge::apply_prepare_result(
+    let mut prepared = crate::lsp::bridge::apply_prepare_result(
         "a",
         &crate::lsp::bridge::VirtualLayout::single("a"),
         None,
     )
-    .unwrap()
-    .map;
-    let virt = Sourced::prepared_for_test(virt, &map, 1, 0);
+    .unwrap();
+    let revocation = std::sync::Arc::new(crate::lsp::bridge::Revocation::default());
+    std::sync::Arc::get_mut(&mut prepared.map)
+        .unwrap()
+        .set_revocation(std::sync::Arc::clone(&revocation));
+    let version = std::sync::atomic::AtomicU64::new(0);
+    let race = PreparedRace::new(|| {
+        Some(crate::lsp::bridge::HostRevision {
+            incarnation: 1,
+            content_version: version.load(std::sync::atomic::Ordering::SeqCst),
+        })
+    });
+    let virt = Sourced::prepared_for_test(virt, &prepared.map, 1, 0);
+    match verdict {
+        Verdict::Current => {}
+        Verdict::Moved => version.store(1, std::sync::atomic::Ordering::SeqCst),
+        Verdict::Stale => revocation.revoke(u64::MAX),
+    }
     let host = async move {
         tokio::time::sleep(std::time::Duration::from_millis(host_delay_ms)).await;
         Ok(Some(Sourced::unprepared(host)))
     };
-    race_layers_preferred(
+    let result = race_layers_preferred(
         &[Virt, Host, Native],
         std::future::ready(Ok(Some(virt))),
         host,
         std::future::ready(Ok(None)),
-        |sourced: &Sourced<T>| layer_answers(sourced, &has_result, |_| current),
+        |sourced: &Sourced<T>| race.answers(sourced, &has_result),
     )
-    .await
-    .unwrap()
-    .expect("a layer answers")
-    .value
+    .await;
+    let uri: Uri = "file:///test/race.md".parse().unwrap();
+    race.conclude(result, &uri, "test", log::Level::Debug)
 }
 
 impl Kakehashi {
@@ -653,28 +753,13 @@ impl Kakehashi {
         sources_verdict(|| self.prepared_request_revision(lsp_uri), sources)
     }
 
-    /// The final check of the one answer chosen for a request on `lsp_uri`
-    /// (see [`Self::verdict_of`]): its value while still current, else the
-    /// verdict that drops it, logged at `level` as `{method}`'s result
-    /// dropped.
-    pub(crate) fn final_answer<T>(
-        &self,
-        lsp_uri: &Uri,
-        sourced: Sourced<T>,
-        method: &str,
-        level: log::Level,
-    ) -> Result<T, Verdict> {
-        let verdict = self.verdict_of(lsp_uri, std::iter::once(&sourced));
-        if !verdict.keeps() {
-            log::log!(
-                target: "kakehashi::bridge",
-                level,
-                "{method} result for {} dropped: {verdict}",
-                lsp_uri.as_str()
-            );
-            return Err(verdict);
-        }
-        Ok(sourced.value)
+    /// A [`PreparedRace`] for a request on `lsp_uri`: the host's revision
+    /// read now, before any layer reads its text.
+    pub(crate) fn prepared_race<'a>(
+        &'a self,
+        lsp_uri: &'a Uri,
+    ) -> PreparedRace<impl Fn() -> Option<crate::lsp::bridge::HostRevision> + 'a> {
+        PreparedRace::new(move || self.prepared_request_revision(lsp_uri))
     }
 }
 
@@ -2577,32 +2662,6 @@ mod tests {
             incarnation,
             content_version,
         })
-    }
-
-    /// Its lock poisoned, the stale fallback still keeps the answer passed
-    /// over and hands it back.
-    #[test]
-    fn a_poisoned_stale_answer_fallback_still_keeps_and_hands_back() {
-        let fallback = std::sync::Arc::new(StaleAnswerFallback::<u8>::default());
-        let poisoner = std::sync::Arc::clone(&fallback);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.0.lock().unwrap();
-            panic!("intentional panic to poison the lock");
-        })
-        .join();
-        assert!(fallback.0.is_poisoned());
-
-        let (map, _) = revocable_map();
-        let sourced = Sourced::prepared_for_test(7u8, &map, 1, 0);
-        assert!(!fallback.answers(&sourced, |_| true, |_| false));
-        assert!(fallback.passed_over());
-        let fallback = std::sync::Arc::try_unwrap(fallback)
-            .ok()
-            .expect("the poisoning thread is gone");
-        assert_eq!(
-            fallback.or_kept(Ok(None)).unwrap().map(|kept| kept.value),
-            Some(7)
-        );
     }
 
     /// An answer is current, at once, while the host is still the revision

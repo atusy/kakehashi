@@ -1011,7 +1011,9 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
 fn a_color_presentation_the_host_moved_under_is_dropped() {
     // The echo mock answers the picker only once released. The host is
     // edited (outside the region) while the request is out: its
-    // presentation, made for the text before the edit, is dropped.
+    // presentation, made for the text before the edit, is dropped, and the
+    // request answered ContentModified, as a rename's or a formatting
+    // request's is (an empty answer would read as no presentation).
     let (mut client, dir) = Setup {
         color_after_release: true,
         wire_log: true,
@@ -1054,8 +1056,7 @@ fn a_color_presentation_the_host_moved_under_is_dropped() {
     hover(&mut client, uri, 0, 0);
     std::fs::write(dir.path().join("release"), "").expect("release");
     let response = client.receive_response_for_id_public(id);
-    assert!(response.get("error").is_none(), "{response}");
-    assert!(result_items(&response).is_empty(), "{response}");
+    assert_eq!(response["error"]["code"], -32801, "{response}");
 }
 
 #[test]
@@ -1485,7 +1486,8 @@ fn a_prepared_answer_of_refused_actions_answers_a_preferred_walk_nothing_else_an
 fn code_actions_the_host_moved_under_are_dropped() {
     // The echo mock answers code actions only once released. The host is
     // edited (outside the region) while the request is out: the actions,
-    // made for the text before the edit, are not offered.
+    // made for the text before the edit, are not offered, and the request
+    // is answered ContentModified.
     let (mut client, dir) = Setup {
         code_action_after_release: true,
         wire_log: true,
@@ -1511,8 +1513,7 @@ fn code_actions_the_host_moved_under_are_dropped() {
     hover(&mut client, uri, 0, 0);
     std::fs::write(dir.path().join("release"), "").expect("release");
     let response = client.receive_response_for_id_public(id);
-    assert!(response.get("error").is_none(), "{response}");
-    assert!(response["result"].is_null(), "{response}");
+    assert_eq!(response["error"]["code"], -32801, "{response}");
 }
 
 #[test]
@@ -1520,7 +1521,8 @@ fn a_rename_range_the_host_moved_under_is_no_answer() {
     // The echo mock answers prepareRename (the word at the position) only
     // once released. Unedited, the word maps where the host has it; the
     // host edited above the region while the request is out, its range,
-    // for the text before the edit, is no answer.
+    // for the text before the edit, is no answer: ContentModified (null
+    // would say there is nothing to rename there).
     for moved in [false, true] {
         let (mut client, dir) = Setup {
             rename_after_release: true,
@@ -1552,10 +1554,10 @@ fn a_rename_range_the_host_moved_under_is_no_answer() {
         }
         std::fs::write(dir.path().join("release"), "").expect("release");
         let response = client.receive_response_for_id_public(id);
-        assert!(response.get("error").is_none(), "{response}");
         if moved {
-            assert!(response["result"].is_null(), "{response}");
+            assert_eq!(response["error"]["code"], -32801, "{response}");
         } else {
+            assert!(response.get("error").is_none(), "{response}");
             assert_eq!(
                 response["result"],
                 json!({
@@ -1569,10 +1571,54 @@ fn a_rename_range_the_host_moved_under_is_no_answer() {
 }
 
 #[test]
+fn a_rename_range_the_host_moved_under_is_not_answered_by_the_host_layer() {
+    // Both layers answer prepareRename, each only once released, and the
+    // host is edited above the region while the requests are out. The
+    // injected layer's range, for the text before the edit, is no answer;
+    // the host layer's was read for that text too, so it does not stand
+    // in, as a rename's does not: ContentModified.
+    let (mut client, dir) = Setup {
+        rename_after_release: true,
+        host_echo: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/prepare-rename-stale-host.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let id = client.send_request_async(
+        "textDocument/prepareRename",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 8 }
+        }),
+    );
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("textDocument/prepareRename\t"))
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < until, "prepareRename requests not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u\n{text}"));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(response["error"]["code"], -32801, "{response}");
+}
+
+#[test]
 fn linked_editing_ranges_the_host_moved_under_are_no_answer() {
     // The echo mock answers linked ranges only once released: the host
     // edited above the region while the request is out, its ranges, for
-    // the text before the edit, are no answer.
+    // the text before the edit, are no answer: ContentModified.
     let (mut client, dir) = Setup {
         linked_after_release: true,
         wire_log: true,
@@ -1601,8 +1647,7 @@ fn linked_editing_ranges_the_host_moved_under_are_no_answer() {
     hover(&mut client, uri, 0, 0);
     std::fs::write(dir.path().join("release"), "").expect("release");
     let response = client.receive_response_for_id_public(id);
-    assert!(response.get("error").is_none(), "{response}");
-    assert!(response["result"].is_null(), "{response}");
+    assert_eq!(response["error"]["code"], -32801, "{response}");
 }
 
 #[test]

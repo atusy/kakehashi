@@ -27,11 +27,17 @@ impl Kakehashi {
         let position = params.text_document_position.position;
         let new_name = params.new_name;
 
-        // Before any layer reads the host's text: the text the virt
+        // Before any layer reads the host's text: the revision the virt
         // layer's answer is made on (see `Sourced::from_region`), and the
-        // one another layer's must still be for to stand in for it (below).
-        let revision = self.prepared_request_revision(&lsp_uri);
-        let virt = self.rename_virt_layer(&lsp_uri, position, &new_name, work_done_token, revision);
+        // one another layer's must still be for to stand in for it.
+        let race = self.prepared_race(&lsp_uri);
+        let virt = self.rename_virt_layer(
+            &lsp_uri,
+            position,
+            &new_name,
+            work_done_token,
+            race.revision(),
+        );
         let native = async {
             let edit = self
                 .native_bindings_answer(&lsp_uri, position, |ctx| {
@@ -40,7 +46,6 @@ impl Kakehashi {
                 .await?;
             Ok(edit.map(Sourced::unprepared))
         };
-        let passed_over = super::super::bridge_context::StaleAnswerFallback::default();
         let answer = self
             .walk_layers_with_native(
                 &lsp_uri,
@@ -59,59 +64,20 @@ impl Kakehashi {
                 },
                 // Read as the race decides: a prepared answer moved or stale
                 // is no answer of its layer, and the race falls through to
-                // the next layer's (a settling one still wins, then waited on
-                // below). Passed over, it is still the answer when no other
-                // layer's is, which the check below drops as ContentModified.
+                // the next layer's.
                 |sourced: &Sourced<WorkspaceEdit>| {
-                    passed_over.answers(sourced, rename_workspace_edit_has_result, |sourced| {
-                        self.sourced_still_current(sourced, &lsp_uri)
-                    })
+                    race.answers(sourced, rename_workspace_edit_has_result)
                 },
             )
             .await;
-        let stands_in = passed_over.passed_over();
-        let answer = passed_over.or_kept(answer)?;
-        // The final answer chosen: its edits checked once more against the
-        // host text, which may have moved while it was held. A rename comes
-        // once per action, like formatting, so the check waits for the
-        // host's last edit to settle and its regions' holds to clear (see
-        // `Self::settled_answer`). A dropped answer is answered as
-        // `ContentModified`, not `null` (which reads as nothing to rename):
-        // an editor showing the error lets the user rename again (how it
-        // is shown is the client's).
-        let Some(sourced) = answer else {
-            return Ok(None);
-        };
-        // Another layer's rename chosen where a prepared one was passed
-        // over stands in for it only while the host is still the text the
-        // request read (neither edited nor closed and reopened), as a
-        // formatting answer's stand-in does: read for the text the host
-        // moved from, its edits are as misplaced as the ones passed over.
-        // The final check below would not tell: it judges only an answer
-        // mapped through a prepared document.
-        if stands_in
-            && !sourced.is_prepared()
-            && !(revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision)
-        {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "rename result for {} dropped: the host text moved since the request read it",
-                lsp_uri.as_str()
-            );
-            let mut error = crate::error::content_modified_error();
-            error.message =
-                "kakehashi: rename result dropped: the host text moved since the request read it"
-                    .into();
-            return Err(error);
-        }
-        match self.final_answer(&lsp_uri, sourced, "rename", log::Level::Warn) {
-            Ok(edit) => Ok(Some(edit)),
-            Err(verdict) => {
-                let mut error = crate::error::content_modified_error();
-                error.message = format!("kakehashi: rename result dropped: {verdict}").into();
-                Err(error)
-            }
-        }
+        // The final answer chosen (see `PreparedRace::conclude`): a prepared
+        // one checked once more against the host, which may have moved
+        // while it was held; another layer's standing in for one passed
+        // over only while the host is still the text the request read. A
+        // dropped answer is `ContentModified`, not `null` (which reads as
+        // nothing to rename): an editor showing the error lets the user
+        // rename again (how it is shown is the client's).
+        race.conclude(answer, &lsp_uri, "rename", log::Level::Warn)
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -307,21 +273,29 @@ mod tests {
         );
     }
 
-    /// Passed over, a prepared rename is still the answer when no other
-    /// layer answers (nothing, or an error), for the final check to answer
-    /// ContentModified; a cancel stays a cancel.
+    /// Passed over, a prepared rename is why the request is answered
+    /// `ContentModified` when no other layer renames (nothing, or an error,
+    /// which it would have outranked); a cancel stays a cancel, and another
+    /// layer's rename stands in while the host is unchanged.
     #[tokio::test]
-    async fn a_rename_passed_over_answers_when_no_other_layer_does() {
+    async fn a_rename_passed_over_is_content_modified_when_no_other_layer_renames() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
-        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        use crate::lsp::bridge::HostRevision;
+        use crate::lsp::lsp_impl::bridge_context::{PreparedRace, race_layers_preferred};
         use tower_lsp_server::jsonrpc::{Error, ErrorCode};
-        let map = crate::lsp::bridge::apply_prepare_result(
+        let mut prepared = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
             None,
         )
-        .unwrap()
-        .map;
+        .unwrap();
+        // Stale: its map revoked, the host unmoved.
+        let revocation = std::sync::Arc::new(crate::lsp::bridge::Revocation::default());
+        std::sync::Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_revocation(std::sync::Arc::clone(&revocation));
+        revocation.revoke(u64::MAX);
+        let map = prepared.map;
         let edit = WorkspaceEdit {
             changes: Some(std::collections::HashMap::from([(
                 "file:///test/a.lua".parse::<Uri>().unwrap(),
@@ -329,46 +303,55 @@ mod tests {
             )])),
             ..Default::default()
         };
+        let uri: Uri = "file:///test/rename-race.md".parse().unwrap();
         let walk = |host: Result<Option<Sourced<WorkspaceEdit>>>| {
             let virt = Sourced::prepared_for_test(edit.clone(), &map, 1, 0);
+            let uri = uri.clone();
             async move {
-                let passed_over =
-                    super::super::super::bridge_context::StaleAnswerFallback::default();
+                let race = PreparedRace::new(|| {
+                    Some(HostRevision {
+                        incarnation: 1,
+                        content_version: 0,
+                    })
+                });
                 let result = race_layers_preferred(
                     &[Virt, Host, Native],
                     std::future::ready(Ok(Some(virt))),
                     std::future::ready(host),
                     std::future::ready(Ok(None)),
                     |sourced: &Sourced<WorkspaceEdit>| {
-                        passed_over.answers(sourced, rename_workspace_edit_has_result, |_| false)
+                        race.answers(sourced, rename_workspace_edit_has_result)
                     },
                 )
                 .await;
-                passed_over.or_kept(result)
+                race.conclude(result, &uri, "rename", log::Level::Debug)
             }
         };
         for host in [Ok(None), Err(Error::internal_error())] {
-            let answer = walk(host).await.unwrap().expect("the passed-over answer");
-            assert!(answer.is_prepared());
+            let error = walk(host).await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::ServerError(-32801));
+            assert!(error.message.contains("rename result dropped"), "{error}");
         }
         assert_eq!(
             walk(Err(Error::request_cancelled()))
                 .await
-                .map(|_| ())
                 .unwrap_err()
                 .code,
             ErrorCode::RequestCancelled
         );
-        let host_answer = walk(Ok(Some(Sourced::unprepared(edit.clone()))))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!host_answer.is_prepared());
+        assert_eq!(
+            walk(Ok(Some(Sourced::unprepared(edit.clone()))))
+                .await
+                .unwrap(),
+            Some(edit.clone())
+        );
     }
 
     /// Under a cross-layer `preferred`, a prepared rename the race finds
-    /// moved or stale is no answer: the host layer's wins, waited for when
-    /// it is still running. One that may be kept wins as ever.
+    /// stale is no answer: the host layer's stands in, waited for when it
+    /// is still running. One the host moved under leaves none to stand in:
+    /// the host layer's rename was read for the text it moved from too. One
+    /// still current wins as ever.
     #[tokio::test]
     async fn a_rename_that_may_not_be_kept_falls_through_to_the_host_layers() {
         let edit = |name: &str| {
@@ -384,20 +367,33 @@ mod tests {
                 ..Default::default()
             }
         };
-        for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
+        use crate::lsp::lsp_impl::bridge_context::Verdict;
+        for (verdict, host_delay_ms) in [
+            (Verdict::Current, 0),
+            (Verdict::Stale, 0),
+            (Verdict::Stale, 20),
+            (Verdict::Moved, 0),
+            (Verdict::Moved, 20),
+        ] {
             let won = super::super::super::bridge_context::race_prepared_virt_against_host(
                 edit("virt"),
                 edit("host"),
                 host_delay_ms,
-                may_keep,
+                verdict,
                 rename_workspace_edit_has_result,
             )
             .await;
-            assert_eq!(
-                won,
-                edit(if may_keep { "virt" } else { "host" }),
-                "{may_keep} {host_delay_ms}"
-            );
+            match verdict {
+                Verdict::Current => assert_eq!(won.unwrap(), Some(edit("virt"))),
+                Verdict::Stale => {
+                    assert_eq!(won.unwrap(), Some(edit("host")), "{host_delay_ms}")
+                }
+                Verdict::Moved => assert_eq!(
+                    won.unwrap_err().code,
+                    tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801),
+                    "{host_delay_ms}"
+                ),
+            }
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
-use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
+use crate::lsp::lsp_impl::bridge_context::{Sourced, Verdict, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/colorPresentation";
 
@@ -19,12 +19,16 @@ impl Kakehashi {
     ) -> Result<Vec<ColorPresentation>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
-        // Before either layer reads the text: what a stand-in for an answer
-        // passed over must still be (see `ColorAnswer::final_presentations`).
-        let revision = self.prepared_request_revision(&lsp_uri);
+        // Before either layer reads the host's text (see `PreparedRace`).
+        let race = self.prepared_race(&lsp_uri);
         let virt = async {
             let presentations = self
-                .color_presentation_virt_layer(&lsp_uri, params.range, params.color)
+                .color_presentation_virt_layer(
+                    &lsp_uri,
+                    params.range,
+                    params.color,
+                    race.revision(),
+                )
                 .await?;
             Ok(presentations.map(ColorAnswer::from_layer))
         };
@@ -34,8 +38,6 @@ impl Kakehashi {
                 .await?;
             Ok(presentations.map(ColorAnswer::unprepared))
         };
-        let passed_over = PassedOver::default();
-        let current = |source: &Sourced<()>| self.sourced_still_current(source, &lsp_uri);
         let chosen = self
             .walk_layers_by_strategy(
                 &lsp_uri,
@@ -44,24 +46,46 @@ impl Kakehashi {
                 virt,
                 host,
                 std::future::ready(Ok(None)),
-                // Under `preferred`, read as the race decides (see
-                // `PassedOver::answers`).
-                |answer: &ColorAnswer| passed_over.answers(answer, current),
+                // Under `preferred`, read as the race decides: a prepared
+                // answer no longer current is no answer of its layer.
+                |answer: &ColorAnswer| {
+                    answer.has_result(|source| race.keeps(std::iter::once(source)))
+                },
                 ColorAnswer::combine,
             )
-            .await?;
-        // The final answer chosen: a prepared part's edits checked once
-        // more against the host, which may have moved while it was held.
-        let Some(answer) = chosen else {
-            return Ok(Vec::new());
+            .await;
+        // The final answer chosen, by the rule every prepared answer
+        // follows (see `PreparedRace`): a prepared part's edits checked once
+        // more against the host, which may have moved while it was held;
+        // the parts left, or another layer's standing in for one passed
+        // over, answering only while the host is still the text the request
+        // read; and what is dropped with nothing left `ContentModified`.
+        let chosen = match chosen {
+            Ok(chosen) => chosen,
+            Err(error)
+                if race.passed_over().is_none()
+                    || error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+            {
+                return Err(error);
+            }
+            Err(_) => None,
         };
-        Ok(answer.final_presentations(
-            || self.prepared_request_revision(&lsp_uri),
-            passed_over.passed(),
-            // Read only once a prepared answer was passed over or dropped,
-            // which only a pool that prepares has.
-            || revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision,
-        ))
+        let judged = match chosen {
+            Some(answer) => answer.final_presentations(
+                || self.prepared_request_revision(&lsp_uri),
+                race.passed_over(),
+                || race.unchanged(),
+            ),
+            None => race.passed_over().map_or(Ok(Vec::new()), Err),
+        };
+        judged.map_err(|verdict| {
+            crate::lsp::lsp_impl::bridge_context::dropped_answer_error(
+                &lsp_uri,
+                "colorPresentation",
+                verdict,
+                log::Level::Debug,
+            )
+        })
     }
 
     async fn color_presentation_virt_layer(
@@ -69,9 +93,8 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         color: Color,
+        revision: Option<crate::lsp::bridge::HostRevision>,
     ) -> Result<Option<Sourced<Vec<ColorPresentation>>>> {
-        // Before the text is read: see `Sourced::from_region`.
-        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
@@ -221,26 +244,33 @@ impl ColorAnswer {
     }
 
     /// [`Self::still_current`], the prepared part judged against the host
-    /// as it is `now` (see `Sourced::verdict`). Dropped, the parts left
-    /// (the host layer's, under `concatenated`) were read for the text the
-    /// request read: they answer only while the host is still that text
-    /// (`unchanged`). So does an answer standing in for a prepared one a
-    /// `preferred` race passed over (`stands_in`).
+    /// as it is `now` (see `Sourced::verdict`), or the verdict that drops
+    /// the whole answer:
+    ///
+    /// - The prepared part dropped, the parts left (the host layer's, under
+    ///   `concatenated`) were read for the text the request read: they
+    ///   answer only while the host is still that text (`unchanged`). So
+    ///   does an answer standing in for a prepared one a `preferred` race
+    ///   passed over (`passed_over`).
+    /// - Dropped with nothing left, it is dropped by the part's verdict.
     fn final_presentations(
         self,
         now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
-        stands_in: bool,
+        passed_over: Option<Verdict>,
         unchanged: impl Fn() -> bool,
-    ) -> Vec<ColorPresentation> {
-        let keeps = self
+    ) -> std::result::Result<Vec<ColorPresentation>, Verdict> {
+        let verdict = self
             .prepared
             .as_ref()
-            .is_none_or(|(source, _)| source.still_current(now));
-        let presentations = self.still_current(|_| keeps);
-        if (!keeps || stands_in) && !presentations.is_empty() && !unchanged() {
-            return Vec::new();
+            .map_or(Verdict::Current, |(source, _)| source.verdict(now()));
+        let presentations = self.still_current(|_| verdict.keeps());
+        let dropped = Some(verdict).filter(|verdict| !verdict.keeps());
+        match dropped.or(passed_over) {
+            None => Ok(presentations),
+            Some(verdict) if presentations.is_empty() => Err(verdict),
+            Some(_) if !unchanged() => Err(Verdict::Moved),
+            Some(_) => Ok(presentations),
         }
-        presentations
     }
 
     /// The presentations, the prepared part kept only while its edits still
@@ -253,31 +283,6 @@ impl ColorAnswer {
             self.items.drain(range);
         }
         self.items
-    }
-}
-
-/// Whether a `preferred` race passed over a prepared answer no longer
-/// current: the answer it then chose stands in for that one, and answers
-/// only while the host is still the text the request read.
-#[derive(Default)]
-struct PassedOver(std::sync::atomic::AtomicBool);
-
-impl PassedOver {
-    /// Whether `answer` wins the race: it has presentations and its
-    /// prepared part, if any, is still `current`. One that is not is no
-    /// answer of its layer, and is noted as passed over.
-    fn answers(&self, answer: &ColorAnswer, current: impl Fn(&Sourced<()>) -> bool) -> bool {
-        if answer.has_result(current) {
-            return true;
-        }
-        if !answer.items.is_empty() {
-            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        false
-    }
-
-    fn passed(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -343,82 +348,82 @@ mod tests {
             ))
         };
         assert_eq!(
-            labels(answer().final_presentations(|| at(1), false, || unreachable!())),
-            ["virt"]
-        );
-        assert!(
             answer()
-                .final_presentations(|| at(2), false, || false)
-                .is_empty()
+                .final_presentations(|| at(1), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["virt".to_string()])
+        );
+        assert_eq!(
+            answer().final_presentations(|| at(2), None, || false),
+            Err(Verdict::Moved)
         );
     }
 
-    /// Under `preferred`, a prepared answer no longer current is no answer
-    /// of its layer: the race goes on to the host layer's, which stands in
-    /// for it only while the host is still the text the request read.
+    /// Under `preferred`, the host layer's answer chosen after a prepared
+    /// one was passed over stands in for it only while the host is still
+    /// the text the request read.
     #[test]
     fn a_host_answer_stands_in_for_one_passed_over_only_on_unchanged_text() {
-        let (map, revocation) = revocable_map();
-        let virt = ColorAnswer::from_layer(Sourced::prepared_for_test(
-            vec![presentation("virt")],
-            &map,
-            1,
-            1,
-        ));
         let host = || ColorAnswer::unprepared(vec![presentation("host")]);
-        // Current: it wins, nothing passed over.
-        let passed_over = PassedOver::default();
-        assert!(passed_over.answers(&virt, |source| source.still_current(|| at(1))));
-        assert!(!passed_over.passed());
-        // Its map revoked, the host unmoved: the host layer's stands in.
-        revocation.revoke(u64::MAX);
-        assert!(!passed_over.answers(&virt, |source| source.still_current(|| at(1))));
-        assert!(passed_over.passed());
-        assert!(passed_over.answers(&host(), |_| unreachable!()));
         assert_eq!(
-            labels(host().final_presentations(|| unreachable!(), true, || true)),
-            ["host"]
+            host()
+                .final_presentations(|| unreachable!(), Some(Verdict::Stale), || true)
+                .map(labels),
+            Ok(vec!["host".to_string()])
         );
         // The host moved: the host layer's was read for the text it moved
         // from too.
-        assert!(
-            host()
-                .final_presentations(|| unreachable!(), true, || false)
-                .is_empty()
+        assert_eq!(
+            host().final_presentations(|| unreachable!(), Some(Verdict::Moved), || false),
+            Err(Verdict::Moved)
         );
         // Nothing passed over, the host layer's answer goes out as it came.
         assert_eq!(
-            labels(host().final_presentations(|| unreachable!(), false, || unreachable!())),
-            ["host"]
+            host()
+                .final_presentations(|| unreachable!(), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["host".to_string()])
         );
     }
 
     /// Under `concatenated`, a dropped prepared part leaves the host
     /// layer's, which answers only while the host is still the text the
-    /// request read.
+    /// request read; nothing left, the answer is dropped by the part's
+    /// verdict.
     #[test]
     fn a_merged_host_part_outlives_a_dropped_prepared_part_only_on_unchanged_text() {
         let (map, revocation) = revocable_map();
-        let merged = || {
-            ColorAnswer::unprepared(vec![presentation("host")]).combine(ColorAnswer::from_layer(
-                Sourced::prepared_for_test(vec![presentation("virt")], &map, 1, 1),
+        let virt = || {
+            ColorAnswer::from_layer(Sourced::prepared_for_test(
+                vec![presentation("virt")],
+                &map,
+                1,
+                1,
             ))
         };
+        let merged = || ColorAnswer::unprepared(vec![presentation("host")]).combine(virt());
         assert_eq!(
-            labels(merged().final_presentations(|| at(1), false, || unreachable!())),
-            ["host", "virt"]
+            merged()
+                .final_presentations(|| at(1), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["host".to_string(), "virt".to_string()])
         );
         // Moved: every part was read for the text the host moved from.
-        assert!(
-            merged()
-                .final_presentations(|| at(2), false, || false)
-                .is_empty()
+        assert_eq!(
+            merged().final_presentations(|| at(2), None, || false),
+            Err(Verdict::Moved)
         );
         // Revoked, the host unmoved: the prepared part alone goes.
         revocation.revoke(u64::MAX);
         assert_eq!(
-            labels(merged().final_presentations(|| at(1), false, || true)),
-            ["host"]
+            merged()
+                .final_presentations(|| at(1), None, || true)
+                .map(labels),
+            Ok(vec!["host".to_string()])
+        );
+        assert_eq!(
+            virt().final_presentations(|| at(1), None, || unreachable!()),
+            Err(Verdict::Stale)
         );
     }
 

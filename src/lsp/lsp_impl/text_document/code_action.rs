@@ -27,7 +27,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
-use super::super::bridge_context::{RangeRequestContext, Sourced};
+use super::super::bridge_context::{RangeRequestContext, Sourced, Verdict};
 use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
 use crate::error::LockResultExt;
@@ -133,8 +133,7 @@ impl RefusedActionsFallback {
     /// The walk's `result`, or, when it found no answer (nothing, or only
     /// a layer's error, which an answer would have outranked), the actions
     /// kept aside, with the error they displace: the answer still if they
-    /// are dropped at the final check (see [`judged_or_displaced`]). A
-    /// cancel stays a cancel.
+    /// are dropped at the final check. A cancel stays a cancel.
     fn or_kept(
         self,
         result: Result<Option<ActionParts>>,
@@ -158,66 +157,42 @@ impl RefusedActionsFallback {
     }
 }
 
-/// The answer once the actions chosen are judged: those kept, or, none
-/// left, the error kept-aside actions displaced (`displaced`), if any —
-/// they never turn a layer's error into an empty answer.
-fn judged_or_displaced(
-    judged: std::result::Result<CodeActionResponse, ()>,
-    displaced: Option<tower_lsp_server::jsonrpc::Error>,
-) -> Result<Option<CodeActionResponse>> {
-    match (judged, displaced) {
-        (Ok(actions), _) => Ok(Some(actions)),
-        (Err(()), Some(error)) => Err(error),
-        (Err(()), None) => Ok(None),
-    }
-}
-
-/// The actions of `parts` judged kept, in order: `Err` when judging emptied
-/// the answer (none left of a stale region's actions). An answer that came
-/// empty stays the empty answer it was (a concatenated walk's `[]`).
-fn current_actions(
-    parts: Vec<(CodeActionResponse, bool)>,
-) -> std::result::Result<CodeActionResponse, ()> {
-    let mut kept: CodeActionResponse = Vec::new();
-    let mut dropped = false;
-    for (actions, keep) in parts {
-        if keep {
-            kept.extend(actions);
-        } else {
-            dropped = true;
-        }
-    }
-    if dropped && kept.is_empty() {
-        return Err(());
-    }
-    Ok(kept)
-}
-
-/// [`current_actions`], each prepared part judged by the same final check
-/// as the other answers mapped through prepared regions
-/// ([`Sourced::verdict`]), against the host as it is `now`: read once for
-/// all parts, and only with a prepared one. The others are kept as they
-/// are.
+/// The actions of `parts` still current, in order: each prepared part
+/// judged by the same final check as the other answers mapped through
+/// prepared regions ([`Sourced::verdict`]), against the host as it is
+/// `now`, read once for all parts and only with a prepared one.
+///
+/// - The host moved: every part goes, the unprepared ones too (the host
+///   layer's, under `concatenated`), read for the text it moved from.
+/// - A part stale on an unmoved host goes alone, the others stay; none
+///   left, the answer is dropped as stale.
+/// - An answer that came empty stays the empty answer it was (a
+///   concatenated walk's `[]`).
 fn judged_actions(
     now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
     parts: ActionParts,
-) -> std::result::Result<CodeActionResponse, ()> {
+) -> std::result::Result<CodeActionResponse, Verdict> {
     let now = parts
         .iter()
         .any(|(_, source)| source.is_some())
         .then(now)
         .flatten();
-    current_actions(
-        parts
-            .into_iter()
-            .map(|(actions, source)| {
-                let keep = source
-                    .as_ref()
-                    .is_none_or(|source| source.verdict(now).keeps());
-                (actions, keep)
-            })
-            .collect(),
-    )
+    let mut kept: CodeActionResponse = Vec::new();
+    let mut dropped = None;
+    for (actions, source) in parts {
+        match source
+            .as_ref()
+            .map_or(Verdict::Current, |source| source.verdict(now))
+        {
+            Verdict::Current => kept.extend(actions),
+            Verdict::Moved => return Err(Verdict::Moved),
+            Verdict::Stale => dropped = Some(Verdict::Stale),
+        }
+    }
+    match dropped {
+        Some(verdict) if kept.is_empty() => Err(verdict),
+        _ => Ok(kept),
+    }
 }
 
 /// Collapse the cross-server `isPreferred` collision on a concatenated menu:
@@ -253,6 +228,8 @@ impl Kakehashi {
         let context = params.context;
         let upstream_caps = self.upstream_code_action_caps();
 
+        // Before any layer reads the host's text (see `PreparedRace`).
+        let race = self.prepared_race(&lsp_uri);
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
         let host = async {
@@ -262,7 +239,7 @@ impl Kakehashi {
             Ok(actions.map(|actions| vec![(actions, None)]))
         };
         let passed_over = RefusedActionsFallback::default();
-        let may_keep = |source: &Sourced<()>| self.sourced_still_current(source, &lsp_uri);
+        let may_keep = |source: &Sourced<()>| race.keeps(std::iter::once(source));
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
         // non-empty layer; `concatenated` merges every layer's actions in priority
@@ -283,28 +260,43 @@ impl Kakehashi {
             )
             .await;
         let (result, displaced) = passed_over.or_kept(result);
-        // The final answer chosen: each prepared region's actions checked
-        // once more against the host text, which may have moved while they
-        // were held (see `judged_actions`). A stale region's actions are
-        // dropped; the others in the answer chosen stay (under
-        // `concatenated`, the host layer's and other regions'). Under a
-        // cross-layer `preferred` a virt answer already moved or stale as
-        // the race decided lost it to the host layer's (`parts_answer`);
-        // the host layer's answer is not in the one chosen, so a virt
-        // answer the host moved under since leaves none, until the editor
-        // asks again.
+        // The final answer chosen, by the rule every prepared answer
+        // follows (see `PreparedRace`): each prepared region's actions
+        // checked once more against the host, which may have moved while
+        // they were held (see `judged_actions`); the host layer's standing
+        // in for a virt answer the race passed over only while the host is
+        // still the text the request read; and what is dropped with nothing
+        // left answered `ContentModified`, or the error kept-aside refused
+        // actions displaced.
+        let dropped = |verdict| {
+            super::super::bridge_context::dropped_answer_error(
+                &lsp_uri,
+                "codeAction",
+                verdict,
+                log::Level::Debug,
+            )
+        };
         let result = match result {
-            Ok(Some(parts)) => judged_or_displaced(
-                judged_actions(|| self.prepared_request_revision(&lsp_uri), parts).inspect_err(|()| {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
-                        lsp_uri.as_str()
-                    );
-                }),
-                displaced,
-            ),
-            other => other.map(|_| None),
+            Ok(Some(parts)) => {
+                match judged_actions(|| self.prepared_request_revision(&lsp_uri), parts) {
+                    Ok(actions) => match race.stand_in_dropped() {
+                        Some(verdict) => Err(dropped(verdict)),
+                        None => Ok(Some(actions)),
+                    },
+                    Err(verdict) => Err(displaced.unwrap_or_else(|| dropped(verdict))),
+                }
+            }
+            Ok(None) => race
+                .passed_over()
+                .map_or(Ok(None), |verdict| Err(dropped(verdict))),
+            Err(error) => Err(match race.passed_over() {
+                Some(verdict)
+                    if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+                {
+                    dropped(verdict)
+                }
+                _ => error,
+            }),
         };
         // Collapse the cross-source isPreferred collision on the FINAL menu,
         // regardless of the cross-layer strategy: WITHIN-layer concatenation can
@@ -1011,7 +1003,7 @@ mod tests {
                 part("second", Some(&second)),
             ]
         };
-        let titles = |answer: std::result::Result<CodeActionResponse, ()>| {
+        let titles = |answer: std::result::Result<CodeActionResponse, Verdict>| {
             answer.map(|actions| {
                 actions
                     .into_iter()
@@ -1043,12 +1035,19 @@ mod tests {
             Ok(vec!["host".into(), "first".into(), "second".into()])
         );
         assert_eq!(reads.get(), 1, "read once for all parts");
-        // Moved: the prepared parts go, all of them.
-        assert_eq!(judged(2, parts()), Ok(vec!["host".into()]));
-        assert_eq!(judged(2, parts().split_off(1)), Err(()));
+        // Moved: every part goes, the host layer's too, read for the text
+        // the host moved from.
+        assert_eq!(judged(2, parts()), Err(Verdict::Moved));
         // Revoked, the host unmoved: that part alone.
         revocation.revoke(u64::MAX);
         assert_eq!(judged(1, parts()), Ok(vec!["host".into(), "first".into()]));
+        // None left: dropped as stale.
+        assert_eq!(judged(1, parts().split_off(2)), Err(Verdict::Stale));
+        // An answer that came empty stays the empty answer it was.
+        assert_eq!(
+            titles(judged_actions(|| unreachable!(), vec![(vec![], None)])),
+            Ok(vec![])
+        );
         assert_eq!(
             titles(judged_actions(|| unreachable!(), vec![part("host", None)])),
             Ok(vec!["host".into()])
@@ -1300,10 +1299,9 @@ mod tests {
         );
     }
 
-    /// A virt answer passed over as moved or stale is not kept aside: with
-    /// the host layer erring, the walk answers that error, not actions the
-    /// final check drops. Kept-aside actions dropped there leave the error
-    /// they displaced.
+    /// A virt answer passed over as moved or stale is not kept aside as
+    /// refused actions are: with the host layer erring, the walk hands back
+    /// that error and nothing displaced.
     #[tokio::test]
     async fn a_stale_answer_passed_over_never_displaces_a_layers_error() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
@@ -1335,51 +1333,6 @@ mod tests {
         let (result, displaced) = passed_over.or_kept(result);
         assert_eq!(result.map(|_| ()).unwrap_err(), Error::internal_error());
         assert!(displaced.is_none());
-        // Kept aside, then dropped: the error they displaced.
-        assert_eq!(
-            judged_or_displaced(Err(()), Some(Error::internal_error())).unwrap_err(),
-            Error::internal_error()
-        );
-        assert_eq!(judged_or_displaced(Err(()), None).unwrap(), None);
-        assert_eq!(judged_or_displaced(Ok(vec![]), None).unwrap(), Some(vec![]));
-    }
-
-    /// The final check drops only a stale prepared region's actions; an
-    /// answer that came empty stays the empty answer it was.
-    #[test]
-    fn the_final_check_drops_only_stale_regions_actions() {
-        let action = |title: &str| {
-            CodeActionOrCommand::CodeAction(CodeAction {
-                title: title.into(),
-                ..Default::default()
-            })
-        };
-        let titles = |answer: std::result::Result<CodeActionResponse, ()>| {
-            answer.map(|actions| {
-                actions
-                    .into_iter()
-                    .map(|action| match action {
-                        CodeActionOrCommand::CodeAction(action) => action.title,
-                        CodeActionOrCommand::Command(command) => command.title,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        // A host layer answering `[]`, nothing else: `[]`.
-        assert_eq!(titles(current_actions(vec![(vec![], true)])), Ok(vec![]));
-        // A stale region beside the host layer's actions: those stay.
-        assert_eq!(
-            titles(current_actions(vec![
-                (vec![action("virt")], false),
-                (vec![action("host")], true)
-            ])),
-            Ok(vec!["host".to_string()])
-        );
-        // Only stale actions: none.
-        assert_eq!(
-            titles(current_actions(vec![(vec![action("virt")], false)])),
-            Err(())
-        );
     }
 
     /// An action resolved while its region went from as is to prepared (an
