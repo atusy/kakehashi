@@ -8731,6 +8731,40 @@ mod tests {
         );
     }
 
+    /// A region minted anew is named by no edit, so its forwarded text is
+    /// reclaimed with its document — also when no document was ever opened.
+    #[tokio::test]
+    async fn orphan_close_reclaims_latest_virtual_content_of_regions_no_longer_live() {
+        let pool = LanguageServerPool::new();
+        let host_uri = Url::parse("file:///test/cache-orphans.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "live");
+        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_1, "orphaned");
+        pool.record_latest_virtual_content(&host_uri, 1, "python", TEST_ULID_LUA_1, "orphaned");
+
+        pool.close_orphaned_docs(
+            &host_uri,
+            &std::collections::HashSet::from([TEST_ULID_LUA_0]),
+        )
+        .await;
+
+        let host = pool.latest_virtual_contents.get(&host_uri).unwrap();
+        let cached: Vec<(String, Vec<String>)> = host
+            .contents
+            .iter()
+            .map(|regions| {
+                (
+                    regions.key().clone(),
+                    regions.iter().map(|region| region.key().clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            cached,
+            vec![("lua".to_string(), vec![TEST_ULID_LUA_0.to_string()])]
+        );
+    }
+
     #[tokio::test]
     async fn replacement_reclaims_only_old_language_virtual_content() {
         let pool = LanguageServerPool::new();
