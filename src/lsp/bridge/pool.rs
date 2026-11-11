@@ -3629,6 +3629,18 @@ impl LanguageServerPool {
             .record_sent_for_test(virtual_uri, connection_key, content, 1);
     }
 
+    /// What this connection holds for `virtual_uri`, as its reader observes
+    /// it when a push about the document arrives.
+    #[cfg(test)]
+    pub(super) fn observe_push_for_test(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+    ) -> Observed {
+        self.document_tracker
+            .observe(virtual_uri, connection_key, 0, Some(1))
+    }
+
     /// Purge this connection's document records, as retiring its process
     /// does.
     #[cfg(test)]

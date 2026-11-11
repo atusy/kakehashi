@@ -177,6 +177,23 @@ pub(crate) struct HeldText {
     /// read before is not placed as is, where the refusal of edits through
     /// a prepared document would not see it.
     pub(crate) as_is_since: u64,
+    /// A push was read while the connection held this text (see
+    /// `DocumentTracker::observe`): once another text replaces it, it is
+    /// kept as that one's `pushed_text`.
+    pub(crate) push_read: bool,
+    /// The newest earlier text of the document a push was read under, kept
+    /// past every text sent since. A server that publishes only what changed
+    /// may never replace that push, which goes on placing through this.
+    pub(crate) pushed_text: Option<PushedText>,
+}
+
+/// A text a connection held for a document before the one it holds now, as
+/// a push read under it places: its [`HeldText::generation`], and the map it
+/// was last held with (`None`: as is).
+#[derive(Debug, Clone)]
+pub(crate) struct PushedText {
+    pub(crate) generation: u64,
+    pub(crate) map: Option<Arc<PreparedMap>>,
 }
 
 /// Put `previous` back as what `connection_key` holds for `uri_string`
@@ -1030,7 +1047,9 @@ impl DocumentTracker {
     /// whatever its record: the rule places such coordinates the same either
     /// way (a prepared text sent later shows in the record at placement), and
     /// identical pushes then stamp alike rather than each counting as a
-    /// change.
+    /// change. A text read so under the document version it was sent with
+    /// is noted (`HeldText::push_read`), to be kept for what was read
+    /// under it once another text replaces it.
     ///
     /// `incarnation`: the process reading them, as
     /// [`Self::connection_generation`] was when it was spawned.
@@ -1044,15 +1063,29 @@ impl DocumentTracker {
         if !self.held_texts_matter(super::RegionPrepare::default()) {
             return super::Observed::AsIsThen;
         }
-        let (held, history) = self.held_now(virtual_uri, connection_key);
+        let mut fingerprints = self
+            .document_fingerprints
+            .lock()
+            .recover_poison("DocumentTracker::document_fingerprints");
+        let (held, history) = self.held_locked(&fingerprints, virtual_uri, connection_key);
         if !history && held.as_ref().is_none_or(|held| held.map.is_none()) {
             return super::Observed::AsIsThen;
+        }
+        let stale_version =
+            version.is_some_and(|version| held.as_ref().is_none_or(|held| held.version != version));
+        // Noted with the read, under the records' lock: the text is kept
+        // for this push once another replaces it (see `record_locked`).
+        if !stale_version
+            && let Some(record) = fingerprints
+                .get_mut(connection_key)
+                .and_then(|docs| docs.get_mut(virtual_uri))
+        {
+            record.push_read = true;
         }
         super::Observed::Read {
             generation: held.as_ref().map(|held| held.generation),
             prepared: history || held.as_ref().is_some_and(|held| held.map.is_some()),
-            stale_version: version
-                .is_some_and(|version| held.as_ref().is_none_or(|held| held.version != version)),
+            stale_version,
             incarnation,
         }
     }
@@ -1135,10 +1168,26 @@ impl DocumentTracker {
             generation,
             version: change.version,
             as_is_since: 0,
+            push_read: false,
+            pushed_text: None,
         };
         // The key is copied only for a document not on record yet.
         let previous = match docs.get_mut(uri_string) {
-            Some(held) => Some(std::mem::replace(held, record)),
+            Some(held) => {
+                let previous = std::mem::replace(held, record);
+                // The text a push was last read under outlives the texts
+                // sent since: the one replaced here if one was, else the
+                // one it kept.
+                held.pushed_text = if previous.push_read {
+                    Some(PushedText {
+                        generation: previous.generation,
+                        map: previous.map.clone(),
+                    })
+                } else {
+                    previous.pushed_text.clone()
+                };
+                Some(previous)
+            }
             None => docs.insert(uri_string.to_owned(), record),
         };
         self.held_generations.store(generation, Ordering::Release);
@@ -2944,7 +2993,7 @@ mod tests {
     }
 
     #[test]
-    fn coordinates_from_a_prepared_text_place_nowhere_once_it_is_replaced() {
+    fn only_a_push_read_under_a_prepared_text_places_once_it_is_replaced() {
         let tracker = DocumentTracker::new();
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
         let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
@@ -2961,14 +3010,23 @@ mod tests {
             1,
         );
         let pushed = tracker.observe(&uri, &conn, 0, Some(1));
-        assert!(matches!(
-            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "  a"),
-            Presentation::Prepared(_)
-        ));
-        // The pair lost its peer: the virtual text goes out as is.
+        let edit = tracker.observe_through(0);
+        for read in [pushed, edit] {
+            assert!(matches!(
+                tracker.presentation(&uri, &conn, read, RegionPrepare::default(), "  a"),
+                Presentation::Prepared(_)
+            ));
+        }
+        // The pair lost its peer: the virtual text goes out as is. The
+        // push stands until its server replaces it, through the map of the
+        // text it was read under; the edit is the replaced text's.
         tracker.record_sent_for_test(&virtual_uri, &conn, "  a\n".into(), 2);
+        match tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "  a\n") {
+            Presentation::Prepared(placed) => assert!(Arc::ptr_eq(&placed, &map)),
+            other => panic!("expected the replaced text's map, got {other:?}"),
+        }
         assert!(matches!(
-            tracker.presentation(&uri, &conn, pushed, RegionPrepare::default(), "  a\n"),
+            tracker.presentation(&uri, &conn, edit, RegionPrepare::default(), "  a\n"),
             Presentation::Unavailable
         ));
         // A push naming the prepared text's version, read after it was

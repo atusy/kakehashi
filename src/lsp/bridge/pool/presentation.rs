@@ -22,7 +22,8 @@ pub(crate) enum Presentation {
     /// text as is.
     AsIs,
     /// Through this map first: the connection holds the text a peer
-    /// prepared from the region's current virtual text.
+    /// prepared from the region's current virtual text — or, for a push,
+    /// held it when the push was read (see `pushed`).
     Prepared(Arc<PreparedMap>),
     /// Not at all: the coordinates describe no current host position.
     Unavailable,
@@ -107,6 +108,8 @@ pub(crate) struct RegionPrepare {
 ///   since, a document closed since, or an earlier version named, places
 ///   nowhere. Elsewhere coordinates translate as on any unprepared path,
 ///   whatever was sent meanwhile.
+/// - A push is the exception to "a text sent since": it places as the text
+///   it was read under does, until a newer push replaces it (see [`pushed`]).
 /// - A text held as is (or nothing on record) translates through the offset
 ///   alone — unless the lifecycle pass prepares the region, whose servers
 ///   are bridged only through a prepared text.
@@ -128,6 +131,14 @@ pub(super) fn presentation(
         || held.is_some_and(|held| held.map.is_some())
         || matches!(observed, Observed::Read { prepared: true, .. });
     if involved {
+        if let Observed::Read {
+            generation,
+            stale_version: false,
+            ..
+        } = observed
+        {
+            return pushed(held, generation, region);
+        }
         // Nothing on record: the document was closed since (every send is
         // recorded before it is queued), or the process that sent them
         // retired (see `DocumentTracker::sent_by_retired`).
@@ -138,11 +149,9 @@ pub(super) fn presentation(
                 // computed for, which the one held now — even as is, after a
                 // prepared one since — may not be.
                 Observed::AsIsThen => true,
-                Observed::Read {
-                    generation,
-                    stale_version,
-                    ..
-                } => stale_version || generation != held.map(|held| held.generation),
+                // A push naming another document version than the text
+                // held when it was read: computed for an earlier one.
+                Observed::Read { .. } => true,
                 // Also held as is since, the same text having been held
                 // prepared when it was read: placed as is, an edit read
                 // through a prepared text would escape its refusal.
@@ -167,8 +176,46 @@ pub(super) fn presentation(
     }
 }
 
+/// How a push places, read while its connection held the text of
+/// generation `read` under the document version it was sent with, where
+/// preparation is involved.
+///
+/// A server that publishes only what changed sends nothing after an edit
+/// its diagnostics stay the same through, so a push stands until a newer
+/// one replaces it, as on any unprepared path: whatever was sent since, and
+/// while an edit still waits for its answer. Its coordinates stay those of
+/// the text it was read under, so it places as that text does — through the
+/// map it was last held with, or as is — and through no other: the text is
+/// the one the connection holds, or the one its record keeps as the newest
+/// a push was read under (see `HeldText::pushed_text`).
+///
+/// It places nowhere once nothing is on record (the document closed, or
+/// its process retired), through a map revoked since, or as is in a region
+/// the lifecycle pass prepares, whose servers are bridged only through a
+/// prepared text.
+fn pushed(held: Option<&HeldText>, read: Option<u64>, region: RegionPrepare) -> Presentation {
+    let Some(held) = held else {
+        return Presentation::Unavailable;
+    };
+    let map = if read == Some(held.generation) {
+        &held.map
+    } else {
+        match &held.pushed_text {
+            Some(text) if read == Some(text.generation) => &text.map,
+            _ => return Presentation::Unavailable,
+        }
+    };
+    match map {
+        None if region.prepared => Presentation::Unavailable,
+        None => Presentation::AsIs,
+        Some(map) if map.revoked() => Presentation::Unavailable,
+        Some(map) => Presentation::Prepared(Arc::clone(map)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::document_tracker::PushedText;
     use super::*;
     use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
 
@@ -185,6 +232,8 @@ mod tests {
             generation,
             version: 1,
             as_is_since: 0,
+            push_read: false,
+            pushed_text: None,
         }
     }
 
@@ -285,10 +334,12 @@ mod tests {
             Presentation::Prepared(_)
         ));
         // Prepared from another virtual text: no current host position.
-        assert!(matches!(
-            presentation(Some(&prepared), true, read(3, true), PREPARED, "w"),
-            Presentation::Unavailable
-        ));
+        for observed in [Observed::Now, through(3)] {
+            assert!(matches!(
+                presentation(Some(&prepared), true, observed, PREPARED, "w"),
+                Presentation::Unavailable
+            ));
+        }
         // Right after its pair lost its peer, the server still holds it.
         assert!(matches!(
             presentation(Some(&prepared), true, Observed::Now, AS_IS, "v"),
@@ -376,6 +427,122 @@ mod tests {
         assert!(matches!(
             presentation(Some(&prepared), true, read(4, true), PREPARED, "v"),
             Presentation::Prepared(_)
+        ));
+    }
+
+    /// A push stands until a newer one replaces it, as on any unprepared
+    /// path: a server that publishes only what changed sends nothing after
+    /// an edit its diagnostics stay the same through. It places as the text
+    /// it was read under does, whatever the region's text is by now.
+    #[test]
+    fn a_push_places_as_the_text_it_was_read_under_whatever_was_sent_since() {
+        let placed_through = |presentation, map: &Arc<PreparedMap>| match presentation {
+            Presentation::Prepared(placed) => Arc::ptr_eq(&placed, map),
+            _ => false,
+        };
+        // Still held, while an edit of the region waits for its answer.
+        let first = map("v");
+        let held_first = held(3, Some(Arc::clone(&first)));
+        assert!(placed_through(
+            presentation(Some(&held_first), true, read(3, true), PREPARED, "w"),
+            &first
+        ));
+        // A text sent since, which keeps the one the push was read under —
+        // prepared, or as is after its pair lost its peer.
+        let kept = Some(PushedText {
+            generation: 3,
+            map: Some(Arc::clone(&first)),
+        });
+        let second = HeldText {
+            pushed_text: kept.clone(),
+            ..held(4, Some(map("w")))
+        };
+        let as_is = HeldText {
+            pushed_text: kept,
+            ..held(4, None)
+        };
+        assert!(placed_through(
+            presentation(Some(&second), true, read(3, true), PREPARED, "w"),
+            &first
+        ));
+        assert!(placed_through(
+            presentation(Some(&as_is), true, read(3, true), AS_IS, "w"),
+            &first
+        ));
+        // Read under a text held as is, in a document once prepared.
+        let after_as_is = HeldText {
+            pushed_text: Some(PushedText {
+                generation: 3,
+                map: None,
+            }),
+            ..held(4, None)
+        };
+        assert!(matches!(
+            presentation(Some(&after_as_is), true, read(3, true), AS_IS, "w"),
+            Presentation::AsIs
+        ));
+    }
+
+    #[test]
+    fn a_push_places_nowhere_once_its_text_describes_nothing_to_show() {
+        let first = map("v");
+        let kept = |map| HeldText {
+            pushed_text: Some(PushedText { generation: 3, map }),
+            ..held(5, Some(self::map("w")))
+        };
+        let second = kept(Some(Arc::clone(&first)));
+        // Read under a text neither held nor kept: an older push, which the
+        // one read under the kept text replaced.
+        assert!(matches!(
+            presentation(Some(&second), true, read(2, true), PREPARED, "w"),
+            Presentation::Unavailable
+        ));
+        // Naming another document version than the text held when read.
+        let stale = Observed::Read {
+            generation: Some(3),
+            prepared: true,
+            stale_version: true,
+            incarnation: 0,
+        };
+        assert!(matches!(
+            presentation(Some(&second), true, stale, PREPARED, "w"),
+            Presentation::Unavailable
+        ));
+        // Closed since.
+        assert!(matches!(
+            presentation(None, true, read(3, true), PREPARED, "w"),
+            Presentation::Unavailable
+        ));
+        // The region's peer answered its current input unusably.
+        let failed = RegionPrepare {
+            prepared: true,
+            failed: true,
+        };
+        assert!(matches!(
+            presentation(Some(&second), true, read(3, true), failed, "w"),
+            Presentation::Unavailable
+        ));
+        // Read under a text held as is, before its pair gained its peer:
+        // the region is bridged only through a prepared text now.
+        assert!(matches!(
+            presentation(Some(&kept(None)), true, read(3, true), PREPARED, "w"),
+            Presentation::Unavailable
+        ));
+        // Its map was revoked since.
+        let revocation = Arc::new(crate::lsp::bridge::protocol::Revocation::default());
+        let mut revoked = map("v");
+        Arc::get_mut(&mut revoked)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        let second = kept(Some(revoked));
+        assert!(matches!(
+            presentation(Some(&second), true, read(3, true), PREPARED, "w"),
+            Presentation::Prepared(_)
+        ));
+        revocation.revoke(u64::MAX);
+        assert!(matches!(
+            presentation(Some(&second), true, read(3, true), PREPARED, "w"),
+            Presentation::Unavailable
         ));
     }
 

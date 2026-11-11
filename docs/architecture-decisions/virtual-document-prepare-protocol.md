@@ -288,9 +288,10 @@ latest the lifecycle pass recorded.
   can share their virtual text (they differ only inside gaps, which it
   masks) or even their prepared text while mapping it back differently. A
   held prepared text built from another virtual text than the region's
-  current one describes no current host position, and a region the
-  lifecycle pass prepares is bridged only through a prepared text: one held
-  as is, or none on record yet, translates nothing. A connection ever sent
+  current one describes no current host position (a push read under it
+  stays placed, see below), and a region the lifecycle pass prepares is
+  bridged only through a prepared text: one held as is, or none on record
+  yet, translates nothing. A connection ever sent
   a prepared text of a document stays suspect for it after its record goes,
   until the host closes. One rule decides all of this, for every path.
 - **A request reads only the text its coordinates describe.** Right after an
@@ -309,12 +310,22 @@ latest the lifecycle pass recorded.
   document: never over a prepared text or a document held for its peer.
 - **A push follows the text its connection held when kakehashi read it.**
   The push is stamped as it is read, before it waits to be published.
-  Where preparation is involved (by the rule above), it is placed only while
-  the connection still holds that very text, and one naming another
-  document version than the one its connection was last sent was computed
-  for an earlier text and places nowhere. Elsewhere — and for a push read
-  while its connection had never held a prepared text of the document — it
-  places as on any unprepared path.
+  Where preparation is involved (by the rule above), it is placed through
+  the map that very text was last held with, and through no other: one
+  naming another document version than the one its connection was last sent
+  was computed for an earlier text and places nowhere. It stays placed that
+  way once the text is replaced — while an edit waits for its answer, and
+  after newer texts are sent — until a push read under a newer text takes
+  its place, as on any unprepared path. A server that publishes only what
+  changed sends nothing after an edit its diagnostics stay the same
+  through, so taking the push down with the text would lose them for good.
+  Until then its positions are the earlier virtual text's, under the
+  region's current offset. It is taken down when the document closes on its
+  connection, when that text's map is revoked, while the region's peer
+  fails its current input, and — read under a text held as is — once the
+  region is prepared. Elsewhere — and for a push read while its connection
+  had never held a prepared text of the document — it places as on any
+  unprepared path.
 - **Cached answers follow the configuration.** An answer is the peer's for
   one launch configuration and its runtime settings, read only under the
   epoch it was asked in. The epoch moves once the new settings are in, so
@@ -470,6 +481,9 @@ a hook per kind of change.
 - A push without a document version, computed for one prepared text but
   read after the next was recorded under another map, is placed through
   the newer map: without a version nothing tells the two apart.
+- Between an edit of a region and its server's next publish, a pushed
+  diagnostic is shown where the text before the edit had it, as on an
+  unprepared document.
 
 ### Neutral
 

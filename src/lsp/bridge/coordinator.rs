@@ -741,6 +741,18 @@ impl BridgeCoordinator {
         );
     }
 
+    /// What `connection_key` holds for `virtual_uri`, as its reader observes
+    /// it when a push about the document arrives.
+    #[cfg(test)]
+    pub(crate) fn observe_push_for_test(
+        &self,
+        virtual_uri: &crate::lsp::bridge::protocol::VirtualDocumentUri,
+        connection_key: &crate::lsp::bridge::pool::ConnectionKey,
+    ) -> super::Observed {
+        self.pool
+            .observe_push_for_test(&virtual_uri.to_uri_string(), connection_key)
+    }
+
     /// Purge `connection_key`'s document records, as retiring its process
     /// does.
     #[cfg(test)]

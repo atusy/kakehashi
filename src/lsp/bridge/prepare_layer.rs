@@ -757,7 +757,7 @@ mod tests {
     use super::super::pool::test_helpers::TEST_ULID_LUA_0;
     use super::super::pool::{ConnectionKey, LanguageServerPool, SentText};
     use super::super::protocol::{VirtualDocumentUri, VirtualLayout, apply_prepare_result};
-    use super::super::{BridgeCoordinator, Observed, Presentation};
+    use super::super::{BridgeCoordinator, Presentation};
     use crate::lsp::CancelForwarder;
     use crate::lsp::diagnostic_cache::HeldStamp;
 
@@ -876,22 +876,23 @@ mod tests {
         let place = |virtual_text: &str, held: Option<&HeldStamp>| {
             coordinator.place_held(&host, "lua", TEST_ULID_LUA_0, virtual_text, held)
         };
-        let stamp = |generation| HeldStamp {
+        // A push stamped as its reader reads it.
+        let stamp = || HeldStamp {
             connection: key.clone(),
-            observed: Observed::Read {
-                generation: Some(generation),
-                prepared: true,
-                stale_version: false,
-                incarnation: 0,
-            },
+            observed: pool.observe_push_for_test(&virtual_uri.to_uri_string(), &key),
             origin: Some(virtual_uri.to_uri_string()),
+        };
+        let placed_through = |presentation, map: &Arc<_>| match presentation {
+            Presentation::Prepared(placed) => Arc::ptr_eq(&placed, map),
+            _ => false,
         };
 
         // Not stamped, in a region the lifecycle pass does not prepare.
         assert!(matches!(place("  a", None), Presentation::AsIs));
 
         // Stamped with the prepared text the connection holds: through its
-        // map, while the region's virtual text is the one it was built from.
+        // map, whatever the region's virtual text is by now — an edit that
+        // waits for its answer does not take the push down.
         let first = dedented("  a");
         pool.record_sent_for_test(
             &virtual_uri,
@@ -901,16 +902,13 @@ mod tests {
                 map: Some(&first.map),
             },
         );
-        match place("  a", Some(&stamp(1))) {
-            Presentation::Prepared(map) => assert!(Arc::ptr_eq(&map, &first.map)),
-            other => panic!("expected the held map, got {other:?}"),
-        }
-        assert!(matches!(
-            place("  b", Some(&stamp(1))),
-            Presentation::Unavailable
-        ));
+        let pushed = stamp();
+        assert!(placed_through(place("  a", Some(&pushed)), &first.map));
+        assert!(placed_through(place("  b", Some(&pushed)), &first.map));
 
-        // A newer text sent since the push was read: it places nowhere.
+        // A newer text sent since the push was read: it still places
+        // through the map of the text it was read under, and a push read
+        // under the newer text through that one's.
         let second = dedented("  b");
         pool.record_sent_for_test(
             &virtual_uri,
@@ -920,14 +918,8 @@ mod tests {
                 map: Some(&second.map),
             },
         );
-        assert!(matches!(
-            place("  b", Some(&stamp(1))),
-            Presentation::Unavailable
-        ));
-        assert!(matches!(
-            place("  b", Some(&stamp(2))),
-            Presentation::Prepared(_)
-        ));
+        assert!(placed_through(place("  b", Some(&pushed)), &first.map));
+        assert!(placed_through(place("  b", Some(&stamp())), &second.map));
         // A push about the region's document under another language (it was
         // re-routed under the same id since the push was read) places
         // nowhere: its coordinates are that document's.
@@ -940,7 +932,7 @@ mod tests {
                 )
                 .to_uri_string(),
             ),
-            ..stamp(2)
+            ..stamp()
         };
         assert!(matches!(
             place("  b", Some(&other)),

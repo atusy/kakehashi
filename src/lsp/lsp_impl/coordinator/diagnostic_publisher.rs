@@ -1035,10 +1035,11 @@ impl DiagnosticPublisher {
             return None;
         }
         // Known stale already — computed for a prepared text the connection
-        // no longer holds (another version named, or another text recorded
-        // since), or sent by a process its replacement took over from: it
-        // would place nowhere, and recorded it would replace the slot of the
-        // push for the text held, dropping those diagnostics.
+        // no longer has on record (another version named, or a text neither
+        // held nor kept as the newest a push was read under), or sent by a
+        // process its replacement took over from: it would place nowhere,
+        // and recorded it would replace the slot of the push that does
+        // place, dropping those diagnostics.
         if let Some(stamp) = &held
             && (stamp.names_stale_version()
                 || self
@@ -1051,17 +1052,18 @@ impl DiagnosticPublisher {
                         generation,
                         prepared: true,
                         ..
-                    } if self
-                        .bridge
-                        .pool()
-                        .held_text(virtual_uri, &stamp.connection)
-                        .map(|held| held.generation)
-                        != generation
+                    } if {
+                        let held = self.bridge.pool().held_text(virtual_uri, &stamp.connection);
+                        held.as_ref().map(|held| held.generation) != generation
+                            && !held
+                                .and_then(|held| held.pushed_text)
+                                .is_some_and(|text| Some(text.generation) == generation)
+                    }
                 ))
         {
             log::debug!(
                 target: LOG_TARGET,
-                "push for a prepared text {virtual_uri} no longer holds, dropping"
+                "push for a prepared text {virtual_uri} no longer has on record, dropping"
             );
             return None;
         }
@@ -4453,7 +4455,7 @@ mod tests {
         };
         assert!(push(false, "current").await.is_some());
         assert!(push(true, "stale").await.is_none(), "dropped");
-        // Read for a text no longer held (another recorded since).
+        // Read with nothing on record, recorded once a text is: not for it.
         server
             .bridge
             .record_sent_as_is_for_test(&virtual_uri, &key, "local x = 2\n");
@@ -4461,6 +4463,85 @@ mod tests {
         let slots = server.diagnostics.snapshot(&host_uri);
         let slot = &slots[&DiagnosticSource::Region("region-1".to_string())]["lua_ls"];
         assert_eq!(slot.diagnostics[0].message, "current");
+    }
+
+    /// A push read under a prepared text another replaced before it was
+    /// recorded is the newest its server sent: it is recorded all the same,
+    /// and places through the text it was read under (a server that
+    /// publishes only what changed may send no other).
+    #[tokio::test]
+    async fn a_push_read_under_a_prepared_text_replaced_since_is_recorded() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let host_uri = Url::parse("file:///test/replaced_push.md").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-1",
+        );
+        let key = crate::lsp::bridge::ConnectionKey::for_server("lua_ls");
+        server
+            .bridge
+            .register_opened_document_for_test(&host_uri, &virtual_uri, &key)
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua_ls".to_string(),
+            BridgeServerConfig {
+                cmd: Some(vec!["lua-language-server".to_string()]),
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+        let send = |text: &str| {
+            let map = crate::lsp::bridge::apply_prepare_result(
+                text,
+                &crate::lsp::bridge::VirtualLayout::single(text),
+                None,
+            )
+            .unwrap()
+            .map;
+            server
+                .bridge
+                .record_sent_prepared_for_test(&virtual_uri, &key, text, &map);
+        };
+        send("local x = 1\n");
+        let stamp = HeldStamp {
+            connection: key.clone(),
+            observed: server.bridge.observe_push_for_test(&virtual_uri, &key),
+            origin: None,
+        };
+        send("local x = 1\nlocal y = 2\n");
+        let publisher = DiagnosticPublisher::new(server);
+        let uri = virtual_uri.to_uri_string();
+        let push = |stamp: &HeldStamp, message| {
+            publisher.record_region_push(
+                &uri,
+                "lua_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                Some(stamp.clone()),
+                vec![diag(message)],
+            )
+        };
+        assert!(push(&stamp, "read before").await.is_some(), "recorded");
+        // One read under a text the record no longer keeps is dropped: the
+        // push read under the second text took the first one's place.
+        let newer = HeldStamp {
+            observed: server.bridge.observe_push_for_test(&virtual_uri, &key),
+            ..stamp.clone()
+        };
+        send("local x = 1\nlocal y = 3\n");
+        assert!(push(&newer, "read after").await.is_some(), "recorded");
+        assert!(push(&stamp, "read before").await.is_none(), "dropped");
+        let slots = server.diagnostics.snapshot(&host_uri);
+        let slot = &slots[&DiagnosticSource::Region("region-1".to_string())]["lua_ls"];
+        assert_eq!(slot.diagnostics[0].message, "read after");
     }
 
     /// A push its connection's retired process sent, read after the
