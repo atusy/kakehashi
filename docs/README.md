@@ -920,7 +920,9 @@ injected text) and `gap` (host text between `injection.combined` captures,
 such as an interpolation). The answer may delete leading whitespace from
 content lines, delete whole blank lines at the document's edges (the line
 break after a Nix `''`, say, so a shebang is the first line), and replace
-any gap with text of any length:
+any gap with text of any length (an interpolation with nothing injected
+before it on its line is not one: kakehashi strips it as it strips a line
+prefix, with or without a peer):
 
 ```ts
 // tsudoi.config.ts

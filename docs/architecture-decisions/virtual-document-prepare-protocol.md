@@ -163,6 +163,16 @@ line the gap is on. (One document is spelled apart: where its span ends
 between a CR and its LF, that CR — the last character of a gap ending
 the document — stands as a space, since no line ends there.)
 
+A gap that opens a line and has content after it on that line is the one
+case with nothing left to present: an interpolation with nothing injected
+before it on its host line (`${pkgs.hello}/bin/hello` written at column
+0) is stripped as a line prefix is, so it is no segment, takes no
+placeholder, and its line reaches servers as `/bin/hello` — as it does
+without a peer. kakehashi knows which text is injected, not what the text
+before it is. Where the host injects the line's indentation too, as a Nix
+string indented in its file does, the interpolation continues a line and
+is a gap like any other.
+
 The answer has the same length and the same `type` order:
 
 - A content segment's `changes` are segment-relative `TextEdit`s that may
@@ -388,6 +398,21 @@ spaces the downstream server then sees (trailing whitespace after a token,
 columns shifted in what it reports), and it cannot express removing a Nix
 escape or collapsing a fence.
 
+### Presenting stripped host text as gaps
+
+Stripped text presented as a gap of no width could take a placeholder,
+which an interpolation opening a host line cannot (see The Request). But
+kakehashi cannot present those interpolations alone: text stripped before
+a line's first injected character is as often a line prefix (a
+blockquote's `> `, a list item's indentation), and nothing in the
+injection tells the two apart. Presenting both would hand a peer every
+prefix of a quoted document as a gap to leave alone, and split that
+document's content at each line: no blank line would be at the
+document's edge any more, each lying beside a gap, so the edge rule would
+have to tell gaps of no width from the others. The cost falls on every
+prefixed document for the sake of a line that starts with an
+interpolation, which reads to servers as it does without a peer.
+
 ### The downstream server prepares its own documents
 
 A server that wants dedented input can dedent internally — but then it also
@@ -464,6 +489,9 @@ a hook per kind of change.
   call and type hierarchy follow-ups for their items.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
+- An interpolation with nothing injected before it on its host line takes
+  no placeholder: stripped like a line prefix, it is no gap (see The
+  Request).
 - A request issued right after an edit waits for the new prepared text to
   reach its server, and fails if a newer edit supersedes it first: as soon
   as its server is sent another text instead. Only a text sent while the
