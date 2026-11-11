@@ -199,9 +199,7 @@ impl Kakehashi {
                         count_request_errors(&cancel_state.request_error_sink, 1);
                     }
                 }
-                // An empty stand-in answers as the race answers when no
-                // layer has edits.
-                edits.filter(|edits| !edits.is_empty())
+                formatting_answer(edits, refused)?
             }
             AggregationStrategy::Concatenated => {
                 // Sequential cross-layer pipeline (cross-layer-aggregation
@@ -265,16 +263,12 @@ impl Kakehashi {
                 // The final answer: the virt edits it builds on checked once
                 // more against the host text, which may have moved while later
                 // layers ran.
-                if !self
-                    .formatting_sources_current(
-                        &lsp_uri,
-                        &virt_sources,
-                        &cancel_state.request_error_sink,
-                    )
-                    .await
-                {
-                    return Ok(None);
-                }
+                self.formatting_sources_current(
+                    &lsp_uri,
+                    &virt_sources,
+                    &cancel_state.request_error_sink,
+                )
+                .await?;
                 match producers {
                     0 => None,
                     // A single producing layer ran against the original text
@@ -649,7 +643,8 @@ impl Kakehashi {
     /// Whether every prepared region a formatting answer was mapped
     /// through is still the host's text (see [`Sourced::still_current`]).
     /// One that is not fails the request — counted in `failure_sink`, for
-    /// the CLI to exit non-zero — and the caller drops the whole answer,
+    /// the CLI to exit non-zero, and answered `ContentModified` (see
+    /// [`formatting_answer`]) — and the caller drops the whole answer,
     /// the host layer's edits and those of regions still current too: the
     /// host moved under the answer, and an edit read for a region no longer
     /// as it was would land elsewhere.
@@ -666,10 +661,10 @@ impl Kakehashi {
         lsp_uri: &tower_lsp_server::ls_types::Uri,
         sources: &[Sourced<()>],
         failure_sink: &RequestErrorSink,
-    ) -> bool {
+    ) -> Result<()> {
         let verdict = self.settled_verdict_of(lsp_uri, sources.iter()).await;
         if verdict.keeps() {
-            return true;
+            return Ok(());
         }
         log::warn!(
             target: "kakehashi::formatting",
@@ -677,7 +672,7 @@ impl Kakehashi {
             lsp_uri.as_str()
         );
         count_request_errors(failure_sink, 1);
-        false
+        Err(dropped_formatting_error(verdict))
     }
 
     /// Format the host document itself (the **host** layer,
@@ -879,6 +874,32 @@ where
         _ => None,
     };
     (stand_in, Some(verdict))
+}
+
+/// What a formatting method answers for the answer its layers chose (see
+/// [`preferred_formatting_answer`]): the edits, `null` for none (an empty
+/// answer, already formatted, included), and `ContentModified` for an
+/// answer `dropped` at the final check with nothing standing in. `null`
+/// there would read as nothing to format, though the action was lost to a
+/// change and can be asked again.
+pub(super) fn formatting_answer(
+    edits: Option<Vec<TextEdit>>,
+    dropped: Option<Verdict>,
+) -> Result<Option<Vec<TextEdit>>> {
+    match (edits, dropped) {
+        (None, Some(verdict)) => Err(dropped_formatting_error(verdict)),
+        // An empty stand-in answers as the race answers when no layer has
+        // edits.
+        (edits, _) => Ok(edits.filter(|edits| !edits.is_empty())),
+    }
+}
+
+/// The `ContentModified` (-32801) a formatting answer dropped at the final
+/// check is answered with, its message saying why.
+fn dropped_formatting_error(verdict: Verdict) -> tower_lsp_server::jsonrpc::Error {
+    let mut error = crate::error::content_modified_error();
+    error.message = format!("kakehashi: formatting result dropped: {verdict}").into();
+    error
 }
 
 /// Select one deterministic edit-producing layer for each host byte range.
@@ -2618,6 +2639,47 @@ mod tests {
             assert_eq!(edits, expected, "{case}");
             assert_eq!(refused, verdict, "{case}");
         }
+    }
+
+    /// A dropped answer nothing stands in for is `ContentModified`, its
+    /// message saying why: `null` would read as nothing to format. A
+    /// stand-in answers in its place, an empty one (the host already
+    /// formatted) as `null`, as an answer never dropped does.
+    #[test]
+    fn a_dropped_answer_nothing_stands_in_for_is_content_modified() {
+        let edit = TextEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: "host".to_string(),
+        };
+        for verdict in [Verdict::Moved, Verdict::Stale, Verdict::Unsettled] {
+            let error = formatting_answer(None, Some(verdict)).unwrap_err();
+            assert_eq!(
+                error.code,
+                tower_lsp_server::jsonrpc::ErrorCode::ServerError(-32801),
+                "{verdict:?}"
+            );
+            assert!(
+                error.message.contains(&verdict.to_string()),
+                "{verdict:?}: {}",
+                error.message
+            );
+            assert_eq!(
+                formatting_answer(Some(vec![edit.clone()]), Some(verdict)).unwrap(),
+                Some(vec![edit.clone()]),
+                "{verdict:?}"
+            );
+            assert_eq!(
+                formatting_answer(Some(Vec::new()), Some(verdict)).unwrap(),
+                None,
+                "{verdict:?}"
+            );
+        }
+        assert_eq!(formatting_answer(None, None).unwrap(), None);
+        assert_eq!(formatting_answer(Some(Vec::new()), None).unwrap(), None);
+        assert_eq!(
+            formatting_answer(Some(vec![edit.clone()]), None).unwrap(),
+            Some(vec![edit])
+        );
     }
 
     /// A prepared region whose formatter answered nothing is not judged

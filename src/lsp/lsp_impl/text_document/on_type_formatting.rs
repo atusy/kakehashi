@@ -49,8 +49,8 @@ impl Kakehashi {
         // while it was held, once the host's last edit settled, and a
         // prepared one dropped as stale or unsettled gives way to the host
         // layer's while the host is unedited. Dropped with nothing standing
-        // in, it is no answer, logged at debug only: trigger keystrokes would
-        // warn each time.
+        // in, it is answered `ContentModified`, logged at debug only: trigger
+        // keystrokes would warn each time.
         let (edits, refused) = self
             .walk_formatting_layers(&lsp_uri, METHOD, METHOD, raw_params, virt, revision)
             .await?;
@@ -66,7 +66,7 @@ impl Kakehashi {
                 }
             );
         }
-        Ok(edits.filter(|edits| !edits.is_empty()))
+        super::formatting::formatting_answer(edits, refused)
     }
 
     /// Virt layer: bridge the injection region under the typed character.

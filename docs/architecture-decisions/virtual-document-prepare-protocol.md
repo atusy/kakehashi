@@ -458,8 +458,11 @@ its host reopened, its map revoked) is dropped at once as stale; one that
 never settles is dropped when the wait ends. The warning says which.
 Dropped (moved, stale or unsettled), the whole answer is dropped (the host's own formatter's edits and
 those of regions still current too) and the request is counted failed, so
-`kakehashi format` exits 2 and writes nothing (range and on-type
-formatting, which no one-shot run makes, answer nothing). Under the
+`kakehashi format` exits 2 and writes nothing. To an editor, each of the
+three formatting methods then answers `ContentModified` (-32801), the
+error LSP provides for a result a change made invalid, its message saying
+which verdict dropped the answer: `null` would read as nothing to format,
+and the action would be lost without a word. Under the
 `preferred` strategy, an answer of any of the three formatting methods
 dropped as stale or unsettled gives way to the host layer's answer when that layer is in the race
 (waited for if still running) and the host is still the text the request
@@ -472,9 +475,11 @@ layer's answer stands in for it, dropped as it settles, only while the
 host is still the text the request read. A reply its map
 refuses counts as that server failing, as any failed reply does:
 `kakehashi format` exits 2 when no other server formats the region.
-On-type formatting is the exception in what it logs: an answer refused, or
-dropped at the final check with nothing standing in, is no answer, logged
-at debug, so that trigger keystrokes do not warn the user each time.
+On-type formatting is the exception in what it logs: an answer refused
+(no answer), or dropped at the final check with nothing standing in
+(`ContentModified`, as above), is logged at debug, so that trigger
+keystrokes do not warn the user each time. An answer its map refuses
+stays `null` for every method: asking again would be refused again.
 
 Formatting outcomes follow one rule, the one `kakehashi format` counts by.
 An answer, an empty one (already formatted) included, is a success. A

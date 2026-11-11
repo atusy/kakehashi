@@ -468,7 +468,8 @@ impl Kakehashi {
         //
         // The final answer is chosen as whole formatting's is: a prepared one
         // dropped as stale or unsettled gives way to the host layer's while
-        // the host is unedited. Nothing is counted: no one-shot run
+        // the host is unedited, and one dropped with nothing standing in is
+        // answered `ContentModified`. Nothing is counted: no one-shot run
         // range-formats.
         let (edits, refused) = self
             .walk_formatting_layers(
@@ -492,7 +493,7 @@ impl Kakehashi {
                 }
             );
         }
-        Ok(edits.filter(|edits| !edits.is_empty()))
+        super::formatting::formatting_answer(edits, refused)
     }
 }
 
