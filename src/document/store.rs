@@ -542,6 +542,50 @@ impl DocumentStore {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
+        };
+        doc.publish_snapshot(&Arc::new(snapshot));
+    }
+
+    /// Resolve a reload placeholder (see
+    /// [`ParseSnapshot::awaiting_reparse`](super::snapshot::ParseSnapshot::awaiting_reparse))
+    /// that a parse pass of `parsed_version` could not replace with a tree:
+    /// publishes the resolved-but-tree-less outcome at that version, so a
+    /// reader settling for the reparse stops waiting and a failed reparse
+    /// never leaves the placeholder standing until the next edit. Gated on
+    /// the pass still being the live version — a pass an edit overtook is
+    /// not the outcome of the text readers now wait on — and on the held
+    /// snapshot being a placeholder, so a real parse result is never
+    /// replaced.
+    pub(crate) fn resolve_reload_placeholder(
+        &self,
+        uri: &Url,
+        expected_incarnation: u64,
+        parsed_version: u64,
+    ) {
+        let Some(doc) = self.documents.get(uri) else {
+            return;
+        };
+        if doc.incarnation() != expected_incarnation || doc.content_version() != parsed_version {
+            return;
+        }
+        if !doc
+            .latest_snapshot_slot()
+            .snapshot
+            .is_some_and(|held| held.awaiting_reparse)
+        {
+            return;
+        }
+        let snapshot = super::snapshot::ParseSnapshot {
+            text: doc.text_arc(),
+            tree: None,
+            language: doc.language_id().map(|s| s.to_string()),
+            parsed_version,
+            incarnation: expected_incarnation,
+            injection_regions: None,
+            regions: None,
+            layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         };
         doc.publish_snapshot(&Arc::new(snapshot));
     }
@@ -808,6 +852,7 @@ mod tests {
             injection_regions: None,
             regions: None,
             layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+            awaiting_reparse: false,
         })
     }
 
@@ -936,6 +981,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }),
         );
         assert!(reparse.current && reparse.published);
@@ -1622,6 +1668,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }),
         );
         assert!(
@@ -1653,6 +1700,7 @@ mod tests {
                 injection_regions: None,
                 regions: None,
                 layer_trees: std::sync::Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
             }
         }
 
@@ -1688,6 +1736,65 @@ mod tests {
                 0,
                 "give-up is a no-op once any snapshot exists"
             );
+        }
+
+        /// A reparse that cannot produce a tree resolves the reload
+        /// placeholder at its own version, so readers settling for the
+        /// reparse stop waiting.
+        #[test]
+        fn failed_reparse_resolves_the_live_placeholder() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///resolve-placeholder.rs").unwrap();
+            let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.publish_giveup_snapshot(&uri, incarnation);
+            store.invalidate_all_parses();
+            let reload_version = store.latest_snapshot(&uri).unwrap().content_version;
+
+            store.resolve_reload_placeholder(&uri, incarnation, reload_version);
+
+            let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+            assert!(!held.awaiting_reparse);
+            assert!(held.tree.is_none());
+            assert_eq!(held.parsed_version, reload_version);
+        }
+
+        /// A pass an edit overtook is not the outcome readers wait on: the
+        /// cell would admit its newer tree-less publish over the trailing
+        /// placeholder, so only the live-version gate keeps it out.
+        #[test]
+        fn an_overtaken_reparse_leaves_the_placeholder_alone() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///overtaken-reparse.rs").unwrap();
+            let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.publish_giveup_snapshot(&uri, incarnation);
+            store.invalidate_all_parses();
+            let reload_version = store.latest_snapshot(&uri).unwrap().content_version;
+            store.update_document(uri.clone(), "ab".into(), None);
+            store.update_document(uri.clone(), "abc".into(), None);
+
+            store.resolve_reload_placeholder(&uri, incarnation, reload_version + 1);
+
+            let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+            assert!(held.awaiting_reparse, "an overtaken pass resolved it");
+            assert_eq!(held.parsed_version, reload_version);
+        }
+
+        /// Only a placeholder is resolved: the cell would admit a newer
+        /// tree-less publish over a trailing tree-less parse result too, so
+        /// only the placeholder gate keeps the call from replacing it.
+        #[test]
+        fn resolution_never_replaces_a_parse_result() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///no-placeholder.rs").unwrap();
+            let incarnation = store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.publish_giveup_snapshot(&uri, incarnation);
+            store.update_document(uri.clone(), "ab".into(), None);
+            let live_version = store.latest_snapshot(&uri).unwrap().content_version;
+
+            store.resolve_reload_placeholder(&uri, incarnation, live_version);
+
+            let held = store.latest_snapshot(&uri).unwrap().slot.snapshot.unwrap();
+            assert_eq!(held.parsed_version, 0, "a parse result was replaced");
         }
 
         #[test]

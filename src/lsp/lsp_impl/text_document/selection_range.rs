@@ -11,8 +11,11 @@ use super::super::{Kakehashi, uri_to_url};
 /// is keyboard-triggered expand/shrink — a silent no-op on a consciously
 /// triggered action is jarring, and the request is not per-keystroke, so it
 /// may briefly wait for the in-flight parse to land before falling back to
-/// `ContentModified`.
-const SELECTION_RANGE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// `ContentModified` (or `null` while a reload's reparse is pending). The same bound as the formatting verbs', but its own
+/// loop rather than `wait_for_explicit_action_snapshot`: a document with no
+/// snapshot yet also waits only this long, not the first-parse backstop.
+const SELECTION_RANGE_WAIT: std::time::Duration =
+    crate::lsp::lsp_impl::snapshot_read::EXPLICIT_ACTION_WAIT;
 
 impl Kakehashi {
     pub(crate) async fn selection_range_impl(
@@ -48,6 +51,11 @@ impl Kakehashi {
         // staleness-reject, with the explicit-action wait). This replaces the
         // former reader on-demand parse: readers never parse inline.
         let deadline = tokio::time::Instant::now() + SELECTION_RANGE_WAIT;
+        let mut expired = false;
+        // The live input the request's positions were authored against: an
+        // edit landing while it waits is newer text, which no answer here
+        // may be computed on.
+        let mut request_lineage = None;
         let snapshot = loop {
             // Subscribe BEFORE checking (lost-wakeup guard, see
             // snapshot_for_tokens), then re-resolve per iteration
@@ -60,40 +68,50 @@ impl Kakehashi {
                 // Unregistered or closed.
                 return Ok(None);
             };
-            match &view.slot.snapshot {
-                Some(snapshot) if snapshot.parsed_version == view.content_version => {
-                    break std::sync::Arc::clone(snapshot);
-                }
-                _ => {
-                    // No snapshot yet (first parse in flight) or trailing an
-                    // edit: wait for the next publish, bounded by the deadline.
-                    let wait = tokio::time::timeout_at(deadline, receiver.changed()).await;
-                    match wait {
-                        // A publish (or close) landed — loop and re-resolve.
-                        Ok(Ok(())) => continue,
-                        // Channel closed: the document is gone.
-                        Ok(Err(_)) => return Ok(None),
-                        // Deadline passed. A stale snapshot exists → the
-                        // coordinates can't be answered: ContentModified. No
-                        // snapshot at all (first parse still running) → the
-                        // pre-snapshot behavior: null.
-                        Err(_elapsed) => {
-                            return if view.slot.snapshot.is_some() {
-                                Err(crate::error::content_modified_error())
-                            } else {
-                                Ok(None)
-                            };
-                        }
-                    }
-                }
+            let lineage = (view.slot.current_incarnation, view.content_version);
+            if *request_lineage.get_or_insert(lineage) != lineage {
+                return Err(crate::error::content_modified_error());
+            }
+            let current = view
+                .slot
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.parsed_version == view.content_version);
+            if let Some(snapshot) = current
+                && !snapshot.awaiting_reparse
+            {
+                break std::sync::Arc::clone(snapshot);
+            }
+            if expired {
+                // Deadline passed, judged on a fresh read: an edit publishes
+                // no snapshot, so one landing mid-wait never woke us. A stale
+                // snapshot exists → the coordinates can't be answered:
+                // ContentModified. No parse of the current text yet — the
+                // first parse or a reload's reparse still running — → the
+                // pre-snapshot behavior: null (the coordinates are the live
+                // text's, there is just no tree for them).
+                return if current.is_none() && view.slot.snapshot.is_some() {
+                    Err(crate::error::content_modified_error())
+                } else {
+                    Ok(None)
+                };
+            }
+            // No snapshot yet (first parse in flight), trailing an edit, or a
+            // reload placeholder whose reparse is still queued: wait for the
+            // next publish, bounded by the deadline.
+            match tokio::time::timeout_at(deadline, receiver.changed()).await {
+                // A publish (or close) landed — loop and re-resolve.
+                Ok(Ok(())) => {}
+                // Channel closed: the document is gone.
+                Ok(Err(_)) => return Ok(None),
+                // Re-resolve once more, then answer from that read.
+                Err(_elapsed) => expired = true,
             }
         };
 
-        // A resolved-but-tree-less snapshot cannot produce selection ranges. See
-        // `ParseSnapshot` for the causes — they include a settings-reload
-        // placeholder that reads as current, so this is not only a failure path:
-        // the wait above breaks on that placeholder and answers `null` instead
-        // of settling for its reparse (#923).
+        // A completed parse that produced no tree cannot produce selection
+        // ranges (see `ParseSnapshot` for the causes). The reload placeholder
+        // never reaches here: the wait above settles for its reparse.
         if snapshot.tree.is_none() {
             return Ok(None);
         }
@@ -142,5 +160,185 @@ impl Kakehashi {
         // None = the work-unit panicked (logged by the pool); serve the
         // no-result fallback rather than an error.
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{Position, TextDocumentIdentifier};
+    use url::Url;
+
+    use super::*;
+    use crate::document::LanguageCheck;
+    use crate::document::snapshot::ParseSnapshot;
+
+    const TEXT: &str = "fn main() { let x = 1; }";
+
+    fn rust_tree(text: &str) -> tree_sitter::Tree {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        parser.parse(text, None).unwrap()
+    }
+
+    /// A rust document with a published tree and its parser registered, so
+    /// the handler passes its language gate.
+    fn server_with_parsed_doc(uri: &Url) -> LspService<Kakehashi> {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server.documents.insert(
+            uri.clone(),
+            TEXT.to_string(),
+            Some("rust".to_string()),
+            Some(rust_tree(TEXT)),
+        );
+        service
+    }
+
+    fn params(uri: &Url) -> SelectionRangeParams {
+        SelectionRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(uri).unwrap(),
+            },
+            positions: vec![Position::new(0, 16)],
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    /// A completed parse of the live version (with or without a tree),
+    /// published through `install_parse` — the placeholder's replacement.
+    fn install_current_parse(server: &Kakehashi, uri: &Url, tree: Option<tree_sitter::Tree>) {
+        let view = server.documents.latest_snapshot(uri).unwrap();
+        let installed = server.documents.install_parse(
+            uri,
+            LanguageCheck::Record,
+            Arc::new(ParseSnapshot {
+                text: Arc::from(TEXT),
+                tree,
+                language: Some("rust".to_string()),
+                parsed_version: view.content_version,
+                incarnation: view.slot.current_incarnation,
+                injection_regions: None,
+                regions: None,
+                layer_trees: Arc::new(std::sync::OnceLock::new()),
+                awaiting_reparse: false,
+            }),
+        );
+        assert!(installed.published, "the reparse must land");
+    }
+
+    /// A settings reload replaces the tree with a version-current placeholder
+    /// until its reparse lands. An expand-selection issued in that window
+    /// must settle for the reparse, not answer `null` off the placeholder.
+    #[tokio::test]
+    async fn waits_for_the_reparse_behind_a_reload_placeholder() {
+        let uri = Url::parse("file:///reload_placeholder.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let reparse = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            install_current_parse(server, &uri, Some(rust_tree(TEXT)));
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), reparse);
+
+        let ranges = result
+            .expect("the reparse is current")
+            .expect("the reparse's tree answers the request");
+        assert_eq!(ranges.len(), 1);
+        assert!(
+            ranges[0].parent.is_some(),
+            "a tree-less walk answers one parentless range; the reparse's tree nests"
+        );
+    }
+
+    /// A completed parse that produced no tree is a final answer: `null` at
+    /// once, not after the wait meant for the placeholder.
+    #[tokio::test]
+    async fn answers_null_at_once_for_a_completed_tree_less_parse() {
+        let uri = Url::parse("file:///tree_less_parse.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+        install_current_parse(server, &uri, None);
+
+        let result = tokio::time::timeout(
+            SELECTION_RANGE_WAIT / 2,
+            server.selection_range_impl(params(&uri)),
+        )
+        .await
+        .expect("a completed parse needs no wait");
+
+        assert!(matches!(result, Ok(None)));
+    }
+
+    /// A reparse still queued at the deadline leaves the live text without a
+    /// tree, not the request's coordinates stale: `null`, as before the first
+    /// parse, rather than `ContentModified`.
+    #[tokio::test(start_paused = true)]
+    async fn answers_null_when_the_reparse_outlasts_the_wait() {
+        let uri = Url::parse("file:///slow_reparse.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let result = server.selection_range_impl(params(&uri)).await;
+
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    /// An edit landing while the request waits on the placeholder makes it
+    /// trailing without waking the wait (edits publish no snapshot): the
+    /// deadline must judge the live state, where the request's coordinates
+    /// may no longer match the text — `ContentModified`, not `null`.
+    #[tokio::test(start_paused = true)]
+    async fn an_edit_during_the_placeholder_wait_is_judged_at_the_deadline() {
+        let uri = Url::parse("file:///edit_during_reload.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), format!("{TEXT}\n"), None);
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), edit);
+
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    /// The request's positions belong to the text it was sent against: an
+    /// edit and its reparse landing while it waits must not be answered
+    /// with ranges computed on the newer text.
+    #[tokio::test]
+    async fn an_edit_reparsed_during_the_wait_is_not_answered() {
+        let uri = Url::parse("file:///edit_reparsed_during_reload.rs").unwrap();
+        let service = server_with_parsed_doc(&uri);
+        let server = service.inner();
+        server.documents.invalidate_all_parses();
+
+        let edit = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            server
+                .documents
+                .update_document(uri.clone(), format!("{TEXT}\n"), None);
+            install_current_parse(server, &uri, Some(rust_tree(TEXT)));
+        };
+        let (result, ()) = tokio::join!(server.selection_range_impl(params(&uri)), edit);
+
+        assert!(result.is_err(), "{result:?}");
     }
 }
