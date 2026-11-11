@@ -288,8 +288,15 @@ selection, and always combined with `preferred` — the sequential
 
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
-Shows inline hints (types, parameter names) for the embedded block overlapping the
-requested range. A hint whose accept-time text edits would corrupt the host
+Shows inline hints (types, parameter names) for every embedded block the
+requested range overlaps, so a visible-range or whole-document request that
+starts in host text still covers the blocks inside it; the hints are merged in
+document order. Under the `preferred` layer walk, a `bridge._self` host server's
+hints show only when no embedded block in the range produced any, so a range
+that covers embedded blocks does not show the host server's hints (combining
+both layers is tracked in
+[#1168](https://github.com/atusy/kakehashi/issues/1168)). A hint whose
+accept-time text edits would corrupt the host
 document around the embedded block is served without them (the edits drop as
 one atomic set). Label-part commands are re-keyed so `workspace/executeCommand`
 routes them back to the producing server (the re-keyed names are not

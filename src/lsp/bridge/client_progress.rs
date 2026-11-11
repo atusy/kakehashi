@@ -200,6 +200,11 @@ pub(crate) struct ClientProgressAggregator {
     /// Whether the terminal `End` has been emitted (drop anything after it; emit
     /// the synthetic teardown `End` at most once).
     ended: bool,
+    /// Whether the winner's own `End` is held until teardown instead of being
+    /// relayed as it arrives ([`Self::deferring_end`]).
+    defer_end: bool,
+    /// The winner's held `End`, relayed by [`Self::take_terminal_end`].
+    held_end: Option<ProgressParamsValue>,
 }
 
 impl ClientProgressAggregator {
@@ -208,6 +213,19 @@ impl ClientProgressAggregator {
             client_token,
             winner: None,
             ended: false,
+            defer_end: false,
+            held_end: None,
+        }
+    }
+
+    /// An aggregator for a request whose sources settle independently (an
+    /// inlay hint walk over several regions): the winner's own `End` is held
+    /// and relayed only at teardown, once every source settled, so a fast
+    /// source cannot close the editor's progress while another is in flight.
+    pub(crate) fn deferring_end(client_token: NumberOrString) -> Self {
+        Self {
+            defer_end: true,
+            ..Self::new(client_token)
         }
     }
 
@@ -219,7 +237,7 @@ impl ClientProgressAggregator {
         source: &NumberOrString,
         value: ProgressParamsValue,
     ) -> Option<ProgressParams> {
-        if self.ended {
+        if self.ended || self.held_end.is_some() {
             return None;
         }
         let is_begin = matches!(
@@ -247,6 +265,10 @@ impl ClientProgressAggregator {
             &value,
             ProgressParamsValue::WorkDone(WorkDoneProgress::End(_))
         ) {
+            if self.defer_end {
+                self.held_end = Some(value);
+                return None;
+            }
             self.ended = true;
         }
         Some(ProgressParams {
@@ -268,14 +290,18 @@ impl ClientProgressAggregator {
     /// leaving a dangling indicator. The caller enqueues the returned `End` while
     /// still holding the aggregator lock, so a concurrent relay is ordered strictly
     /// before or after this terminal — never interleaved.
+    ///
+    /// A held `End` ([`Self::deferring_end`]) is relayed here as the terminal,
+    /// in place of the synthetic one.
     pub(crate) fn take_terminal_end(&mut self) -> Option<ProgressParams> {
         let emit = self.winner.is_some() && !self.ended;
         self.ended = true;
+        let held = self.held_end.take();
         emit.then(|| ProgressParams {
             token: self.client_token.clone(),
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+            value: held.unwrap_or(ProgressParamsValue::WorkDone(WorkDoneProgress::End(
                 tower_lsp_server::ls_types::WorkDoneProgressEnd { message: None },
-            )),
+            ))),
         })
     }
 }
@@ -623,5 +649,46 @@ mod tests {
             agg.on_downstream_progress(&src(), end()).is_none(),
             "and a late End relays nothing"
         );
+    }
+
+    /// A request whose sources settle at different times (an inlay hint walk
+    /// over several regions) holds the winner's own `End` until teardown, so
+    /// the editor's progress does not close while another source is still in
+    /// flight; teardown then relays that `End`, message included.
+    #[test]
+    fn deferring_aggregator_holds_the_winners_end_until_teardown() {
+        let mut agg = ClientProgressAggregator::deferring_end(client_token());
+        let a = NumberOrString::String("src-a".to_string());
+        let b = NumberOrString::String("src-b".to_string());
+        assert!(agg.on_downstream_progress(&a, begin()).is_some());
+        assert!(agg.on_downstream_progress(&a, report()).is_some());
+        let own_end = ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+            message: Some("done".to_string()),
+        }));
+        assert!(
+            agg.on_downstream_progress(&a, own_end.clone()).is_none(),
+            "the winner's End is held"
+        );
+        assert!(
+            agg.on_downstream_progress(&a, report()).is_none(),
+            "nothing of the winner relays after its held End"
+        );
+        assert!(agg.on_downstream_progress(&b, begin()).is_none());
+
+        let terminal = agg
+            .take_terminal_end()
+            .expect("teardown relays the held End");
+        assert_eq!(terminal.token, client_token());
+        assert_eq!(terminal.value, own_end);
+        assert!(agg.take_terminal_end().is_none(), "End is emitted once");
+    }
+
+    /// Without a held `End`, a deferring aggregator closes like any other:
+    /// the synthetic terminal `End` after a relayed `Begin`.
+    #[test]
+    fn deferring_aggregator_synthesizes_the_end_when_none_was_held() {
+        let mut agg = ClientProgressAggregator::deferring_end(client_token());
+        assert!(agg.on_downstream_progress(&src(), begin()).is_some());
+        assert_eq!(agg.take_terminal_end().map(|p| p.value), Some(end()));
     }
 }
