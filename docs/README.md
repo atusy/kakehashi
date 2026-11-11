@@ -763,10 +763,6 @@ When multiple language servers can handle the same injection language, `aggregat
 > entry or nothing. The cost is symmetric and worth knowing: a deliberate
 > global restriction at `aggregation._` does not reach routing either. To
 > control routing, write the key itself, at any language level.
->
-> The experimental `kakehashi/virtualDocument/prepare` key reads its own
-> entry or nothing as well, and names no server when it has none — see
-> "Preparing Virtual Documents" below.
 
 Example with per-method priorities, strategy, and maxFanOut:
 
@@ -887,23 +883,26 @@ servers see it, via `kakehashi/virtualDocument/prepare`
 `experimental.kakehashi.virtualDocumentPrepare`. The feature requires
 `KAKEHASHI_EXPERIMENTAL=true`.
 
-The server is named like those of any other method, by the method's
+The server is chosen like those of any other method, by the method's
 aggregation `priorities` among the servers bridged for the language (so the
 server must list the languages it prepares, or `"*"`). The strategy is
-always `preferred`: the first named server, in priority order, that
-advertises the request prepares the document; when none does, the document
-is sent as is. Unlike other methods, the key names no server by default
-(`priorities = []`) and does not inherit the `aggregation._` entry:
-nothing is prepared, and no document waits for a server to start, until
-`priorities` are written at the key itself. `["*"]` names every server
-bridged for the language.
+always `preferred`: the first server in priority order that advertises the
+request prepares the document; when none does, the document is sent as is.
+The default `priorities = ["*"]` uses any server that offers it; `[]` opts
+a language out. Like any method, it inherits the `aggregation._` entry's
+`priorities` when it has no entry of its own: an allowlist of language
+servers written there must name the peer too, or nothing prepares.
 
-A named server that advertises the request is asked for every document of
-the pair, and answering `null` still makes a document prepared, so a peer
-meant for some hosts only is best named for those alone:
+A server that advertises the request is asked wherever it is bridged, and
+answering `null` still makes a document prepared, so a peer meant for some
+hosts only is best enabled for those alone:
 
 ```toml
-# Prepare injections in Nix with tsudoi
+# Prepare nothing by default…
+[languages._.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
+priorities = []
+
+# …except injections in Nix, with tsudoi
 [languages.nix.bridge._.aggregation."kakehashi/virtualDocument/prepare"]
 priorities = ["tsudoi"]
 

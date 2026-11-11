@@ -162,13 +162,6 @@ language axis is untouched — a `bridge._` entry still supplies the routing key
 to `bridge.<lang>` exactly as it supplies any other — and no other map in the
 configuration has an exempt key.
 
-While it is experimental, `kakehashi/virtualDocument/prepare` reads its own
-entry or nothing in the same way (virtual-document-prepare-protocol), for the
-opposite hazard: the shipped `aggregation."_"` entry says
-`priorities = ["*"]`, and inheriting it would make every server bridged for a
-language a prepare candidate, behind whose handshake the language's documents
-are held. Its `priorities` default to `[]` for the same reason.
-
 ## Consequences
 
 ### Positive

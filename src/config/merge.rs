@@ -30,9 +30,8 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
 
 /// Resolve one method's entry out of an `aggregation` map, applying the map's
 /// `"_"` method wildcard — except for
-/// [`BRIDGE_ROUTING_METHOD`](super::settings::BRIDGE_ROUTING_METHOD) and
-/// [`VIRTUAL_DOCUMENT_PREPARE_METHOD`](super::settings::VIRTUAL_DOCUMENT_PREPARE_METHOD),
-/// which read their own key or nothing.
+/// [`BRIDGE_ROUTING_METHOD`](super::settings::BRIDGE_ROUTING_METHOD), which reads its
+/// own key or nothing.
 ///
 /// The exemption is deliberate (bridge-routing-protocol). Every
 /// `aggregation."_"` entry written before routing existed is an LSP fan-out
@@ -47,23 +46,14 @@ pub(crate) fn resolve_with_wildcard<V: Clone>(
 /// *equals* the `"_"` entry would otherwise be stripped as redundant on
 /// serialization and come back meaning something else.
 ///
-/// The prepare key is exempt for the opposite hazard
-/// (virtual-document-prepare-protocol): the shipped `aggregation."_"` entry
-/// says `priorities = ["*"]`, and inheriting it would make every server
-/// bridged for a language a prepare candidate, behind whose handshake each
-/// of the language's documents is held. A peer is the server the
-/// configuration names at the prepare key, and no other.
-///
 /// This is the method axis only. The language axis is untouched: a `bridge._`
-/// entry still supplies either key to `bridge.<lang>` like any other,
+/// entry still supplies the routing key to `bridge.<lang>` like any other,
 /// through [`merge_bridge_language_configs`].
 pub(crate) fn resolve_aggregation_for_method(
     map: &HashMap<String, AggregationConfig>,
     method: &str,
 ) -> Option<AggregationConfig> {
-    if method == super::settings::BRIDGE_ROUTING_METHOD
-        || method == super::settings::VIRTUAL_DOCUMENT_PREPARE_METHOD
-    {
+    if method == super::settings::BRIDGE_ROUTING_METHOD {
         return map.get(method).cloned();
     }
     resolve_with_wildcard(map, method, merge_aggregation_configs)
@@ -1896,10 +1886,9 @@ mod tests {
         );
     }
 
-    /// A prepare entry at `languages._.bridge._` (here the explicit `[]`)
-    /// lands in every host's bridge map, beside the shipped
-    /// `bridge._.enabled = true`: which languages a host bridges is the same
-    /// with it as without it.
+    /// The README's prepare opt-out at `languages._.bridge._` lands in every
+    /// host's bridge map, beside the shipped `bridge._.enabled = true`: which
+    /// languages a host bridges is the same with it as without it.
     #[test]
     fn a_prepare_opt_out_for_every_host_bridges_what_the_defaults_do() {
         use crate::config::defaults::default_settings;
