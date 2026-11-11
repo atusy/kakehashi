@@ -2244,7 +2244,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
             ..Default::default()
         });
         service.inner().bridge.prepare_settings_changed(&settings);

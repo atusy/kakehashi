@@ -38,11 +38,6 @@ pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 /// [`crate::config::merge::resolve_aggregation_for_method`].
 pub(crate) const BRIDGE_ROUTING_METHOD: &str = "kakehashi/bridge/routing";
 
-/// The kakehashi→peer request that prepares a virtual document
-/// (virtual-document-prepare-protocol), which takes its candidates from the
-/// `aggregation` map under this key, read like any LSP method's.
-pub(crate) const VIRTUAL_DOCUMENT_PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
-
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {

@@ -78,39 +78,6 @@ pub(in crate::lsp::bridge) fn devnull_config() -> BridgeServerConfig {
     devnull_config_for_language("lua")
 }
 
-/// `languages` under which every server bridged for a language is one of
-/// its prepare candidates. The prepare key names no server by default, so a
-/// test that wants a peer says so, as a configuration has to.
-pub(crate) fn languages_any_server_prepares()
--> std::collections::HashMap<String, crate::config::settings::LanguageSettings> {
-    use crate::config::WILDCARD_KEY;
-    use crate::config::settings::{
-        AggregationConfig, BridgeLanguageConfig, LanguageSettings, PRIORITIES_WILDCARD,
-        VIRTUAL_DOCUMENT_PREPARE_METHOD,
-    };
-    let every_server = AggregationConfig {
-        priorities: Some(vec![PRIORITIES_WILDCARD.to_string()]),
-        ..Default::default()
-    };
-    let bridge = BridgeLanguageConfig {
-        enabled: Some(true),
-        aggregation: Some(
-            [(VIRTUAL_DOCUMENT_PREPARE_METHOD.to_string(), every_server)]
-                .into_iter()
-                .collect(),
-        ),
-    };
-    [(
-        WILDCARD_KEY.to_string(),
-        LanguageSettings {
-            bridge: Some([(WILDCARD_KEY.to_string(), bridge)].into_iter().collect()),
-            ..Default::default()
-        },
-    )]
-    .into_iter()
-    .collect()
-}
-
 /// Create a BridgeServerConfig for a mock server with a specific language.
 pub(crate) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
     BridgeServerConfig {

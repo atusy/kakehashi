@@ -2455,7 +2455,6 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
                 ..Default::default()
             }));
         let mut parser = tree_sitter::Parser::new();
@@ -3056,7 +3055,6 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
                 ..Default::default()
             }));
         let mut parser = tree_sitter::Parser::new();

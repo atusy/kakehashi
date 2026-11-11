@@ -792,7 +792,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
             ..Default::default()
         }));
         pool.record_prepare_advertisement(&ConnectionKey::for_server("peer"), true);
@@ -1053,7 +1052,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
             ..Default::default()
         }));
         let target = coordinator.prepare_target("markdown", "lua").unwrap();
@@ -1234,7 +1232,6 @@ mod tests {
                         )
                     })
                     .collect(),
-                languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
                 ..Default::default()
             })
         };
@@ -1426,7 +1423,6 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
             ..Default::default()
         }));
         let host = Url::parse("file:///test/as-is.md").unwrap();
