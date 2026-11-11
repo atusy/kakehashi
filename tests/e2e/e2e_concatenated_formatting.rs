@@ -87,14 +87,18 @@ const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_concatenated_formatting.md";
 
 fn open_markdown(client: &mut LspClient) {
+    open_markdown_text(client, MARKDOWN_URI, MARKDOWN);
+}
+
+fn open_markdown_text(client: &mut LspClient, uri: &str, text: &str) {
     client.send_notification(
         "textDocument/didOpen",
         json!({
             "textDocument": {
-                "uri": MARKDOWN_URI,
+                "uri": uri,
                 "languageId": "markdown",
                 "version": 1,
-                "text": MARKDOWN
+                "text": text
             }
         }),
     );
@@ -190,6 +194,41 @@ priorities = ["mock-range-upper"]
         new_text.contains("LOCAL X = 1"),
         "range-only server must have formatted the region through the \
          rangeFormatting fallback; newText: {new_text:?}"
+    );
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_concatenated_formatting_keeps_a_list_fence_indented_past_its_blank_line() {
+    // The fence's blank line keeps no indentation, so it records no prefix.
+    // `append` adds a line, so every continuation line takes the region's
+    // common prefix, which must still be the item's two columns.
+    const LIST_MARKDOWN: &str = "- item\n\n  ```lua\n  local x = 1\n\n  local y = 2\n  ```\n";
+    const LIST_URI: &str = "file:///test_concatenated_formatting_list.md";
+    let bin = mock_formatter_bin();
+    let (mut client, _config_dir) = init_client(
+        r#"
+[languages.markdown.bridge.lua.aggregation."textDocument/formatting"]
+strategy = "concatenated"
+priorities = ["mock-append"]
+"#,
+        json!({
+            "mock-append": { "cmd": [bin, "append"], "languages": ["lua"] },
+        }),
+    );
+
+    open_markdown_text(&mut client, LIST_URI, LIST_MARKDOWN);
+
+    let edits = request_formatting_with_retry(&mut client, LIST_URI)
+        .expect("concatenated pipeline must produce a region replacement edit");
+
+    assert_eq!(edits.len(), 1, "expected one region replacement edit");
+    assert_eq!(edits[0]["range"]["start"]["line"], 3);
+    assert_eq!(edits[0]["range"]["start"]["character"], 2);
+    assert_eq!(
+        edits[0]["newText"], "local x = 1\n\n  local y = 2\n  -- mock-marker\n",
+        "every continuation line holding text must keep the item's indentation"
     );
 
     shutdown(&mut client);
