@@ -19,6 +19,9 @@
 //! duplicate or lose content. All-safe responses (single-line edits and
 //! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
 //! through (a newline-bearing `new_text` in a prefixed region still rejects).
+//! A list item's fence records no prefix for its blank rows, so any text
+//! other than spaces, tabs and line breaks written onto one is unsafe too:
+//! it would read back dedented by the item's indentation, or end the item.
 //! Unprefixed regions are exempt from the prefix rules but still subject to
 //! region containment and the fence-boundary EOL rule. Re-applying prefixes to `new_text` (which would let these
 //! edits APPLY instead of dropping) means rewriting it per embedded newline;
@@ -780,6 +783,40 @@ mod tests {
         assert_eq!(edits.len(), 1, "all-safe response passes: {edits:?}");
         assert_eq!(edits[0].new_text, "safe");
         assert_eq!(edits[0].range.start.line, 4, "translated to host line");
+    }
+
+    /// A list item's fence ("- item\n\n  ```py\n  a = 1\n\n\n  ```\n"): its
+    /// blank rows record no prefix. A response writing text there would end
+    /// the list item or dedent the text, so it drops whole; an edit behind
+    /// the prefix of a content row still applies.
+    #[test]
+    fn transform_drops_a_response_writing_on_a_list_item_blank_row() {
+        let host = "- item\n\n  ```py\n  a = 1\n\n\n  ```\n";
+        let offset = RegionOffset::with_content(3, vec![2, 0, 0, 0], "a = 1\n\n\n");
+        let region_end = Position::new(6, 0);
+        let respond = |start: (u32, u32), end: (u32, u32), new_text: &str| {
+            let response = json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": [
+                    { "range": { "start": { "line": start.0, "character": start.1 },
+                                 "end": { "line": end.0, "character": end.1 } },
+                      "newText": new_text }
+                ]
+            });
+            transform_formatting_response_to_host(response, &offset, "a = 1\n\n\n", region_end)
+                .unwrap()
+        };
+
+        for new_text in ["b = 2\n", "b = 2", "  b = 2\n"] {
+            let edits = respond((1, 0), (1, 0), new_text);
+            assert!(edits.is_empty(), "{new_text:?} must drop: {edits:?}");
+        }
+
+        let edits = respond((0, 4), (0, 5), "2");
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &edits),
+            "- item\n\n  ```py\n  a = 2\n\n\n  ```\n"
+        );
     }
 
     fn default_options() -> FormattingOptions {

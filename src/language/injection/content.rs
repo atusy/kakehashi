@@ -43,14 +43,70 @@ pub(crate) fn extract_clean_content(
 /// Each offset is the width of the blockquote prefix (or other excluded content)
 /// before the gap on that line. When `included_ranges` is `None`, returns
 /// `vec![start_column]` — the non-blockquote fallback where only line 0 has an offset.
+#[cfg(test)]
 pub(super) fn compute_line_column_offsets(
     host_text: &str,
     byte_range: std::ops::Range<usize>,
     start_column: u32,
     included_ranges: Option<&[tree_sitter::Range]>,
 ) -> Vec<u32> {
+    compute_line_prefixes(
+        host_text,
+        byte_range,
+        start_column,
+        included_ranges,
+        |_, _| LinePrefix::Other,
+    )
+    .0
+}
+
+/// What the host text before a virtual line's content is made of: the text
+/// a column offset skips. Only a markdown container's continuation (the
+/// `> ` of a blockquote, a list item's indentation, as tree-sitter-md parses
+/// them) repeats on every line of a block; anything else (the code before a
+/// string that opens mid-line, an excluded escape sequence) is no container
+/// prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinePrefix {
+    /// No text, or a container continuation of spaces and tabs only: list-item
+    /// indentation, as wide as markdown reads it (a tab reaches the next
+    /// multiple of 4 from the line start, CommonMark §2.2).
+    Whitespace(u32),
+    /// A container continuation holding markers (`>`).
+    Container,
+    /// Any other text.
+    Other,
+}
+
+impl LinePrefix {
+    /// The class of a container continuation spanning `text`.
+    pub(super) fn continuation(text: &str) -> Self {
+        let mut width = 0u32;
+        for byte in text.bytes() {
+            match byte {
+                b' ' => width = width.saturating_add(1),
+                b'\t' => width = (width / 4).saturating_add(1).saturating_mul(4),
+                _ => return Self::Container,
+            }
+        }
+        Self::Whitespace(width)
+    }
+}
+
+/// [`compute_line_column_offsets`], with what each line's prefix is made of,
+/// as `classify` reads the host span before the line's gap: from the LSP
+/// line start (`None` on the region's first line, whose start lies before
+/// the region) to the gap's start byte. Gaps arrive in document order. Lines
+/// without a recorded offset have an empty prefix.
+pub(super) fn compute_line_prefixes(
+    host_text: &str,
+    byte_range: std::ops::Range<usize>,
+    start_column: u32,
+    included_ranges: Option<&[tree_sitter::Range]>,
+    mut classify: impl FnMut(Option<usize>, usize) -> LinePrefix,
+) -> (Vec<u32>, Vec<LinePrefix>) {
     match included_ranges {
-        None => vec![start_column],
+        None => (vec![start_column], Vec::new()),
         Some(ranges) => {
             // Build a map from virtual line → column offset.
             // Each gap range starts at a known point with a column value.
@@ -79,10 +135,12 @@ pub(super) fn compute_line_column_offsets(
                 }
             };
             let mut offsets = Vec::new();
+            let mut prefixes = Vec::new();
             for range in ranges {
                 let gap_abs_byte = byte_range.start.saturating_add(range.start_byte);
                 advance_to(gap_abs_byte, &mut line, &mut line_start);
                 let gap_start_line = line;
+                let prefix = classify((gap_start_line > 0).then_some(line_start), gap_abs_byte);
                 // The column offset is the gap's start column within the host line.
                 // For the first line of the content node, use start_column
                 // (which accounts for the full prefix from the line start).
@@ -103,18 +161,141 @@ pub(super) fn compute_line_column_offsets(
                 // its spanned lines stay at the default 0.
                 if offsets.len() <= line {
                     offsets.resize(line + 1, 0);
+                    prefixes.resize(line + 1, LinePrefix::Whitespace(0));
                 }
                 if let Some(slot) = offsets.get_mut(gap_start_line) {
                     *slot = column;
+                    prefixes[gap_start_line] = prefix;
                 }
             }
             if offsets.is_empty() {
-                vec![start_column]
+                (vec![start_column], Vec::new())
             } else {
-                offsets
+                (offsets, prefixes)
             }
         }
     }
+}
+
+/// The virtual lines of a region that are blank rows of a markdown
+/// container block, which the edit checks protect.
+///
+/// A list item's fence leaves its blank rows unindented (or indented less
+/// than its content), so virtual column 0 maps there to a host column short
+/// of the item's indentation. Such a row is blank in `virtual_content`
+/// (spaces and tabs only, as markdown counts it), and its nearest row that
+/// holds text (before it, or after it when none is before) records a
+/// container prefix wider than the row's own: none, or whitespace only that
+/// markdown reads as narrower (a blank row keeping one space of a two-space
+/// item; a tab, which reaches column 4, is wide enough there). A prefix of
+/// other text (a string opening mid-line) is no
+/// container, and a row recording no prefix that holds text (a lazy
+/// continuation line) anchors nothing. The row after the content's final
+/// line break is the closing fence's, which the edit checks treat apart.
+/// Two linear passes over the rows.
+#[cfg(test)]
+pub(crate) fn protected_blank_rows(
+    columns: &[u32],
+    prefixes: &[LinePrefix],
+    virtual_content: &str,
+) -> Vec<u32> {
+    container_blank_rows(columns, prefixes, virtual_content, 0).0
+}
+
+/// [`protected_blank_rows`], and every blank row of a container block whose
+/// prefix is only whitespace, protected or not (a tab row giving a two-space
+/// item its full indentation). The concatenated pipeline's common prefix
+/// skips the latter: such a row keeps none or part of the item's
+/// indentation, which must not narrow the prefix the item's content takes.
+///
+/// `opener_width` is the width of the list-item indentation before the
+/// block's opening line (0 when there is none): it anchors blank rows that
+/// no row holding text anchors, as in a fence holding only blank rows.
+pub(crate) fn container_blank_rows(
+    columns: &[u32],
+    prefixes: &[LinePrefix],
+    virtual_content: &str,
+    opener_width: u32,
+) -> (Vec<u32>, Vec<u32>) {
+    if columns.len() <= 1 || (opener_width == 0 && !columns.iter().any(|&column| column > 0)) {
+        return (Vec::new(), Vec::new());
+    }
+    // Whether each LSP line (a lone CR ends one too, as the offsets count
+    // them) is blank as markdown reads it.
+    let mut blank = Vec::with_capacity(columns.len());
+    let bytes = virtual_content.as_bytes();
+    let mut line_blank = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                blank.push(line_blank);
+                line_blank = true;
+            }
+            b'\r' => {
+                blank.push(line_blank);
+                line_blank = true;
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b' ' | b'\t' => {}
+            _ => line_blank = false,
+        }
+        i += 1;
+    }
+    // The row after the final line break is the closing fence's.
+    if !virtual_content.ends_with(['\n', '\r']) {
+        blank.push(line_blank);
+    }
+    let rows = columns.len().min(blank.len());
+    let prefix = |row: usize| {
+        prefixes
+            .get(row)
+            .copied()
+            .unwrap_or(LinePrefix::Whitespace(0))
+    };
+    // A row holding text anchors the blank rows near it with the width of
+    // its container prefix (0 when it has none).
+    let anchor = |row: usize| {
+        (!blank[row]).then(|| match prefix(row) {
+            LinePrefix::Whitespace(width) => width,
+            LinePrefix::Container => columns[row],
+            LinePrefix::Other => 0,
+        })
+    };
+    let mut next_anchor = vec![None; rows];
+    let mut next = None;
+    for row in (0..rows).rev() {
+        next_anchor[row] = next;
+        if let Some(width) = anchor(row) {
+            next = Some(width);
+        }
+    }
+    let mut previous = None;
+    let mut protected = Vec::new();
+    let mut container = Vec::new();
+    for row in 0..rows {
+        if blank[row] {
+            let width = previous.or(next_anchor[row]).unwrap_or(opener_width);
+            // No prefix, or whitespace markdown reads short of the
+            // container's: virtual column 0 lands short of the block's
+            // content there. A tab reaching the content's column is enough.
+            let short = columns[row] == 0
+                || matches!(prefix(row), LinePrefix::Whitespace(own) if own < width);
+            let whitespace = columns[row] == 0 || matches!(prefix(row), LinePrefix::Whitespace(_));
+            if width > 0 && short {
+                protected.push(row as u32);
+            }
+            if width > 0 && whitespace {
+                container.push(row as u32);
+            }
+        }
+        if let Some(width) = anchor(row) {
+            previous = Some(width);
+        }
+    }
+    (protected, container)
 }
 
 /// Per-parse wall-clock budget for every native parse that runs on the
@@ -640,6 +821,40 @@ mod tests {
         // Included sub-ranges past the end of the (clamped) content are skipped.
         let oversized = [range_at(0, 999, 0, 0)];
         assert_eq!(extract_clean_content("hi", 0..2, Some(&oversized)), "hi");
+    }
+
+    /// Splitting each region on one long host line into lines takes time
+    /// linear in the regions, not in the line before each: nothing reads
+    /// back to the line start. Scanning back for each of the 20k regions
+    /// below would take seconds (about 2e9 byte checks); the bound leaves a
+    /// wide margin for a loaded machine.
+    #[test]
+    fn regions_on_one_long_line_classify_their_prefixes_in_linear_time() {
+        const REGIONS: usize = 20_000;
+        let host = "f`ab`, ".repeat(REGIONS);
+        let gap = tree_sitter::Range {
+            start_byte: 0,
+            end_byte: 2,
+            start_point: tree_sitter::Point::new(0, 0),
+            end_point: tree_sitter::Point::new(0, 2),
+        };
+        let started = std::time::Instant::now();
+        for region in 0..REGIONS {
+            let start = region * 7 + 2;
+            let (offsets, prefixes) = compute_line_prefixes(
+                &host,
+                start..start + 2,
+                start as u32,
+                Some(std::slice::from_ref(&gap)),
+                |_, _| LinePrefix::Other,
+            );
+            assert_eq!((offsets.len(), prefixes[0]), (1, LinePrefix::Other));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "took {elapsed:?}"
+        );
     }
 
     #[test]

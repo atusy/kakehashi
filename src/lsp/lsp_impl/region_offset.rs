@@ -212,7 +212,11 @@ pub(super) fn resolved_region_geometry(
     resolved: ResolvedInjection,
 ) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
-    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
+    let offset = RegionOffset::with_protected_blank_rows(
+        start_line,
+        resolved.line_column_offsets,
+        &resolved.protected_blank_rows,
+    );
     let region_end = region_host_end(&resolved.virtual_content, &offset);
     (
         offset,
@@ -241,11 +245,355 @@ mod tests {
             injection_language: "rust".to_string(),
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
+            protected_blank_rows: Vec::new(),
+            container_blank_rows: Vec::new(),
             contiguous: true,
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);
 
         assert_eq!(region_end, Position::new(2, 4));
+    }
+
+    const FENCE_QUERY: &str = "((fenced_code_block (info_string (language) @injection.language) \
+        (code_fence_content) @injection.content))";
+    const COMBINED_FENCE_QUERY: &str = "((fenced_code_block (info_string (language) \
+        @injection.language) (code_fence_content) @injection.content) \
+        (#set! injection.combined))";
+    const COMBINED_HOST: &str = "> ```py\n> a = 1\n> ```\n\n```py\nb = 2\n\nc = 3\n```\n";
+    const INLINE_QUERY: &str =
+        "((inline) @injection.content (#set! injection.language \"markdown_inline\"))";
+
+    /// The regions injection discovery finds in a markdown `host`.
+    fn discover(host: &str, query: &str) -> Vec<ResolvedInjection> {
+        discover_in(tree_sitter_md::LANGUAGE.into(), host, query)
+    }
+
+    /// The regions injection discovery finds in a `host` of `language`.
+    fn discover_in(
+        language: tree_sitter::Language,
+        host: &str,
+        query: &str,
+    ) -> Vec<ResolvedInjection> {
+        let md = language;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(&md, query).unwrap();
+        crate::language::InjectionResolver::resolve_all(
+            &LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+    }
+
+    /// Whether the edit checks the bridge applies take a host `edit` on the
+    /// region discovered from `host`, through the production geometry.
+    fn accepts(resolved: ResolvedInjection, edit: &tower_lsp_server::ls_types::TextEdit) -> bool {
+        let host_uri: tower_lsp_server::ls_types::Uri = "file:///test.md".parse().unwrap();
+        let workspace_edit = tower_lsp_server::ls_types::WorkspaceEdit {
+            changes: Some(
+                [(host_uri.clone(), vec![edit.clone()])]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let (offset, region_end, _, _) = resolved_region_geometry(resolved);
+        crate::lsp::bridge::workspace_edit_within_region(
+            &workspace_edit,
+            &host_uri,
+            &offset,
+            region_end,
+        ) && crate::lsp::bridge::workspace_edit_preserves_line_prefixes(
+            &workspace_edit,
+            &host_uri,
+            &offset,
+            region_end,
+        )
+    }
+
+    fn edit(
+        start: (u32, u32),
+        end: (u32, u32),
+        new_text: &str,
+    ) -> tower_lsp_server::ls_types::TextEdit {
+        tower_lsp_server::ls_types::TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            ),
+            new_text: new_text.to_string(),
+        }
+    }
+
+    /// Edits on rows recording no prefix that are not blank rows of a
+    /// prefixed block are judged as on any content row. Each accepted edit
+    /// is applied to the host, and discovery reads back the edited text.
+    #[rstest::rstest]
+    // A blockquote paragraph's lazy continuation row "b".
+    #[case::lazy_continuation_in_a_blockquote(
+        "> a\nb\n> c\n", INLINE_QUERY, 0, ((1, 0), (1, 1), "x"), "a\nx\nc"
+    )]
+    // A list item paragraph's lazy continuation row "b".
+    #[case::lazy_continuation_in_a_list_item(
+        "- a\nb\n  c\n", INLINE_QUERY, 0, ((1, 0), (1, 1), "x"), "a\nx\nc"
+    )]
+    // A combined region: a blockquoted fence, then a plain fence whose rows
+    // record no prefix. Its code row "b = 2" ...
+    #[case::plain_fence_row_after_a_blockquoted_fence(
+        COMBINED_HOST,
+        COMBINED_FENCE_QUERY,
+        0,
+        ((5, 0), (5, 1), "z"),
+        "a = 1\n\n\n\nz = 2\n\nc = 3\n"
+    )]
+    // ... and its own blank row.
+    #[case::plain_fence_blank_row_after_a_blockquoted_fence(
+        COMBINED_HOST,
+        COMBINED_FENCE_QUERY,
+        0,
+        ((6, 0), (6, 0), "x"),
+        "a = 1\n\n\n\nb = 2\nx\nc = 3\n"
+    )]
+    fn an_edit_on_an_unprefixed_content_row_is_accepted(
+        #[case] host: &str,
+        #[case] query: &str,
+        #[case] region: usize,
+        #[case] change: ((u32, u32), (u32, u32), &str),
+        #[case] expected_virtual: &str,
+    ) {
+        let resolved = discover(host, query).swap_remove(region);
+        let change = edit(change.0, change.1, change.2);
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(
+            discover(&edited, query)[region].virtual_content,
+            expected_virtual
+        );
+    }
+
+    /// Discovery's list-item fence: its blank rows stay protected through
+    /// the production geometry, and a blank line added there still applies.
+    #[test]
+    fn a_list_item_fence_keeps_its_blank_rows_protected() {
+        let host = "- item\n\n  ```py\n  a = 1\n\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert!(!accepts(resolved(), &edit((4, 0), (4, 0), "b = 2")));
+        assert!(!accepts(resolved(), &edit((5, 0), (5, 0), "b = 2\n")));
+        assert!(accepts(resolved(), &edit((4, 0), (4, 0), "\n")));
+    }
+
+    /// A string whose content has an escape sequence records per-line
+    /// offsets, the first being where the string opens mid-line. That is no
+    /// container prefix: the blank rows inside the string are content rows
+    /// of the host language, and text written there is judged as anywhere.
+    #[test]
+    fn a_blank_row_inside_a_string_opening_mid_line_is_not_protected() {
+        let host = "x = \"\"\"a\n\nb\\tc\n\nd\"\"\"\n";
+        let query = "((string (string_content) @injection.content) \
+            (#set! injection.language \"sql\"))";
+        let discover = |host: &str| discover_in(tree_sitter_python::LANGUAGE.into(), host, query);
+        let resolved = discover(host).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![7, 0, 3, 0, 0]);
+
+        let change = edit((1, 0), (1, 0), "z");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited)[0].virtual_content, "a\nz\nbc\n\nd");
+    }
+
+    /// Discovery marks only blank rows of markdown container blocks.
+    #[rstest::rstest]
+    #[case::list_fence_trailing_blank_rows("- item\n\n  ```py\n  a = 1\n\n\n  ```\n", FENCE_QUERY, vec![1, 2])]
+    #[case::list_fence_leading_blank_rows("- item\n\n  ```py\n\n\n  a = 1\n  ```\n", FENCE_QUERY, vec![0, 1])]
+    #[case::ordered_list_fence("1. item\n\n   ```py\n   a\n\n   b\n   ```\n", FENCE_QUERY, vec![1])]
+    #[case::blockquote_fence("> ```py\n> a\n>\n> b\n> ```\n", FENCE_QUERY, vec![])]
+    // A list fence holding only blank rows: the opener's indentation anchors.
+    #[case::blank_only_list_fence("- item\n\n  ```py\n\n  ```\n", FENCE_QUERY, vec![0])]
+    #[case::two_blank_rows_only_list_fence("- item\n\n  ```py\n\n\n  ```\n", FENCE_QUERY, vec![0, 1])]
+    #[case::blank_only_blockquote_fence("> ```py\n>\n> ```\n", FENCE_QUERY, vec![])]
+    // Opened on the item's own line: the marker gives the content column.
+    #[case::blank_only_fence_on_the_marker_line("- ```py\n\n  ```\n", FENCE_QUERY, vec![0])]
+    #[case::blank_only_fence_on_an_ordered_marker_line("10. ```py\n\n    ```\n", FENCE_QUERY, vec![0])]
+    #[case::blank_only_fence_on_an_indented_marker_line("  - ```py\n\n    ```\n", FENCE_QUERY, vec![0])]
+    #[case::blank_only_plain_fence("```py\n\n```\n", FENCE_QUERY, vec![])]
+    // A blank row keeping less whitespace than the item's indentation.
+    #[case::list_fence_short_whitespace_row("- item\n\n  ```py\n  a\n \n  b\n  ```\n", FENCE_QUERY, vec![1])]
+    #[case::list_fence_short_whitespace_row_crlf("- item\r\n\r\n  ```py\r\n  a\r\n \r\n  b\r\n  ```\r\n", FENCE_QUERY, vec![1])]
+    // A tab reaches the next tab stop (column 4), past a two-space item's
+    // content, but short of a six-space item's.
+    #[case::list_fence_tab_row("- item\n\n  ```py\n  a\n\t\n  b\n  ```\n", FENCE_QUERY, vec![])]
+    #[case::six_space_list_fence_tab_row(
+        "10.   item\n\n      ```py\n      a\n\t\n      b\n      ```\n",
+        FENCE_QUERY,
+        vec![1]
+    )]
+    // A blank row keeping the item's whole indentation is a content row.
+    #[case::list_fence_full_whitespace_row("- item\n\n  ```py\n  a\n  \n  b\n  ```\n", FENCE_QUERY, vec![])]
+    #[case::lazy_continuation("> a\nb\n> c\n", INLINE_QUERY, vec![])]
+    fn discovery_marks_the_blank_rows_of_container_blocks(
+        #[case] host: &str,
+        #[case] query: &str,
+        #[case] expected: Vec<u32>,
+    ) {
+        assert_eq!(discover(host, query)[0].protected_blank_rows, expected);
+    }
+
+    /// A blank row keeping one space of a two-space item records offset 1:
+    /// text written there lands at host column 1, outside the item.
+    #[test]
+    fn a_short_whitespace_blank_row_of_a_list_item_fence_is_protected() {
+        let host = "- item\n\n  ```py\n  a\n \n  b\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![2, 1, 2, 0]);
+        assert!(!accepts(resolved(), &edit((4, 1), (4, 1), "x")));
+        // Deleting the row's content still applies.
+        assert!(accepts(resolved(), &edit((4, 1), (4, 1), "")));
+    }
+
+    /// A host that is not markdown never protects a row, even where an
+    /// excluded child at a line start reads like a list marker (`123`,
+    /// `1.`): only tree-sitter-md's container continuations are prefixes.
+    #[rstest::rstest]
+    #[case::digits("const a = [\n123,\n\n456];\n", "[\n,\n,\n]")]
+    #[case::ordered_marker_like("const a = [\n1.,\n\n2.];\n", "[\n,\n,\n]")]
+    fn a_non_markdown_host_with_list_like_children_protects_nothing(
+        #[case] host: &str,
+        #[case] expected_virtual: &str,
+    ) {
+        let query = "((array) @injection.content (#set! injection.language \"json\"))";
+        let discover =
+            |host: &str| discover_in(tree_sitter_javascript::LANGUAGE.into(), host, query);
+        let resolved = discover(host).swap_remove(0);
+        assert!(resolved.line_column_offsets.len() > 1 && resolved.line_column_offsets[1] > 0);
+        assert_eq!(resolved.protected_blank_rows, Vec::<u32>::new());
+
+        // A comma (no child node of its own) written on the blank row.
+        let change = edit((2, 0), (2, 0), ",");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited)[0].virtual_content, expected_virtual);
+    }
+
+    /// A blank row holding a tab gives a two-space item its indentation:
+    /// text written after the tab stays in the item and reads back as
+    /// written.
+    #[test]
+    fn a_tab_blank_row_of_a_two_space_list_item_fence_takes_text() {
+        let host = "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n";
+        let resolved = discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![2, 1, 2, 0]);
+        let change = edit((4, 1), (4, 1), "x");
+        assert!(accepts(resolved, &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(
+            discover(&edited, FENCE_QUERY)[0].virtual_content,
+            "a\nx\nb\n"
+        );
+    }
+
+    /// In a six-space item a tab reaches column 4, short of the content: text
+    /// written after it would leave the item, so it is refused.
+    #[test]
+    fn a_tab_blank_row_of_a_six_space_list_item_fence_is_protected() {
+        let host = "10.   item\n\n      ```py\n      a\n\t\n      b\n      ```\n";
+        let resolved = discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![6, 1, 6, 0]);
+        let change = edit((4, 1), (4, 1), "x");
+        assert!(!accepts(resolved, &change));
+        // Applied anyway, the text does not read back as written.
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_ne!(
+            discover(&edited, FENCE_QUERY)
+                .first()
+                .map(|r| r.virtual_content.as_str()),
+            Some("a\nx\nb\n")
+        );
+    }
+
+    /// A list fence holding only blank rows has no row with the item's
+    /// indentation; the opener's anchors its rows. Text written there is
+    /// refused, and a blank line added still applies and reads back.
+    #[test]
+    fn a_list_fence_holding_only_blank_rows_keeps_them_protected() {
+        let host = "- item\n\n  ```py\n\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![0, 0, 0]);
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+        let change = edit((3, 0), (3, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n\n");
+    }
+
+    /// A fence holding only blank rows records no prefix anywhere: apart from
+    /// refusing text on its protected rows, its edits are judged as main
+    /// judges a plain fence. Blank lines, whitespace and deletions apply and
+    /// read back as the server meant them.
+    #[rstest::rstest]
+    #[case::blank_line_added((3, 0), (3, 0), "\n", "\n\n")]
+    #[case::row_deleted((3, 0), (4, 0), "", "")]
+    #[case::whitespace_written((3, 0), (3, 0), "  ", "\n")]
+    fn a_list_fence_holding_one_blank_row_takes_blank_edits(
+        #[case] start: (u32, u32),
+        #[case] end: (u32, u32),
+        #[case] new_text: &str,
+        #[case] expected_virtual: &str,
+    ) {
+        let host = "- item\n\n  ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().protected_blank_rows, vec![0]);
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+
+        let change = edit(start, end, new_text);
+        assert!(accepts(resolved(), &change), "{change:?} must be accepted");
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        let read_back = discover(&edited, FENCE_QUERY);
+        assert_eq!(
+            read_back.first().map_or("", |r| r.virtual_content.as_str()),
+            expected_virtual
+        );
+    }
+
+    /// A fence opened on its list item's own line takes the item's content
+    /// column from the marker: text written on its blank row is refused, a
+    /// blank line still applies and reads back.
+    #[test]
+    fn a_blank_only_fence_on_the_marker_line_keeps_its_row_protected() {
+        let host = "- ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        assert_eq!(resolved().line_column_offsets, vec![0, 0]);
+        assert!(!accepts(resolved(), &edit((1, 0), (1, 0), "x")));
+        let change = edit((1, 0), (1, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n");
+    }
+
+    /// A blank-only list fence's region ends at column 0 of its closing
+    /// fence's row, which records no prefix either: text written there lands
+    /// before the fence's indentation and ends the item, so it is refused,
+    /// as on the boundary row of a fence with text. A blank line inserted
+    /// there still applies and reads back, and so does text on the leading
+    /// protected row's refusal.
+    #[test]
+    fn a_blank_only_list_fence_refuses_text_at_its_region_end() {
+        let host = "- item\n\n  ```py\n\n  ```\n";
+        let resolved = || discover(host, FENCE_QUERY).swap_remove(0);
+        let (_, region_end, _, _) = resolved_region_geometry(resolved());
+        assert_eq!(region_end, Position::new(4, 0));
+        assert!(!accepts(resolved(), &edit((4, 0), (4, 0), "pass\n")));
+        // The leading edge: the protected first row refuses text already.
+        assert!(!accepts(resolved(), &edit((3, 0), (3, 0), "pass")));
+
+        let change = edit((4, 0), (4, 0), "\n");
+        assert!(accepts(resolved(), &change));
+        let edited = crate::text::edit::apply_text_edits(host, &[change]);
+        assert_eq!(discover(&edited, FENCE_QUERY)[0].virtual_content, "\n\n");
     }
 }

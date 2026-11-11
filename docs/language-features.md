@@ -130,8 +130,9 @@ on demand from the server that produced it. Because the language server only see
 the isolated snippet, any edits it returns — including auto-import edits — are
 placed relative to the embedded block, so file-level imports may not land where they
 would in a standalone file. Edits that would corrupt the host document around the
-embedded block (escape the region, break blockquote `> ` prefixes, or merge content
-into the closing fence) are dropped fail-closed: an unsafe primary edit drops
+embedded block (escape the region, break blockquote `> ` prefixes or a list
+item's indentation, or merge content into the closing fence) are dropped
+fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
 stage — is dropped whole and the completion itself still applies. A resolve
@@ -217,8 +218,8 @@ reproducible pipeline needs a deterministic order. It runs at most 64 named
 servers per region; `maxFanOut` can set a lower limit.
 
 A response whose edits would corrupt the host document around the embedded
-block (escape the region, break blockquote `> ` prefixes, or merge content
-into the closing fence) is dropped **whole** — a formatter answer is one
+block (escape the region, break blockquote `> ` prefixes or a list item's
+indentation, or merge content into the closing fence) is dropped **whole** — a formatter answer is one
 atomic diff, so applying only its safe edits could duplicate or lose content.
 The same rule covers range and on-type formatting.
 

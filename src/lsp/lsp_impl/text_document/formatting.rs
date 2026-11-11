@@ -956,9 +956,10 @@ async fn dispatch_concatenated_formatting(
     cancel_rx: Option<CancelReceiver>,
     request_error_sink: RequestErrorSink,
 ) -> Option<Vec<TextEdit>> {
-    let offset = RegionOffset::with_per_line_offsets(
+    let offset = RegionOffset::with_protected_blank_rows(
         region_ctx.resolved.region.line_range.start,
         region_ctx.resolved.line_column_offsets.clone(),
+        &region_ctx.resolved.protected_blank_rows,
     );
     let original_virtual = region_ctx.resolved.virtual_content.clone();
     // Precompute the host replacement range now, while we still hold
@@ -1380,6 +1381,7 @@ async fn dispatch_concatenated_formatting(
         &final_text?,
         &offset,
         &host_line_prefixes,
+        &region_ctx.resolved.container_blank_rows,
     )?;
     Some(vec![TextEdit {
         range: replacement_range,
@@ -1692,6 +1694,7 @@ fn pipeline_region_text(
     final_text: &str,
     offset: &RegionOffset,
     host_line_prefixes: &[String],
+    container_blank_rows: &[u32],
 ) -> Option<String> {
     // A region opening mid-line, after a delimiter on its first line (a Nix
     // `''`), has its leading line break as layout and no line prefix: the
@@ -1726,10 +1729,107 @@ fn pipeline_region_text(
     } else {
         std::borrow::Cow::Borrowed(host_line_prefixes)
     };
+    let first_row_prefix = host_line_prefixes.first().cloned().unwrap_or_default();
+    let common = block_common_prefix(&host_line_prefixes, container_blank_rows);
+    let (host_line_prefixes, first_row_blank) =
+        fill_blank_row_prefixes(host_line_prefixes, offset, &common);
     // Decision point 4: the virtual output starts at column 0 of the embedded
     // language, so every continuation line must re-gain its host prefix before
     // the whole-region replacement is emitted.
-    Some(reapply_host_line_prefixes(&final_text, &host_line_prefixes))
+    let text = reapply_host_line_prefixes_with(&final_text, &host_line_prefixes, &common);
+    // The replacement starts after the first row's host prefix, so a first
+    // row that is a blank row (none, or a short part of the indentation)
+    // takes the rest of the block's prefix here when the output puts text on
+    // it. A short prefix the block's does not extend (a tab before a
+    // space-indented item) cannot be completed: the region is left as is.
+    match first_row_blank {
+        Some(prefix)
+            if split_lsp_lines(&text)
+                .first()
+                .is_some_and(|(line, _)| !crate::text::is_markdown_blank(line)) =>
+        {
+            let rest = prefix.strip_prefix(first_row_prefix.as_str())?;
+            Some(format!("{rest}{text}"))
+        }
+        _ => Some(text),
+    }
+}
+
+/// The region's common host prefix, which continuation lines take when the
+/// line count changes: the longest prefix shared by its rows, past the
+/// trailing empty entries (the closing fence's row) and past the blank rows
+/// of markdown container blocks whose prefix is only whitespace
+/// (`container_blank_rows`, as discovery marks them). A list item's blank
+/// row keeps none, a part, or a tab of the item's indentation, and none of
+/// those may narrow the prefix the item's content takes. Every other row
+/// counts, so a region without such rows gets the prefix it always did.
+fn block_common_prefix(prefixes: &[String], container_blank_rows: &[u32]) -> String {
+    let mut content = prefixes;
+    while let [rest @ .., last] = content {
+        if !last.is_empty() {
+            break;
+        }
+        content = rest;
+    }
+    let mut skipped = container_blank_rows.iter().peekable();
+    let mut kept = (0u32..).zip(content).filter_map(|(row, prefix)| {
+        while skipped.next_if(|&&blank| blank < row).is_some() {}
+        if skipped.next_if_eq(&&row).is_some() {
+            None
+        } else {
+            Some(prefix)
+        }
+    });
+    let Some(first) = kept.next() else {
+        return String::new();
+    };
+    kept.fold(first.as_str(), |common, prefix| {
+        let len = common
+            .char_indices()
+            .zip(prefix.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((at, c), _)| at + c.len_utf8());
+        &common[..len]
+    })
+    .to_string()
+}
+
+/// A list item's fence leaves its blank rows unindented, so a per-line
+/// region records no prefix for them, and output lines mapped there would
+/// start at host column 0 and end the item; a blank row keeping part of the
+/// indentation records a short prefix, with the same effect. Such a blank
+/// row, as discovery marks it on `offset`, takes the block's common prefix
+/// (`common`, see [`block_common_prefix`]) instead. Rows
+/// recording no prefix that hold text (a lazy continuation line) keep none,
+/// and a region with one column offset has unprefixed later rows by design.
+///
+/// Also returns the prefix the first row takes when it is a blank row, as
+/// the replacement range starts after that row's (empty) host prefix.
+fn fill_blank_row_prefixes<'a>(
+    prefixes: std::borrow::Cow<'a, [String]>,
+    offset: &RegionOffset,
+    common: &str,
+) -> (std::borrow::Cow<'a, [String]>, Option<String>) {
+    let blank_row = |i: usize| offset.is_protected_blank_row(i);
+    if !offset.has_protected_blank_rows() || !(0..prefixes.len()).any(blank_row) {
+        return (prefixes, None);
+    }
+    if common.is_empty() {
+        return (prefixes, None);
+    }
+    let fill = common;
+    let first_row_blank = blank_row(0).then(|| fill.to_string());
+    let filled = (0..prefixes.len())
+        .map(|i| {
+            if blank_row(i) {
+                fill.to_string()
+            } else {
+                prefixes[i].clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    (std::borrow::Cow::Owned(filled), first_row_blank)
 }
 
 /// Re-apply the region's host per-line prefixes to the pipeline's final text
@@ -1756,7 +1856,29 @@ fn pipeline_region_text(
 /// - **Empty output lines** get the prefix with trailing whitespace trimmed
 ///   (`>` not `> `; a space-only prefix is left off entirely) so the pipeline
 ///   introduces no trailing-whitespace violations.
+#[cfg(test)]
 fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -> String {
+    let mut content = host_line_prefixes;
+    while let [rest @ .., last] = content {
+        if !last.is_empty() {
+            break;
+        }
+        content = rest;
+    }
+    reapply_host_line_prefixes_with(
+        final_text,
+        host_line_prefixes,
+        longest_common_prefix(content),
+    )
+}
+
+/// [`reapply_host_line_prefixes`] with the region's common prefix `lcp`
+/// given, as [`block_common_prefix`] computes it.
+fn reapply_host_line_prefixes_with(
+    final_text: &str,
+    host_line_prefixes: &[String],
+    lcp: &str,
+) -> String {
     let lines = split_lsp_lines(final_text);
     if lines.len() <= 1 {
         // Single-line output sits entirely after the first line's host prefix.
@@ -1764,24 +1886,7 @@ fn reapply_host_line_prefixes(final_text: &str, host_line_prefixes: &[String]) -
     }
 
     let line_count_preserved = lines.len() == host_line_prefixes.len();
-    let lcp = if line_count_preserved {
-        ""
-    } else {
-        // A region whose content ends with '\n' carries a trailing
-        // empty-prefix entry for the synthetic line bucket after the final
-        // newline; that host line's own prefix sits OUTSIDE the replacement
-        // range (the range ends at its column 0). Including it would
-        // collapse the LCP to "" for a uniformly prefixed blockquote, so the
-        // LCP is computed over the content lines' prefixes only.
-        let mut content_prefixes = host_line_prefixes;
-        while let [rest @ .., last] = content_prefixes {
-            if !last.is_empty() {
-                break;
-            }
-            content_prefixes = rest;
-        }
-        longest_common_prefix(content_prefixes)
-    };
+    let lcp = if line_count_preserved { "" } else { lcp };
 
     // Reserve for the prefixes being prepended too (slight over-reserve when
     // empty lines get a trimmed prefix), so the string never reallocates.
@@ -1857,6 +1962,7 @@ fn lsp_line_count(text: &str) -> usize {
 /// Longest common prefix of all strings, on char boundaries. Empty input or
 /// any empty string yields the empty prefix. Returns a slice of the first
 /// string (the prefix is by definition a substring of it), so no allocation.
+#[cfg(test)]
 fn longest_common_prefix(strings: &[String]) -> &str {
     let mut iter = strings.iter();
     let Some(first) = iter.next() else {
@@ -2042,6 +2148,8 @@ mod tests {
             injection_language: language.to_string(),
             virtual_content: String::new(),
             line_column_offsets: vec![0],
+            protected_blank_rows: Vec::new(),
+            container_blank_rows: Vec::new(),
             contiguous: true,
         }
     }
@@ -2679,6 +2787,7 @@ mod tests {
             "{\n}\n  ",
             &RegionOffset::new(1, 19),
             &nix_prefixes(4),
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n{\n}\n  "));
@@ -2695,6 +2804,7 @@ mod tests {
             "    {}\n  ",
             &RegionOffset::new(1, 19),
             &nix_prefixes(3),
+            &[],
         );
 
         assert_eq!(text, None);
@@ -2717,6 +2827,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n  ",
             &RegionOffset::new(1, 19),
             &prefixes,
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n{\n    \"a\": 1\n}\n  "));
@@ -2733,6 +2844,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n",
             &RegionOffset::with_per_line_offsets(3, vec![2, 0]),
             &prefixes,
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
@@ -2748,6 +2860,7 @@ mod tests {
             "{\n    \"a\": 1\n}",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }"));
@@ -2758,6 +2871,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n>     \"a\": 1\n> }\n"));
@@ -2772,6 +2886,7 @@ mod tests {
             "{\n    \"a\": 1\n}\n\n",
             &RegionOffset::with_per_line_offsets(1, vec![2]),
             &["  ".to_string(), String::new(), String::new()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n      \"a\": 1\n  }\n\n"));
@@ -2790,6 +2905,7 @@ mod tests {
                 String::new(),
                 String::new(),
             ],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\nif x; then\n  y\nfi\n  "));
@@ -2804,6 +2920,7 @@ mod tests {
             "{\n  \"a\": 1\n}",
             &RegionOffset::new(0, 19),
             &["  d = /* json */ ''".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("{\n  \"a\": 1\n}"));
@@ -2818,14 +2935,470 @@ mod tests {
             "\nx",
             &RegionOffset::with_per_line_offsets(3, vec![2]),
             &["> ".to_string()],
+            &[],
         );
 
         assert_eq!(text.as_deref(), Some("\n> x"));
     }
 
+    /// A list item's fence records no prefix for its blank rows. Formatted
+    /// text the pipeline puts back must keep every non-blank line indented
+    /// as the item's content, or the list item ends. Each case applies the
+    /// pipeline's replacement to the host and compares the exact host text.
+    #[rstest::rstest]
+    // A blank line added between two content rows (line count changes).
+    #[case::interior_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n  b\n  ```\n",
+        vec![2, 0, 2, 0],
+        "a = 1\n\nb\n",
+        "a = 1\n\n\nb\n",
+        "- item\n\n  ```py\n  a = 1\n\n\n  b\n  ```\n"
+    )]
+    // A line added after a leading blank row (line count changes).
+    #[case::leading_blank_row(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "\na = 1\nb = 2\n",
+        "- item\n\n  ```py\n\n  a = 1\n  b = 2\n  ```\n"
+    )]
+    // The leading blank row dropped: the first line now opens the block.
+    #[case::leading_blank_row_dropped(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "a = 1\n",
+        "- item\n\n  ```py\n  a = 1\n  ```\n"
+    )]
+    // A no-break space is text to markdown, not a blank line.
+    #[case::no_break_space_onto_leading_blank_row(
+        "- item\n\n  ```py\n\n  a = 1\n  ```\n",
+        vec![0, 2, 0],
+        "\na = 1\n",
+        "\u{a0}\na = 1\n",
+        "- item\n\n  ```py\n  \u{a0}\n  a = 1\n  ```\n"
+    )]
+    // Content moved onto a trailing blank row (line count kept).
+    #[case::content_onto_trailing_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n\n  ```\n",
+        vec![2, 0, 0, 0],
+        "a = 1\n\n\n",
+        "a = 1\nb\n\n",
+        "- item\n\n  ```py\n  a = 1\n  b\n\n  ```\n"
+    )]
+    // Content moved onto the blank row (line count kept).
+    #[case::content_onto_blank_row(
+        "- item\n\n  ```py\n  a = 1\n\n  b\n  ```\n",
+        vec![2, 0, 2, 0],
+        "a = 1\n\nb\n",
+        "a = 1\nc\nb\n",
+        "- item\n\n  ```py\n  a = 1\n  c\n  b\n  ```\n"
+    )]
+    fn pipeline_keeps_a_list_item_fence_indented_past_its_blank_rows(
+        #[case] host: &str,
+        #[case] columns: Vec<u32>,
+        #[case] original_virtual: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: &str,
+    ) {
+        let offset = RegionOffset::with_content(3, columns.clone(), original_virtual);
+        let mapper = crate::text::PositionMapper::new(host);
+        let prefixes = extract_host_line_prefixes(
+            &mapper,
+            host,
+            3,
+            &columns,
+            lsp_line_count(original_virtual),
+        );
+        let new_text = pipeline_region_text(
+            original_virtual,
+            formatted,
+            &offset,
+            &prefixes,
+            &offset.protected_blank_row_list(),
+        )
+        .expect("the region changed");
+        let range = region_replacement_range(original_virtual, &offset).unwrap();
+
+        let edited_host =
+            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]);
+        assert_eq!(edited_host, expected_host);
+        // Read back by injection discovery, the host holds the formatted text.
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(&edited_host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &md,
+            "((fenced_code_block (info_string (language) @injection.language) \
+              (code_fence_content) @injection.content))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            &edited_host,
+            &query,
+            0,
+        );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].virtual_content, formatted);
+    }
+
+    /// A paragraph's lazy continuation line records no prefix but holds
+    /// text: the pipeline leaves it as it was when it changes another line,
+    /// adding no prefix the host did not have.
+    #[rstest::rstest]
+    #[case::blockquote("> a\nb\n> c\n", "a\nb\nC", "> a\nb\n> C\n")]
+    #[case::list_item("- a\nb\n  c\n", "a\nb\nC", "- a\nb\n  C\n")]
+    fn pipeline_leaves_a_lazy_continuation_line_unprefixed(
+        #[case] host: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: &str,
+    ) {
+        let md: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&md).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &md,
+            "((inline) @injection.content (#set! injection.language \"markdown_inline\"))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        assert_eq!(resolved.line_column_offsets, vec![2, 0, 2]);
+        let offset = RegionOffset::with_content(
+            0,
+            resolved.line_column_offsets.clone(),
+            &resolved.virtual_content,
+        );
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            0,
+            &resolved.line_column_offsets,
+            lsp_line_count(&resolved.virtual_content),
+        );
+        let new_text = pipeline_region_text(
+            &resolved.virtual_content,
+            formatted,
+            &offset,
+            &prefixes,
+            &[],
+        )
+        .expect("the region changed");
+        let range = region_replacement_range(&resolved.virtual_content, &offset).unwrap();
+
+        assert_eq!(
+            crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]),
+            expected_host
+        );
+    }
+
+    /// A string whose content has an escape sequence records per-line
+    /// offsets, with prefixes made of host code (`    x = """`), not of
+    /// container markers. The pipeline adds none of that text to output
+    /// on the string's blank rows.
+    #[test]
+    fn pipeline_adds_no_prefix_to_blank_rows_of_a_string_opening_mid_line() {
+        let host = "    x = \"\"\"a\n\n    \\tb\"\"\"\n";
+        let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &language,
+            "((string (string_content) @injection.content) \
+              (#set! injection.language \"sql\"))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.py").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        let original = resolved.virtual_content.clone();
+        let columns = resolved.line_column_offsets.clone();
+        assert_eq!(
+            (original.as_str(), columns.as_slice()),
+            ("a\n\n    b", &[11, 0, 6][..])
+        );
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            0,
+            &columns,
+            lsp_line_count(&original),
+        );
+        assert!(resolved.container_blank_rows.is_empty());
+        let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
+
+        let text = pipeline_region_text(&original, "a\nz\n    b", &offset, &prefixes, &[])
+            .expect("the region changed");
+
+        assert_eq!(text, "a\nz\n    \\t    b");
+    }
+
+    const SHORT_ROW_HOST: &str = "- item\n\n  ```py\n  a\n \n  b\n  ```\n";
+
+    /// A region discovery marks no container blank rows on (a Python string)
+    /// gets the common prefix main gives it: its blank row's empty prefix
+    /// still counts when the line count changes.
+    #[test]
+    fn pipeline_keeps_main_s_common_prefix_outside_container_blocks() {
+        let text = pipeline_region_text(
+            "a\n\n    b",
+            "a\nz\n\n    b",
+            &RegionOffset::with_per_line_offsets(0, vec![11, 0, 6]),
+            &[
+                "    x = \"\"\"".to_string(),
+                String::new(),
+                "    \\t".to_string(),
+            ],
+            &[],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\nz\n\n    b"));
+    }
+
+    /// Without container blank rows, the common prefix is main's: the
+    /// longest prefix of the rows past the trailing empty entries.
+    #[test]
+    fn block_common_prefix_without_container_blank_rows_is_main_s() {
+        let fixtures: &[&[&str]] = &[
+            &["> ", "> ", ""],
+            &["> ", "> > ", "> "],
+            &["> ", ">", "> "],
+            &["  ", "", "  ", ""],
+            &["  ", " ", "  ", ""],
+            &["  ", "\t", "  ", ""],
+            &["", "  ", ""],
+            &["    x = \"\"\"", "", "    \\t"],
+            &["    ", ""],
+            &["    ", "", ""],
+            &["  d = /* json */ ''"],
+            &["> - ", ">   ", ">", ">   "],
+            &[],
+            &["", "", ""],
+        ];
+        for fixture in fixtures {
+            let prefixes: Vec<String> = fixture.iter().map(|p| p.to_string()).collect();
+            let mut content = prefixes.as_slice();
+            while let [rest @ .., last] = content {
+                if !last.is_empty() {
+                    break;
+                }
+                content = rest;
+            }
+            assert_eq!(
+                block_common_prefix(&prefixes, &[]),
+                longest_common_prefix(content),
+                "{fixture:?}"
+            );
+        }
+    }
+
+    /// A blank row keeping one space of a two-space item records a 1-space
+    /// prefix. It is a blank row of the item: output there takes the item's
+    /// indentation, and its short prefix does not narrow the common prefix
+    /// that new lines take.
+    #[rstest::rstest]
+    // Line count changed: new lines take the common prefix.
+    #[case::line_added(
+        SHORT_ROW_HOST,
+        "a\n\nb\nc\n",
+        Some("- item\n\n  ```py\n  a\n\n  b\n  c\n  ```\n")
+    )]
+    // Line count kept: text put on the short row takes the item's prefix.
+    #[case::text_onto_the_short_row(
+        SHORT_ROW_HOST,
+        "a\nz\nb\n",
+        Some("- item\n\n  ```py\n  a\n  z\n  b\n  ```\n")
+    )]
+    // A leading short row the output now opens with text: the row's own
+    // space stays, and the rest of the item's indentation is added.
+    #[case::leading_short_row_dropped(
+        "- item\n\n  ```py\n \n  a\n  ```\n",
+        "a\n",
+        Some("- item\n\n  ```py\n  a\n  ```\n")
+    )]
+    // A fence holding only blank rows is all layout to the pipeline (see
+    // `restore_edge_layout`): it is left as it is, as main leaves it.
+    #[case::blank_only_fence("- item\n\n  ```py\n\n  ```\n", "pass\n", None)]
+    // A leading tab row already gives the item its indentation: the
+    // output's first line keeps the tab.
+    #[case::leading_tab_row_dropped(
+        "- item\n\n  ```py\n\t\n  a\n  ```\n",
+        "a\n",
+        Some("- item\n\n  ```py\n\ta\n  ```\n")
+    )]
+    // An interior tab row neither narrows the prefix new lines take nor
+    // takes one itself.
+    #[case::tab_row_line_added(
+        "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n",
+        "a\n\nb\nc\n",
+        Some("- item\n\n  ```py\n  a\n\n  b\n  c\n  ```\n")
+    )]
+    #[case::text_onto_a_tab_row(
+        "- item\n\n  ```py\n  a\n\t\n  b\n  ```\n",
+        "a\nz\nb\n",
+        Some("- item\n\n  ```py\n  a\n\tz\n  b\n  ```\n")
+    )]
+    fn pipeline_indents_a_short_whitespace_blank_row_of_a_list_item_fence(
+        #[case] host: &str,
+        #[case] formatted: &str,
+        #[case] expected_host: Option<&str>,
+    ) {
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(host, None).unwrap();
+        let query = tree_sitter::Query::new(
+            &language,
+            "((fenced_code_block (info_string (language) @injection.language) \
+              (code_fence_content) @injection.content))",
+        )
+        .unwrap();
+        let resolved = crate::language::InjectionResolver::resolve_all(
+            &crate::language::LanguageCoordinator::new(),
+            &crate::language::NodeTracker::new(),
+            &url::Url::parse("file:///test.md").unwrap(),
+            &tree,
+            host,
+            &query,
+            0,
+        )
+        .swap_remove(0);
+        let original = resolved.virtual_content.clone();
+        let columns = resolved.line_column_offsets.clone();
+        let start_line = resolved.region.line_range.start;
+        let prefixes = extract_host_line_prefixes(
+            &crate::text::PositionMapper::new(host),
+            host,
+            start_line,
+            &columns,
+            lsp_line_count(&original),
+        );
+        let container_blank_rows = resolved.container_blank_rows.clone();
+        let (offset, ..) = crate::lsp::lsp_impl::region_offset::resolved_region_geometry(resolved);
+        let range = region_replacement_range(&original, &offset).unwrap();
+        let edited = pipeline_region_text(
+            &original,
+            formatted,
+            &offset,
+            &prefixes,
+            &container_blank_rows,
+        )
+        .map(|new_text| crate::text::edit::apply_text_edits(host, &[TextEdit { range, new_text }]));
+
+        assert_eq!(edited.as_deref(), expected_host);
+    }
+
+    /// Filling the blank rows of a long list-item fence takes time linear
+    /// in its rows. Rescanning the rows after each one would make the
+    /// 200k-row fence below take a minute or more (about 2e10 row checks);
+    /// the bound leaves a wide margin for a loaded machine.
+    #[rstest::rstest]
+    // Closed by a fence row: the content ends with a line break.
+    #[case::closed_fence(String::new(), "\n")]
+    // A prefixed last row, the content ending mid-row on it.
+    #[case::prefixed_last_row("  ".to_string(), "b")]
+    fn pipeline_fills_the_blank_rows_of_a_long_fence_in_linear_time(
+        #[case] last_prefix: String,
+        #[case] last_text: &str,
+    ) {
+        const BLANK_ROWS: usize = 199_999;
+        let mut columns = vec![2];
+        columns.extend(std::iter::repeat_n(0, BLANK_ROWS));
+        columns.push(u32::from(!last_prefix.is_empty()) * 2);
+        let mut prefixes = vec!["  ".to_string()];
+        prefixes.extend(std::iter::repeat_n(String::new(), BLANK_ROWS));
+        prefixes.push(last_prefix);
+        let original = format!("a{}{}", "\n".repeat(BLANK_ROWS + 1), last_text.trim_end());
+        let formatted = format!("a\nc{}{}", "\n".repeat(BLANK_ROWS), last_text.trim_end());
+        let started = std::time::Instant::now();
+
+        let offset = RegionOffset::with_content(3, columns, &original);
+        let text = pipeline_region_text(
+            &original,
+            &formatted,
+            &offset,
+            &prefixes,
+            &offset.protected_blank_row_list(),
+        )
+        .expect("the region changed");
+
+        assert!(text.starts_with("a\n  c\n"), "{:?}", &text[..12]);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_leaves_an_unprefixed_last_row_of_a_region_ending_mid_row() {
+        // A custom query's region ending mid-row on an unprefixed row: that
+        // row is content, not a blank row of a prefixed block.
+        let text = pipeline_region_text(
+            "x\ny",
+            "x\nz",
+            &RegionOffset::with_per_line_offsets(3, vec![4, 0]),
+            &["    ".to_string(), String::new()],
+            &[],
+        );
+
+        assert_eq!(text.as_deref(), Some("x\nz"));
+    }
+
+    #[test]
+    fn pipeline_leaves_the_row_after_a_blockquoted_fence_content_unprefixed() {
+        // The row after the content's final line break is the closing
+        // fence's, whose own prefix follows the replacement.
+        let text = pipeline_region_text(
+            "a\nb\n",
+            "a\nc\n",
+            &RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]),
+            &["> ".to_string(), "> ".to_string(), String::new()],
+            &[],
+        );
+
+        assert_eq!(text.as_deref(), Some("a\n> c\n"));
+    }
+
+    #[test]
+    fn pipeline_leaves_the_later_rows_of_a_one_offset_region_unprefixed() {
+        // One column offset: only the first row is offset, by design.
+        let text = pipeline_region_text(
+            "x\ny\n",
+            "x\nz\n",
+            &RegionOffset::new(3, 4),
+            &["    ".to_string(), String::new(), String::new()],
+            &[],
+        );
+
+        assert_eq!(text.as_deref(), Some("x\nz\n"));
+    }
+
     #[test]
     fn pipeline_lets_a_fence_lose_its_leading_blank_line() {
-        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[]);
+        let text = pipeline_region_text("\nx\n", "x\n", &RegionOffset::new(1, 0), &[], &[]);
 
         assert_eq!(text.as_deref(), Some("x\n"));
     }
