@@ -70,6 +70,9 @@ struct Setup {
     /// Have the echo mock answer renames only once the test creates
     /// `release` in its directory.
     rename_after_release: bool,
+    /// Also bridge markdown itself to an echo mock (`hostecho`), whose
+    /// rename answers the host layer.
+    host_echo: bool,
     /// Have the echo mock answer code actions only once the test creates
     /// `release` in its directory.
     code_action_after_release: bool,
@@ -104,6 +107,7 @@ impl Default for Setup {
             second_on_type: false,
             color_after_release: false,
             rename_after_release: false,
+            host_echo: false,
             code_action_after_release: false,
             apply_edit_after_change: false,
             second_code_action: false,
@@ -157,6 +161,14 @@ impl Setup {
             markdown["layers"] = json!({ "aggregation": {
                 "textDocument/formatting": { "strategy": strategy, "priorities": priorities },
                 "textDocument/onTypeFormatting": { "strategy": strategy, "priorities": priorities }
+            } });
+        }
+        if self.host_echo {
+            markdown["bridge"]["_self"] = json!({ "enabled": true });
+            // Hovers stay with the injected layer: a test's hover is then
+            // answered while the host mock holds a rename back.
+            markdown["layers"] = json!({ "aggregation": {
+                "textDocument/hover": { "priorities": ["virt"] }
             } });
         }
         if self.combined {
@@ -231,6 +243,12 @@ impl Setup {
             servers["second"] = json!({
                 "cmd": [mock_bin(), "code-action"],
                 "languages": ["lua"]
+            });
+        }
+        if self.host_echo {
+            servers["hostecho"] = json!({
+                "cmd": [mock_bin(), "echo-document"],
+                "languages": ["markdown"]
             });
         }
         if self.slow_host.is_some() {
@@ -1092,6 +1110,49 @@ fn a_rename_the_host_moved_under_is_answered_as_content_modified() {
         .any(|line| line.starts_with("textDocument/rename\t"))
     {
         assert!(Instant::now() < until, "rename request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    assert_eq!(response["error"]["code"], -32801, "{response}");
+}
+
+#[test]
+fn a_rename_the_host_moved_under_is_not_answered_by_the_host_layer() {
+    // Both layers answer the rename, each only once released, and the
+    // host is edited while the requests are out. The injected layer's
+    // answer, made for the text before the edit, is no answer; the host
+    // layer's was read for that text too, so it does not stand in: the
+    // editor is told the content was modified.
+    let (mut client, dir) = Setup {
+        rename_after_release: true,
+        host_echo: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/rename-stale-host.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": 3, "character": 8 },
+        "newName": "y"
+    });
+    let id = client.send_request_async("textDocument/rename", request);
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with("textDocument/rename\t"))
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < until, "rename requests not sent");
         std::thread::sleep(Duration::from_millis(20));
     }
     change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
