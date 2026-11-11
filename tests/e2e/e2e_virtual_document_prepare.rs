@@ -1102,6 +1102,33 @@ fn a_rename_the_host_moved_under_is_answered_as_content_modified() {
 }
 
 #[test]
+fn a_rename_its_map_refuses_is_answered_as_an_error() {
+    // The echo mock answers an edit past the document's end, which the
+    // map refuses, and no other server or layer renames: the editor is
+    // told why, not that there is nothing to rename.
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/rename-refused.md";
+    let text = "# t\n\n```lua\n  local x = 1 -- REFUSE\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 8 },
+            "newName": "y"
+        }),
+    );
+    assert_eq!(response["error"]["code"], -32803, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cannot be mapped back")),
+        "{response}"
+    );
+}
+
+#[test]
 fn linked_editing_ranges_map_back_through_the_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
     let uri = "file:///prepare/linked.md";

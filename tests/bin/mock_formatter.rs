@@ -31,7 +31,8 @@
 //!   the hovered line in its own coordinates; formatting, range and on-type
 //!   (`;`) formatting uppercase, each `; ` breaking the line; rename replaces the first line
 //!   (with `MOCK_RENAME_AFTER_RELEASE`, once the release file exists, as
-//!   prepareRename answers the word at the position); linked
+//!   prepareRename answers the word at the position; a document holding
+//!   `REFUSE` gets an edit past its end instead); linked
 //!   editing ranges are every occurrence of the word at the position; code
 //!   actions are `echo-fix` (the first line replaced) and the lazy
 //!   `echo-wrap` (resolved: the document wrapped in `do`/`end`); a pull diagnostic
@@ -3111,6 +3112,25 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                // A document holding `REFUSE` gets an edit past its end,
+                // which a prepared map refuses.
+                if documents
+                    .get(&uri)
+                    .is_some_and(|text| text.contains("REFUSE"))
+                {
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({ "changes": { uri: [{
+                            "range": {
+                                "start": { "line": 99, "character": 0 },
+                                "end": { "line": 99, "character": 0 }
+                            },
+                            "newText": "x"
+                        }] } }),
+                    );
+                    continue;
+                }
                 let width = documents
                     .get(&uri)
                     .and_then(|text| text.lines().next())
