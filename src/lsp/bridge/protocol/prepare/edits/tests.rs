@@ -3464,6 +3464,27 @@ mod formatting {
         );
     }
 
+    #[test]
+    fn every_line_rewritten_past_likeness_is_changed_on_its_own() {
+        // Every line given other letters, as many lines as before: none
+        // pairs with the line it was, and each is still changed in place,
+        // not replaced with the rest in one stretch.
+        let count = 20_000;
+        let virtual_text: String = (0..count).map(|index| format!("  a{index} x\n")).collect();
+        let map = dedent_lines(&virtual_text, &vec![2; count]);
+        let formatted: String = (0..count).map(|index| format!("b{index} y\n")).collect();
+        let answer = [edit((0, 0), (count as u32, 0), &formatted)];
+        let mapped = map.map_formatting_answer(&answer).unwrap();
+        let expected: String = (0..count).map(|index| format!("  b{index} y\n")).collect();
+        assert!(apply_to(&virtual_text, &mapped) == expected);
+        assert!(mapped.len() >= count, "{}", mapped.len());
+        assert!(
+            mapped
+                .iter()
+                .all(|edit| edit.range.start.line == edit.range.end.line)
+        );
+    }
+
     #[rstest::rstest]
     #[case::lf("  a\n  b", "  a b")]
     #[case::crlf("  a\r\n  b", "  a b")]

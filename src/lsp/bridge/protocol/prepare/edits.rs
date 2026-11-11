@@ -463,11 +463,10 @@ impl PreparedMap {
     /// what differs and pushed onto `changes`, after the ones before it.
     /// The lines are paired where they read alike but for whitespace and
     /// punctuation (a line a formatter respaced or requoted is the line it
-    /// was), and each pair, and each run of lines between pairs, is
-    /// narrowed on its own. With `work` out, they are taken line for line
-    /// where both hold as many lines, as one text otherwise. Whatever the
-    /// pairing, the change writes `written`: it decides only how small
-    /// the stretches are.
+    /// was), none once `work` is out; each pair is narrowed on its own,
+    /// and so is each run of lines between pairs (see [`Self::push_run`]).
+    /// Whatever the pairing, the change writes `written`: it decides only
+    /// how small the stretches are.
     fn push_changes(
         &self,
         range: Range<usize>,
@@ -476,38 +475,50 @@ impl PreparedMap {
         changes: &mut Vec<(Range<usize>, String)>,
     ) {
         let held = &self.virtual_lines.text[range.clone()];
-        let counts = (
-            lines_with_breaks(held).count(),
-            lines_with_breaks(written).count(),
-        );
-        let Some(pairs) = rewritten_lines(held, written, counts, work) else {
-            if counts.0 == counts.1 {
-                for ((start, held), (_, written)) in
-                    lines_with_breaks(held).zip(lines_with_breaks(written))
-                {
-                    self.push_narrowed(range.start + start, held, written, work, changes);
-                }
-            } else {
-                self.push_narrowed(range.start, held, written, work, changes);
-            }
-            return;
-        };
         let (mut held_at, mut written_at) = (0, 0);
-        for (old, new) in pairs
+        for (old, new) in rewritten_lines(held, written, work)
+            .unwrap_or_default()
             .into_iter()
             .chain([(held.len()..held.len(), written.len()..written.len())])
         {
-            // The lines between pairs, then the pair.
-            for (old, new) in [(held_at..old.start, written_at..new.start), (old, new)] {
-                (held_at, written_at) = (old.end, new.end);
-                self.push_narrowed(
-                    range.start + old.start,
-                    &held[old],
-                    &written[new],
-                    work,
-                    changes,
-                );
+            self.push_run(
+                range.start + held_at,
+                &held[held_at..old.start],
+                &written[written_at..new.start],
+                work,
+                changes,
+            );
+            (held_at, written_at) = (old.end, new.end);
+            self.push_narrowed(
+                range.start + old.start,
+                &held[old],
+                &written[new],
+                work,
+                changes,
+            );
+        }
+    }
+
+    /// The change of V's whole lines `held`, at `start`, into the lines
+    /// `written`, none of which pairs with one of them: line for line where
+    /// both hold as many lines (a formatter rewriting every line in place
+    /// changes each on its own), as one text otherwise.
+    fn push_run(
+        &self,
+        start: usize,
+        held: &str,
+        written: &str,
+        work: &mut Work,
+        changes: &mut Vec<(Range<usize>, String)>,
+    ) {
+        if lines_with_breaks(held).count() == lines_with_breaks(written).count() {
+            for ((at, held), (_, written)) in
+                lines_with_breaks(held).zip(lines_with_breaks(written))
+            {
+                self.push_narrowed(start + at, held, written, work, changes);
             }
+        } else {
+            self.push_narrowed(start, held, written, work, changes);
         }
     }
 
@@ -1543,20 +1554,20 @@ fn alike_lines(old_lines: &[(usize, &str)], new: &str, work: &mut Work) -> Vec<(
         .collect()
 }
 
-/// The lines of `held` and `written` (holding `counts` lines) that read
-/// alike in their letters and digits, a longest run of them in order: for
-/// each, the bytes of the line in either text. `None` when `work` runs
-/// out, each line costing `LINE_STEPS` before it is kept. Lines are
-/// compared by a hash of those characters: two that only hash alike pair
-/// as well, which costs a stretch narrowed less, nothing else.
+/// The lines of `held` and `written` that read alike in their letters and
+/// digits, a longest run of them in order: for each, the bytes of the line
+/// in either text. `None` when `work` runs out, each line costing
+/// `LINE_STEPS` before it is kept. Lines are compared by a hash of those
+/// characters: two that only hash alike pair as well, which costs a
+/// stretch narrowed less, nothing else.
 fn rewritten_lines(
     held: &str,
     written: &str,
-    counts: (usize, usize),
     work: &mut Work,
 ) -> Option<Vec<(Range<usize>, Range<usize>)>> {
     use std::hash::{Hash, Hasher};
-    work.spend(LINE_STEPS.saturating_mul(counts.0 + counts.1))?;
+    let count = lines_with_breaks(held).count() + lines_with_breaks(written).count();
+    work.spend(LINE_STEPS.saturating_mul(count))?;
     work.spend((held.len() + written.len()) / BYTES_PER_STEP)?;
     let lines = |text: &str| -> (Vec<Range<usize>>, Vec<u64>) {
         lines_with_breaks(text)
