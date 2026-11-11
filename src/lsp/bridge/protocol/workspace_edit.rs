@@ -34,6 +34,7 @@ use super::virtual_uri::VirtualDocumentUri;
 /// spec applies `documentChanges` in order, so dropping just the op (e.g. a
 /// virtual→real rename) would misdirect later edits at an unrelated existing
 /// file — the caller must discard the whole edit instead.
+#[cfg(test)]
 pub(crate) fn transform_workspace_edit_to_host(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,

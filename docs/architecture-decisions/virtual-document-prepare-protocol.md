@@ -461,6 +461,13 @@ edit states (one ending where the other starts is kept). A file
 operation on a virtual document refuses the whole edit, and other regions'
 virtual documents are dropped, as on any document.
 
+A rename whose edit the map refuses counts as its server not answering:
+a server ranked below it, or another layer, may rename. When none does,
+the rename is answered with a `RequestFailed` error naming the reason,
+not with `null`: that reads as nothing to rename, while a server did
+rename, and asking again would be refused again. (A file operation on a
+virtual document, no rename on any document, stays no answer.)
+
 prepareRename's range, which the client shows as what a rename replaces,
 and linked editing ranges, which it types into together, are offered only
 where they cover in the host exactly the text they cover in P (no removed

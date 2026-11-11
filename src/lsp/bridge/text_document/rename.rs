@@ -20,9 +20,9 @@ use super::super::pool::{LanguageServerPool, UpstreamId};
 use tower_lsp_server::ls_types::RenameParams;
 
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, WorkspaceEditRefusal,
     build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, workspace_edit_has_effect,
+    transform_workspace_edit_to_host_explained, workspace_edit_has_effect,
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
@@ -32,6 +32,9 @@ impl LanguageServerPool {
     /// Delegates to [`execute_bridge_request_with_handle`](Self::execute_bridge_request_with_handle) for the
     /// full lifecycle, providing rename-specific request building and response
     /// transformation.
+    ///
+    /// The inner `Err` is a reply whose edit a prepared map refused: the
+    /// server answered, and its rename cannot be placed in the host.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_rename_request(
         &self,
@@ -47,7 +50,7 @@ impl LanguageServerPool {
         new_name: &str,
         upstream_request_id: Option<UpstreamId>,
         client_progress_token: Option<NumberOrString>,
-    ) -> io::Result<Option<WorkspaceEdit>> {
+    ) -> io::Result<Result<Option<WorkspaceEdit>, WorkspaceEditRefusal>> {
         let handle = self
             .get_or_create_virtual_connection(
                 server_name,
@@ -58,7 +61,7 @@ impl LanguageServerPool {
             )
             .await?;
         if !handle.has_capability("textDocument/rename") {
-            return Ok(None);
+            return Ok(Ok(None));
         }
         self.execute_position_bridge_request_with_handle(
             handle,
@@ -137,29 +140,40 @@ fn transform_workspace_edit_response_to_host(
         offset,
         Position::new(u32::MAX, u32::MAX),
     )
+    .unwrap_or(None)
 }
 
 /// Transform a WorkspaceEdit response and reject edits that escape the region.
+///
+/// `Ok(None)` is no rename (the server's, or one dropped as any document's
+/// is); `Err` is a rename the server answered that a prepared map refused,
+/// which the handler tells the editor when no other server renames.
 fn transform_workspace_edit_response_to_host_bounded(
     mut response: serde_json::Value,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
     region_end: Position,
-) -> Option<WorkspaceEdit> {
+) -> Result<Option<WorkspaceEdit>, WorkspaceEditRefusal> {
     if response_has_jsonrpc_error(&response, "textDocument/rename") {
-        return None;
+        return Ok(None);
     }
-    let result = response.get_mut("result").map(serde_json::Value::take)?;
+    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
+        return Ok(None);
+    };
 
     if result.is_null() {
-        return None;
+        return Ok(None);
     }
 
     // Parse into typed WorkspaceEdit
-    let mut edit: WorkspaceEdit = serde_json::from_value(result).ok()?;
+    let Ok(mut edit) = serde_json::from_value::<WorkspaceEdit>(result) else {
+        return Ok(None);
+    };
 
-    if !transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset) {
+    if let Err(refusal) =
+        transform_workspace_edit_to_host_explained(&mut edit, request_virtual_uri, host_uri, offset)
+    {
         // Through a prepared document, an edit set the host cannot take:
         // said once per rename, its server then counting as not answering.
         if offset.prepared().is_some() {
@@ -168,7 +182,13 @@ fn transform_workspace_edit_response_to_host_bounded(
                 "rename edit for {request_virtual_uri} refused: it cannot be mapped back through the prepared virtual document"
             );
         }
-        return None;
+        return match refusal {
+            // Refused on any document, prepared or not: no rename.
+            WorkspaceEditRefusal::VirtualFileOperation => Ok(None),
+            WorkspaceEditRefusal::DirectHostEditInRegion | WorkspaceEditRefusal::Unmappable => {
+                Err(refusal)
+            }
+        };
     }
     // A multi-file rename's OTHER real files can carry versioned entries;
     // those versions are bridge-local (the downstream's own counters) and
@@ -176,14 +196,14 @@ fn transform_workspace_edit_response_to_host_bounded(
     strip_bridge_local_versions(&mut edit);
 
     if !workspace_edit_within_region(&edit, host_uri, offset, region_end) {
-        return None;
+        return Ok(None);
     }
 
     if !workspace_edit_preserves_line_prefixes(&edit, host_uri, offset, region_end) {
-        return None;
+        return Ok(None);
     }
 
-    workspace_edit_has_effect(&edit).then_some(edit)
+    Ok(workspace_edit_has_effect(&edit).then_some(edit))
 }
 
 #[cfg(test)]
@@ -944,7 +964,7 @@ mod tests {
         );
 
         assert!(
-            edit.is_none(),
+            matches!(edit, Ok(None)),
             "rename must not strip host line prefixes in blockquoted regions"
         );
     }
@@ -978,8 +998,78 @@ mod tests {
         );
 
         assert!(
-            edit.is_none(),
+            matches!(edit, Ok(None)),
             "rename must not insert unprefixed lines into blockquoted regions"
+        );
+    }
+
+    /// A rename the prepared map refuses is told apart from no rename, for
+    /// the handler to say why; a file operation on a virtual document
+    /// stays no rename, as on an unprepared document.
+    #[test]
+    fn a_rename_a_prepared_map_refuses_is_not_no_rename() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let virtual_text = "  local x = 1\n";
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(
+                serde_json::from_value(json!({"segments": [{"type": "content", "changes": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 2}
+                    },
+                    "newText": ""
+                }]}]}))
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(3, 0).with_prepared(prepared.map);
+        let transform = |result: serde_json::Value, offset: &RegionOffset| {
+            transform_workspace_edit_response_to_host_bounded(
+                json!({"jsonrpc": "2.0", "id": 42, "result": result}),
+                &virtual_uri,
+                &host_uri,
+                offset,
+                Position::new(4, 0),
+            )
+        };
+        let past_the_end = json!({"changes": {virtual_uri.clone(): [{
+            "range": {
+                "start": {"line": 99, "character": 0},
+                "end": {"line": 99, "character": 0}
+            },
+            "newText": "x"
+        }]}});
+        assert_eq!(
+            transform(past_the_end.clone(), &offset),
+            Err(WorkspaceEditRefusal::Unmappable)
+        );
+        // Unprepared, the same edit is dropped as it always was.
+        assert_eq!(transform(past_the_end, &RegionOffset::new(3, 0)), Ok(None));
+        let file_operation = json!({"documentChanges": [
+            {"kind": "delete", "uri": virtual_uri.clone()}
+        ]});
+        assert_eq!(transform(file_operation.clone(), &offset), Ok(None));
+        assert_eq!(
+            transform(file_operation, &RegionOffset::new(3, 0)),
+            Ok(None)
+        );
+        // One the map takes still maps.
+        let in_line = json!({"changes": {virtual_uri.clone(): [{
+            "range": {
+                "start": {"line": 0, "character": 6},
+                "end": {"line": 0, "character": 7}
+            },
+            "newText": "y"
+        }]}});
+        let mapped = transform(in_line, &offset).unwrap().unwrap();
+        assert_eq!(
+            mapped.changes.unwrap()[&host_uri][0].range.start,
+            Position::new(3, 8)
         );
     }
 }

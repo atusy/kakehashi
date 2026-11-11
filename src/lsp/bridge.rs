@@ -90,6 +90,7 @@ pub(crate) use protocol::RequestId;
 #[cfg(test)]
 pub(crate) use protocol::Revocation;
 pub(crate) use protocol::VirtualDocumentUri;
+pub(crate) use protocol::WorkspaceEditRefusal;
 pub(crate) use protocol::decode_command;
 pub(crate) use protocol::host_position_within_region_bounds;
 pub(crate) use protocol::host_range_selects_nothing;

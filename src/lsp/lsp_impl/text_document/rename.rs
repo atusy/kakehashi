@@ -7,11 +7,12 @@
 //! `TextDocumentEdit.version`s are nulled. The first layer producing a
 //! non-empty result wins (`preferred`).
 
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::{NumberOrString, Position, RenameParams, Uri, WorkspaceEdit};
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::bridge::WorkspaceEditRefusal;
 use crate::lsp::bridge::strip_bridge_local_versions;
 use crate::lsp::bridge::workspace_edit_has_effect;
 use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim};
@@ -113,13 +114,19 @@ impl Kakehashi {
         // Fan-out rename requests to all matching servers
         let pool = self.bridge.pool_arc();
         let position = ctx.position;
+        // A reply its prepared map refused, the highest-ranked to arrive
+        // so: its server counts as not answering, so one ranked below it
+        // may, and it is told only when none does (below).
+        let refused = std::sync::Arc::new(std::sync::OnceLock::new());
         let result = dispatch_preferred(
             &ctx.document,
             pool.clone(),
             |t| {
                 let new_name = new_name.to_string();
+                let refused = std::sync::Arc::clone(&refused);
                 async move {
-                    t.pool
+                    let reply = t
+                        .pool
                         .send_rename_request(
                             &t.server_name,
                             &t.server_config,
@@ -134,7 +141,11 @@ impl Kakehashi {
                             t.upstream_id,
                             t.client_progress_token,
                         )
-                        .await
+                        .await?;
+                    Ok(reply.unwrap_or_else(|refusal| {
+                        let _ = refused.set(refusal);
+                        None
+                    }))
                 }
             },
             rename_option_has_result,
@@ -142,9 +153,29 @@ impl Kakehashi {
         )
         .await;
         let edit = result.handle(&self.notifier(), "rename", None, Ok).await?;
+        let edit = refused_unless_answered(edit, refused.get().copied())?;
         Ok(edit.map(|edit| {
             Sourced::from_region(&ctx.document, edit, self.bridge.node_tracker(), revision)
         }))
+    }
+}
+
+/// The virt layer's answer once its servers answered: a rename a server
+/// made that the prepared map refused, no other server renaming, is an
+/// error saying why. `null` would read as nothing to rename, and asking
+/// again changes nothing. As its layer's error, it still gives way to
+/// another layer's rename.
+fn refused_unless_answered(
+    edit: Option<WorkspaceEdit>,
+    refusal: Option<WorkspaceEditRefusal>,
+) -> Result<Option<WorkspaceEdit>> {
+    match (edit, refusal) {
+        (None, Some(refusal)) => Err(Error {
+            code: ErrorCode::ServerError(tower_lsp_server::ls_types::error_codes::REQUEST_FAILED),
+            message: format!("kakehashi: rename refused: {refusal}").into(),
+            data: None,
+        }),
+        (edit, _) => Ok(edit),
     }
 }
 
@@ -190,6 +221,69 @@ mod tests {
 
         assert!(rename_workspace_edit_has_result(&edit));
         assert!(rename_option_has_result(&Some(edit)));
+    }
+
+    /// A rename the map refused is told only when no server renamed.
+    #[test]
+    fn a_refused_rename_is_an_error_only_when_no_server_renamed() {
+        let edit = workspace_edit(json!({
+            "changes": { "file:///test.md": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "newText": "x"
+            }] }
+        }));
+        let refusal = WorkspaceEditRefusal::Unmappable;
+
+        let error = refused_unless_answered(None, Some(refusal)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ServerError(-32803));
+        assert!(
+            error.message.contains(&refusal.to_string()),
+            "{}",
+            error.message
+        );
+        // A server ranked below the one refused renamed: its rename stands.
+        assert_eq!(
+            refused_unless_answered(Some(edit.clone()), Some(refusal)).unwrap(),
+            Some(edit)
+        );
+        assert_eq!(refused_unless_answered(None, None).unwrap(), None);
+    }
+
+    /// The refusal is its layer's error: another layer's rename wins over
+    /// it, and it is the answer when no other layer renames.
+    #[tokio::test]
+    async fn a_refused_rename_gives_way_to_another_layers_rename() {
+        use crate::config::settings::LayerSource::{Host, Native, Virt};
+        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
+        let edit = workspace_edit(json!({
+            "changes": { "file:///test.md": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 1 }
+                },
+                "newText": "x"
+            }] }
+        }));
+        let walk = |host: Option<WorkspaceEdit>| {
+            race_layers_preferred(
+                &[Virt, Host, Native],
+                std::future::ready(refused_unless_answered(
+                    None,
+                    Some(WorkspaceEditRefusal::Unmappable),
+                )),
+                std::future::ready(Ok(host)),
+                std::future::ready(Ok(None)),
+                rename_workspace_edit_has_result,
+            )
+        };
+        assert_eq!(walk(Some(edit.clone())).await.unwrap(), Some(edit));
+        assert_eq!(
+            walk(None).await.unwrap_err().code,
+            ErrorCode::ServerError(-32803)
+        );
     }
 
     /// Passed over, a prepared rename is still the answer when no other
