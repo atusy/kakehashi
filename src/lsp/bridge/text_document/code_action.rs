@@ -1007,22 +1007,16 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         };
-        // The final check, as a rename's or a formatting answer's: the map's
-        // region still the host's text (settled, not held, recorded with
-        // those very coordinates, the map unrevoked). The host unedited
-        // since the action was listed is the caller's to check, with the
-        // envelope's revision.
+        // The final check, as a rename's or a formatting answer's: the map
+        // the reply was read through not revoked since (its peer failed the
+        // text it prepared). The host unedited since the action was listed
+        // is the caller's to check, with the envelope's revision.
         if let Some(map) = &held_map
-            && !self.host_text_still_current(
-                &host_url,
-                &envelope.injection_language,
-                &envelope.region_id,
-                map,
-            )
+            && map.revoked()
         {
             log::debug!(
                 target: "kakehashi::bridge",
-                "codeAction/resolve: the prepared text the action was listed on is no longer the host's; returning unresolved"
+                "codeAction/resolve: the prepared text the action was listed on was revoked; returning unresolved"
             );
             re_envelope_action(&mut action, &envelope);
             return action;

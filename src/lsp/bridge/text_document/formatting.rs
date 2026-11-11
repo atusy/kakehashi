@@ -2564,7 +2564,6 @@ mod tests {
         pool.note_host_edited(&host, 1, 1);
         let top = reply("top");
         // Settled, this region's text unchanged: the next server replies.
-        pool.note_host_settled(&host, 1, 1);
         let next = reply("next");
         assert!(!next.as_ref().unwrap().is_empty());
         let mut tasks = tokio::task::JoinSet::new();

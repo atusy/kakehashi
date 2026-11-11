@@ -1466,7 +1466,6 @@ mod tests {
         let id = wait_for_sent_request(&handle, &upstream).await;
         pool.note_host_edited(&uri, 1, 1);
         pool.record_latest_prepared_for_test(&uri, 1, "lua", &region, &after);
-        pool.note_host_settled(&uri, 1, 1);
         let _ = handle.router().route(serde_json::json!({
             "jsonrpc": "2.0", "id": id.as_i64(), "result": [{
                 "position": {"line": 0, "character": 0}, "label": "add lines",
@@ -1530,7 +1529,6 @@ mod tests {
         record(&before);
         pool.note_host_edited(&uri, 1, 1);
         record(&after);
-        pool.note_host_settled(&uri, 1, 1);
         let offset = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
         // What the edit would do through the request's map.
         let mut edits = vec![TextEdit {
@@ -1546,165 +1544,15 @@ mod tests {
             edits[0].range,
             Range::new(Position::new(0, 2), Position::new(0, 3))
         );
-        assert!(!pool.host_text_still_current(&uri, "lua", TEST_ULID_LUA_0, &before.map));
-    }
-
-    /// A response is placed through its request's map only while the
-    /// region's latest recorded content is the request's very text in the
-    /// very same coordinates: not while the host's newer text waits for its
-    /// answer, nor once another text is recorded — re-indented under the
-    /// same prepared text, or typed on — whatever the connection still
-    /// holds, which lags behind.
-    #[tokio::test]
-    async fn a_response_is_placed_only_while_its_map_describes_the_current_host_text() {
-        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
-        let strip = |virtual_text: &str, columns: u32| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
-                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": columns}}, "newText": ""}
-            ]}]}))
-            .unwrap();
-            apply_prepare_result(
-                virtual_text,
-                &VirtualLayout::single(virtual_text),
-                Some(answer),
-            )
-            .unwrap()
-        };
-        // Every line's two leading spaces stripped (lines with fewer are
-        // left alone).
-        let strip_lines = |virtual_text: &str| {
-            let changes: Vec<_> = virtual_text
-                .split('\n')
-                .enumerate()
-                .filter(|(_, line)| line.starts_with("  "))
-                .map(|(line, _)| serde_json::json!({
-                    "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 2}},
-                    "newText": ""
-                }))
-                .collect();
-            let answer = serde_json::from_value(
-                serde_json::json!({"segments": [{"type": "content", "changes": changes}]}),
-            )
-            .unwrap();
-            apply_prepare_result(
-                virtual_text,
-                &VirtualLayout::single(virtual_text),
-                Some(answer),
-            )
-            .unwrap()
-        };
-        // `  red` re-indented to `    red`: the same prepared text; typed
-        // on to `  redd`: another.
-        let before = strip("  red\n", 2);
-        let reindented = strip("    red\n", 4);
-        let typed = strip("  redd\n", 2);
-        assert_eq!(before.text, reindented.text);
-        let pool = LanguageServerPool::preparing();
-        // The prepare layer's table, which holds are kept in.
-        pool.prepare_failures_for_test();
-        let host_uri = Url::parse("file:///test/reindent.md").unwrap();
-        pool.open_host_incarnation(&host_uri, 1).await;
-        let record = |prepared: &crate::lsp::bridge::protocol::PreparedDocument| {
-            pool.record_latest_virtual_content(
-                &host_uri,
-                1,
-                "lua",
-                TEST_ULID_LUA_0,
-                SentText {
-                    text: &prepared.text,
-                    map: Some(&prepared.map),
-                },
-            );
-        };
-        record(&before);
-        let request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&before.map));
-        let current = |offset: &RegionOffset| {
-            offset.prepared().is_none_or(|request_map| {
-                pool.host_text_still_current(&host_uri, "lua", TEST_ULID_LUA_0, request_map)
-            })
-        };
-        assert!(current(&request));
-        // The host's newer text waits for its answer: held.
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
-        assert!(!current(&request));
-        // Its answer recorded (the hold cleared in the same step): the same
-        // prepared text under a new map, however late the connection is.
-        record(&reindented);
-        assert!(!current(&request));
-        // Typing on recorded another prepared text: dropped too (the
-        // client asks again for it).
-        record(&typed);
-        assert!(!current(&request));
-        // The request's own text current again (an undo): kept, in the same
-        // coordinates whichever answer gave them.
-        record(&strip("  red\n", 2));
-        assert!(current(&request));
-        // Typed on as its indentation changed (`  red` to `    redx`).
-        record(&strip("    redx\n", 4));
-        assert!(!current(&request));
-        // Lines added, before or after a dedented one, or left alone: other
-        // texts, whose blank lines and joins place an edit otherwise.
-        let two_lines = strip_lines("  red\n  b\n");
-        let two_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&two_lines.map));
-        record(&two_lines);
-        assert!(current(&two_request));
-        record(&strip_lines("  red\n  x\n  b\n"));
-        assert!(!current(&two_request));
-        record(&strip_lines("  red\n  b\nc\n"));
-        assert!(!current(&two_request));
-        // A blank line typed on (`  a\n\n` to `  a\nb\n`): the request's
-        // map gives an inserted line the content's indentation, the current
-        // one joins `b` as typed.
-        let blank = strip_lines("  a\n\n");
-        let blank_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&blank.map));
-        record(&blank);
-        assert!(current(&blank_request));
-        record(&strip_lines("  a\nb\n"));
-        assert!(!current(&blank_request));
-        // The region sent as is since (its pair lost its peer).
-        pool.record_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0, "  red\n");
-        assert!(!current(&request));
-        record(&before);
-        // The host edited, its pass not settled yet (the parse window,
-        // before any hold is published): the recorded text may be the one
-        // before the edit, so pending.
-        pool.note_host_edited(&host_uri, 1, 7);
-        assert!(!current(&request));
-        // A pass settling an older version, or another incarnation's,
-        // settles nothing.
-        pool.note_host_settled(&host_uri, 1, 6);
-        pool.note_host_settled(&host_uri, 2, 7);
-        assert!(!current(&request));
-        // Settled: the recorded text describes the host again.
-        pool.note_host_settled(&host_uri, 1, 7);
-        assert!(current(&request));
-        // An older pass finishing late does not unsettle it.
-        pool.note_host_settled(&host_uri, 1, 5);
-        assert!(current(&request));
-        // Edited and settled past the request's map: the existing rule.
-        pool.note_host_edited(&host_uri, 1, 8);
-        record(&reindented);
-        pool.note_host_settled(&host_uri, 1, 8);
-        assert!(!current(&request));
-        record(&before);
-        // A map its peer revoked since describes nothing it still gives.
-        // (Its own map recorded first: only the revocation refuses it.)
-        let revocation = Arc::new(crate::lsp::bridge::protocol::Revocation::default());
-        let mut revoked = strip("  red\n", 2).map;
-        Arc::get_mut(&mut revoked)
-            .unwrap()
-            .set_revocation(Arc::clone(&revocation));
-        record(&before);
-        let revoked_request = RegionOffset::new(0, 0).with_prepared(Arc::clone(&revoked));
-        assert!(current(&revoked_request));
-        revocation.revoke(crate::lsp::bridge::protocol::next_presentation());
-        assert!(revoked.revoked());
-        assert!(!current(&revoked_request));
-        // A request as is reads nothing.
-        pool.note_host_edited(&host_uri, 1, 9);
-        assert!(current(&RegionOffset::new(0, 0)));
-        pool.hold_latest_virtual_content(&host_uri, 1, "lua", TEST_ULID_LUA_0);
-        assert!(current(&RegionOffset::new(0, 0)));
+        // The typing moved the host past the revision the request read:
+        // its answer is dropped, and it is not waited for.
+        assert!(pool.host_moved_past(
+            &uri,
+            crate::lsp::bridge::HostRevision {
+                incarnation: 1,
+                content_version: 0,
+            }
+        ));
     }
 
     /// A request is queued only while its connection holds the text it was
