@@ -26,8 +26,9 @@ use crate::text::position::normalize_lone_carriage_returns;
 use serde::{Deserialize, Serialize};
 use tower_lsp_server::ls_types::{Position, TextEdit};
 
-/// The request kakehashi sends to the configured prepare peer.
-pub(crate) const PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
+/// The request kakehashi sends to the configured prepare peer; also the
+/// `aggregation` key its candidates are named under.
+pub(crate) const PREPARE_METHOD: &str = crate::config::settings::VIRTUAL_DOCUMENT_PREPARE_METHOD;
 
 /// How long one prepare request may wait for its answer (after the peer is
 /// up). A request that times out counts as no answer and is retried with

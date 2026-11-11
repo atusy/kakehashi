@@ -724,7 +724,7 @@ pub(crate) fn resolve_aggregation_config_from_settings(
         // Intentionally use a stable hard-coded fallback when no bridge config
         // resolves at all. The wildcard "_" strategy may evolve in the future,
         // but this path should remain predictable even if wildcard defaults do.
-        .unwrap_or_else(ResolvedAggregationConfig::with_defaults)
+        .unwrap_or_else(|| ResolvedAggregationConfig::with_defaults_for(method_name))
 }
 
 /// Which servers may contribute **pushed** diagnostics to the injection
@@ -2244,6 +2244,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            languages: crate::lsp::bridge::test_helpers::languages_any_server_prepares(),
             ..Default::default()
         });
         service.inner().bridge.prepare_settings_changed(&settings);

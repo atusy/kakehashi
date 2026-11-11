@@ -28,16 +28,17 @@ the cases someone thought of.
 
 kakehashi asks a peer, `kakehashi/virtualDocument/prepare`, how to present
 each virtual document before any downstream server sees it, and keeps all
-coordinate bookkeeping itself. The peer is any language server that
-advertises the request; tsudoi-language-server is the intended one, since
-its handlers are user code.
+coordinate bookkeeping itself. The peer is a language server the
+configuration names for the request and that advertises it;
+tsudoi-language-server is the intended one, since its handlers are user
+code.
 
 Edits are not mapped back through a prepared document: methods whose
 answers are edits are not available on one (see Coordinates).
 
 ### Configuration and Discovery
 
-The peer is chosen like the servers of any other method, through the
+The peer is named like the servers of any other method, through the
 per-method aggregation map under the method key
 `kakehashi/virtualDocument/prepare`:
 
@@ -46,15 +47,21 @@ per-method aggregation map under the method key
 priorities = ["tsudoi"]
 ```
 
-- The candidates are the servers bridged for the injection language — the
-  ones its `languages` select, as for any request — so a peer lists the
-  languages it prepares (or `"*"`), and receives their documents like any
-  downstream server; `priorities` on the other methods (or the `"_"`
-  method entry) keep it out of their fan-out.
-- `priorities` follows aggregation-priorities-wildcard and inherits from
-  the `"_"` method entry like every LSP method: an ordered allowlist,
-  `"*"` for the unlisted rest (by server name), `["*"]` by default, and
-  `[]` opts a language out.
+- The candidates are the servers `priorities` names among those bridged
+  for the injection language — the ones its `languages` select, as for
+  any request — so a peer lists the languages it prepares (or `"*"`), and
+  receives their documents like any downstream server; `priorities` on
+  the other methods (or the `"_"` method entry) keep it out of their
+  fan-out.
+- `priorities` is an ordered allowlist as for every LSP method
+  (aggregation-priorities-wildcard), `"*"` standing for the unlisted rest
+  (by server name), but it is read at the prepare key alone, never
+  inherited from the `"_"` method entry, and is `[]` by default. A pair
+  with nothing written at the key has no candidate: nothing is looked up,
+  no handshake is waited for, and its documents are sent as is, as
+  without experimental features. An explicit `["*"]` makes every bridged
+  server a candidate. Along the language axis the key is like any other:
+  `bridge._` supplies it to a `bridge.<lang>` that has none.
 - The strategy is always `preferred`: the first candidate, in priority
   order, that advertises
   `capabilities.experimental.kakehashi.virtualDocumentPrepare: true` in its
@@ -110,7 +117,8 @@ The feature is present only with `KAKEHASHI_EXPERIMENTAL=true`. Without
 it, a server's `initialize` result is still parsed, and its advertisement
 is noted on its connection, but it is never recorded for its pairs, so
 nothing is looked up or asked. Only pairs that are
-bridged and have a server for the injection language are prepared.
+bridged and name, at the prepare key, a server of the injection language
+are prepared.
 
 ### The Request
 
@@ -363,6 +371,18 @@ has to translate its own coordinates back, and off-the-shelf servers cannot.
 The protocol exists so the peer that presents is not the server that
 analyzes.
 
+### Every bridged server a candidate by default
+
+Reading `priorities` like any LSP method's — inherited from the `"_"`
+method entry, `["*"]` when unset — would need no configuration for a peer
+to be found. But a candidate still starting is waited for, so every
+region would be held until the slowest server of its language had
+answered its handshake, for whoever turned experimental features on for
+another feature and configured no peer; and an `aggregation."_"`
+allowlist written for LSP methods would decide the candidates. The key
+reads its own entry or nothing instead, as `kakehashi/bridge/routing`
+does.
+
 ### Fall through to the next advertising candidate
 
 Asking the next candidate when the chosen one fails would let a flaky
@@ -403,9 +423,9 @@ a hook per kind of change.
 
 - Every new document version waits for a peer round-trip before downstream
   servers see it.
-- With experimental features on, a language's first document waits for its
-  servers' handshakes to learn whether any prepares it, even when none
-  does.
+- Where candidates are named, a pair's first document waits for their
+  handshakes to learn whether any prepares it, even when none does;
+  `["*"]` names every server bridged for the language.
 - Edit-producing methods (completion, code actions, rename, formatting and
   the others listed in Coordinates) and inbound `workspace/applyEdit` are
   not available on prepared documents; inlay hints lose their edits.
@@ -413,10 +433,10 @@ a hook per kind of change.
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than
   unsent, so servers may see unprepared text until it is up.
-- A peer bridged for every language (`"*"`) prepares every injection it
-  can under the default `priorities`, and declining with `null` still
-  makes a document prepared; restricting it takes `priorities = []` where
-  it should not apply.
+- A peer bridged for every language (`"*"`) and named for every host
+  (at `languages._.bridge._`) prepares every injection it can, and
+  declining with `null` still makes a document prepared; restricting it
+  takes naming it only where it should apply.
 - `*/resolve` for items from prepared documents is refused (stale), as are
   call and type hierarchy follow-ups for their items.
 - Host text the injection query includes in content cannot be protected as

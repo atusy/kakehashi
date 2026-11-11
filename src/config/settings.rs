@@ -33,15 +33,38 @@ pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 /// The kakehashi→downstream routing request (bridge-routing-protocol), which
 /// takes its provider order from the `aggregation` map under this key.
 ///
-/// The first non-LSP method name in that key space, and the only key exempt
-/// from the map's `"_"` method wildcard — see
+/// The first non-LSP method name in that key space, and with
+/// [`VIRTUAL_DOCUMENT_PREPARE_METHOD`] one of the two keys exempt from the
+/// map's `"_"` method wildcard — see
 /// [`crate::config::merge::resolve_aggregation_for_method`].
 pub(crate) const BRIDGE_ROUTING_METHOD: &str = "kakehashi/bridge/routing";
+
+/// The kakehashi→peer request that prepares a virtual document
+/// (virtual-document-prepare-protocol), which takes its candidates from the
+/// `aggregation` map under this key.
+///
+/// Exempt from the map's `"_"` method wildcard, and naming no server by
+/// default (see [`default_priorities_for_method`]): a pair's documents are
+/// held until every candidate has answered its handshake, so a server is a
+/// candidate only where the configuration names it at this key.
+pub(crate) const VIRTUAL_DOCUMENT_PREPARE_METHOD: &str = "kakehashi/virtualDocument/prepare";
 
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {
     vec![PRIORITIES_WILDCARD.to_string()]
+}
+
+/// [`default_priorities`], but for [`VIRTUAL_DOCUMENT_PREPARE_METHOD`]: `[]`,
+/// no candidate. Every server bridged for a language being one would hold
+/// each of its documents until the slowest had started, for whoever enabled
+/// experimental features without configuring a peer.
+fn default_priorities_for_method(method: &str) -> Vec<String> {
+    if method == VIRTUAL_DOCUMENT_PREPARE_METHOD {
+        Vec::new()
+    } else {
+        default_priorities()
+    }
 }
 
 /// Aggregation strategy for combining results from multiple bridge servers.
@@ -268,6 +291,15 @@ impl ResolvedAggregationConfig {
             push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
         }
     }
+
+    /// [`Self::with_defaults`] with `method`'s default `priorities`: none
+    /// for [`VIRTUAL_DOCUMENT_PREPARE_METHOD`].
+    pub(crate) fn with_defaults_for(method: &str) -> Self {
+        Self {
+            priorities: default_priorities_for_method(method),
+            ..Self::with_defaults()
+        }
+    }
 }
 
 fn default_aggregation_strategy_for_method(method: &str) -> AggregationStrategy {
@@ -301,7 +333,7 @@ impl BridgeLanguageConfig {
     ///
     /// A method-specific entry inherits any unset fields from the `_` wildcard
     /// entry (wildcard-config-inheritance) — except at
-    /// [`BRIDGE_ROUTING_METHOD`]; see
+    /// [`BRIDGE_ROUTING_METHOD`] and [`VIRTUAL_DOCUMENT_PREPARE_METHOD`]; see
     /// [`crate::config::merge::resolve_aggregation_for_method`].
     fn resolve_aggregation_entry(&self, method: &str) -> Option<AggregationConfig> {
         crate::config::merge::resolve_aggregation_for_method(self.aggregation.as_ref()?, method)
@@ -327,16 +359,19 @@ impl BridgeLanguageConfig {
                     .strategy
                     .unwrap_or_else(|| default_aggregation_strategy_for_method(method)),
                 // None (unset after merge) resolves to ["*"] — all servers,
-                // first-win. An explicit [] survives as the per-method
-                // fan-out kill switch (aggregation-priorities-wildcard).
-                priorities: entry.priorities.unwrap_or_else(default_priorities),
+                // first-win — but for the prepare key, which names none. An
+                // explicit [] survives as the per-method fan-out kill switch
+                // (aggregation-priorities-wildcard).
+                priorities: entry
+                    .priorities
+                    .unwrap_or_else(|| default_priorities_for_method(method)),
                 max_fan_out: entry.max_fan_out.and_then(|raw| usize::try_from(raw).ok()),
                 pull_fallback: entry.pull_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
                 push_fallback: entry.push_fallback.unwrap_or(DEFAULT_DIAGNOSTIC_FALLBACK),
             },
             None => ResolvedAggregationConfig {
                 strategy: default_aggregation_strategy_for_method(method),
-                priorities: default_priorities(),
+                priorities: default_priorities_for_method(method),
                 max_fan_out: None,
                 pull_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,
                 push_fallback: DEFAULT_DIAGNOSTIC_FALLBACK,

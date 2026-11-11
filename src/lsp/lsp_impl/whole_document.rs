@@ -486,6 +486,14 @@ mod tests {
                         },
                     )
                 })
+                // The peer is the server named at the prepare key.
+                .chain([(
+                    crate::config::settings::VIRTUAL_DOCUMENT_PREPARE_METHOD.to_string(),
+                    crate::config::settings::AggregationConfig {
+                        priorities: Some(vec!["peer".to_string()]),
+                        ..Default::default()
+                    },
+                )])
                 .collect(),
             ),
         };
