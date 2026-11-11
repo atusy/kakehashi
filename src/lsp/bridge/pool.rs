@@ -3737,6 +3737,41 @@ impl LanguageServerPool {
         self.document_tracker.held_text(virtual_uri, connection_key)
     }
 
+    /// The generation of the text `connection_key` holds for `virtual_uri`
+    /// (see [`HeldText::generation`]), while that is the text `prepared`
+    /// describes: what an item listed through `prepared` records, for its
+    /// resolve to find the text again. `None` once another text was sent
+    /// (other coordinates), or none is held.
+    pub(in crate::lsp::bridge) fn generation_held_under(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        prepared: &super::protocol::PreparedMap,
+    ) -> Option<u64> {
+        self.held_text(virtual_uri, connection_key)
+            .filter(|held| {
+                super::protocol::PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared))
+            })
+            .map(|held| held.generation)
+    }
+
+    /// The map `connection_key` holds for `virtual_uri` now, while the
+    /// text it holds is still the one of `generation` (the one an item's
+    /// envelope recorded as it was listed, see
+    /// [`Self::generation_held_under`]). `None` once another text was sent,
+    /// none prepared is held, or the item recorded none.
+    pub(in crate::lsp::bridge) fn map_held_at(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        generation: Option<u64>,
+    ) -> Option<Arc<super::protocol::PreparedMap>> {
+        let generation = generation?;
+        self.held_text(virtual_uri, connection_key)
+            .filter(|held| held.generation == generation)
+            .and_then(|held| held.map)
+    }
+
     /// Record `content` as sent to this connection, as a queued send would.
     #[cfg(test)]
     pub(super) fn record_sent_for_test(

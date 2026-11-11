@@ -1188,10 +1188,8 @@ impl LanguageServerPool {
         prepared: &PreparedMap,
         upstream_caps: UpstreamCodeActionCaps,
     ) -> (Option<u64>, UpstreamCodeActionCaps, bool) {
-        let held_generation = virtual_uri
-            .and_then(|uri| self.held_text(uri, connection_key))
-            .filter(|held| PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared)))
-            .map(|held| held.generation);
+        let held_generation =
+            virtual_uri.and_then(|uri| self.generation_held_under(uri, connection_key, prepared));
         match held_generation {
             Some(_) => (held_generation, upstream_caps, true),
             None => (
@@ -1216,9 +1214,7 @@ impl LanguageServerPool {
         connection_key: &ConnectionKey,
         envelope: &CodeActionEnvelope,
     ) -> Option<Arc<PreparedMap>> {
-        self.held_text(virtual_uri, connection_key)
-            .filter(|held| Some(held.generation) == envelope.held_generation)
-            .and_then(|held| held.map)
+        self.map_held_at(virtual_uri, connection_key, envelope.held_generation)
     }
 
     /// Send a `codeAction/resolve` request on an already-connected handle and
