@@ -1026,6 +1026,110 @@ fn a_pushed_diagnostic_follows_its_prepared_region_below_an_edit() {
     a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(true, EDITED_ABOVE, 5);
 }
 
+/// The item a resolving mock completes at the end of `pr` in `uri`, once
+/// the peer and the mock are up.
+fn resolvable_item(client: &mut LspClient, uri: &str) -> Value {
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 4 } }),
+        );
+        if let Some(item) = result_items(&response).into_iter().next() {
+            return item;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for a completion through the prepared document");
+}
+
+#[test]
+fn a_completion_item_from_a_prepared_document_resolves_what_holds_no_position() {
+    // The mock answers a resolve with the text it holds for the item's
+    // document as its `detail`: the resolve reached it, and it answered for
+    // the prepared text.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-text",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    assert!(item.get("detail").is_none(), "{item}");
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    assert_eq!(
+        resolved["result"]["detail"],
+        json!("local x = 1\npr\n"),
+        "{resolved}"
+    );
+    // Resolved again, as a client does on every selection move.
+    let resolved = client.send_request("completionItem/resolve", resolved["result"].clone());
+    assert_eq!(
+        resolved["result"]["detail"],
+        json!("local x = 1\npr\n"),
+        "{resolved}"
+    );
+}
+
+#[test]
+fn a_resolve_on_a_prepared_document_takes_no_edit_from_its_answer() {
+    // This mock's resolve adds an additional edit on the prepared text's
+    // second line, with a `detail`: the map the item came through is not
+    // carried, so only the `detail` is taken.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-additional-edit",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-edit.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    let detail = resolved["result"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("mock-resolved:"), "{resolved}");
+    assert!(
+        resolved["result"].get("additionalTextEdits").is_none(),
+        "{resolved}"
+    );
+    assert!(resolved["result"].get("textEdit").is_none(), "{resolved}");
+}
+
+#[test]
+fn a_resolve_is_not_answered_for_a_prepared_text_its_document_left_behind() {
+    // The edit's prepared text takes the peer two seconds (`SLOW`): until
+    // it is sent, the server still holds the text prepared before the edit,
+    // and a resolve answered from it would describe a document that is
+    // gone. The item comes back as it went.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-text",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-stale.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    change(
+        &mut client,
+        uri,
+        2,
+        "# t\n\n```lua\n  local SLOW = 1\n  pr\n```\n",
+    );
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    assert_eq!(resolved["result"], item, "{resolved}");
+}
+
 fn pull_capabilities() -> Value {
     json!({
         "textDocument": { "diagnostic": { "dynamicRegistration": false } },
