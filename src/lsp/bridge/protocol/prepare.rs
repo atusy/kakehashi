@@ -1787,6 +1787,46 @@ mod tests {
         );
     }
 
+    /// An interpolation with nothing injected before it on its host line is
+    /// stripped as a line prefix is (discovery cannot tell the two apart),
+    /// so it is no segment: the peer has no gap to give a placeholder, and
+    /// the line starts where the content after it does. One with injected
+    /// text before it on its line -- the line's indentation is enough -- is
+    /// a gap.
+    #[test]
+    fn host_text_opening_a_line_before_content_is_no_gap() {
+        use crate::language::injection::build_combined_virtual_content;
+        let segments = |text: &str, included: &[Range<usize>]| {
+            let (virtual_text, _, gaps) =
+                build_combined_virtual_content(text, 0..text.len(), included);
+            let layout = VirtualLayout::from_gaps(&virtual_text, &gaps);
+            layout
+                .segments()
+                .iter()
+                .map(|segment| (segment.kind, segment.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        // `${x}` at column 0, between two string fragments.
+        assert_eq!(
+            segments("a\n${x}/bin\n", &[0..2, 6..11]),
+            vec![(SegmentKind::Content, "a\n/bin\n".to_string())]
+        );
+        // The same after an injected indent.
+        assert_eq!(
+            segments("a\n  ${x}/bin\n", &[0..4, 8..13]),
+            vec![
+                (SegmentKind::Content, "a\n  ".to_string()),
+                (SegmentKind::Gap, "${x}".to_string()),
+                (SegmentKind::Content, "/bin\n".to_string()),
+            ]
+        );
+        // A blockquote's prefix reads the same to discovery as the first.
+        assert_eq!(
+            segments("a\n> b\n", &[0..2, 4..6]),
+            vec![(SegmentKind::Content, "a\nb\n".to_string())]
+        );
+    }
+
     /// What a gap's host text stands as in the virtual document, read off
     /// the request alone, as the protocol document tells a peer to: spaces
     /// for the text up to its first line break (one per UTF-16 code unit)
