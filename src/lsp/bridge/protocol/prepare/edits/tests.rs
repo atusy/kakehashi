@@ -281,6 +281,155 @@ fn lines_inserted_before_an_edit_on_the_same_line_map() {
     );
 }
 
+/// `main` mapped alone, as a completion item's main edit goes out, then
+/// `added` mapped beside it, as its resolve's additional edits are.
+fn added_beside(map: &PreparedMap, main: &TextEdit, added: &[TextEdit]) -> Option<Vec<TextEdit>> {
+    let sent = map.map_one_with_extent(main).expect("the main edit maps");
+    map.map_edits_beside(added, &sent)
+}
+
+#[test]
+fn edits_added_beside_a_main_edit_sent_on_map_as_with_it() {
+    // A completion rewriting `pa` on the block's third line; its resolve
+    // adds an import at the top and a line below the one it rewrites.
+    let virtual_text = "  a\n\n  pa\n  x\n";
+    let map = dedent_by_two(virtual_text);
+    let main = edit((2, 0), (2, 2), "Path");
+    let added = [
+        edit((0, 0), (0, 0), "from pathlib import Path\n"),
+        edit((3, 0), (3, 1), "y"),
+    ];
+    let mapped = added_beside(&map, &main, &added).unwrap();
+    // As the set mapped together would have been.
+    let together = map
+        .map_edits(
+            &[main.clone(), added[0].clone(), added[1].clone()],
+            EditMode::Extent,
+        )
+        .unwrap();
+    assert_eq!(mapped, together[1..]);
+    assert_eq!(
+        apply_to(virtual_text, &together),
+        "  from pathlib import Path\n  a\n\n  Path\n  y\n"
+    );
+}
+
+#[test]
+fn lines_added_before_a_main_edit_sent_on_map_to_its_start() {
+    // The import goes above the very line the completion rewrites from its
+    // start: both map to where the line's text starts, the import first.
+    let virtual_text = "  pa\n  x\n";
+    let map = dedent_by_two(virtual_text);
+    let main = edit((0, 0), (0, 2), "Path");
+    let added = [edit((0, 0), (0, 0), "from pathlib import Path\n")];
+    let sent = map.map_one_with_extent(&main).unwrap();
+    let mapped = map.map_edits_beside(&added, &sent).unwrap();
+    assert_eq!(mapped[0].range.start, sent.range.start);
+    assert_eq!(
+        apply_to(virtual_text, &[mapped[0].clone(), sent]),
+        "  from pathlib import Path\n  Path\n  x\n"
+    );
+    // Two imports there, in the order sent.
+    let added = [
+        edit((0, 0), (0, 0), "import a\n"),
+        edit((0, 0), (0, 0), "import b\n"),
+    ];
+    let mapped = added_beside(&map, &main, &added).unwrap();
+    assert_eq!(
+        apply_to(virtual_text, &mapped),
+        "  import a\n  import b\n  pa\n  x\n"
+    );
+}
+
+#[test]
+fn edits_added_where_they_meet_the_main_edit_sent_on_are_refused() {
+    let virtual_text = "  pa\n  x\n";
+    let map = dedent_by_two(virtual_text);
+    let main = edit((0, 0), (0, 2), "Path");
+    for added in [
+        // Inside what the main edit replaces, or over part of it.
+        edit((0, 1), (0, 1), "z"),
+        edit((0, 1), (1, 0), ""),
+        // Ending where it starts, or starting where it ends: the main
+        // edit's text as its server wrote it, which decides how two edits
+        // meeting mid-line read together, is not what was sent on.
+        edit((0, 2), (0, 2), "z"),
+        edit((0, 2), (1, 0), ""),
+        // At its start, but no whole lines.
+        edit((0, 0), (0, 0), "z"),
+    ] {
+        assert_eq!(
+            added_beside(&map, &main, std::slice::from_ref(&added)),
+            None,
+            "{added:?}"
+        );
+    }
+    // Lines before a main edit that took the line's indent along (it
+    // replaces the whole line): the two would not start at one place.
+    let whole_line = edit((0, 0), (1, 0), "Path\n");
+    let lines = edit((0, 0), (0, 0), "import a\n");
+    assert_eq!(
+        added_beside(&map, &whole_line, std::slice::from_ref(&lines)),
+        None
+    );
+    // Lines before one inserting at the line's start: nothing tells which
+    // of the two insertions the client makes first.
+    let inserting = edit((0, 0), (0, 0), "P");
+    assert_eq!(
+        added_beside(&map, &inserting, std::slice::from_ref(&lines)),
+        None
+    );
+    // Lines before one deleting from the line's start join what is left.
+    let deleting = edit((0, 0), (0, 1), "");
+    assert_eq!(added_beside(&map, &deleting, &[lines]), None);
+}
+
+#[test]
+fn lines_added_where_a_placeholder_breaks_a_host_line_are_refused_beside_the_main_edit() {
+    // `  a${x}\n`, the interpolation shown as `x\n`: P's line after it is
+    // the rest of the host line, no line start of the host's, whose indent
+    // the added lines' last break could give back.
+    let virtual_text = "  a    \n";
+    let prepared = prepare_pieces(
+        virtual_text,
+        [
+            (SegmentKind::Content, 0..3, String::new()),
+            (SegmentKind::Gap, 3..7, "${x}".to_string()),
+            (SegmentKind::Content, 7..8, String::new()),
+        ],
+        json!({"segments": [
+            {"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]},
+            {"type": "gap", "content": "x\n"},
+            {"type": "content"}
+        ]}),
+    );
+    assert_eq!(prepared.text, "ax\n\n");
+    let main = edit((1, 0), (2, 0), "z\n");
+    let lines = edit((1, 0), (1, 0), "\n");
+    assert_eq!(added_beside(&prepared.map, &main, &[lines]), None);
+}
+
+#[test]
+fn edits_added_beside_no_extent_of_the_virtual_text_are_refused() {
+    let virtual_text = "  pa\n  x\n";
+    let map = dedent_by_two(virtual_text);
+    let added = [edit((1, 0), (1, 1), "y")];
+    // Reversed, or on a line past the text's last.
+    for beside in [edit((0, 4), (0, 2), "Path"), edit((7, 0), (7, 1), "Path")] {
+        assert_eq!(map.map_edits_beside(&added, &beside), None, "{beside:?}");
+    }
+    // Into a gap's host text.
+    let (_, map) = interpolated();
+    let beside = edit((0, 6), (0, 6), "z");
+    assert!(map.virtual_position_in_gap(beside.range.start));
+    assert_eq!(
+        map.map_edits_beside(&[edit((0, 0), (0, 1), "y")], &beside),
+        None
+    );
+}
+
 #[test]
 fn a_reversed_edit_past_the_end_is_refused() {
     let map = prepare("a", json!([]));
@@ -1172,6 +1321,16 @@ mod properties {
             })
     }
 
+    /// Floors of
+    /// `edits_added_beside_a_main_edit_sent_on_map_only_as_the_set_would_have`,
+    /// measured over 9 runs of its 30,000 cases: main edits that map alone
+    /// (min 11,320), sets placed beside one (min 436, of some 760 mapping
+    /// together), and those with lines placed at the main edit's start (min
+    /// 36).
+    const SENT_FLOOR: usize = 10_000;
+    const PLACED_FLOOR: usize = 350;
+    const LINES_BEFORE_FLOOR: usize = 15;
+
     /// An edit to P: two char-boundary picks, a column overshoot, a text.
     type EditSpec = (u16, u16, bool, usize);
 
@@ -1539,6 +1698,100 @@ mod properties {
             mapped_sets.get() > property_floor(450, 4000),
             "mapped {}",
             mapped_sets.get()
+        );
+    }
+
+    #[test]
+    fn edits_added_beside_a_main_edit_sent_on_map_only_as_the_set_would_have() {
+        // A completion item's main edit goes out mapped alone; the edits
+        // its resolve adds are mapped beside what was sent. Whatever that
+        // accepts, mapping the set together accepts too, and maps alike:
+        // the main edit as it went out, the added edits to the same
+        // places. (The other way does not hold: beside an edit whose text
+        // as the server wrote it is gone, touching edits are refused.)
+        let mut runner = property_runner(30_000);
+        let (sent, placed, together) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let lines_before = Cell::new(0);
+        let strategy = (
+            prop::collection::vec(line_spec(), 1..7),
+            prop::collection::vec(any::<bool>(), 1..8),
+            (any::<bool>(), any::<bool>()),
+            prop::collection::vec(0..PLACEHOLDERS.len(), 1..4),
+            prop::collection::vec(edit_spec(), 2..5),
+            // Often, the first added edit inserts at the main edit's start,
+            // as an import above the line a completion rewrites does.
+            prop::option::weighted(0.4, 0..INSERTS.len()),
+        );
+        runner
+            .run(&strategy, |(lines, dedent, edges, placeholders, specs, at_start)| {
+                let (virtual_text, layout) = document(&lines);
+                let answer = answer(&virtual_text, &layout, &dedent, edges, &placeholders);
+                let Ok(prepared) = apply_prepare_result(
+                    &virtual_text,
+                    &layout,
+                    serde_json::from_value(answer).unwrap(),
+                ) else {
+                    return Ok(());
+                };
+                let map = &prepared.map;
+                let mut set = edits(map, &specs);
+                if let Some(text) = at_start {
+                    set[1] = TextEdit {
+                        range: LspRange::new(set[0].range.start, set[0].range.start),
+                        new_text: INSERTS[text].to_string(),
+                    };
+                }
+                let (main, added) = set.split_first().unwrap();
+                let Some(main_sent) = map.map_one_with_extent(main) else {
+                    return Ok(());
+                };
+                sent.set(sent.get() + 1);
+                let as_set = map.map_edits(&set, EditMode::Extent);
+                if as_set.is_some() {
+                    together.set(together.get() + 1);
+                }
+                let Some(beside) = map.map_edits_beside(added, &main_sent) else {
+                    return Ok(());
+                };
+                placed.set(placed.get() + 1);
+                let Some(as_set) = as_set else {
+                    return Err(TestCaseError::fail(format!(
+                        "{added:?} placed beside {main:?} (sent as {main_sent:?}), refused as a set, on {virtual_text:?} prepared as {:?}",
+                        prepared.text
+                    )));
+                };
+                prop_assert_eq!(&as_set[0], &main_sent);
+                prop_assert_eq!(&as_set[1..], &beside[..]);
+                if added
+                    .iter()
+                    .zip(&beside)
+                    .any(|(edit, mapped)| {
+                        edit.range.start == main.range.start
+                            && mapped.range.start == main_sent.range.start
+                    })
+                {
+                    lines_before.set(lines_before.get() + 1);
+                }
+                check(&virtual_text, map, &set, &as_set)
+            })
+            .unwrap();
+        // Not vacuous: see the floors. (The rarer two are held to at least
+        // their share, which a much reduced run rounds to none.)
+        assert!(
+            sent.get() > property_floor(SENT_FLOOR, 30_000),
+            "main edits sent {}",
+            sent.get()
+        );
+        assert!(
+            placed.get() >= property_floor(PLACED_FLOOR, 30_000),
+            "placed {} of {} mapping together",
+            placed.get(),
+            together.get()
+        );
+        assert!(
+            lines_before.get() >= property_floor(LINES_BEFORE_FLOOR, 30_000),
+            "lines placed before the main edit {}",
+            lines_before.get()
         );
     }
 

@@ -119,6 +119,14 @@ enum FirstIndent<'a> {
     Existing(&'a str),
 }
 
+/// Edits keeping their extents, each mapped on its own, in the order sent.
+struct PlacedExtents {
+    /// Each edit's extent in P.
+    extents: Vec<Range<usize>>,
+    /// The change each makes to V: the bytes it replaces, and their text.
+    changes: Vec<(Range<usize>, String)>,
+}
+
 impl PreparedMap {
     /// Translate a set of edits a downstream server made to P into edits to
     /// V, as `mode` reads them (see [`EditMode`]), one for each in order (a
@@ -610,6 +618,80 @@ impl PreparedMap {
 
     /// [`EditMode::Extent`]: each edit mapped on its own.
     fn map_extents(&self, edits: &[TextEdit]) -> Option<Vec<TextEdit>> {
+        self.to_text_edits(self.placed_extents(edits)?.changes)
+    }
+
+    /// [`EditMode::Extent`] for edits the client applies together with one
+    /// mapped and sent on before them: a completion item's additional
+    /// edits, which its server gives only on resolve, beside the item's
+    /// main edit as it went out. `beside` is that edit on V — one range
+    /// the client may apply it through, and its text.
+    ///
+    /// The edits map as a set of their own, and the set with `beside` is
+    /// held to what mapping them together would have been (see
+    /// [`Self::placed_extents`]), read from what is left of the main edit.
+    /// Its extent in P is the one its extent in V maps back to (whatever
+    /// the peer deleted around either end sits at one P offset); its text
+    /// as the server wrote it is gone (re-indented, a snippet back in place
+    /// of its expansion). So an edit overlapping or touching it in P is
+    /// refused whatever the texts say — but for lines inserted at a line
+    /// start right before it, where the text sent on tells enough: it
+    /// starts with text of its own (not indentation, which the map may
+    /// have written), at the V offset the lines map to. Edits apart from it
+    /// in P map as they do alone. The edited V is then checked as a whole,
+    /// with the main edit as it was sent.
+    ///
+    /// `None` — refuse the edits — as [`Self::map_edits`] does, and when
+    /// `beside` names no extent of V or reaches into a gap.
+    pub(crate) fn map_edits_beside(
+        &self,
+        edits: &[TextEdit],
+        beside: &TextEdit,
+    ) -> Option<Vec<TextEdit>> {
+        let PlacedExtents {
+            extents,
+            mut changes,
+        } = self.placed_extents(edits)?;
+        let (main_virtual, _) =
+            sorted_extents(&self.virtual_lines, std::slice::from_ref(beside), false)?;
+        let main_virtual = main_virtual.into_iter().next()?;
+        if self.virtual_range_reaches_into_gap(main_virtual.start, main_virtual.end) {
+            return None;
+        }
+        let main = map_offset(&self.runs, main_virtual.start, Bias::Start, Side::Virtual)
+            ..map_offset(&self.runs, main_virtual.end, Bias::End, Side::Virtual);
+        let prepared = &self.prepared_lines.text;
+        let main_starts_with_text = beside
+            .new_text
+            .chars()
+            .next()
+            .is_some_and(|first| !first.is_whitespace());
+        for ((extent, edit), (change, _)) in extents.iter().zip(edits).zip(&changes) {
+            if extent.end < main.start || main.end < extent.start {
+                continue;
+            }
+            let lines_before = extent.is_empty()
+                && extent.start == main.start
+                && !main.is_empty()
+                && is_line_start(prepared, extent.start)
+                && self.starts_host_line(extent.start)
+                && edit.new_text.ends_with(['\n', '\r'])
+                && main_starts_with_text
+                && change.start == main_virtual.start;
+            if !lines_before {
+                return None;
+            }
+        }
+        changes.push((main_virtual, beside.new_text.clone()));
+        if !self.mapped_edits_keep_host_text(&changes) {
+            return None;
+        }
+        changes.pop();
+        self.to_text_edits(changes)
+    }
+
+    /// [`Self::map_extents`] before the mapped set is checked as a whole.
+    fn placed_extents(&self, edits: &[TextEdit]) -> Option<PlacedExtents> {
         let prepared = &self.prepared_lines.text;
         let (ranges, order) = sorted_extents(&self.prepared_lines, edits, false)?;
         // Edits that touch — one ending where another starts, two inserting
@@ -630,18 +712,11 @@ impl PreparedMap {
         // Only at a line start the host has too: one a placeholder's own line
         // break shows in P mid-line in V starts no existing host line, whose
         // indent the inserted lines' last break could give back.
-        let host_line_start = |offset: usize| {
-            self.removed_indent_at(offset).is_some()
-                || is_line_start(
-                    &self.virtual_lines.text,
-                    map_offset(&self.runs, offset, Bias::Start, Side::Prepared),
-                )
-        };
         let lines_before = |earlier: usize, later: usize| {
             ranges[earlier].is_empty()
                 && edits[earlier].new_text.ends_with(['\n', '\r'])
                 && begins_line(edits[later].new_text.chars().next())
-                && host_line_start(ranges[later].start)
+                && self.starts_host_line(ranges[later].start)
         };
         let mut lines_inserted_before = Vec::new();
         for pair in order.windows(2) {
@@ -680,7 +755,20 @@ impl PreparedMap {
         {
             return None;
         }
-        self.to_text_edits(mapped)
+        Some(PlacedExtents {
+            extents: ranges,
+            changes: mapped,
+        })
+    }
+
+    /// Whether P `offset` is a line start the host has too: one where the
+    /// peer removed an indent, or that starts a line in V.
+    fn starts_host_line(&self, offset: usize) -> bool {
+        self.removed_indent_at(offset).is_some()
+            || is_line_start(
+                &self.virtual_lines.text,
+                map_offset(&self.runs, offset, Bias::Start, Side::Prepared),
+            )
     }
 
     /// [`EditMode::InLine`]: each edit within one line (neither what it

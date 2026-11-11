@@ -176,7 +176,8 @@ impl Kakehashi {
     ///   for it (the pool sends its resolve only to a server holding the
     ///   text prepared from the region's current one, see
     ///   `LanguageServerPool::queue_if_holding_text_prepared_from`), and
-    ///   nothing its answer says of positions is read. What the lifecycle
+    ///   nothing its answer says of positions is read but the edits it
+    ///   adds, through the map that server holds. What the lifecycle
     ///   pass knows of the region is not asked: a request may have opened
     ///   the document with its prepared text before the pass recorded it.
     fn completion_resolve_region(

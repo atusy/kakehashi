@@ -1014,7 +1014,8 @@ pub(crate) struct EnvelopeOffset {
     /// carry: it never resolves through these offsets alone, whatever the
     /// region reads as by then (after its pair lost its peer, the offsets
     /// alone compare equal) — a code action's resolves through the text its
-    /// server held as it was listed (see `CodeActionEnvelope`), other items
+    /// server held as it was listed (see `CodeActionEnvelope`), as do the
+    /// edits a completion item's resolve adds (see `ListedOn`), other items
     /// not at all.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prepared: bool,
