@@ -257,8 +257,8 @@ change takes it along and gives it back). Every line the edit's text
 begins regains the indentation the peer removed from the segment it lands
 in — but text joined at the start of a whitespace line the peer kept,
 including a line the edit begins there, gains none (it is text typed on
-that line, its whitespace after it; a formatting answer writing there is
-refused instead, see below) — provided every indentation the peer removed from the segment's content
+that line, its whitespace after it; a formatting answer is read as the
+text it leaves instead, see below) — provided every indentation the peer removed from the segment's content
 lines is the same (lines it left alone do not count, nor do
 whitespace-only lines, but in a segment holding nothing else); otherwise
 an edit creating a line of text that would regain it there is refused,
@@ -306,7 +306,7 @@ No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
 
 A formatter's answer (formatting, range and on-type formatting, and the
-concatenated pipeline's result) is read as what it changes, not edit for
+concatenated pipeline's result) is read as the text it leaves, not edit for
 edit: its edits are applied to P (an end at the start of the line just
 past P's last naming P's end, as whole-document answers do), the region's
 edge layout of P restored as for any document (but for an on-type answer,
@@ -315,85 +315,81 @@ reformatting of the region: one dropping P's final line break is refused
 where the peer deleted closing lines after it, and dropped whole
 otherwise, as any answer still removing the line break that ends a
 region is: what follows the region, a closing fence say, would join its
-last line), and the result diffed against P. An answer
-changing a region whose peer dedented it unevenly — a line of text (not
-whitespace alone) the peer left alone, or
-dedented otherwise than the rest of its segment — is refused before any
-pairing: every line of a whole answer is rewritten text, and which old
-line each is, and so which indentation it regains, only a pairing reads;
-with one indentation for every line of the content, no reading decides an
-indentation. (Edits that keep their extents state where they go, and
-still map there.) Lines are paired first: a line of text with the line
-it was rewritten from (alike to the byte, then alike but for the whitespace
-around its text, a line found once in each text anchoring the rest; a line
-alike but for whitespace to several, as many on each side, is not paired
-to the byte, since reindented one copy may read as another did, but in
-order with the lines alike to several below), then one alike but for
-whitespace anywhere in it, the same way; then, between those, lines found as many
-times on each side (a `}` among several), by the fewest changes; then a
-line other lines were joined onto (found by looking up the old lines'
-texts, not comparing every pair; a line whose text, or the text it joins
-onto, has more than one copy still to pair is left to the stages after,
-which place it among what they pair); then blank lines with blank lines — as
-many as can pair, and of the alignments pairing as many, the one keeping
-most whitespace lines with ones holding the same whitespace, so that text
-the formatter writes beside blank lines is a line of its own whenever a
-blank line of the answer could be the line it would otherwise be written
-on, not text written on one (which, on a whitespace line the peer kept,
-would regain no indentation and lose the formatter's relative
-indentation); then lines of text in order from either end of what is left
-while their letters and digits are alike (a line whose quotes or
-punctuation a formatter rewrote is the line it was). Each pair, and
-each run of lines left between pairs, is then diffed by character. A run
-holding lines of text on P's side is diffed without its blank lines, which
-go whole: its new text is that text rewritten, never text written on a
-blank line the answer removed (which would take that line's indentation,
-not the content's). A run of blank lines takes the answer's lines line for
-line where it holds as many there (not ending with a line break P lacks);
-with more or fewer, the blank lines went and the other lines are the
-content's. Text where an empty line was, or one the peer emptied, takes
-the content's indentation. Text where a whitespace line the peer kept was
-is refused, even typed right after that whitespace: in a whole-text
-answer, "typed on that line" is only how the diff aligned the text, which
-reads as well as a line written in its place, the kept line removed, and
-the two readings give different host text. (Edits that keep their extents,
-a completion's say, state where they go: text inserted after a kept line's
-whitespace is typed on that line, gaining no indentation.) Every stretch
-the result differs from P in maps as one edit does above; stretches
-touching at a line start stay apart where the later replaces some of that
-line's start with text, or where the earlier ends with a line break of P
-and the later replaces no line break. Of two stretches touching there, the
-first leaves the line's removed indentation to the second rather than take
-it along and give it back (the same text), so they do not both claim it.
-The set is then checked as a whole, as above. Which of several blank lines
-alike a line was written on, or which went, no answer tells: the run's
-diff decides.
+last line). The text V takes for the edited P is then written, line by
+line:
 
-The diff has a budget counted in work, not time: each step of its searches
-(a comparison, a cell of a table, a diagonal followed) spends one, about a
-million in all and 16 more for each byte of the texts (pairing every line
-and diffing each on its own is linear work no fixed budget covers for a
-large region), so an answer is accepted or refused alike on any machine
-and under any load. The character diff pairs the characters other than
+- A line the answer left as it was — whole lines alike at either end of P
+  and the edited P, then a longest run of lines alike between them — stays
+  as V has it, whatever the peer removed from it: a whitespace-only line
+  keeps the host's whitespace.
+- Any other line is written as the edited P has it, after the indentation
+  the peer removed from the content. Every line the answer wrote regains
+  it, a whitespace-only one too; an empty line carries none.
+- A last line written with no line break, where P ends with one, takes
+  the place of the indentation-only last line the peer removed.
+
+The edits sent are what V differs from that text in. The lines not alike
+are replaced; within them, lines reading alike in their letters and digits
+are paired (a line a formatter respaced or requoted is the line it was),
+and each pair is narrowed to the characters that differ. So is each run
+of lines between pairs: line for line where the answer writes as many
+lines as V holds there, as one stretch otherwise. The set is then checked
+as a whole, as above.
+Any diff of V against the same text leaves the same host text, so how
+lines pair decides only how small the edits are, and which of several
+whitespace-only lines P shows alike keeps the host's whitespace — never
+where text goes, nor which indentation it regains.
+
+An answer changing a region whose peer dedented it unevenly — a line of
+text (not whitespace alone) the peer left alone, or dedented otherwise
+than the rest of its segment — is refused: every line an answer writes
+regains the one indentation of the content, which such a region does not
+have. (Edits that keep their extents state where they go, and still map
+there.) So is an answer rewriting a line that holds a gap's text, or the
+line after one a gap's text ends: V holds other text there than P shows.
+Lines it leaves alike may hold gaps, and the lines around them map.
+
+Text where a whitespace line the peer kept was is a line of the content,
+like any other the answer wrote: the server formatted P, and the host
+takes each of its lines as far from the content's left edge as the server
+wrote it. Whether a diff would read that text as typed on the kept line
+or as a line written in its place does not come into it.
+
+Pairing lines and narrowing the changes has a budget counted in work, not
+time: each step of its searches (a diagonal followed, a cell of a table)
+spends one, each line indexed or kept to pair eight, and each byte
+compared by character sixteen — about a million in all and 16 more for
+each byte of the texts, 2^24 at most. So an answer maps to the same edits
+on any machine and under any load. The budget decides only how small the
+edits are: out of work, the lines not yet paired are replaced whole (a
+whitespace-only line among them as the answer wrote it), and no answer
+is refused for its size. Whole lines alike at either end of P and the
+edited P are set aside first, uncharged, so the work follows what the
+answer changes, not the region's size: a one-line answer costs its line
+in any region. The character diff pairs the characters other than
 whitespace first and diffs only what lies between them, so an answer that
-mostly moves whitespace (a pretty-printer's) costs work linear in the
-texts. An answer whose diff runs out of work is refused, and logged apart
-from the refusals its shape decides. The tables quadratic in what they
-search (the line diff's trace, and pairing blank lines, 4 bytes a step)
-are spent before they are taken, so their memory is linear in the budget,
-which itself grows with the texts but stops at 2^24 steps: some 64 MiB at
-most. The line diff's frontier is no wider than the square root of the
-work, as no search reaches further. The rest (the lines' keys and
-indexes, and the characters the character diff compares) is linear in
-the texts. Whole lines alike
-at either end of P and the edited P are set aside first, uncharged, so the
-work follows what the answer changes, not the region's size: a one-line
-answer costs its line in any region, and a 20,000-line region of half a
-megabyte rewritten whole maps in some 30 to 100 ms (release build, on a
-loaded machine), so the
-diff runs where the answer arrives. The budget decides only which answers
-are refused, never what an accepted one writes; a large region heavily
-rewritten may be refused.
+mostly moves whitespace (a pretty-printer's) is narrowed in work linear
+in the texts. What the searches keep of the answer is spent before it is
+taken, some four bytes a step: 64 MiB at most. Only P's lines are
+indexed, and of the answer's only those alike to one of them are kept, so
+beside that the mapping holds what is linear in the texts (the edited P,
+the lines V takes, the edits): a 15 MB answer to a 590-byte region maps
+to one edit in 90 to 190 ms within 87 MB, and a 33 MB one in 210 to 420
+ms within 175 MB (release build, on a loaded machine). What the mapping
+does beyond its budget is linear in the answer, as reading and parsing
+the answer already were, so it runs where the answer arrives, not on a
+blocking thread.
+
+An earlier design mapped each stretch of a diff of P against the edited P
+as one edit, so the indentation a stretch regained depended on how the
+diff had aligned the lines. Making the alignment safe took eight stages
+of line pairing and a refusal wherever two readings gave different host
+text (text where a kept whitespace line was), and its keys for every
+line, kept as text, took 1.5 GB for that 15 MB answer before refusing it
+as out of work. Over the same generated answers (253,804 changing P) the
+two designs leave the same host text but on whitespace-only lines (8% of
+the answers); writing the text first maps another 3% the earlier one
+refused, and refuses none it mapped.
 
 ### Workspace Edits
 
@@ -408,25 +404,21 @@ it replaces nor its text holds a line break) creates no line and regains no
 indentation: it maps as the one edit it makes, keeping its extent, as a
 completion's does — on any region, an unevenly dedented one included. Any
 other group is replayed on the whole lines it reaches (groups whose lines
-meet are one) and diffed there against P exactly as a formatting answer is,
-with its budget and refusals: what it leaves alike stays as the host has it
-(a whitespace line's whitespace, a line the peer left alone), and its new
-lines regain the content's indentation — alike as the diff reads it: a new
-line reading as a line already in the group apart from its whitespace (a
-moved line re-indented under a new header, a header repeating one below)
-can be read as that line where repeated lines lie between them, those
-lines then read as rewritten, a whitespace line among them taking the
-content's indentation. Such a group is refused, with the
-whole edit, on a region the peer dedented unevenly, as a formatting answer
-is. Groups are diffed apart, never as one text: a whole-text diff could move
-a change onto another line reading the same in P (the first of two alike
-lines deleted, a whitespace line below the second going with it), against
-what the edits state. The mapped set is then checked as a whole, as above.
+meet are one), and those lines are rewritten in V exactly as a formatting
+answer's are, with its budget and refusals: what the group leaves alike
+stays as the host has it (a whitespace line's whitespace), and the lines
+it writes regain the content's indentation. Such a group is refused, with
+the whole edit, on a region the peer dedented unevenly, as a formatting
+answer is. Groups are rewritten apart, never as one text: across the whole
+text a line the edits left alone could be read as another reading the same
+in P (the first of two alike lines deleted, a whitespace line below the
+second going with it), against what the edits state. The mapped set is
+then checked as a whole, as above.
 A `documentChanges` entry holding annotated edits, which must keep their
 identity and count, is taken only where replaying maps one edit for each:
 every edit within one line and touching no other, each then mapped
 keeping its extent; an entry whose edits add, remove or rewrite lines, or
-touch, is refused with the whole edit, as no edit of a replayed diff is
+touch, is refused with the whole edit, as no edit of a replayed group is
 any one of them.
 
 The choice was made on an exact-text property built without the map:
@@ -439,9 +431,9 @@ whole document; the expected host text is the same change made to those
 lines. Its default run (6000 cases) gives, on evenly dedented documents:
 replayed, 1835 exact, none wrong or refused; each edit keeping its extent,
 318 wrong (every whole-document form rewriting a blank or left-alone line
-as created) and 8 refused (touching edits at a line start); diffed as one
-whole text, 2 wrong (a blank line deleted by name, the diff picking another
-P shows alike). On unevenly dedented documents replay maps every in-line
+as created) and 8 refused (touching edits at a line start); rewritten as
+one whole text, 2 wrong (a blank line deleted by name, the pairing picking
+another P shows alike). On unevenly dedented documents replay maps every in-line
 change and refuses every one reaching across lines; extent maps many of
 those, but is wrong on 548. Which of several blank lines alike a whole
 document rewritten deletes no edit of that shape tells, and is left out.
@@ -1040,36 +1032,32 @@ editors keep a snippet as is.
 - A lazy code action whose server was sent another text since it was
   listed (a re-prepare, an edit) resolves to nothing; it is listed again on
   the next request.
-- A formatting answer whose diff runs out of its work budget is refused, so a
-  large region heavily reformatted may be left as it is (counted a failure
-  by `kakehashi format`). The common case costs work linear in the region:
-  an answer that keeps most lines, mostly moves whitespace, respaces every
-  line (`x=1` to `x = 1`), or rewrites the punctuation of every line
-  (`f('a')` to `f("a");`, 20,000 lines). Pairing blank lines takes a table
-  quadratic in the blank lines of one stretch no line of text anchors: an
-  answer changing the letters of every line of text, with whitespace lines
-  between them, is refused from about 1,100 such text lines (some 2,200
-  lines in all); one that also collapses the blank lines between them (two
-  to one), from about 770 text lines. Hashing or comparing a line's text
-  costs a step for every 64 bytes of it (lines are numbered once, then
-  compared as numbers), so the budget bounds the diff's time with long
-  lines too, and the answer's positions and the result's convert to bytes
-  and UTF-16 columns in one pass over each line they fall on, each line
-  found in a few lookups, uncharged:
-  1 MB of 1 KB lines, each rewritten at its end, maps in some 60 ms; 4 MB
-  of them is refused in some 200 ms, and a 4 MB answer to a 500 KB region
-  in some 140 ms (release build, measured on a loaded machine).
+- A formatting answer whose diff runs out of its work budget maps to
+  coarser edits, not to other text: the lines not yet paired are replaced
+  whole, so an editor loses the marks and folds it kept on them, and the
+  whitespace-only lines among them take the answer's whitespace. The
+  common case is narrowed in work linear in the region: an answer that
+  keeps most lines, mostly moves whitespace, respaces every line (`x=1`
+  to `x = 1`), or rewrites the punctuation of every line (`f('a')` to
+  `f("a");`, 20,000 lines, each changed where it differs). Past the
+  budget's cap (2^24 steps, some megabyte of text compared by character),
+  lines are replaced whole, one by one where the answer writes as many
+  lines as it replaces. The answer's positions and the result's
+  convert to bytes and UTF-16 columns in one pass over each line they
+  fall on, each line found in a few lookups, uncharged.
 - The concatenated formatting pipeline does not re-apply host line prefixes
   on a prepared document: a prefixed (blockquoted) prepared region fails
   the request instead.
 - Formatting, range and on-type formatting refuse a region whose peer
   dedented it unevenly (a line of text left alone, or dedented otherwise
   than the rest), whatever the answer changes; completions, hints and
-  other edits that keep their extents still map there. Reading a whole
-  answer back onto lines that kept indentations of their own met one
-  ambiguity after another (copies crossing, a line moved off its own
-  indentation, one copy reindented into another's text), several mapped
-  to wrong text before they were found; a refusal is the safe side. The
+  other edits that keep their extents still map there. Every line an
+  answer writes regains the content's one indentation, and such a region
+  has none; reading which line was which from a pairing instead, as an
+  earlier design did, met one ambiguity after another (copies crossing, a
+  line moved off its own indentation, one copy reindented into another's
+  text), several mapped to wrong text before they were found. A refusal
+  is the safe side. The
   usual peers dedent evenly: a Nix `''` string strips the least
   indentation of its lines (a line opening with an interpolation counts,
   so one at column 0 strips none), `textwrap.dedent`, `indoc!` and `<<~`
@@ -1077,16 +1065,21 @@ editors keep a snippet as is.
   CommonMark fence strips up to its opener's own indentation from each
   line, so a line less indented than an indented fence's opener is
   dedented unevenly, and that block is not formatted through its peer.
-- Text a formatter writes where a whitespace-only line the peer kept was is
-  refused, typed after its whitespace or not: a whole-text answer does not
-  tell text typed on that line from a line written in its place. That is
-  text in the kept line's place line for line, or, where the answer holds
-  more or fewer lines there, text starting with exactly that line's
-  whitespace; text indented otherwise is a line of the content. Where an
-  answer reads as well as a line of its own beside the blank lines, that
-  reading is taken. The exact-text property, which writes on kept
-  whitespace lines on purpose, sees such refusals in about 1.4% of its
-  answers changing evenly dedented documents.
+- A whitespace-only line keeps the host's whitespace only where the
+  answer leaves the line as it was and the diff pairs it with itself. One
+  the answer rewrites (other whitespace, another line break), one of
+  several alike the pairing reads as another, and any not yet paired when
+  the diff runs out of work, is written as the answer has it: empty, or
+  after the content's indentation. A peer that strips the indentation
+  from every line shows that line back as the server wrote it; one that
+  keeps whitespace-only lines as they are shows it indented once more.
+  Formatters leave no whitespace on blank lines, so in practice such a
+  line is emptied.
+- A formatting answer rewriting the line a gap's text is on, or the line
+  after one a gap's text ends, is refused, as is a workspace edit creating
+  or removing lines there. Lines holding gaps map when left alike, but
+  edit carriers stay closed on prepared documents with gaps (see
+  Coordinates).
 - A peer must be bridged for the languages it prepares, so it receives
   their documents too; keeping it out of other methods takes `priorities`.
 - A peer that cannot start leaves its documents unprepared rather than

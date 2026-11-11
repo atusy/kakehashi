@@ -74,7 +74,9 @@ impl std::fmt::Display for FormattingRefusal {
 /// work, the lines not yet paired are replaced whole, on any machine and
 /// under any load alike (the count, not a clock, decides). What runs around
 /// the searches (applying the answer to P, reading both texts' lines,
-/// writing the lines V takes) is linear in the texts.
+/// writing the lines V takes) is linear in the texts, as reading and
+/// parsing the answer already were: the mapping runs where the answer
+/// arrives, on the async runtime, rather than on a blocking thread.
 const FORMATTING_DIFF_BUDGET: usize = 1 << 20;
 
 /// The most a formatting answer's diff may spend, the per-byte allowance
