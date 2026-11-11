@@ -142,6 +142,27 @@ whitespace. Host text the virtual document strips altogether (a blockquote's
 see it, so there is nothing to replace; next to a gap it is part of that
 gap's `content`. An isolated injection is a single content segment.
 
+A peer does not see the virtual document, whose lines the rules below
+name, but the segments spell it. Its text is each segment's in order: a
+content segment's `content` as it is, and for a gap what stands for its
+host text there —
+
+- a space for each UTF-16 code unit of the text up to the gap's first line
+  break, when the gap continues a line of content (the segment before it
+  is content that does not end in a line break), and nothing for that
+  text when the gap opens a line (it is the first segment, or follows
+  content that ends in a line break);
+- then each of its line breaks as the host has it (LF, CRLF or a lone CR),
+  and nothing for the text after one. Host text before the first injected
+  character of its line is stripped, not masked: a blockquote's `> `, and
+  just as much the `}` closing an interpolation opened on a line above.
+
+So content after a gap that holds a line break starts a line of the
+virtual document, and content after a gap on one line goes on with the
+line the gap is on. (One document is spelled apart: where its span ends
+between a CR and its LF, that CR — the last character of a gap ending
+the document — stands as a space, since no line ends there.)
+
 The answer has the same length and the same `type` order:
 
 - A content segment's `changes` are segment-relative `TextEdit`s that may
