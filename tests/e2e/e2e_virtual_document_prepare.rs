@@ -758,7 +758,9 @@ fn a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(
     change(&mut client, uri, 2, edited);
     let mut published = None;
     if edited.contains("local y = 2") {
-        // The region only moved: no server is sent anything.
+        // The region only moved: no server is sent anything, and the
+        // diagnostic is published again where it is now.
+        published = Some(vec![wait_for_echo_diagnostic(&mut client, uri, message)]);
     } else {
         // Both mocks (the peer is bridged for lua too) log the change they
         // are sent; the echo mock finds its first-line diagnostic unchanged
@@ -783,12 +785,8 @@ fn a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(
     // Past the publish debounce: whatever the edit publishes is in by now.
     published =
         last_published_echo_diagnostics(&mut client, uri, Duration::from_secs(2)).or(published);
-    let published = published.unwrap_or_else(|| {
-        // Nothing published keeps what the editor already shows, which is
-        // right only where the diagnostic did not move.
-        assert_eq!(line, 3, "the moved diagnostic was not published again");
-        vec![diagnostic.clone()]
-    });
+    // Nothing published keeps what the editor already shows.
+    let published = published.unwrap_or_else(|| vec![diagnostic.clone()]);
     assert_eq!(
         published
             .iter()
