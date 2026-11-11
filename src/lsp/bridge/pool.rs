@@ -2984,6 +2984,22 @@ impl LanguageServerPool {
         }
     }
 
+    /// Forget the forwarded content of every region not among `live_regions`,
+    /// so a region minted anew does not leave its old text cached until the
+    /// host closes.
+    pub(crate) fn retain_live_virtual_contents(
+        &self,
+        host_uri: &Url,
+        live_regions: &std::collections::HashSet<&str>,
+    ) {
+        if let Some(host) = self.latest_virtual_contents.get(host_uri) {
+            host.contents.retain(|_, regions| {
+                regions.retain(|region_id, _| live_regions.contains(region_id.as_str()));
+                !regions.is_empty()
+            });
+        }
+    }
+
     pub(crate) fn clear_replaced_virtual_contents(
         &self,
         host_uri: &Url,

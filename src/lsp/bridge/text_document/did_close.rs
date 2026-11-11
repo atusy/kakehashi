@@ -309,6 +309,9 @@ impl LanguageServerPool {
     /// names it, so only asking every open document "does your region still
     /// exist?" finds it.
     ///
+    /// The forwarded text of every region outside `live_regions` goes too,
+    /// whether or not a document was open for it.
+    ///
     /// A formatting scratch document is left to its pipeline, which closes it
     /// whatever became of the region it was copied from.
     pub(crate) async fn close_orphaned_docs(
@@ -316,6 +319,7 @@ impl LanguageServerPool {
         host_uri: &Url,
         live_regions: &std::collections::HashSet<&str>,
     ) -> std::collections::HashSet<String> {
+        self.retain_live_virtual_contents(host_uri, live_regions);
         let to_close = self
             .take_host_virtual_docs_where(host_uri, |doc| {
                 let region_id = doc.virtual_uri.region_id();
