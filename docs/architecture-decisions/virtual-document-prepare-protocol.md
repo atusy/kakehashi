@@ -442,9 +442,15 @@ a hook per kind of change.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
 - A request issued right after an edit waits for the new prepared text to
-  reach its server, and fails if a newer edit supersedes it first. A request
-  on an unprepared document waits the same way while its server still holds
-  a prepared text (right after its pair lost its peer).
+  reach its server, and fails if a newer edit supersedes it first: as soon
+  as its server is sent another text instead. Only a text sent while the
+  request waits tells: one its server held already may be the text before
+  the request's own, or, after an undo, an answer given later for the text
+  the undo left. So a superseded request that starts waiting after the
+  newer text was sent (its own answer came late) waits five seconds for
+  nothing, unless the editor cancels it. A request on an unprepared
+  document waits the same way while its server still holds a prepared text
+  (right after its pair lost its peer).
 - A save made while a document's answer is pending reaches no server that
   has not started opening the document by the time the answer arrives.
 - A save one connection refuses, because a newer answer reached it first,

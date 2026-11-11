@@ -23,9 +23,10 @@ use crate::lsp::bridge::protocol::{
 
 /// How long a request waits for the lifecycle pass to send the text it was
 /// built for (see [`LanguageServerPool::wait_for_request_text`]). Its answer
-/// is in by then, and the send follows it within a lifecycle pass; a request
-/// whose text a newer edit superseded never sees it sent, and fails here (the
-/// editor usually cancels such a request first).
+/// is in by then, and the send follows it within a lifecycle pass. A request
+/// whose text a newer edit superseded never sees it sent: it fails as the
+/// newer text is, and waits this long only when that text was sent before
+/// it started waiting (the editor usually cancels such a request first).
 const REQUEST_TEXT_WAIT: std::time::Duration = PREPARE_TIMEOUT;
 
 fn request_text_not_held(connection_key: &super::ConnectionKey) -> io::Error {
@@ -441,8 +442,10 @@ impl LanguageServerPool {
     /// text, whose answer the request's map would misread. Likewise right
     /// after a pair gains or loses its peer. The lifecycle pass is the only
     /// sender (a request sending here could overtake a newer text), so the
-    /// request waits for it, and fails if it does not come. A document not
-    /// open there is opened by the request with its own text.
+    /// request waits for it, and fails if it does not come: as soon as the
+    /// connection is sent another text instead (a newer edit superseded the
+    /// request), or once the budget runs out. A document not open there is
+    /// opened by the request with its own text.
     async fn wait_for_request_text(
         &self,
         uri_string: &str,
@@ -458,6 +461,9 @@ impl LanguageServerPool {
         }
         let deadline = tokio::time::Instant::now() + REQUEST_TEXT_WAIT;
         let _waiting = self.document_tracker.wait_for_held_changes();
+        // Read before the first check: a text recorded past it was sent
+        // while this request waited.
+        let since = self.document_tracker.held_through();
         loop {
             // Enabled before the check: a record made after it wakes the
             // wait.
@@ -476,6 +482,20 @@ impl LanguageServerPool {
                 || self.holds_request_text(uri_string, connection_key, offset)
             {
                 return Ok(());
+            }
+            // Sent another text since the wait began (or held as is again):
+            // superseded. The lifecycle pass sends a host's texts in the
+            // order of its edits, each from the text the host has then, so
+            // this one is at least as new as the request's own, which is
+            // not coming. A text the connection held already says nothing:
+            // it is most often the one before the request's — and by its
+            // answer's age, after an undo, would even look the newer one.
+            if self
+                .document_tracker
+                .held_text(uri_string, connection_key)
+                .is_some_and(|held| held.generation > since || held.as_is_since > since)
+            {
+                return Err(request_text_not_held(connection_key));
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
                 return Err(request_text_not_held(connection_key));
