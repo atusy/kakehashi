@@ -1301,6 +1301,131 @@ mod tests {
         }
     }
 
+    /// A multi-line edit the client would have adjusted (the item asks for
+    /// that, or names no mode where the client adjusts by default) was
+    /// written for a client giving the lines below the caret's line that
+    /// line's indentation up to the edit. Inserted as is, they get it here:
+    /// what P shows of it, with what the peer removed.
+    #[rstest]
+    // `  foo\n    bar.\n` dedented by two: the caret after `bar.`, whose
+    // line keeps two spaces in P.
+    #[case::the_item_asks_to_adjust(
+        "  foo\n    bar.\n",
+        6,
+        json!({"insertTextMode": 2}),
+        json!({"completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}}),
+        "baz(\n    )",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    #[case::the_client_adjusts_by_default(
+        "  foo\n    bar.\n",
+        6,
+        json!({}),
+        json!({
+            "insertTextMode": 2,
+            "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+        }),
+        "baz(\n    )",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    // No way to tell the client: the mode it would not honor is cleared.
+    #[case::the_item_asks_a_client_that_cannot_be_told(
+        "  foo\n    bar.\n",
+        6,
+        json!({"insertTextMode": 2}),
+        json!({}),
+        "baz(\n    )",
+        None
+    )]
+    // The indentation P shows is a tab: kept as it is, after what the peer
+    // removed.
+    #[case::the_line_is_indented_with_a_tab(
+        "  foo\n  \tbar.\n",
+        5,
+        json!({"insertTextMode": 2}),
+        json!({"completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}}),
+        "baz(\n  \t)",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    // An edit starting inside the indentation: only up to its start.
+    #[case::the_edit_starts_inside_the_indentation(
+        "  foo\n      bar.\n",
+        2,
+        json!({"insertTextMode": 2}),
+        json!({"completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}}),
+        "baz(\n    )",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    // Written to be inserted as is: only what the peer removed comes back.
+    #[case::the_item_asks_as_is(
+        "  foo\n    bar.\n",
+        6,
+        json!({"insertTextMode": 1}),
+        json!({
+            "insertTextMode": 2,
+            "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+        }),
+        "baz(\n  )",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    #[case::the_client_inserts_as_is_by_default(
+        "  foo\n    bar.\n",
+        6,
+        json!({}),
+        json!({
+            "insertTextMode": 1,
+            "completionItem": {"insertTextModeSupport": {"valueSet": [1, 2]}}
+        }),
+        "baz(\n  )",
+        Some(tower_lsp_server::ls_types::InsertTextMode::AS_IS)
+    )]
+    fn a_prepared_multi_line_edit_the_client_would_adjust_keeps_the_caret_lines_indent(
+        #[case] virtual_text: &str,
+        #[case] character: u32,
+        #[case] mut completed: serde_json::Value,
+        #[case] completion_capabilities: serde_json::Value,
+        #[case] new_text: &str,
+        #[case] mode: Option<tower_lsp_server::ls_types::InsertTextMode>,
+    ) {
+        use tower_lsp_server::ls_types::{CompletionTextEdit, Range};
+        let offset = dedented_offset(virtual_text);
+        let capabilities = serde_json::from_value(
+            json!({"textDocument": {"completion": completion_capabilities}}),
+        )
+        .unwrap();
+        completed["label"] = json!("baz");
+        // Both shapes an item's edit takes, at the caret on P's line 1.
+        let at = json!({"line": 1, "character": character});
+        let range = json!({"start": at, "end": at});
+        let host = Position::new(11, character + 2);
+        for text_edit in [
+            json!({"range": range, "newText": "baz(\n)"}),
+            json!({"insert": range, "replace": range, "newText": "baz(\n)"}),
+        ] {
+            completed["textEdit"] = text_edit;
+            let mut completed = item(completed.clone());
+            assert!(transform_completion_item(
+                &mut completed,
+                &offset,
+                Position::new(12, 0),
+                Some(host),
+                ClientInsertMode::from_capabilities(Some(&capabilities)),
+            ));
+            let (ranges, text) = match completed.text_edit.as_ref().unwrap() {
+                CompletionTextEdit::Edit(edit) => (vec![edit.range], &edit.new_text),
+                CompletionTextEdit::InsertAndReplace(edit) => {
+                    (vec![edit.insert, edit.replace], &edit.new_text)
+                }
+            };
+            assert_eq!(text, new_text);
+            assert!(
+                ranges.iter().all(|range| *range == Range::new(host, host)),
+                "{ranges:?}"
+            );
+            assert_eq!(completed.insert_text_mode, mode);
+        }
+    }
+
     /// The prepared-only rules leave an unprepared item as main sends it:
     /// its edit range need not contain the caret, its multi-line edit keeps
     /// the insert mode it asked for whatever the client does, and its
