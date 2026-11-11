@@ -983,7 +983,12 @@ edit-producing methods is available on a prepared document whose
 injection is combined from separate pieces. Items listed from a prepared
 document other than code actions are not resolved further:
 `*/resolve`, and call and type hierarchy follow-ups (incoming and outgoing
-calls, supertypes and subtypes), return nothing more. A document the server fails to prepare is not sent downstream at
+calls, supertypes and subtypes), return nothing more — but a completion
+item, whose resolve brings its documentation and detail, and the edits its
+server adds then (an auto-import) as long as nothing was typed since the
+list came: an editor that resolves the item it highlights gets them, one
+that resolves only after inserting the accepted item (Neovim's built-in
+completion) does not. A document the server fails to prepare is not sent downstream at
 all; answer `null` to keep a document unchanged.
 A document left unchanged is still asked about and waited for, but its
 completion items come as from a document never prepared, snippets included.
