@@ -87,6 +87,12 @@ struct Setup {
     /// Have the echo mock answer linked editing ranges only once the test
     /// creates `release` in its directory.
     linked_after_release: bool,
+    /// Have the echo mock answer completion only once the test creates
+    /// `release` in its directory.
+    completion_after_release: bool,
+    /// Have the echo mock answer inlay hints only once the test creates
+    /// `release` in its directory.
+    inlay_after_release: bool,
 }
 
 impl Default for Setup {
@@ -113,6 +119,8 @@ impl Default for Setup {
             second_code_action: false,
             echo_code_action_preferred: false,
             linked_after_release: false,
+            completion_after_release: false,
+            inlay_after_release: false,
         }
     }
 }
@@ -206,6 +214,12 @@ impl Setup {
         }
         if self.linked_after_release {
             builder = builder.env("MOCK_LINKED_AFTER_RELEASE", "1");
+        }
+        if self.completion_after_release {
+            builder = builder.env("MOCK_COMPLETION_AFTER_RELEASE", "1");
+        }
+        if self.inlay_after_release {
+            builder = builder.env("MOCK_INLAY_AFTER_RELEASE", "1");
         }
         if self.apply_edit_after_change {
             builder = builder.env("MOCK_APPLY_EDIT_AFTER_CHANGE", "1");
@@ -1005,6 +1019,105 @@ fn a_formatting_answer_the_host_moved_under_is_dropped_as_it_is_chosen() {
             "{strategy} {method}, edited: {response}"
         );
     }
+}
+
+#[test]
+fn completion_items_the_host_moved_under_are_not_offered() {
+    // The echo mock answers completion only once released. The host is
+    // edited (outside the region) while the request is out: the items,
+    // their edits made for the text before the edit, are not offered. A
+    // completion is asked again on the next keystroke, so the answer is
+    // none, not an error.
+    let (mut client, dir) = Setup {
+        completion_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/completion-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let request =
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 13 } });
+    for moved in [false, true] {
+        let id = client.send_request_async("textDocument/completion", request.clone());
+        let wire = dir.path().join("wire.log");
+        let sent = |wire: &std::path::Path| {
+            std::fs::read_to_string(wire)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("textDocument/completion\t"))
+                .count()
+        };
+        let until = Instant::now() + Duration::from_secs(10);
+        while sent(&wire) < 1 {
+            assert!(Instant::now() < until, "completion request not sent");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if moved {
+            change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+            hover(&mut client, uri, 0, 0);
+        }
+        std::fs::write(dir.path().join("release"), "").expect("release");
+        let response = client.receive_response_for_id_public(id);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            result_items(&response).is_empty(),
+            moved,
+            "moved: {moved}: {response}"
+        );
+        if !moved {
+            // Held again for the next request.
+            std::fs::remove_file(dir.path().join("release")).expect("hold again");
+            std::fs::write(&wire, "").expect("clear the wire log");
+        }
+    }
+}
+
+#[test]
+fn inlay_hints_the_host_moved_under_stay_shown_without_their_edits() {
+    // The echo mock answers inlay hints only once released. The host is
+    // edited (outside the region) while the request is out: the hint is
+    // still shown (as any hint computed before an edit is), without the
+    // edit made for the text before it.
+    let (mut client, dir) = Setup {
+        inlay_after_release: true,
+        wire_log: true,
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/inlay-stale.md";
+    let text = "# t\n\n```lua\n  local x = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let id = client.send_request_async(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 4, "character": 0 }
+            }
+        }),
+    );
+    let wire = dir.path().join("wire.log");
+    let until = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&wire)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.starts_with("textDocument/inlayHint\t"))
+    {
+        assert!(Instant::now() < until, "inlay hint request not sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    change(&mut client, uri, 2, &format!("# u{}", &text[3..]));
+    hover(&mut client, uri, 0, 0);
+    std::fs::write(dir.path().join("release"), "").expect("release");
+    let response = client.receive_response_for_id_public(id);
+    let hints = result_items(&response);
+    assert_eq!(hints.len(), 1, "{response}");
+    assert!(hints[0].get("textEdits").is_none(), "{response}");
 }
 
 #[test]
