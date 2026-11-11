@@ -98,9 +98,9 @@ fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) ->
 /// came, though none answered (on a prepared document, all disabled:
 /// refused by its map) — as the walk would choose them were the document
 /// unprepared, so a client showing disabled actions shows why the fix is
-/// refused. Unlike the stale fallback, what it keeps may still be kept,
-/// and it stands in for a layer's error only while the final check keeps
-/// it.
+/// refused. What it keeps is still current as it is kept (a moved or stale
+/// answer is passed over, never kept aside), and it stands in for a
+/// layer's error only while the final check keeps it.
 #[derive(Default)]
 struct RefusedActionsFallback(std::sync::Mutex<Option<ActionParts>>);
 
