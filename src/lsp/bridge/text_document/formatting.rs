@@ -7,24 +7,22 @@
 //! can reuse it; [`super::on_type_formatting`] uses
 //! [`transform_on_type_formatting_response_to_host`].
 //!
-//! # Known limitation: formatting in prefixed regions can drop WHOLE responses
+//! # Multi-line edits in prefixed regions
 //!
 //! [`RegionOffset::column_for_line`] translates positions correctly for both
 //! `new()` (single-column) and `with_per_line_offsets()` (blockquote `> `) shapes.
 //! But `new_text` of a multi-line edit starts at column 0 of the embedded language,
-//! so replacement lines would insert at host column 0 instead of re-applying the
-//! `> ` prefix. A response containing any such edit is dropped WHOLE by the
-//! shared prefix guard (`text_edit_safe_in_region`) — a formatter
-//! answer is one atomic diff, so applying only its safe edits could
-//! duplicate or lose content. All-safe responses (single-line edits and
-//! zero-width inserts — the common `trimTrailingWhitespace` cases) pass
-//! through (a newline-bearing `new_text` in a prefixed region still rejects).
-//! Unprefixed regions are exempt from the prefix rules but still subject to
-//! region containment and the fence-boundary EOL rule. Re-applying prefixes to `new_text` (which would let these
-//! edits APPLY instead of dropping) means rewriting it per embedded newline;
-//! deferred because it interacts with `trim_final_newlines` semantics —
-//! the lsp_impl concatenated pipeline's `reapply_host_line_prefixes` is the
-//! model if demand appears.
+//! so applied as it came, replacement lines would land at host column 0 without
+//! the `> ` prefix. Each such edit is therefore given the region's prefix on the
+//! lines it leaves behind (`place_text_edits_in_region`), which takes an
+//! offset that knows what the prefixes say and a region whose lines of text
+//! share one. A response with an edit that still cannot be applied safely is
+//! dropped WHOLE — a formatter answer is one atomic diff, so applying only
+//! its safe edits could duplicate or lose content. Unprefixed regions are
+//! exempt from the prefix rules but still subject to region containment and
+//! the fence-boundary EOL rule. (The lsp_impl concatenated pipeline has one
+//! whole-region text instead of edits, and re-applies prefixes to it by its
+//! own `reapply_host_line_prefixes`.)
 
 use std::io;
 
@@ -43,8 +41,8 @@ use url::Url;
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, region_host_end,
-    response_has_jsonrpc_error, text_edit_safe_in_region,
+    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, place_text_edits_in_region,
+    region_host_end, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -676,10 +674,14 @@ fn transform_formatting_style_response(
         }
     }
 
-    // Prefix safety (same guard codeAction/rename/applyEdit apply via the
-    // WorkspaceEdit form): the transform translates RANGES but emits newText
-    // verbatim, so a multi-line replacement or newline insertion in a
-    // prefixed (blockquote) region would strip the `> ` prefixes it overlaps.
+    // Prefix safety (same rule codeAction/rename/applyEdit apply via the
+    // WorkspaceEdit form): range translation leaves newText as the server
+    // wrote it, so a multi-line replacement or newline insertion in a
+    // prefixed (blockquote, list item) region would strip the prefixes it
+    // overlaps and add lines without one. Each such edit is given the
+    // region's prefix on the lines it leaves behind; one that cannot be —
+    // the region has no single prefix, or the edit would write onto the
+    // closing fence's line — is unsafe.
     // ALL-OR-NOTHING: a formatting response is one atomic diff — formatters
     // routinely pair a line-deletion with a same-line insertion of the merged
     // text, so dropping only the unsafe half would duplicate or lose content.
@@ -687,10 +689,7 @@ fn transform_formatting_style_response(
     // the document is left untouched, like the null "already formatted"
     // answer). All-zero regions (plain fences) skip the prefix rules but are
     // still containment- and fence-boundary-checked.
-    if !edits
-        .iter()
-        .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-    {
+    if place_text_edits_in_region(&mut edits, offset, region_end).is_err() {
         warn!(
             target: "kakehashi::bridge",
             "Dropped a formatting response ({} edit(s)): an edit is unsafe for the \
@@ -747,6 +746,48 @@ mod tests {
         assert!(
             edits.is_empty(),
             "a response with any prefix-breaking edit must drop whole: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn transform_gives_added_lines_the_prefix_when_the_offset_knows_it() {
+        // The same blockquote region, its offset built from the host text:
+        // the whole-document replacement a formatter answers with keeps the
+        // `> ` on each line after the first, and leaves the closing fence's
+        // line — where the region ends — to the host.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_line_prefixes(
+            Some(std::sync::Arc::new(
+                crate::language::injection::LinePrefixes::for_test("> ", &[]),
+            )),
+        );
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end": { "line": 2, "character": 0 } },
+                  "newText": "a\n\nb\nc\n" }
+            ]
+        });
+
+        let edits =
+            transform_formatting_response_to_host(response, &offset, "aaaa\nbbbb\n", region_end)
+                .unwrap();
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "a\n>\n> b\n> c\n");
+        assert_eq!(
+            (edits[0].range.start, edits[0].range.end),
+            (
+                Position {
+                    line: 3,
+                    character: 2
+                },
+                region_end
+            )
         );
     }
 

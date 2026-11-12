@@ -19,7 +19,7 @@ mod ranges;
 pub(crate) const MAX_INJECTION_DEPTH: usize = 10;
 
 pub(crate) use content::{
-    NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, parse_with_deadline,
+    LinePrefixes, NATIVE_PARSE_BUDGET, byte_to_point, byte_to_point_anchored, parse_with_deadline,
     parse_with_deadline_cancellable, parse_with_ranges,
 };
 #[cfg(test)]
