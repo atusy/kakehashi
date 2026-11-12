@@ -484,7 +484,7 @@ fn main() {
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "completion-no-resolve" => json!({
+                    "completion-no-resolve" | "completion-additional-line" => json!({
                         "completionProvider": {},
                         "textDocumentSync": 1
                     }),
@@ -1051,6 +1051,19 @@ fn main() {
                         });
                         if stamp_resolve_process {
                             result["items"][0]["data"]["mockPid"] = json!(std::process::id());
+                        }
+                        // `completion-additional-line`: the item brings a
+                        // whole new line at the top of the document with it
+                        // (the auto-import shape), so a test can see where a
+                        // line-prefixed region puts that line.
+                        if mode == "completion-additional-line" {
+                            result["items"][0]["additionalTextEdits"] = json!([{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 }
+                                },
+                                "newText": "-- import\n"
+                            }]);
                         }
                         if mode == "completion-resolve-echo-edit" {
                             let position = &message["params"]["position"];
