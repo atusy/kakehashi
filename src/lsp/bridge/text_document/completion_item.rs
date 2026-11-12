@@ -36,7 +36,7 @@ use super::super::pool::{
 use super::super::protocol::{
     JsonRpcRequest, PreparedMap, RegionOffset, RequestId, response_has_jsonrpc_error,
     text_edit_safe_in_region, translate_host_range_to_virtual,
-    translate_virtual_edits_beside_host_mains,
+    translate_virtual_edits_beside_host_mains, translate_virtual_range_to_host,
 };
 use super::completion::{KakehashiEnvelope, strip_envelope, transform_completion_item};
 use super::host::{HostDocument, sync_host_document};
@@ -747,6 +747,10 @@ struct ListedText {
 /// - the map refuses them beside the main edit, or a member is unsafe for
 ///   the injection region.
 ///
+/// On a document the peer left as it is (see
+/// `PreparedMap::changes_nothing`) only the first and the region's checks
+/// hold: nothing there is mapped beside anything.
+///
 /// The item is kept either way: its main edit still applies, though
 /// possibly without its auto-import — availability over fidelity, never an
 /// edit placed where its server did not mean it.
@@ -764,6 +768,31 @@ fn place_added_edits(
         .as_ref()
         .is_some_and(|served| !served.is_empty())
     {
+        return;
+    }
+    // A document the peer left as it is: the added edits are the virtual
+    // document's own, with no indentation to regain and no main edit whose
+    // mapping they could disagree with. They go as a document as is sends
+    // them, all or nothing by the region's checks.
+    if offset
+        .prepared()
+        .is_some_and(|prepared| prepared.changes_nothing())
+    {
+        for edit in added.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        if added
+            .iter()
+            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        {
+            item.additional_text_edits = Some(added);
+        } else {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: dropped the additionalTextEdits ({}) an item's resolve added: a member is unsafe for the injection region",
+                added.len()
+            );
+        }
         return;
     }
     let mains: Vec<TextEdit> = match &item.text_edit {

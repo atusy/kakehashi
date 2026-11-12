@@ -332,7 +332,11 @@ added edits are dropped whole when the item was served with additional
 edits of its own (it deferred none, and its request went without them, so
 whether the answer's stand for them or beside them is not told), or
 without a main edit (the editor inserts its text over a range it picks,
-which nothing can be checked beside, as at listing).
+which nothing can be checked beside, as at listing). On a document the
+peer left as it is, nothing is mapped beside anything: the added edits
+are the virtual document's own and are placed as a document as is places
+them, with a main edit or without one; only an item served with
+additional edits of its own goes without them.
 
 A formatter's answer (formatting, range and on-type formatting, and the
 concatenated pipeline's result) is read as the text it leaves, not edit for
@@ -1087,8 +1091,10 @@ editors keep a snippet as is.
   unsent, so servers may see unprepared text until it is up.
 - A document the peer leaves as it is costs less than one it changes,
   not nothing: it waits for the peer's answer like any other, and what
-  is listed from it resolves as from a prepared document. Only its
-  completion items go as a document as is sends them (see Edits).
+  is listed from it resolves as from a prepared document (a completion
+  item only while nothing was typed since its list came). Only its
+  completion items, and the edits their resolve adds, go as a document
+  as is sends them (see Edits).
 - A peer bridged for every language (`"*"`) prepares every injection it
   can under the default `priorities`, and declining with `null` still
   makes a document prepared; restricting it takes `priorities = []` where
