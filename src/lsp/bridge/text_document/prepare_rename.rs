@@ -15,10 +15,10 @@ use tower_lsp_server::ls_types::{Position, PrepareRenameResponse, TextDocumentPo
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
-use super::super::protocol::translate_virtual_range_to_host;
+use super::super::protocol::translate_editable_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    host_position_within_region_bounds, response_has_jsonrpc_error,
+    host_position_admitted, response_has_jsonrpc_error,
 };
 
 impl LanguageServerPool {
@@ -54,16 +54,7 @@ impl LanguageServerPool {
             // Returning None would cause clients to treat the symbol as "not renameable",
             // silently disabling rename for servers that only advertise textDocument/rename.
             if handle.has_capability("textDocument/rename") {
-                // The shortcut must respect the same bounds the dispatch path
-                // enforces: a caret outside the region's content is not
-                // renameable-at-position, and a phantom DefaultBehavior would
-                // win preferred aggregation over real lower-priority results.
-                if !host_position_within_region_bounds(host_position, &offset, region_end) {
-                    return Ok(None);
-                }
-                return Ok(Some(PrepareRenameResponse::DefaultBehavior {
-                    default_behavior: true,
-                }));
+                return Ok(default_behavior_at(host_position, &offset, region_end));
             }
             return Ok(None);
         }
@@ -85,6 +76,25 @@ impl LanguageServerPool {
         )
         .await?
     }
+}
+
+/// The answer for a server that renames but does not prepare: the client's
+/// default behavior, where the caret is one the dispatch path would send.
+/// The shortcut respects the same bounds: a caret outside the region's
+/// content, or on host text the prepared document leaves out (a deleted
+/// edge line, a gap), is not renameable-at-position, and a phantom
+/// DefaultBehavior would win preferred aggregation over real lower-priority
+/// results.
+fn default_behavior_at(
+    host_position: Position,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> Option<PrepareRenameResponse> {
+    host_position_admitted(host_position, offset, region_end)
+        .is_ok()
+        .then_some(PrepareRenameResponse::DefaultBehavior {
+            default_behavior: true,
+        })
 }
 
 /// Build a JSON-RPC prepareRename request for a downstream language server.
@@ -140,20 +150,28 @@ fn transform_prepare_rename_response_to_host(
         }
     };
 
-    // Transform range coordinates for variants that contain a Range
-    match &mut prepare_rename {
-        PrepareRenameResponse::Range(range) => {
-            translate_virtual_range_to_host(range, offset);
-        }
-        PrepareRenameResponse::RangeWithPlaceholder { range, .. } => {
-            translate_virtual_range_to_host(range, offset);
+    // Transform range coordinates for variants that contain a Range: the
+    // symbol the client shows as what the rename replaces (the rename's own
+    // edit comes with its answer), so on a prepared document it must cover
+    // the host text the server saw there; otherwise no answer.
+    let mapped = match &mut prepare_rename {
+        PrepareRenameResponse::Range(range)
+        | PrepareRenameResponse::RangeWithPlaceholder { range, .. } => {
+            translate_editable_virtual_range_to_host(range, offset)
         }
         PrepareRenameResponse::DefaultBehavior { .. } => {
             // No coordinates to transform
+            true
         }
-    }
+    };
 
-    Ok(Some(prepare_rename))
+    if !mapped {
+        log::debug!(
+            target: "kakehashi::bridge",
+            "prepareRename: the range covers other host text than it covers in the prepared virtual document; no answer"
+        );
+    }
+    Ok(mapped.then_some(prepare_rename))
 }
 
 #[cfg(test)]
@@ -348,5 +366,144 @@ mod tests {
             }
             _ => panic!("Expected Range variant"),
         }
+    }
+
+    /// A server that renames but does not prepare answers the default
+    /// behavior only where the dispatch path would send the request: not on
+    /// a blank line the prepare peer deleted, nor outside the region.
+    #[test]
+    fn the_default_behavior_shortcut_skips_host_text_the_prepared_document_leaves_out() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // `\n  foo\n` at host line 10: the opening blank line goes, and the
+        // indent of `foo`.
+        let virtual_text = "\n  foo\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let region_end = Position::new(12, 0);
+        let offset = RegionOffset::new(10, 0).with_prepared(prepared.map);
+        let default = Some(PrepareRenameResponse::DefaultBehavior {
+            default_behavior: true,
+        });
+        assert_eq!(
+            default_behavior_at(Position::new(10, 0), &offset, region_end),
+            None
+        );
+        assert_eq!(
+            default_behavior_at(Position::new(11, 3), &offset, region_end),
+            default
+        );
+        assert_eq!(
+            default_behavior_at(Position::new(13, 0), &offset, region_end),
+            None
+        );
+        // Unprepared, the deleted line's place is the region's own.
+        assert_eq!(
+            default_behavior_at(Position::new(10, 0), &RegionOffset::new(10, 0), region_end),
+            default
+        );
+    }
+
+    /// `  a = 1\n  b\n`, dedented by two, at host line 3.
+    fn prepared_offset() -> RegionOffset {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  a = 1\n  b\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        RegionOffset::new(3, 0).with_prepared(prepared.map)
+    }
+
+    #[test]
+    fn a_prepared_rename_range_across_a_quoted_line_break_maps_to_none() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        // Blockquoted: each host line opens with `> `, left out of V.
+        let virtual_text = "a\nb\n";
+        let answer =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": []}]}))
+                .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let offset =
+            RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_prepared(prepared.map);
+        let response = |end: (u32, u32)| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": end.0, "character": end.1}},
+                "placeholder": "a"
+            }})
+        };
+        // In the host it would cover `a\n> b`: the new name would replace
+        // the next line's `> ` too.
+        assert!(
+            transform_prepare_rename_response_to_host(response((1, 1)), &offset)
+                .unwrap()
+                .is_none()
+        );
+        // Within its line it maps, after the `> `.
+        let Some(PrepareRenameResponse::RangeWithPlaceholder { range, .. }) =
+            transform_prepare_rename_response_to_host(response((0, 1)), &offset).unwrap()
+        else {
+            panic!("mapped");
+        };
+        assert_eq!(
+            (range.start, range.end),
+            (Position::new(3, 2), Position::new(3, 3))
+        );
+    }
+
+    #[test]
+    fn a_prepared_documents_rename_range_maps_where_it_reads_alike() {
+        let response = |start: (u32, u32), end: (u32, u32)| {
+            json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "range": {"start": {"line": start.0, "character": start.1}, "end": {"line": end.0, "character": end.1}},
+                "placeholder": "a"
+            }})
+        };
+        // `a` at the start of its dedented line: after the host's indent.
+        let Some(PrepareRenameResponse::RangeWithPlaceholder { range, .. }) =
+            transform_prepare_rename_response_to_host(response((0, 0), (0, 1)), &prepared_offset())
+                .unwrap()
+        else {
+            panic!("mapped");
+        };
+        assert_eq!(
+            (range.start, range.end),
+            (Position::new(3, 2), Position::new(3, 3))
+        );
+        // Across the line break: the host has the next line's indent there.
+        assert!(
+            transform_prepare_rename_response_to_host(response((0, 6), (1, 1)), &prepared_offset())
+                .unwrap()
+                .is_none()
+        );
+        // As is, an unprepared document's range maps as before.
+        assert!(
+            transform_prepare_rename_response_to_host(
+                response((0, 6), (1, 1)),
+                &RegionOffset::new(3, 0)
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 }

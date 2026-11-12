@@ -36,11 +36,12 @@ use super::super::pool::{
     ConnectionHandle, ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
-    host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
-    translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    JsonRpcRequest, PreparedMap, RegionOffset, RequestId, VirtualDocumentUri, WorkspaceEditRefusal,
+    encode_command, host_position_within_region, response_has_jsonrpc_error,
+    strip_bridge_local_versions, transform_workspace_edit_to_host_explained,
+    translate_host_range_to_virtual, translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
+    workspace_edit_has_effect, workspace_edit_preserves_line_prefixes,
+    workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 use super::host::{HostResolveContext, HostResolveReader};
@@ -90,6 +91,13 @@ pub(crate) struct CodeActionEnvelope {
     /// existing enveloped actions deserialize unchanged.
     #[serde(default)]
     pub(crate) host_layer: bool,
+    /// For an action minted from a prepared document (`offset.prepared`),
+    /// the generation of the text its server held as the action was listed
+    /// (see `HeldText::generation`): a resolve maps its reply through the
+    /// map the server holds then only while it holds that very text. The
+    /// map itself is not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) held_generation: Option<u64>,
 }
 
 impl CodeActionEnvelope {
@@ -117,6 +125,7 @@ pub(crate) struct CodeActionEnvelopeContext<'a> {
     offset: &'a RegionOffset,
     incarnation: Option<u64>,
     content_version: Option<u64>,
+    held_generation: Option<u64>,
 }
 
 /// Wrap `action.data` in a Kakehashi envelope for origin tracking, capturing
@@ -139,6 +148,7 @@ fn envelope_action_data(action: &mut CodeAction, ctx: &CodeActionEnvelopeContext
         content_version: ctx.content_version,
         incarnation: ctx.incarnation,
         host_layer: false,
+        held_generation: ctx.held_generation,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
 }
@@ -172,6 +182,7 @@ fn envelope_host_action(
         content_version: revision.map(|r| r.content_version),
         incarnation: revision.map(|r| r.incarnation),
         host_layer: true,
+        held_generation: None,
     };
     action.data = Some(wrap_envelope(&envelope, inner));
 }
@@ -216,6 +227,7 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
             content_version: envelope.content_version,
             incarnation: envelope.incarnation,
             host_layer: envelope.host_layer,
+            held_generation: envelope.held_generation,
         },
         inner,
     ));
@@ -374,8 +386,12 @@ fn translate_edit_host_ward_strict(
     if workspace_edit_touches_foreign_region(edit, request_virtual_uri) {
         return Err(REASON_CROSS_REGION);
     }
-    if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
-        return Err(REASON_CROSS_REGION);
+    match transform_workspace_edit_to_host_explained(edit, request_virtual_uri, host_uri, offset) {
+        Ok(()) => {}
+        Err(WorkspaceEditRefusal::VirtualFileOperation) => return Err(REASON_CROSS_REGION),
+        Err(WorkspaceEditRefusal::DirectHostEditInRegion | WorkspaceEditRefusal::Unmappable) => {
+            return Err(REASON_PREPARED);
+        }
     }
     // Reached directly by the client-driven resolve path (which bypasses
     // bridge_code_action's own strip): versions on OTHER real files are
@@ -497,11 +513,29 @@ impl LanguageServerPool {
             return Ok(None);
         };
 
+        // An action minted from a prepared document resolves later through
+        // the map its server then holds, only while it holds the very text
+        // the action was listed on: the generation of the text it holds now
+        // (as the reply was read), when that is still the request's.
+        // Already another (a newer text sent meanwhile), the lazy actions
+        // cannot be enveloped, and are resolved here or dropped as for an
+        // editor that cannot resolve them.
+        let listing = offset.prepared().map(|prepared| {
+            let uri = crate::lsp::lsp_impl::url_to_uri(host_uri).ok().map(|host| {
+                VirtualDocumentUri::new(&host, injection_language, region_id).to_uri_string()
+            });
+            self.listing_on_prepared(uri.as_deref(), handle.key(), prepared, upstream_caps)
+        });
+        let (held_generation, upstream_caps, listed_on_held) = match listing {
+            Some(listing) => listing,
+            None => (None, upstream_caps, true),
+        };
+
         // Phase 2: eager-resolve fallback. A client without resolve+data
         // support can never complete a lazy action and may strip our routing
         // envelope, so resolve those actions downstream now (bounded: only the
         // lazy ones). Failures fall through to the phase-3 REASON_RESOLVE path.
-        if !upstream_caps.can_envelope() {
+        if resolves_within_request(upstream_caps, listed_on_held) {
             // Only noted with the prepare layer (see `note_held`).
             let virtual_uri = self
                 .prepares()
@@ -514,7 +548,7 @@ impl LanguageServerPool {
                 &handle,
                 &mut actions,
                 upstream_request_id,
-                virtual_uri.as_deref(),
+                virtual_uri.as_deref().map(|uri| (uri, offset.prepared())),
             )
             .await;
         }
@@ -548,6 +582,7 @@ impl LanguageServerPool {
             server_name,
             incarnation: Some(revision.incarnation),
             content_version: Some(revision.content_version),
+            held_generation,
         };
         Ok(Some(bridge_code_actions(
             actions,
@@ -570,7 +605,7 @@ impl LanguageServerPool {
         handle: &Arc<ConnectionHandle>,
         actions: &mut [CodeActionOrCommand],
         upstream_id: Option<UpstreamId>,
-        virtual_uri: Option<&str>,
+        held_as: Option<(&str, Option<&PreparedMap>)>,
     ) {
         if !handle.has_capability("codeAction/resolve") {
             return;
@@ -616,7 +651,7 @@ impl LanguageServerPool {
                             action,
                             upstream_id,
                             None,
-                            virtual_uri,
+                            held_as,
                         )
                         .await,
                     )
@@ -909,8 +944,39 @@ impl LanguageServerPool {
             return action;
         }
 
-        let offset = RegionOffset::from(&envelope.offset);
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
+        // Only noted with the prepare layer (see `note_held`).
+        let virtual_uri = host_uri_lsp
+            .as_ref()
+            .filter(|_| self.prepares())
+            .map(|host| {
+                VirtualDocumentUri::new(host, &envelope.injection_language, &envelope.region_id)
+                    .to_uri_string()
+            });
+        // An action minted from a prepared document: through the map its
+        // server holds now, only while that is the very text the action was
+        // listed on (the generation it was minted under), and the map the
+        // action's coordinates are in.
+        let held_map = if envelope.offset.prepared {
+            let held = virtual_uri
+                .as_deref()
+                .and_then(|uri| self.prepared_action_held_map(uri, handle.key(), &envelope));
+            let Some(map) = held else {
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "codeAction/resolve: its server no longer holds the prepared text the action was listed on; returning unresolved"
+                );
+                re_envelope_action(&mut action, &envelope);
+                return action;
+            };
+            Some(map)
+        } else {
+            None
+        };
+        let offset = match &held_map {
+            Some(map) => RegionOffset::from(&envelope.offset).with_prepared(Arc::clone(map)),
+            None => RegionOffset::from(&envelope.offset),
+        };
 
         // Forward with the ORIGINAL (unsuffixed) title restored and any
         // client-supplied ranges translated back to virtual coordinates. Keep
@@ -920,21 +986,15 @@ impl LanguageServerPool {
             std::mem::replace(&mut outgoing.title, envelope.original_title.clone());
         translate_action_ranges_host_to_virtual(&mut outgoing, &offset);
 
-        // Only noted with the prepare layer (see `note_held`).
-        let virtual_uri = host_uri_lsp
-            .as_ref()
-            .filter(|_| self.prepares())
-            .map(|host| {
-                VirtualDocumentUri::new(host, &envelope.injection_language, &envelope.region_id)
-                    .to_uri_string()
-            });
         let Some(resolved) = self
             .send_code_action_resolve_on_handle(
                 &handle,
                 outgoing,
                 upstream_id,
                 None,
-                virtual_uri.as_deref(),
+                // Computed on the text the action was listed on: as is, or
+                // the one the held map describes.
+                virtual_uri.as_deref().map(|uri| (uri, held_map.as_deref())),
             )
             .await
         else {
@@ -947,6 +1007,26 @@ impl LanguageServerPool {
             re_envelope_action(&mut action, &envelope);
             return action;
         };
+        // The final check, as a rename's or a formatting answer's: the map's
+        // region still the host's text (settled, not held, recorded with
+        // those very coordinates, the map unrevoked). The host unedited
+        // since the action was listed is the caller's to check, with the
+        // envelope's revision.
+        if let Some(map) = &held_map
+            && !self.host_text_still_current(
+                &host_url,
+                &envelope.injection_language,
+                &envelope.region_id,
+                map,
+            )
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "codeAction/resolve: the prepared text the action was listed on is no longer the host's; returning unresolved"
+            );
+            re_envelope_action(&mut action, &envelope);
+            return action;
+        }
 
         finalize_virt_resolved_action(
             resolved,
@@ -1098,6 +1178,55 @@ fn finalize_virt_resolved_action(
 }
 
 impl LanguageServerPool {
+    /// How a prepared list's lazy actions are handed out, read as its reply
+    /// is: the generation of the text its server holds when that is still
+    /// the one `prepared` describes (for its envelopes to record), the
+    /// editor's capabilities as the policy reads them, and whether the
+    /// list was computed on the text its server holds. Once another text
+    /// was sent (other coordinates, or a newer generation), no envelope can
+    /// record it: the actions go as for an editor that cannot resolve them,
+    /// and are not resolved within the request either, whose every reply
+    /// would be discarded.
+    fn listing_on_prepared(
+        &self,
+        virtual_uri: Option<&str>,
+        connection_key: &ConnectionKey,
+        prepared: &PreparedMap,
+        upstream_caps: UpstreamCodeActionCaps,
+    ) -> (Option<u64>, UpstreamCodeActionCaps, bool) {
+        let held_generation = virtual_uri
+            .and_then(|uri| self.held_text(uri, connection_key))
+            .filter(|held| PreparedMap::same_coordinates(held.map.as_deref(), Some(prepared)))
+            .map(|held| held.generation);
+        match held_generation {
+            Some(_) => (held_generation, upstream_caps, true),
+            None => (
+                None,
+                UpstreamCodeActionCaps {
+                    data_support: false,
+                    ..upstream_caps
+                },
+                false,
+            ),
+        }
+    }
+
+    /// The map an action minted from a prepared document resolves through:
+    /// the one its server holds for `virtual_uri` now, while that is the
+    /// very text the action was listed on (the generation its envelope
+    /// records). `None` once another text was sent, or none prepared is
+    /// held.
+    fn prepared_action_held_map(
+        &self,
+        virtual_uri: &str,
+        connection_key: &ConnectionKey,
+        envelope: &CodeActionEnvelope,
+    ) -> Option<Arc<PreparedMap>> {
+        self.held_text(virtual_uri, connection_key)
+            .filter(|held| Some(held.generation) == envelope.held_generation)
+            .and_then(|held| held.map)
+    }
+
     /// Send a `codeAction/resolve` request on an already-connected handle and
     /// parse the response into a resolved `CodeAction`. Returns `None` on any
     /// failure (register/send/wait/parse) so callers can fail soft.
@@ -1107,7 +1236,7 @@ impl LanguageServerPool {
         action: CodeAction,
         upstream_id: Option<UpstreamId>,
         host_context: Option<HostResolveContext<'_>>,
-        virtual_uri: Option<&str>,
+        held_as: Option<(&str, Option<&PreparedMap>)>,
     ) -> Option<CodeAction> {
         let connection_key = handle.key();
         if let Some(ref id) = upstream_id {
@@ -1168,9 +1297,11 @@ impl LanguageServerPool {
                 return None;
             }
             // What the producer holds for the virtual document as the
-            // resolve is queued: the reply must be computed on that text.
-            if let Some(uri) = virtual_uri {
-                held = self.note_held(uri, connection_key);
+            // resolve is queued: the reply must be computed on that text,
+            // the one its item was minted from (as is, or through the map
+            // `held_as` names).
+            if let Some((uri, expected)) = held_as {
+                held = self.note_held_under(uri, connection_key, expected);
             }
             if let Err(e) = handle.send_request(request, request_id) {
                 drop(connections);
@@ -1378,6 +1509,8 @@ pub(crate) struct VirtLayerContext<'a> {
     server_name: &'a str,
     incarnation: Option<u64>,
     content_version: Option<u64>,
+    /// See [`CodeActionEnvelope::held_generation`].
+    held_generation: Option<u64>,
 }
 
 impl VirtLayerContext<'_> {
@@ -1390,8 +1523,19 @@ impl VirtLayerContext<'_> {
             offset: self.offset,
             incarnation: self.incarnation,
             content_version: self.content_version,
+            held_generation: self.held_generation,
         }
     }
+}
+
+/// Whether a list's lazy actions are resolved within its request: for an
+/// editor that cannot resolve them itself — but not for a prepared list its
+/// server no longer holds the text of (`listed_on_held` false: another text
+/// was sent since), whose every reply the resolve's text check would
+/// discard, the list waiting for each meanwhile. Those are dropped or
+/// disabled as unresolvable.
+fn resolves_within_request(upstream_caps: UpstreamCodeActionCaps, listed_on_held: bool) -> bool {
+    !upstream_caps.can_envelope() && listed_on_held
 }
 
 /// Upstream client capabilities that gate the bridge action policy
@@ -1454,6 +1598,25 @@ pub(crate) fn bridge_code_actions(
 
 const REASON_RESOLVE: &str = "this action could not be resolved to an applicable edit";
 const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host document";
+const REASON_PREPARED: &str =
+    "the edit cannot be mapped back through the prepared virtual document it was computed on";
+
+#[cfg(test)]
+pub(crate) fn prepared_map_refusal_for_test() -> tower_lsp_server::ls_types::CodeActionDisabled {
+    tower_lsp_server::ls_types::CodeActionDisabled {
+        reason: REASON_PREPARED.into(),
+    }
+}
+
+/// Whether `action` came back disabled because a prepared map refused its
+/// edit: an answer only a prepared document gives, unlike an action its
+/// server disabled, or one any document's edit transform refuses.
+pub(crate) fn refused_by_prepared_map(action: &CodeAction) -> bool {
+    action
+        .disabled
+        .as_ref()
+        .is_some_and(|disabled| disabled.reason == REASON_PREPARED)
+}
 const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";
@@ -1818,7 +1981,7 @@ mod tests {
                         },
                         Some(upstream_id),
                         None,
-                        Some(&uri),
+                        Some((&uri, None)),
                     )
                     .await
                 })
@@ -1857,6 +2020,359 @@ mod tests {
                 request.await.unwrap().is_some(),
                 sent.is_none(),
                 "prepared text sent: {sent:?}"
+            );
+        }
+    }
+
+    /// An action minted through a prepared map, resolved within its
+    /// request: its reply is kept only when computed on the text that map
+    /// describes, held as the resolve is queued and still as it answers.
+    #[tokio::test]
+    async fn a_resolve_within_its_request_is_kept_only_on_the_text_its_map_describes() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let minted = dedented("  a");
+        // What the connection holds as the resolve is queued, and what it
+        // is sent after.
+        for (held, after, kept) in [
+            ("prepared", None, true),
+            ("prepared", Some("  b"), false),
+            ("as is", None, false),
+        ] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("ruff");
+            let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host = Url::parse("file:///test.md").unwrap();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+                "lua",
+                "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+            );
+            if held == "prepared" {
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &minted.text,
+                        map: Some(&minted.map),
+                    },
+                );
+            } else {
+                pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            }
+            let upstream_id = UpstreamId::Number(79);
+            let request = {
+                let pool = Arc::clone(&pool);
+                let handle = Arc::clone(&handle);
+                let upstream_id = upstream_id.clone();
+                let uri = virtual_uri.to_uri_string();
+                let map = Arc::clone(&minted.map);
+                tokio::spawn(async move {
+                    pool.send_code_action_resolve_on_handle(
+                        &handle,
+                        CodeAction {
+                            title: "lazy".into(),
+                            ..Default::default()
+                        },
+                        Some(upstream_id),
+                        None,
+                        Some((&uri, Some(&map))),
+                    )
+                    .await
+                })
+            };
+            let downstream_id = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(id) = handle
+                        .router()
+                        .lookup_downstream_ids(&upstream_id)
+                        .into_iter()
+                        .next()
+                    {
+                        break id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be admitted");
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while !handle.router().is_sent(downstream_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("resolve request must be sent");
+            if let Some(text) = after {
+                let other = dedented(text);
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &other.text,
+                        map: Some(&other.map),
+                    },
+                );
+            }
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": { "title": "resolved" }
+            }));
+            assert_eq!(
+                request.await.unwrap().is_some(),
+                kept,
+                "held {held}, sent after: {after:?}"
+            );
+        }
+    }
+
+    /// A prepared action resolves through the map its server holds only
+    /// while that is the text it was listed on.
+    #[test]
+    fn a_prepared_action_resolves_only_through_the_text_it_was_listed_on() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("ruff");
+        let host = Url::parse("file:///test.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "lua",
+            "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+        );
+        let uri = virtual_uri.to_uri_string();
+        let listed = dedented("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &listed.text,
+                map: Some(&listed.map),
+            },
+        );
+        let generation = pool.held_text(&uri, &key).unwrap().generation;
+        let offset = RegionOffset::new(3, 0).with_prepared(Arc::clone(&listed.map));
+        let mut action = CodeAction {
+            title: "Fix".to_string(),
+            data: Some(json!({ "id": 1 })),
+            ..CodeAction::default()
+        };
+        envelope_action_data(
+            &mut action,
+            &CodeActionEnvelopeContext {
+                held_generation: Some(generation),
+                ..envelope_ctx_for_test(&offset)
+            },
+        );
+        let envelope = extract_code_action_envelope(&action).unwrap();
+        assert!(envelope.offset.prepared);
+        let map = pool
+            .prepared_action_held_map(&uri, &key, &envelope)
+            .expect("the text it was listed on");
+        assert!(Arc::ptr_eq(&map, &listed.map));
+        // Another text sent since: not resolved through its map.
+        let other = dedented("  b");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &other.text,
+                map: Some(&other.map),
+            },
+        );
+        assert!(
+            pool.prepared_action_held_map(&uri, &key, &envelope)
+                .is_none()
+        );
+    }
+
+    /// A prepared list's lazy actions are enveloped with the generation of
+    /// the text its server holds while that is the list's; once another text
+    /// was sent, none is enveloped nor resolved within the request.
+    #[test]
+    fn a_prepared_list_envelopes_its_lazy_actions_only_while_its_text_is_held() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let listed = dedented("  a");
+        for sent_after in [None, Some("  b"), Some("  a")] {
+            let pool = LanguageServerPool::preparing();
+            let key = ConnectionKey::for_server("ruff");
+            let virtual_uri =
+                VirtualDocumentUri::new(&make_host_uri(), "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            let uri = virtual_uri.to_uri_string();
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &listed.text,
+                    map: Some(&listed.map),
+                },
+            );
+            let generation = pool.held_text(&uri, &key).unwrap().generation;
+            // A newer text, or the same one under other coordinates.
+            if let Some(text) = sent_after {
+                let mut other = dedented(text);
+                if text == "  a" {
+                    other =
+                        apply_prepare_result("  a", &VirtualLayout::single("  a"), None).unwrap();
+                }
+                pool.record_sent_for_test(
+                    &virtual_uri,
+                    &key,
+                    SentText {
+                        text: &other.text,
+                        map: Some(&other.map),
+                    },
+                );
+            }
+            let (held, caps, listed_on_held) =
+                pool.listing_on_prepared(Some(&uri), &key, &listed.map, caps_resolve());
+            if sent_after.is_none() {
+                assert_eq!(held, Some(generation));
+                assert!(caps.can_envelope() && listed_on_held);
+            } else {
+                assert_eq!(held, None, "{sent_after:?}");
+                assert!(!caps.can_envelope(), "{sent_after:?}");
+                assert!(
+                    !resolves_within_request(caps, listed_on_held),
+                    "{sent_after:?}"
+                );
+            }
+        }
+    }
+
+    /// Lazy actions are resolved within their request for an editor that
+    /// cannot resolve them, never for a prepared list whose text its server
+    /// no longer holds.
+    #[test]
+    fn lazy_actions_resolve_within_the_request_only_on_the_text_held() {
+        let cannot = UpstreamCodeActionCaps {
+            data_support: false,
+            ..caps_resolve()
+        };
+        assert!(resolves_within_request(cannot, true));
+        assert!(!resolves_within_request(cannot, false));
+        assert!(!resolves_within_request(caps_resolve(), true));
+    }
+
+    /// A prepared action's resolve reply is mapped only while its region
+    /// still passes the final check: its map revoked meanwhile (or the
+    /// region re-prepared, held), the action comes back unresolved.
+    #[tokio::test]
+    async fn a_prepared_actions_resolve_is_judged_as_its_reply_arrives() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::pool::test_helpers::{
+            create_handle_advertising_resolve_methods, devnull_config, wait_for_sent_request,
+        };
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            let mut listed =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+            let revocation = Arc::new(Revocation::default());
+            Arc::get_mut(&mut listed.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("ruff");
+            let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let virtual_uri =
+                VirtualDocumentUri::new(&make_host_uri(), "lua", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &listed.text,
+                    map: Some(&listed.map),
+                },
+            );
+            let generation = pool
+                .held_text(&virtual_uri.to_uri_string(), &key)
+                .unwrap()
+                .generation;
+            let offset = RegionOffset::new(3, 0).with_prepared(Arc::clone(&listed.map));
+            let mut action = CodeAction {
+                title: "Fix".to_string(),
+                data: Some(json!({ "id": 1 })),
+                ..CodeAction::default()
+            };
+            envelope_action_data(
+                &mut action,
+                &CodeActionEnvelopeContext {
+                    held_generation: Some(generation),
+                    // No host lifetime tracked in this pool.
+                    incarnation: None,
+                    ..envelope_ctx_for_test(&offset)
+                },
+            );
+            let mut settings = WorkspaceSettings::default();
+            settings
+                .language_servers
+                .insert("ruff".to_string(), devnull_config());
+            let upstream_id = UpstreamId::Number(80);
+            let resolve = {
+                let pool = Arc::clone(&pool);
+                let upstream_id = upstream_id.clone();
+                tokio::spawn(async move {
+                    pool.dispatch_code_action_resolve(
+                        action,
+                        &settings,
+                        caps_resolve(),
+                        Some(upstream_id),
+                        Position::new(4, 0),
+                        &|_| None,
+                    )
+                    .await
+                })
+            };
+            let request_id = wait_for_sent_request(&handle, &upstream_id).await;
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            let uri = virtual_uri.to_uri_string();
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": request_id.as_i64(),
+                "result": {
+                    "title": "Fix",
+                    "edit": { "changes": { uri: [{
+                        "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                        "newText": "b"
+                    }] } }
+                }
+            }));
+            let resolved = resolve.await.unwrap();
+            assert_eq!(
+                resolved.edit.is_none(),
+                revoked,
+                "revoked: {revoked}: {resolved:?}"
             );
         }
     }
@@ -1943,6 +2459,7 @@ mod tests {
             original_title: "old".into(),
             inner: None,
             host_layer: true,
+            held_generation: None,
         };
         let upstream_id = UpstreamId::Number(77);
         let request = {
@@ -2047,6 +2564,63 @@ mod tests {
             "source.organizeImports"
         );
         assert_eq!(json["params"]["context"]["triggerKind"], 1);
+    }
+
+    /// A diagnostic a server published through a prepared document comes
+    /// back in a code action request with the range it published: servers
+    /// match their quick fixes by range.
+    #[test]
+    fn a_prepared_documents_diagnostics_reach_its_server_as_it_published_them() {
+        use super::super::super::protocol::{VirtualLayout, apply_prepare_result};
+        let virtual_text = "  local x = 1\n  return x\n";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""},
+            {"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        let offset = RegionOffset::new(3, 0).with_prepared(prepared.map);
+        // Published over P's (1, 0)-(1, 6), `return`, at a dedented line's
+        // start.
+        let mut published = Range {
+            start: Position::new(1, 0),
+            end: Position::new(1, 6),
+        };
+        translate_virtual_range_to_host(&mut published, &offset);
+        assert_eq!(
+            (published.start, published.end),
+            (Position::new(4, 2), Position::new(4, 8))
+        );
+        let context = CodeActionContext {
+            diagnostics: vec![Diagnostic {
+                range: published,
+                ..diagnostic_at(4)
+            }],
+            only: None,
+            trigger_kind: None,
+        };
+        let request = build_code_action_request(
+            &VirtualDocumentUri::new(&test_host_uri(), "lua", "region-0"),
+            published,
+            context,
+            &offset,
+            Position::new(5, 0),
+            RequestId::new(1),
+            None,
+        );
+        let json = serde_json::to_value(&request).unwrap();
+        let expected =
+            json!({"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 6}});
+        assert_eq!(json["params"]["range"], expected);
+        assert_eq!(
+            json["params"]["context"]["diagnostics"][0]["range"],
+            expected
+        );
     }
 
     #[test]
@@ -2280,6 +2854,7 @@ mod tests {
             server_name: "ruff",
             incarnation: Some(1),
             content_version: Some(0),
+            held_generation: None,
         };
         Some(bridge_code_actions(
             actions,
@@ -3055,6 +3630,7 @@ mod tests {
             offset,
             incarnation: Some(1),
             content_version: None,
+            held_generation: None,
         }
     }
 

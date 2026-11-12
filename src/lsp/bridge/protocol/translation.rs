@@ -193,6 +193,60 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
     }
 }
 
+/// [`translate_virtual_range_to_host`] for a range that stands for its
+/// text: one a client shows as what an action works on (prepareRename's,
+/// which the client highlights and fills the new name in from) or edits
+/// through in place (linked ranges typed into together). `false`, with
+/// `range` left as it came, when on a prepared document it would cover
+/// other host text than it covers there: text V lacks (see
+/// [`PreparedMap::map_ranges_alike`]), or a line prefix the host has and V
+/// leaves out (a blockquote's `> ` past a line break it reaches across).
+pub(crate) fn translate_editable_virtual_range_to_host(
+    range: &mut Range,
+    offset: &RegionOffset,
+) -> bool {
+    translate_editable_virtual_ranges_to_host(std::slice::from_mut(range), offset)
+}
+
+/// [`translate_editable_virtual_range_to_host`] for several ranges, all
+/// or none (linked ranges, typed into together): `false`, with `ranges`
+/// left as they came, when any is refused. Through a prepared map their
+/// ends are converted all at once (see [`PreparedMap::map_ranges_alike`]).
+pub(crate) fn translate_editable_virtual_ranges_to_host(
+    ranges: &mut [Range],
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for range in ranges.iter_mut() {
+            translate_virtual_range_to_host(range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = prepared.map_ranges_alike(ranges) else {
+        return false;
+    };
+    if mapped
+        .iter()
+        .any(|range| crosses_a_line_prefix(*range, offset))
+    {
+        return false;
+    }
+    for (range, mut mapped) in ranges.iter_mut().zip(mapped) {
+        translate_unprepared_virtual_position_to_host(&mut mapped.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut mapped.end, offset);
+        *range = mapped;
+    }
+    true
+}
+
+/// Whether a V range reaches past a line break onto a line the host opens
+/// with a prefix V leaves out (a blockquote's `> `): in the host it covers
+/// that prefix too, text the server never saw.
+fn crosses_a_line_prefix(range: Range, offset: &RegionOffset) -> bool {
+    (range.start.line.saturating_add(1)..=range.end.line)
+        .any(|line| offset.column_for_line(line) > 0)
+}
+
 /// Translate, in place, a set of edits a downstream server made to one
 /// virtual document into host coordinates, as `mode` reads them; `false` —
 /// the caller drops the set or its carrier — when the set is refused, with
@@ -214,6 +268,9 @@ pub(crate) fn translate_virtual_text_edits_to_host(
         }
         return true;
     };
+    // Only a mode mapping one edit for each, in order: a replayed set may
+    // come back with others (see `translate_virtual_replayed_edits_to_host`).
+    debug_assert_ne!(mode, EditMode::Replay, "edits mapped one for each");
     let Some(mapped) = map_to_host(prepared, edits, offset, mode) else {
         return false;
     };
@@ -242,6 +299,40 @@ pub(crate) fn translate_virtual_formatting_edits_to_host(
     shift_to_host(&mut mapped, offset);
     *edits = mapped;
     Ok(())
+}
+
+/// [`translate_virtual_text_edits_to_host`] for one document's edits a
+/// client applies together (a rename's, a code action's workspace edit),
+/// replayed on a prepared document ([`EditMode::Replay`]). Mapped, the set
+/// may hold other edits than it came with: it is replaced whole; `false`,
+/// with `edits` left as they came, when refused.
+pub(crate) fn translate_virtual_replayed_edits_to_host(
+    edits: &mut Vec<TextEdit>,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = map_to_host(prepared, edits, offset, EditMode::Replay) else {
+        return false;
+    };
+    *edits = mapped;
+    true
+}
+
+/// Where a prepared document's virtual text starts and ends in the host,
+/// the edge lines its peer deleted included: the host text whose every
+/// edit must go through the map. `None` for an unprepared document.
+pub(crate) fn prepared_region_host_span(offset: &RegionOffset) -> Option<Range> {
+    let prepared = offset.prepared()?;
+    let mut start = Position::new(0, 0);
+    let mut end = prepared.virtual_end();
+    translate_unprepared_virtual_position_to_host(&mut start, offset);
+    translate_unprepared_virtual_position_to_host(&mut end, offset);
+    Some(Range { start, end })
 }
 
 /// [`translate_virtual_text_edits_to_host`] for one edit keeping its
@@ -468,6 +559,35 @@ pub(crate) fn host_position_within_region_bounds(
     region_end: Position,
 ) -> bool {
     host_position_within_region(host_position, offset) && host_position <= region_end
+}
+
+/// Why a host position is not sent to a region's downstream servers (see
+/// [`host_position_admitted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PositionRefusal {
+    /// [`host_position_hidden_by_prepare`]: no place in the prepared
+    /// document.
+    HiddenByPrepare,
+    /// Not [`host_position_within_region_bounds`].
+    OutsideRegion,
+}
+
+/// Whether a position request at `host_position` is sent to the region's
+/// downstream servers, or why not: one rule for every path that answers
+/// for such a request, so a shortcut answering without sending agrees with
+/// the request it stands in for.
+pub(crate) fn host_position_admitted(
+    host_position: Position,
+    offset: &RegionOffset,
+    region_end: Position,
+) -> Result<(), PositionRefusal> {
+    if host_position_hidden_by_prepare(host_position, offset) {
+        return Err(PositionRefusal::HiddenByPrepare);
+    }
+    if !host_position_within_region_bounds(host_position, offset, region_end) {
+        return Err(PositionRefusal::OutsideRegion);
+    }
+    Ok(())
 }
 
 /// Translate a single host position to virtual coordinates.
