@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use tower_lsp_server::ls_types::{Position, Range};
+use tower_lsp_server::ls_types::{Position, Range, TextEdit};
 
-use super::prepare::{Bias, PreparedMap};
+use super::prepare::{Bias, EditMode, PreparedMap};
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -131,6 +131,12 @@ fn translate_virtual_position_to_host_biased(
     if let Some(prepared) = offset.prepared() {
         *pos = prepared.to_virtual(*pos, bias);
     }
+    translate_unprepared_virtual_position_to_host(pos, offset);
+}
+
+/// V → host only, ignoring `offset`'s prepared map: for coordinates already
+/// mapped out of the prepared document.
+fn translate_unprepared_virtual_position_to_host(pos: &mut Position, offset: &RegionOffset) {
     let virtual_line = pos.line;
     pos.line = pos.line.saturating_add(offset.line());
     pos.character = pos
@@ -187,6 +193,108 @@ pub(crate) fn translate_virtual_range_to_host(range: &mut Range, offset: &Region
     }
 }
 
+/// Translate, in place, a set of edits a downstream server made to one
+/// virtual document into host coordinates, as `mode` reads them; `false` —
+/// the caller drops the set or its carrier — when the set is refused, with
+/// `edits` left as they came.
+///
+/// An edit to a prepared document must also restore the indentation its new
+/// lines lost and keep off the host text the peer hid (gaps, deleted edge
+/// lines), so the set goes through [`PreparedMap::map_edits`]. An
+/// unprepared document's edits translate one by one, as ranges, allocating
+/// nothing.
+pub(crate) fn translate_virtual_text_edits_to_host(
+    edits: &mut [TextEdit],
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        for edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        return true;
+    };
+    let Some(mapped) = prepared.map_edits(edits, mode) else {
+        return false;
+    };
+    for (edit, mut mapped) in edits.iter_mut().zip(mapped) {
+        translate_unprepared_virtual_position_to_host(&mut mapped.range.start, offset);
+        translate_unprepared_virtual_position_to_host(&mut mapped.range.end, offset);
+        *edit = mapped;
+    }
+    true
+}
+
+/// Translate, in place, a main edit and the additional edits a client
+/// applies together with it, as `mode` reads them. `mains` is the main edit
+/// once per range the client may apply it through (an insert/replace edit
+/// has two; none for an item with no main edit), each translated alone.
+/// `None` — the caller drops the carrier — when a main edit is refused;
+/// otherwise whether the additional edits were kept (`true` without any),
+/// refused ones left as they came for the caller to drop.
+///
+/// A prepared document maps each main edit with the additional ones as the
+/// one set the client applies: edits harmless one by one can together
+/// corrupt host text the document hides. The additional edits are kept only
+/// when every set maps, with its main edit mapping as it does alone (so the
+/// edits sent are the set checked), and the additional edits mapping alike
+/// in every set. With no main edit there is no set to check: refused. An
+/// unprepared document's main edits translate as ranges, allocating
+/// nothing; its additional edits are not passed here (callers translate
+/// them once the main edit is accepted, as no set needs checking).
+pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
+    mains: &mut [TextEdit],
+    additional: Option<&mut Vec<TextEdit>>,
+    offset: &RegionOffset,
+    mode: EditMode,
+) -> Option<bool> {
+    // No additional edits is nothing to check or drop.
+    let additional = additional.filter(|additional| !additional.is_empty());
+    debug_assert!(
+        additional.is_none() || offset.prepared().is_some(),
+        "an unprepared document's additional edits are translated by the caller"
+    );
+    // The main edits as sent, to map with the additional ones: cloned only
+    // when there are any.
+    let sent: Vec<TextEdit> = match &additional {
+        Some(_) => mains.to_vec(),
+        None => Vec::new(),
+    };
+    for main in mains.iter_mut() {
+        if !translate_virtual_text_edits_to_host(std::slice::from_mut(main), offset, mode) {
+            return None;
+        }
+    }
+    let Some(additional) = additional else {
+        return Some(true);
+    };
+    let mut agreed: Option<Vec<TextEdit>> = None;
+    for (sent, mapped) in sent.into_iter().zip(mains.iter()) {
+        let mut set = Vec::with_capacity(additional.len() + 1);
+        set.push(sent);
+        set.extend(additional.iter().cloned());
+        // Each edit maps from P and itself alone (touching edits whose texts
+        // would bear on each other are refused), so the main edit maps in
+        // the set as alone and the additional edits alike for every main:
+        // these comparisons guard that the set sent is the set checked.
+        if !translate_virtual_text_edits_to_host(&mut set, offset, mode) || set[0] != *mapped {
+            return Some(false);
+        }
+        let set = set.split_off(1);
+        if agreed.as_ref().is_some_and(|agreed| *agreed != set) {
+            return Some(false);
+        }
+        agreed = Some(set);
+    }
+    match agreed {
+        Some(mapped) => {
+            *additional = mapped;
+            Some(true)
+        }
+        None => Some(false),
+    }
+}
+
 // =============================================================================
 // Host -> Virtual (request direction)
 // =============================================================================
@@ -237,6 +345,38 @@ pub(crate) fn host_position_hidden_by_prepare(
     translate_host_position_to_unprepared_virtual(&mut position, offset);
     prepared.virtual_position_in_gap(position)
         || prepared.virtual_position_in_removed_lines(position)
+}
+
+/// Whether the host range reaches into a gap of the prepared document
+/// `offset` maps to: host-owned text a downstream answer keyed to that range
+/// (a color presentation's label) would overwrite — the prepared range may
+/// even be empty there, where an edit would only insert beside it.
+pub(crate) fn host_range_in_prepared_gap(host_range: Range, offset: &RegionOffset) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut range = host_range;
+    translate_host_position_to_unprepared_virtual(&mut range.start, offset);
+    translate_host_position_to_unprepared_virtual(&mut range.end, offset);
+    prepared.virtual_range_in_gap(range)
+}
+
+/// Whether `host_position` lies within indentation or blank lines the
+/// prepare peer removed from the document `offset` maps to, starts included
+/// (and from where the deleted closing lines start). Downstream sees the
+/// caret elsewhere instead — at the line's content, the document's start or
+/// the content's end — so an edit it anchors there (a completion's replace
+/// range) would not contain the caret the client asked at.
+pub(crate) fn host_position_in_removed_indent(
+    host_position: Position,
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut position = host_position;
+    translate_host_position_to_unprepared_virtual(&mut position, offset);
+    prepared.virtual_position_in_removed_indent(position)
 }
 
 /// [`host_position_within_region`] plus the trailing bound: the position must
@@ -371,6 +511,77 @@ mod tests {
             range,
             Range::new(Position::new(10, 6), Position::new(11, 0))
         );
+    }
+
+    #[test]
+    fn a_host_caret_in_removed_indent_is_recognized() {
+        // `prepared_offset`: host line 11 is V line 1 (`    y`), from column
+        // 0, its first two columns removed.
+        let offset = prepared_offset();
+        for character in [0, 1] {
+            assert!(
+                host_position_in_removed_indent(Position::new(11, character), &offset),
+                "{character}"
+            );
+        }
+        assert!(!host_position_in_removed_indent(
+            Position::new(11, 2),
+            &offset
+        ));
+        assert!(!host_position_in_removed_indent(
+            Position::new(11, 1),
+            &RegionOffset::new(10, 4)
+        ));
+    }
+
+    #[test]
+    fn prepared_text_edits_restore_the_indent_in_host_coordinates() {
+        let offset = prepared_offset();
+        // A line inserted after `y` (P (1, 2)) regains the removed indent.
+        let mut edits = [TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(1, 3)),
+            new_text: "\n  z".to_string(),
+        }];
+        assert!(translate_virtual_text_edits_to_host(
+            &mut edits,
+            &offset,
+            EditMode::Extent
+        ));
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(11, 5), Position::new(11, 5))
+        );
+        assert_eq!(edits[0].new_text, "\n    z");
+        // A refused set is left as it came.
+        let reversed = TextEdit {
+            range: Range::new(Position::new(1, 3), Position::new(0, 0)),
+            new_text: "x".to_string(),
+        };
+        let mut edits = [reversed.clone()];
+        assert!(!translate_virtual_text_edits_to_host(
+            &mut edits,
+            &offset,
+            EditMode::Extent
+        ));
+        assert_eq!(edits, [reversed]);
+    }
+
+    #[test]
+    fn unprepared_text_edits_translate_as_ranges() {
+        let mut edits = [TextEdit {
+            range: Range::new(Position::new(0, 1), Position::new(1, 0)),
+            new_text: "\nz".to_string(),
+        }];
+        assert!(translate_virtual_text_edits_to_host(
+            &mut edits,
+            &RegionOffset::new(10, 4),
+            EditMode::Extent
+        ));
+        assert_eq!(
+            edits[0].range,
+            Range::new(Position::new(10, 5), Position::new(11, 0))
+        );
+        assert_eq!(edits[0].new_text, "\nz");
     }
 
     #[test]

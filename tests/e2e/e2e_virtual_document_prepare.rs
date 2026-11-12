@@ -266,6 +266,160 @@ fn downstream_sees_the_dedented_document_and_maps_back() {
     );
 }
 
+/// The completion items, inlay hints or color presentations a request got,
+/// whichever shape its result takes.
+fn result_items(response: &Value) -> Vec<Value> {
+    match &response["result"] {
+        Value::Array(items) => items.clone(),
+        Value::Object(list) => list["items"].as_array().cloned().unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+#[test]
+fn edits_on_a_prepared_document_map_back_reindented() {
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/edits.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  pr\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+
+    // Completion at the end of `pr` (P (1, 2)): the inserted second line
+    // regains the host indent, and the line added above the first lands
+    // after the host's indent, followed by it.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 4 } }),
+    );
+    let items = result_items(&response);
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "echo-edit")
+        .unwrap_or_else(|| panic!("no echo-edit item: {response}"));
+    assert_eq!(
+        item["textEdit"],
+        json!({
+            "range": {
+                "start": { "line": 4, "character": 4 },
+                "end": { "line": 4, "character": 4 }
+            },
+            "newText": "int(x)\n  print(y)"
+        })
+    );
+    assert_eq!(
+        item["additionalTextEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 2 }
+            },
+            "newText": "-- c\n  "
+        }])
+    );
+    // A caret in the removed indent gets none, not even an item without an
+    // edit, which the client would insert at the caret unmapped: the server
+    // would see it at the line's content.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 1 } }),
+    );
+    assert!(result_items(&response).is_empty(), "{response}");
+
+    // The hint's edit at P (0, 0) lands after the host indent.
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            }
+        }),
+    );
+    let hints = result_items(&response);
+    assert_eq!(hints.len(), 1, "{response}");
+    assert_eq!(hints[0]["position"], json!({ "line": 3, "character": 3 }));
+    assert_eq!(
+        hints[0]["textEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 2 }
+            },
+            "newText": "existing "
+        }])
+    );
+
+    // A presentation keyed to the request range over `x` maps back onto it,
+    // as does one the server places there itself (P (0, 6)-(0, 7)).
+    let range = json!({
+        "start": { "line": 3, "character": 8 },
+        "end": { "line": 3, "character": 9 }
+    });
+    let response = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+            "range": range
+        }),
+    );
+    let presentations = result_items(&response);
+    assert_eq!(presentations.len(), 2, "{response}");
+    assert_eq!(
+        presentations[0]["textEdit"],
+        json!({ "range": range, "newText": "#ff0000" })
+    );
+    assert_eq!(
+        presentations[1]["textEdit"],
+        json!({ "range": range, "newText": "#00ff00" })
+    );
+}
+
+#[test]
+fn an_incomplete_list_dropped_whole_still_asks_to_requery() {
+    // Every item is a snippet, which a prepared document cannot carry: no
+    // item comes back, but the ask to re-query does, as the next keystroke
+    // may yield items that map.
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/requery.md";
+    let text = "# t\n\n```lua\n  local SNIPPETS = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 7 } }),
+    );
+    assert_eq!(
+        response["result"],
+        json!({ "isIncomplete": true, "items": [] }),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_document_the_peer_left_as_it_is_completes_as_one_never_prepared() {
+    // Nothing for the peer to remove: no indentation, no blank edge line.
+    // The document still goes through it, but its text is the virtual
+    // document's own, so the snippet a prepared document drops (above)
+    // comes back, still the snippet its server sent.
+    let (mut client, _dir) = Setup::default().start();
+    let uri = "file:///prepare/left-as-it-is.md";
+    let text = "# t\n\n```lua\nlocal SNIPPETS = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 7 } }),
+    );
+    let items = result_items(&response);
+    assert_eq!(items.len(), 1, "{response}");
+    assert_eq!(items[0]["label"], "s");
+    assert_eq!(items[0]["insertTextFormat"], 2);
+    let inserted = items[0]["insertText"].as_str().unwrap_or_default();
+    assert!(inserted.starts_with("s$"), "{response}");
+}
+
 #[test]
 fn formatting_is_not_offered_on_a_prepared_document() {
     let (mut client, _dir) = Setup::default().start();
@@ -274,9 +428,10 @@ fn formatting_is_not_offered_on_a_prepared_document() {
     open(&mut client, uri, text);
     hover_with_retry(&mut client, uri, 3, 4);
 
-    // The echo mock would uppercase the document; no edit is mapped back
-    // through a prepared one. Refused up front, not by a wait for a text the
-    // server never holds (which would take the 5 s budget).
+    // The echo mock would uppercase the document; a formatter's edits to a
+    // prepared one are not mapped back through its map. Refused up front,
+    // not by a wait for a text the server never holds (which would take the
+    // 5 s budget).
     for method in ["textDocument/formatting", "textDocument/rangeFormatting"] {
         let started = Instant::now();
         let response = client.send_request(
@@ -572,6 +727,67 @@ fn without_experimental_features_nothing_is_prepared() {
         }),
     );
     assert!(!response["result"].is_null(), "{response}");
+    // Edits translate as ranges only, as on main: no text re-indented.
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 4 } }),
+    );
+    let items = result_items(&response);
+    let item = items
+        .iter()
+        .find(|item| item["label"] == "echo-edit")
+        .unwrap_or_else(|| panic!("no echo-edit item: {response}"));
+    assert_eq!(
+        item["textEdit"],
+        json!({
+            "range": {
+                "start": { "line": 3, "character": 4 },
+                "end": { "line": 3, "character": 4 }
+            },
+            "newText": "int(x)\nprint(y)"
+        })
+    );
+    assert_eq!(
+        item["additionalTextEdits"][0]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    assert_eq!(item["additionalTextEdits"][0]["newText"], "-- c\n");
+    let response = client.send_request(
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 4, "character": 0 }
+            }
+        }),
+    );
+    let hints = result_items(&response);
+    assert_eq!(hints.len(), 1, "{response}");
+    assert_eq!(
+        hints[0]["textEdits"][0]["range"]["start"],
+        json!({ "line": 3, "character": 0 })
+    );
+    let response = client.send_request(
+        "textDocument/colorPresentation",
+        json!({
+            "textDocument": { "uri": uri },
+            "color": { "red": 1.0, "green": 0.0, "blue": 0.0, "alpha": 1.0 },
+            "range": {
+                "start": { "line": 3, "character": 8 },
+                "end": { "line": 3, "character": 9 }
+            }
+        }),
+    );
+    let presentations = result_items(&response);
+    assert_eq!(presentations.len(), 2, "{response}");
+    assert_eq!(
+        presentations[1]["textEdit"]["range"],
+        json!({
+            "start": { "line": 3, "character": 6 },
+            "end": { "line": 3, "character": 7 }
+        })
+    );
     let log = std::fs::read_to_string(dir.path().join("wire.log")).expect("wire log");
     assert!(log.contains("textDocument/didOpen\t"), "{log}");
     assert!(!log.contains("kakehashi/virtualDocument/prepare"), "{log}");
@@ -831,6 +1047,110 @@ fn a_pushed_diagnostic_outlives_an_edit_inside_its_prepared_region() {
 #[test]
 fn a_pushed_diagnostic_follows_its_prepared_region_below_an_edit() {
     a_pushed_diagnostic_outlives_an_edit_its_server_stays_silent_on(true, EDITED_ABOVE, 5);
+}
+
+/// The item a resolving mock completes at the end of `pr` in `uri`, once
+/// the peer and the mock are up.
+fn resolvable_item(client: &mut LspClient, uri: &str) -> Value {
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 4, "character": 4 } }),
+        );
+        if let Some(item) = result_items(&response).into_iter().next() {
+            return item;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for a completion through the prepared document");
+}
+
+#[test]
+fn a_completion_item_from_a_prepared_document_resolves_what_holds_no_position() {
+    // The mock answers a resolve with the text it holds for the item's
+    // document as its `detail`: the resolve reached it, and it answered for
+    // the prepared text.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-text",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    assert!(item.get("detail").is_none(), "{item}");
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    assert_eq!(
+        resolved["result"]["detail"],
+        json!("local x = 1\npr\n"),
+        "{resolved}"
+    );
+    // Resolved again, as a client does on every selection move.
+    let resolved = client.send_request("completionItem/resolve", resolved["result"].clone());
+    assert_eq!(
+        resolved["result"]["detail"],
+        json!("local x = 1\npr\n"),
+        "{resolved}"
+    );
+}
+
+#[test]
+fn a_resolve_on_a_prepared_document_takes_no_edit_from_its_answer() {
+    // This mock's resolve adds an additional edit on the prepared text's
+    // second line, with a `detail`: the map the item came through is not
+    // carried, so only the `detail` is taken.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-additional-edit",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-edit.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    let detail = resolved["result"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("mock-resolved:"), "{resolved}");
+    assert!(
+        resolved["result"].get("additionalTextEdits").is_none(),
+        "{resolved}"
+    );
+    assert!(resolved["result"].get("textEdit").is_none(), "{resolved}");
+}
+
+#[test]
+fn a_resolve_is_not_answered_for_a_prepared_text_its_document_left_behind() {
+    // The edit's prepared text takes the peer two seconds (`SLOW`): until
+    // it is sent, the server still holds the text prepared before the edit,
+    // and a resolve answered from it would describe a document that is
+    // gone. The item comes back as it went.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-text",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-stale.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item(&mut client, uri);
+    change(
+        &mut client,
+        uri,
+        2,
+        "# t\n\n```lua\n  local SLOW = 1\n  pr\n```\n",
+    );
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    assert_eq!(resolved["result"], item, "{resolved}");
 }
 
 fn pull_capabilities() -> Value {

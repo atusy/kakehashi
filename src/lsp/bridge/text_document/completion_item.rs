@@ -31,10 +31,7 @@ use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
 };
-use super::completion::{
-    EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
-    transform_completion_item,
-};
+use super::completion::{KakehashiEnvelope, strip_envelope, transform_completion_item};
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{
@@ -311,15 +308,37 @@ impl LanguageServerPool {
         // later blockquote marker edited from `> ` to `>` changes a later
         // line's column while the start stays) belongs to the reply, which
         // the downstream computes against the virtual text as it is now.
-        let outgoing =
-            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
+        //
+        // An item minted from a prepared document goes without its edits:
+        // the map their ranges came through is not carried to map them back.
+        let prepared = envelope.offset.prepared;
+        let outgoing = if prepared {
+            prepared_completion_resolve_item(&item)
+        } else {
+            prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset))
+        };
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id, &envelope, document)
             .await
         {
+            // Nor is anything its answer says of positions read: the item
+            // served stays, with what the answer fills in beside them.
+            Some(resolved) if prepared => {
+                take_position_free_fields(&mut item, resolved);
+                re_envelope_item(&mut item, &envelope);
+                item
+            }
             Some(mut resolved) => {
-                if transform_completion_item(&mut resolved, &offset, region_end, None) {
+                // Only an unprepared region gets here, so the client's insert
+                // mode, which only a prepared edit consults, does not matter.
+                if transform_completion_item(
+                    &mut resolved,
+                    &offset,
+                    region_end,
+                    None,
+                    super::completion::ClientInsertMode::default(),
+                ) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
                     // must use that same geometry rather than the producer's.
@@ -463,6 +482,27 @@ impl LanguageServerPool {
                 if !self.is_document_opened_on_connection(&virtual_uri, connection_key) {
                     return Err(io::Error::other("completion document is no longer open"));
                 }
+                // An item minted from a prepared document resolves from the
+                // prepared text its server holds, which must be the one made
+                // from the region's current text: nothing is sent to bring
+                // it there (the lifecycle pass alone sends prepared texts),
+                // so until it is, the item stays unresolved.
+                if envelope.offset.prepared {
+                    return self
+                        .queue_if_holding_text_prepared_from(
+                            &document.host_uri,
+                            &virtual_uri,
+                            connection_key,
+                            &document.text,
+                            || handle.send_request(request, request_id),
+                        )
+                        .ok_or_else(|| {
+                            io::Error::other(
+                                "completion document does not hold its current prepared text",
+                            )
+                        })?
+                        .map_err(io::Error::from);
+                }
                 // The text is the region's as is: it never replaces a
                 // prepared one, nor reaches a region held for its peer.
                 if self.refuses_text_as_is(&document.host_uri, &virtual_uri, connection_key) {
@@ -569,6 +609,33 @@ fn prepare_completion_resolve_item(item: &CompletionItem, offset: &RegionOffset)
     outgoing
 }
 
+/// Build the outgoing `completionItem/resolve` item from one served from a
+/// prepared document: a clone without its edits. Their ranges are host
+/// positions the prepared text's map gave them, and their text was
+/// re-indented on the way; the map is not carried to undo either, and
+/// ranges of another text are not what the server sent. It resolves from
+/// its own `data`.
+fn prepared_completion_resolve_item(item: &CompletionItem) -> CompletionItem {
+    let mut outgoing = item.clone();
+    outgoing.text_edit = None;
+    outgoing.additional_text_edits = None;
+    outgoing
+}
+
+/// Take from a resolve's answer what it fills in that holds no position:
+/// `documentation` and `detail`, the two LSP lets every server defer.
+/// Everything else stays as the item was served: edits and a command's
+/// arguments would be read in the prepared text's coordinates, and the
+/// insert format and mode were settled against the map when it was minted.
+fn take_position_free_fields(item: &mut CompletionItem, resolved: CompletionItem) {
+    if resolved.documentation.is_some() {
+        item.documentation = resolved.documentation;
+    }
+    if resolved.detail.is_some() {
+        item.detail = resolved.detail;
+    }
+}
+
 /// Translate a served (host-coordinate) item's edit ranges back to virtual
 /// coordinates before forwarding it in a `completionItem/resolve` request —
 /// the inverse of `transform_completion_item`'s range translation.
@@ -596,21 +663,26 @@ fn translate_item_ranges_host_to_virtual(item: &mut CompletionItem, offset: &Reg
 /// The resolved item may have its own `data` (from the downstream's resolve
 /// response). We wrap it again so that future resolves can still be routed.
 fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
-    let ctx = EnvelopeContext {
-        server_name: &envelope.origin,
-        injection_language: &envelope.injection_language,
+    // The offset as a fresh mint writes it, keeping the prepared mark (see
+    // `EnvelopeOffset::rewritten`), as every carrier re-envelopes. The layer
+    // is kept too: a host-layer item resolved once must still take the host
+    // path on the client's NEXT resolve of it.
+    let offset = envelope.offset.rewritten();
+    // Field by field: `..envelope.clone()` would clone `inner`, the
+    // server's whole data payload, only to drop it.
+    let rebuilt = KakehashiEnvelope {
+        origin: envelope.origin.clone(),
+        injection_language: envelope.injection_language.clone(),
         incarnation: envelope.incarnation,
-        host_uri: &envelope.host_uri,
-        region_id: &envelope.region_id,
-        offset: &RegionOffset::from(&envelope.offset),
-        region_end: envelope
-            .region_end
-            .map(|(line, character)| Position { line, character }),
-        // Preserve the layer: a host-layer item that has been resolved once
-        // must still take the host path on the client's NEXT resolve of it.
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        inner: None,
+        offset,
+        region_end: envelope.region_end,
         host_layer: envelope.host_layer,
     };
-    envelope_item_data(item, &ctx);
+    let inner = item.data.take();
+    item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
 }
 
 #[cfg(test)]
@@ -640,6 +712,30 @@ mod tests {
             region_end: Some((9, 0)),
             host_layer: false,
         }
+    }
+
+    #[test]
+    fn a_refused_resolve_keeps_the_prepared_mark() {
+        let mut envelope = test_envelope();
+        envelope.offset.prepared = true;
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &envelope);
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(back.offset.prepared);
+        // As is, the envelope is written as before.
+        let mut item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"resolve_id": 99})),
+            ..Default::default()
+        };
+        re_envelope_item(&mut item, &test_envelope());
+        let back = extract_envelope(&item).expect("re-enveloped");
+        assert!(!back.offset.prepared);
+        assert_eq!(back.offset.line_column_offsets, Some(vec![0]));
     }
 
     #[cfg(unix)]
@@ -966,6 +1062,211 @@ mod tests {
         let wire = std::fs::read_to_string(output.path()).unwrap();
         assert!(!wire.contains("textDocument/didChange"), "{wire}");
         assert!(!wire.contains("completionItem/resolve"), "{wire}");
+    }
+
+    /// An item minted from a prepared document resolves on the prepared
+    /// text its connection holds, with nothing sent to the document first —
+    /// but only while that text was prepared from the region's current one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prepared_item_resolves_only_on_the_text_prepared_from_the_current_one() {
+        use crate::lsp::bridge::pool::test_helpers::create_handle_with_command;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::bridge::{ConnectionKey, ConnectionState};
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let key = ConnectionKey::for_server("lua-ls");
+        let (handle, _) = create_handle_with_command(
+            ConnectionState::Ready,
+            key.clone(),
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$1\"".into(),
+                "sh".into(),
+                output.path().to_str().unwrap().into(),
+            ],
+            None,
+        )
+        .await;
+        let pool = Arc::new(LanguageServerPool::preparing());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let mut envelope = test_envelope();
+        envelope.offset.prepared = true;
+        let uri = Url::parse(&envelope.host_uri).unwrap();
+        pool.open_host_incarnation(&uri, 1).await;
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&uri).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        let virtual_text = "  a";
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &VirtualLayout::single(virtual_text),
+            Some(answer),
+        )
+        .unwrap();
+        pool.ensure_document_opened(
+            &mut ConnectionHandleSender(&handle),
+            &uri,
+            &virtual_uri,
+            SentText {
+                text: &prepared.text,
+                map: Some(&prepared.map),
+            },
+            &key,
+        )
+        .await
+        .unwrap();
+        let edit_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let document = |text: &str| {
+            let edit_lock = Arc::clone(&edit_lock);
+            let host_uri = uri.clone();
+            let language_id = envelope.injection_language.clone();
+            let text = Arc::from(text);
+            async move {
+                CompletionResolveDocument {
+                    host_uri,
+                    language_id,
+                    text,
+                    geometry: None,
+                    revision: HostRevision {
+                        incarnation: 1,
+                        content_version: 2,
+                    },
+                    edit_guard: edit_lock.lock_owned().await,
+                }
+            }
+        };
+
+        // The region's text moved on, its prepared text not yet sent: the
+        // connection still holds the one prepared before.
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pool.send_completion_resolve_on_handle(
+                &handle,
+                CompletionItem::default(),
+                None,
+                &envelope,
+                document("  ab").await,
+            ),
+        )
+        .await
+        .expect("refused without waiting for a reply");
+        assert!(reply.is_none(), "left unresolved");
+        let wire = std::fs::read_to_string(output.path()).unwrap();
+        assert!(!wire.contains("completionItem/resolve"), "{wire}");
+
+        // The text it was prepared from: the resolve goes out, and nothing
+        // else does.
+        let document = document(virtual_text).await;
+        let resolving = {
+            let (pool, handle, envelope) = (Arc::clone(&pool), Arc::clone(&handle), envelope);
+            tokio::spawn(async move {
+                pool.send_completion_resolve_on_handle(
+                    &handle,
+                    CompletionItem::default(),
+                    None,
+                    &envelope,
+                    document,
+                )
+                .await
+            })
+        };
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let wire = std::fs::read_to_string(output.path()).unwrap();
+                if wire.contains("completionItem/resolve") {
+                    break wire;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the resolve is sent");
+        assert!(!wire.contains("textDocument/didChange"), "{wire}");
+        resolving.abort();
+    }
+
+    #[test]
+    fn a_prepared_item_goes_to_its_resolve_without_its_edits() {
+        let range = tower_lsp_server::ls_types::Range::default();
+        let edit = tower_lsp_server::ls_types::TextEdit {
+            range,
+            new_text: "x".to_string(),
+        };
+        let item = CompletionItem {
+            label: "x".to_string(),
+            data: Some(json!({"id": 1})),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(
+                edit.clone(),
+            )),
+            additional_text_edits: Some(vec![edit]),
+            ..Default::default()
+        };
+        let outgoing = prepared_completion_resolve_item(&item);
+        assert_eq!(
+            outgoing,
+            CompletionItem {
+                label: "x".to_string(),
+                data: Some(json!({"id": 1})),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_prepared_items_resolve_takes_only_what_holds_no_position() {
+        use tower_lsp_server::ls_types::{Documentation, InsertTextMode, Range, TextEdit};
+        let edit = |text: &str| TextEdit {
+            range: Range::default(),
+            new_text: text.to_string(),
+        };
+        let served = CompletionItem {
+            label: "x".to_string(),
+            detail: Some("served".to_string()),
+            text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit(
+                "served",
+            ))),
+            insert_text_mode: Some(InsertTextMode::AS_IS),
+            ..Default::default()
+        };
+        let mut item = served.clone();
+        take_position_free_fields(
+            &mut item,
+            CompletionItem {
+                label: "y".to_string(),
+                detail: Some("resolved".to_string()),
+                documentation: Some(Documentation::String("docs".to_string())),
+                text_edit: Some(tower_lsp_server::ls_types::CompletionTextEdit::Edit(edit(
+                    "resolved",
+                ))),
+                additional_text_edits: Some(vec![edit("import")]),
+                command: Some(tower_lsp_server::ls_types::Command {
+                    title: "import".to_string(),
+                    command: "import".to_string(),
+                    arguments: None,
+                }),
+                insert_text_mode: Some(InsertTextMode::ADJUST_INDENTATION),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            item,
+            CompletionItem {
+                detail: Some("resolved".to_string()),
+                documentation: Some(Documentation::String("docs".to_string())),
+                ..served.clone()
+            }
+        );
+        // What the answer leaves out stays as it was served.
+        let mut item = served.clone();
+        take_position_free_fields(&mut item, CompletionItem::default());
+        assert_eq!(item, served);
     }
 
     // ==========================================================================
