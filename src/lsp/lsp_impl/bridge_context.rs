@@ -64,12 +64,173 @@ fn method_requires_contiguous_injection(method: &str) -> bool {
         "textDocument/codeAction"
             | "textDocument/colorPresentation"
             | "textDocument/completion"
+            | "textDocument/formatting"
             | "textDocument/inlayHint"
             | "textDocument/linkedEditingRange"
             | "textDocument/onTypeFormatting"
             | "textDocument/prepareRename"
+            | "textDocument/rangeFormatting"
             | "textDocument/rename"
     )
+}
+
+/// Whether `method` is closed to a region: one that is not contiguous, or
+/// whose document is prepared (`prepared`), cannot take the edits the method
+/// answers with — no edit is mapped back through a prepared document. Inlay
+/// hints stay open to a contiguous prepared document (they are display; their
+/// edits are dropped instead).
+pub(crate) fn method_closed_to(resolved: &ResolvedInjection, method: &str, prepared: bool) -> bool {
+    method_closed_to_with(resolved, method, || prepared)
+}
+
+/// [`method_closed_to`], asking whether the document is prepared only for
+/// a method that depends on it.
+fn method_closed_to_with(
+    resolved: &ResolvedInjection,
+    method: &str,
+    prepared: impl FnOnce() -> bool,
+) -> bool {
+    method_requires_contiguous_injection(method)
+        && (!resolved.contiguous || (method != "textDocument/inlayHint" && prepared()))
+}
+
+/// [`prepare_request_context`] for a `method` request: `None` when the
+/// document could not be prepared, or when `method` is closed to it as
+/// prepared — checked again with the answer in, since the lifecycle pass may
+/// not have looked the region up yet.
+pub(crate) async fn prepare_request_context_for(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    ctx: DocumentRequestContext,
+    method: &str,
+) -> Option<DocumentRequestContext> {
+    let ctx = prepare_request_context(bridge, host_language, ctx)
+        .await
+        .ok()?;
+    (!method_closed_to(&ctx.resolved, method, ctx.prepared.is_some())).then_some(ctx)
+}
+
+/// Whether a method is open to a region (see
+/// `Kakehashi::method_gate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MethodGate {
+    Open,
+    /// Closed by the region's shape or its prepared document.
+    Closed,
+    /// Its peer could not prepare it: not bridged, a failed request for a
+    /// caller counting them.
+    Unprepared,
+}
+
+/// Start the prepare attempts of every region `regions` names (of a host in
+/// `host_language`), without waiting: a request that then waits for each
+/// region's context in turn waits about the slowest attempt, not one after
+/// another, its waits sharing the attempts already running.
+pub(crate) fn start_prepare_attempts<'a>(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    regions: impl IntoIterator<Item = (&'a Url, &'a crate::language::injection::ResolvedInjection)>,
+) {
+    for (host_uri, resolved) in regions {
+        let Some(target) = bridge.prepare_target(host_language, &resolved.injection_language)
+        else {
+            continue;
+        };
+        let _ = bridge.prepared_document_now_for_request(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri,
+                host_language,
+                injection_language: &resolved.injection_language,
+                region_id: &resolved.region.region_id,
+                virtual_text: &resolved.virtual_content,
+                gaps: &resolved.gaps,
+            },
+        );
+    }
+}
+
+/// Present `ctx`'s virtual document as downstream servers see it, waiting for
+/// the prepare peer when the (host, injection) pair has one: the context's
+/// virtual content becomes the prepared text and its fan-out translates
+/// through the prepared map. A miss when the document could not be prepared:
+/// the region is then not bridged at all, never bridged unprepared.
+pub(crate) async fn prepare_request_context(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    mut ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, crate::lsp::bridge::PrepareMiss> {
+    let Some(target) = bridge.prepare_target(host_language, &ctx.resolved.injection_language)
+    else {
+        return Ok(ctx);
+    };
+    let input = crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    };
+    match bridge.prepared_document(&target, input).await? {
+        crate::lsp::bridge::PrepareAnswer::AsIs => {}
+        crate::lsp::bridge::PrepareAnswer::Prepared(prepared) => {
+            ctx.resolved.virtual_content = prepared.text.clone();
+            ctx.prepared = Some(std::sync::Arc::clone(&prepared.map));
+        }
+        // Not given out as an answer: `prepared_document` reports it as a
+        // miss.
+        crate::lsp::bridge::PrepareAnswer::Unusable => {
+            return Err(crate::lsp::bridge::PrepareMiss::Failed);
+        }
+    }
+    Ok(ctx)
+}
+
+/// [`prepare_request_context`] without waiting, for paths that cannot: a
+/// document whose answer is not in yet is skipped like a failed one (its
+/// host is synced again when the answer arrives).
+pub(crate) fn prepare_request_context_now(
+    bridge: &crate::lsp::bridge::BridgeCoordinator,
+    host_language: &str,
+    mut ctx: DocumentRequestContext,
+) -> Result<DocumentRequestContext, PrepareSkip> {
+    let Some(target) = bridge.prepare_target(host_language, &ctx.resolved.injection_language)
+    else {
+        return Ok(ctx);
+    };
+    let input = crate::lsp::bridge::PrepareInput {
+        host_uri: &ctx.uri,
+        host_language,
+        injection_language: &ctx.resolved.injection_language,
+        region_id: &ctx.resolved.region.region_id,
+        virtual_text: &ctx.resolved.virtual_content,
+        gaps: &ctx.resolved.gaps,
+    };
+    match bridge.prepared_document_now_for_request(&target, input) {
+        crate::lsp::bridge::PrepareLookup::Answered(crate::lsp::bridge::PrepareAnswer::AsIs) => {}
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Prepared(prepared),
+        ) => {
+            ctx.resolved.virtual_content = prepared.text.clone();
+            ctx.prepared = Some(std::sync::Arc::clone(&prepared.map));
+        }
+        crate::lsp::bridge::PrepareLookup::Answered(
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+        ) => return Err(PrepareSkip::Failed),
+        crate::lsp::bridge::PrepareLookup::Pending => return Err(PrepareSkip::Pending),
+    }
+    Ok(ctx)
+}
+
+/// Why [`prepare_request_context_now`] gave no context to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareSkip {
+    /// The peer could not prepare the region.
+    Failed,
+    /// No answer yet. A collection runs again once it arrives, and covers
+    /// the region.
+    Pending,
 }
 
 /// The region-boundary rule a method's position resolves under.
@@ -196,6 +357,10 @@ pub(crate) struct DocumentRequestContext {
     /// aggregates the fanned-out downstreams' `$/progress` onto it
     /// (ls-bridge-client-progress); `None` disables client-progress aggregation.
     pub(crate) client_progress_token: Option<tower_lsp_server::ls_types::NumberOrString>,
+    /// Prepared ↔ virtual coordinates when `resolved.virtual_content` holds
+    /// the prepared document downstream servers see (see
+    /// [`prepare_request_context`]).
+    pub(crate) prepared: Option<std::sync::Arc<crate::lsp::bridge::PreparedMap>>,
 }
 
 /// All resolved context needed to send a **host** bridge request
@@ -1086,7 +1251,13 @@ impl Kakehashi {
             return None;
         };
 
-        if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+        // At once on what the lifecycle pass knows, a pending answer
+        // included (most likely prepared); checked again with the answer in
+        // (see `prepare_request_context_for`). Formatting waits instead (see
+        // `method_gate`).
+        if method_closed_to_with(&resolved, method_name, || {
+            self.lifecycle_prepares(&uri, &resolved)
+        }) {
             return None;
         }
 
@@ -1310,7 +1481,8 @@ impl Kakehashi {
             method_name,
         );
 
-        Some(DocumentRequestContext {
+        let ctx = DocumentRequestContext {
+            prepared: None,
             uri: preamble.uri,
             resolved: preamble.resolved,
             region_end: Some(preamble.region_end),
@@ -1320,7 +1492,81 @@ impl Kakehashi {
             strategy: agg.strategy,
             max_fan_out: agg.max_fan_out,
             client_progress_token: None,
-        })
+        };
+        prepare_request_context_for(&self.bridge, &preamble.language_name, ctx, method_name).await
+    }
+
+    /// Whether `method` is open to a region of a `host_language` host, for
+    /// formatting. Closed by the region's shape ([`method_closed_to`]);
+    /// otherwise, for a method the rule closes on a prepared document, by
+    /// the prepare answer for the text being formatted, waited for (not the
+    /// one the lifecycle pass holds the document on, which can be older): only a document
+    /// sent as is takes edits, and one its peer could not prepare is told
+    /// apart (not bridged at all).
+    ///
+    /// Unlike a request's preamble, which closes an edit method at once on
+    /// what the lifecycle pass knows (a pending answer included) and checks
+    /// again once the answer is in, this waits even while the pass holds the
+    /// document pending: formatting must tell a failed peer apart, which the
+    /// CLI counts as a failure, rather than answer nothing.
+    pub(crate) async fn method_gate(
+        &self,
+        uri: &Url,
+        host_language: &str,
+        resolved: &ResolvedInjection,
+        method: &str,
+    ) -> MethodGate {
+        if method_closed_to(resolved, method, false) {
+            return MethodGate::Closed;
+        }
+        let region = self.bridge.prepare_region(
+            uri,
+            &resolved.injection_language,
+            &resolved.region.region_id,
+        );
+        // Open even were the region prepared: no answer to wait for.
+        if !method_closed_to(resolved, method, true) {
+            return MethodGate::Open;
+        }
+        // The answer, waited for even while the lifecycle pass holds the
+        // document on it: one the peer cannot give is told apart.
+        let Some(target) = self
+            .bridge
+            .prepare_target(host_language, &resolved.injection_language)
+        else {
+            return if region.prepared {
+                MethodGate::Closed
+            } else {
+                MethodGate::Open
+            };
+        };
+        let input = crate::lsp::bridge::PrepareInput {
+            host_uri: uri,
+            host_language,
+            injection_language: &resolved.injection_language,
+            region_id: &resolved.region.region_id,
+            virtual_text: &resolved.virtual_content,
+            gaps: &resolved.gaps,
+        };
+        match self.bridge.prepared_document(&target, input).await {
+            Ok(crate::lsp::bridge::PrepareAnswer::AsIs) => MethodGate::Open,
+            Ok(_) => MethodGate::Closed,
+            Err(_) => MethodGate::Unprepared,
+        }
+    }
+
+    /// Whether the lifecycle pass prepares a region's current document (or
+    /// holds it back for its peer): what [`method_closed_to`] closes edit
+    /// methods by. Not whether a server still holds a prepared text of it
+    /// (see `BridgeCoordinator::region_coordinates_may_be_prepared`).
+    pub(crate) fn lifecycle_prepares(&self, uri: &Url, resolved: &ResolvedInjection) -> bool {
+        self.bridge
+            .prepare_region(
+                uri,
+                &resolved.injection_language,
+                &resolved.region.region_id,
+            )
+            .prepared
     }
 
     /// Resolve all aggregation settings (strategy, priorities, max_fan_out) for a
@@ -1886,7 +2132,9 @@ impl Kakehashi {
         };
         let mut contexts = Vec::new();
         for resolved in regions {
-            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+            if method_closed_to_with(&resolved, method_name, || {
+                self.lifecycle_prepares(&uri, &resolved)
+            }) {
                 continue;
             }
             // Clamp to the region so the translated range is in-region; skip a
@@ -1972,6 +2220,267 @@ mod tests {
     use crate::config::settings::{
         AggregationConfig, AggregationStrategy, BridgeLanguageConfig, LanguageSettings,
     };
+
+    /// A Kakehashi over a preparing pool whose markdown lua documents have
+    /// one candidate, and a region of it no lifecycle pass looked up.
+    fn kakehashi_with_an_unlooked_region() -> (
+        tower_lsp_server::LspService<crate::lsp::lsp_impl::Kakehashi>,
+        crate::language::injection::ResolvedInjection,
+        Url,
+    ) {
+        let pool = std::sync::Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                std::sync::Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(std::sync::Arc::clone(&pool)),
+            )
+        });
+        let settings = std::sync::Arc::new(crate::config::WorkspaceSettings {
+            auto_install: false,
+            language_servers: [(
+                "peer".to_string(),
+                crate::lsp::bridge::test_helpers::devnull_config_for_language("lua"),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        service.inner().bridge.prepare_settings_changed(&settings);
+        let resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: "01J0000000000000000000000A".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: "  a".to_string(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+            gaps: Default::default(),
+        };
+        (
+            service,
+            resolved,
+            Url::parse("file:///test/unlooked.md").unwrap(),
+        )
+    }
+
+    /// Answer the region's current text with `answer`, as a request's
+    /// attempt would — the lifecycle pass still holds nothing.
+    fn answer(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        resolved: &crate::language::injection::ResolvedInjection,
+        answer: crate::lsp::bridge::PrepareAnswer,
+    ) {
+        answer_held(server, uri, resolved, answer, false);
+        assert!(!server.lifecycle_prepares(uri, resolved));
+    }
+
+    /// [`answer`], the lifecycle pass holding the document on it when
+    /// `held`.
+    fn answer_held(
+        server: &crate::lsp::lsp_impl::Kakehashi,
+        uri: &Url,
+        resolved: &crate::language::injection::ResolvedInjection,
+        answer: crate::lsp::bridge::PrepareAnswer,
+        held: bool,
+    ) {
+        let target = server.bridge.prepare_target("markdown", "lua").unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: uri,
+                host_language: "markdown",
+                injection_language: "lua",
+                region_id: &resolved.region.region_id,
+                virtual_text: &resolved.virtual_content,
+                gaps: &resolved.gaps,
+            },
+            answer,
+            held,
+        );
+    }
+
+    fn dedented() -> crate::lsp::bridge::PrepareAnswer {
+        let answer = serde_json::from_value(serde_json::json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        crate::lsp::bridge::PrepareAnswer::Prepared(std::sync::Arc::new(
+            crate::lsp::bridge::apply_prepare_result(
+                "  a",
+                &crate::lsp::bridge::VirtualLayout::single("  a"),
+                Some(answer),
+            )
+            .unwrap(),
+        ))
+    }
+
+    /// An edit method on a region the lifecycle pass has not looked up yet
+    /// is closed once its answer is in, unless the document goes as is;
+    /// inlay hints stay open (their edits are dropped instead).
+    #[tokio::test]
+    async fn an_answer_closes_edit_methods_before_the_lifecycle_pass_looks() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer(server, &uri, &resolved, dedented());
+        let gate = |method| server.method_gate(&uri, "markdown", &resolved, method);
+        assert_eq!(gate("textDocument/formatting").await, MethodGate::Closed);
+        assert_eq!(
+            gate("textDocument/rangeFormatting").await,
+            MethodGate::Closed
+        );
+        assert_eq!(gate("textDocument/inlayHint").await, MethodGate::Open);
+
+        let ctx = || DocumentRequestContext {
+            prepared: None,
+            uri: uri.clone(),
+            resolved: resolved.clone(),
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let for_method =
+            |method| prepare_request_context_for(&server.bridge, "markdown", ctx(), method);
+        assert!(for_method("textDocument/rename").await.is_none());
+        assert!(for_method("textDocument/completion").await.is_none());
+        let hint = for_method("textDocument/inlayHint")
+            .await
+            .expect("hints stay open");
+        assert!(hint.prepared.is_some());
+        assert_eq!(hint.resolved.virtual_content, "a");
+    }
+
+    /// A region the lifecycle pass holds on an unusable answer is not
+    /// bridged: formatting tells it apart from a closed one, as a failure.
+    #[tokio::test]
+    async fn a_region_its_peer_failed_is_unprepared_for_edit_methods() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer_held(
+            server,
+            &uri,
+            &resolved,
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+            true,
+        );
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
+                .await,
+            MethodGate::Unprepared
+        );
+    }
+
+    /// The gate answers for the text being formatted: an unusable answer the
+    /// lifecycle pass holds the document on, for an older text, does not
+    /// make a text answered as is unprepared.
+    #[tokio::test]
+    async fn the_gate_answers_for_the_text_being_formatted() {
+        let (service, older, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer_held(
+            server,
+            &uri,
+            &older,
+            crate::lsp::bridge::PrepareAnswer::Unusable,
+            true,
+        );
+        let mut current = older.clone();
+        current.virtual_content = "b".to_string();
+        answer_held(
+            server,
+            &uri,
+            &current,
+            crate::lsp::bridge::PrepareAnswer::AsIs,
+            false,
+        );
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &current, "textDocument/formatting")
+                .await,
+            MethodGate::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_sending_the_document_as_is_keeps_edit_methods_open() {
+        let (service, resolved, uri) = kakehashi_with_an_unlooked_region();
+        let server = service.inner();
+        answer(
+            server,
+            &uri,
+            &resolved,
+            crate::lsp::bridge::PrepareAnswer::AsIs,
+        );
+        assert_eq!(
+            server
+                .method_gate(&uri, "markdown", &resolved, "textDocument/formatting")
+                .await,
+            MethodGate::Open
+        );
+        let ctx = DocumentRequestContext {
+            prepared: None,
+            uri: uri.clone(),
+            resolved: resolved.clone(),
+            region_end: None,
+            configs: Vec::new(),
+            upstream_request_id: None,
+            priorities: vec!["*".to_string()],
+            strategy: AggregationStrategy::Preferred,
+            max_fan_out: None,
+            client_progress_token: None,
+        };
+        let ctx =
+            prepare_request_context_for(&server.bridge, "markdown", ctx, "textDocument/rename")
+                .await
+                .expect("a document sent as is takes edits");
+        assert!(ctx.prepared.is_none());
+    }
+
+    #[test]
+    fn a_prepared_document_is_closed_to_edit_methods_but_not_inlay_hints() {
+        let mut resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 0..1,
+                line_range: 0..1,
+                start_column: 0,
+                region_id: String::new(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: String::new(),
+            line_column_offsets: vec![],
+            contiguous: true,
+            gaps: Default::default(),
+        };
+        for method in [
+            "textDocument/rename",
+            "textDocument/completion",
+            "textDocument/codeAction",
+            "textDocument/prepareRename",
+            "textDocument/formatting",
+            "textDocument/rangeFormatting",
+            "textDocument/linkedEditingRange",
+        ] {
+            assert!(!method_closed_to(&resolved, method, false), "{method}");
+            assert!(method_closed_to(&resolved, method, true), "{method}");
+        }
+        assert!(!method_closed_to(&resolved, "textDocument/inlayHint", true));
+        assert!(!method_closed_to(&resolved, "textDocument/hover", true));
+        resolved.contiguous = false;
+        assert!(method_closed_to(&resolved, "textDocument/inlayHint", false));
+    }
 
     #[tokio::test]
     async fn host_resolve_snapshot_keeps_language_and_text_together_during_edits() {
@@ -3363,10 +3872,12 @@ mod tests {
             "textDocument/codeAction",
             "textDocument/colorPresentation",
             "textDocument/completion",
+            "textDocument/formatting",
             "textDocument/inlayHint",
             "textDocument/linkedEditingRange",
             "textDocument/onTypeFormatting",
             "textDocument/prepareRename",
+            "textDocument/rangeFormatting",
             "textDocument/rename",
         ] {
             assert!(method_requires_contiguous_injection(method), "{method}");

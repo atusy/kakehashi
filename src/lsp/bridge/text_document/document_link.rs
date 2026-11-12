@@ -21,7 +21,9 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::DocumentLink;
 use url::Url;
 
-use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
+};
 use super::super::protocol::{
     DocumentParams, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_whole_document_request, response_has_jsonrpc_error,
@@ -100,21 +102,22 @@ fn strip_document_link_envelope(link: &mut DocumentLink) -> Option<DocumentLinkE
 }
 
 fn re_envelope_link(link: &mut DocumentLink, envelope: &DocumentLinkEnvelope) {
-    let offset = RegionOffset::from(&envelope.offset);
-    envelope_link_data(
-        link,
-        &DocumentLinkEnvelopeContext {
-            server_name: &envelope.origin,
-            host_uri: &envelope.host_uri,
-            region_id: &envelope.region_id,
-            injection_language: &envelope.injection_language,
-            incarnation: envelope.incarnation,
-            connection_generation: envelope.connection_generation,
-            connection_key: envelope.connection_key.as_ref(),
-            offset: &offset,
-            host_layer: envelope.host_layer,
-        },
-    );
+    // Written as a fresh mint writes it, but keeping the mark of a link
+    // minted from a prepared document (see `EnvelopeOffset::rewritten`).
+    // Field by field: the offset is rewritten, not cloned to be dropped.
+    let rebuilt = DocumentLinkEnvelope {
+        origin: envelope.origin.clone(),
+        host_uri: envelope.host_uri.clone(),
+        region_id: envelope.region_id.clone(),
+        injection_language: envelope.injection_language.clone(),
+        incarnation: envelope.incarnation,
+        connection_generation: envelope.connection_generation,
+        connection_key: envelope.connection_key.clone(),
+        offset: envelope.offset.rewritten(),
+        inner: None,
+        host_layer: envelope.host_layer,
+    };
+    link.data = Some(wrap_envelope(&rebuilt, link.data.take()));
 }
 
 pub(crate) fn envelope_host_document_links(
@@ -369,6 +372,7 @@ impl LanguageServerPool {
         let request = build_document_link_resolve_request(&outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
 
+        let mut held = HeldNote::default();
         let send_result = if envelope.is_host_layer() {
             self.enqueue_host_resolve(
                 &handle,
@@ -397,6 +401,15 @@ impl LanguageServerPool {
                     "producer connection was replaced before resolve send",
                 ))
             } else {
+                // What the producer holds for the virtual document as the
+                // resolve is queued: the reply (a target computed from it)
+                // must be computed on that text.
+                held = self.note_region_held(
+                    &host_uri,
+                    &envelope.injection_language,
+                    &envelope.region_id,
+                    connection_key,
+                );
                 handle.send_request(request, request_id).map_err(Into::into)
             }
         };
@@ -438,7 +451,10 @@ impl LanguageServerPool {
                     && self.document_connection_generation(connection_key) == expected_generation
             })
         };
-        if !producer_is_still_live {
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it, or after it, once its region gained a peer): not on
+        // the text the link was minted from.
+        if !producer_is_still_live || !self.held_unchanged(&held) {
             re_envelope_link(&mut link, &envelope);
             return link;
         }
@@ -566,6 +582,104 @@ mod tests {
                 host_layer: false,
             },
         )
+    }
+
+    /// A resolve has no text check of its own: one whose reply was computed
+    /// on a prepared text (sent before the resolve was queued, or after,
+    /// once its region gained a peer) is dropped, its target computed on
+    /// another text than the link was minted from.
+    #[tokio::test]
+    async fn a_link_resolve_computed_on_a_prepared_text_is_dropped() {
+        use crate::lsp::bridge::pool::SentText;
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let record_prepared = |pool: &LanguageServerPool, virtual_uri: &VirtualDocumentUri| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            let prepared =
+                apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer)).unwrap();
+            pool.record_sent_for_test(
+                virtual_uri,
+                &ConnectionKey::for_server("lua-ls"),
+                SentText {
+                    text: &prepared.text,
+                    map: Some(&prepared.map),
+                },
+            );
+        };
+        // When a prepared text is sent: never, before the resolve is queued,
+        // after, or before and closed again (the server may still answer
+        // from it); "closed as is" closes a document only ever held as is.
+        for sent in [
+            None,
+            Some("before"),
+            Some("after"),
+            Some("closed"),
+            Some("closed as is"),
+        ] {
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("lua-ls");
+            let handle = create_handle_advertising_resolve_methods(key.clone()).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test.md").unwrap();
+            pool.open_host_incarnation(&host_uri, 1).await;
+            let region_id = "01JPMQ8ZYYQA1W3AVPW4JDRZFR";
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                "lua",
+                region_id,
+            );
+            pool.record_sent_for_test(&virtual_uri, &key, SentText::from("  a"));
+            if matches!(sent, Some("before" | "closed")) {
+                record_prepared(&pool, &virtual_uri);
+            }
+            if matches!(sent, Some("closed" | "closed as is")) {
+                pool.untrack_document(&virtual_uri, &key).await;
+            }
+            let envelope = DocumentLinkEnvelope {
+                origin: "lua-ls".into(),
+                host_uri: host_uri.to_string(),
+                region_id: region_id.to_string(),
+                injection_language: "lua".to_string(),
+                incarnation: Some(1),
+                connection_generation: Some(pool.document_connection_generation(&key)),
+                connection_key: Some(key.clone()),
+                offset: EnvelopeOffset::from(&RegionOffset::new(0, 0)),
+                inner: Some(json!({ "token": 1 })),
+                host_layer: false,
+            };
+            let upstream_id = UpstreamId::Number(79);
+            let request = {
+                let pool = Arc::clone(&pool);
+                let upstream_id = upstream_id.clone();
+                tokio::spawn(async move {
+                    pool.send_document_link_resolve_request(
+                        &BridgeServerConfig::default(),
+                        unresolved_link(Some(json!({ "token": 1 }))),
+                        envelope,
+                        Some(upstream_id),
+                        &super::super::test_helpers::resolve_host_snapshot,
+                    )
+                    .await
+                })
+            };
+            let downstream_id = wait_for_sent_request(&handle, &upstream_id).await;
+            if sent == Some("after") {
+                record_prepared(&pool, &virtual_uri);
+            }
+            let _ = handle.router().route(json!({
+                "jsonrpc": "2.0",
+                "id": downstream_id.as_i64(),
+                "result": {
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+                    "target": "file:///resolved.lua"
+                }
+            }));
+            let result = request.await.unwrap();
+            let surfaces = matches!(sent, None | Some("closed as is"));
+            assert_eq!(result.target.is_some(), surfaces, "{sent:?}");
+        }
     }
 
     #[tokio::test]

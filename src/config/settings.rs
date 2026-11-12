@@ -3340,6 +3340,128 @@ kind = "locals""#;
         );
     }
 
+    /// The prepare key is one more method key: with nothing written at it,
+    /// it resolves to `["*"]` — every server bridged for the language is a
+    /// candidate — as any method does.
+    #[test]
+    fn prepare_priorities_default_to_every_server() {
+        let unconfigured = BridgeLanguageConfig::default();
+        assert_eq!(
+            unconfigured
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            vec![PRIORITIES_WILDCARD.to_string()]
+        );
+
+        // An entry that leaves `priorities` unset resolves the same way.
+        let entry_without_priorities = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                "kakehashi/virtualDocument/prepare".to_string(),
+                AggregationConfig::default(),
+            )])),
+        };
+        assert_eq!(
+            entry_without_priorities
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            vec![PRIORITIES_WILDCARD.to_string()]
+        );
+    }
+
+    /// The prepare key inherits the `"_"` method entry like every LSP
+    /// method: an allowlist written there names the prepare candidates too,
+    /// and `[]` there opts the pair out.
+    #[test]
+    fn prepare_priorities_inherit_the_method_wildcard() {
+        let wildcard = |priorities: &[&str]| BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(HashMap::from([(
+                WILDCARD_KEY.to_string(),
+                AggregationConfig {
+                    priorities: Some(priorities.iter().map(|name| name.to_string()).collect()),
+                    ..Default::default()
+                },
+            )])),
+        };
+
+        let allowlist = wildcard(&["tsudoi"]);
+        assert_eq!(
+            allowlist
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            allowlist
+                .resolve_aggregation("textDocument/hover")
+                .priorities,
+            "the prepare key reads the wildcard as any method does"
+        );
+        assert_eq!(
+            allowlist
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            &["tsudoi".to_string()]
+        );
+        assert!(
+            wildcard(&[])
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities
+                .is_empty()
+        );
+    }
+
+    /// What is written *at* the prepare key outranks the `"_"` method entry,
+    /// at any language level.
+    #[test]
+    fn prepare_priorities_written_at_the_prepare_key_outrank_the_wildcard() {
+        let entry = |priorities: &[&str]| AggregationConfig {
+            priorities: Some(priorities.iter().map(|name| name.to_string()).collect()),
+            ..Default::default()
+        };
+        let named = |priorities: &[&str]| {
+            HashMap::from([
+                (WILDCARD_KEY.to_string(), entry(&["lua-ls"])),
+                (
+                    "kakehashi/virtualDocument/prepare".to_string(),
+                    entry(priorities),
+                ),
+            ])
+        };
+        let config = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(named(&["tsudoi"])),
+        };
+        assert_eq!(
+            config
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            &["tsudoi".to_string()]
+        );
+
+        let every_server = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: Some(named(&[PRIORITIES_WILDCARD])),
+        };
+        assert_eq!(
+            every_server
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            vec![PRIORITIES_WILDCARD.to_string()]
+        );
+
+        // The language axis is untouched: `bridge._` supplies the key to a
+        // language that names none.
+        let concrete_language = BridgeLanguageConfig {
+            enabled: Some(true),
+            aggregation: None,
+        };
+        assert_eq!(
+            crate::config::merge_bridge_language_configs(&config, &concrete_language)
+                .resolve_aggregation("kakehashi/virtualDocument/prepare")
+                .priorities,
+            &["tsudoi".to_string()]
+        );
+    }
+
     #[test]
     fn should_resolve_aggregation_priorities_defaults_to_wildcard_when_no_aggregation() {
         // Absent priorities resolve to ["*"] — all servers, first-win

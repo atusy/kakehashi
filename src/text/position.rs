@@ -32,7 +32,10 @@ impl<'text> PositionMapper<'text> {
     }
 }
 
-fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
+/// `text` with every lone CR (one not followed by LF) replaced by LF: the
+/// same byte offsets and UTF-16 widths, with the LSP line boundaries a
+/// LF-only line index recognizes.
+pub(crate) fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let Some(first_lone_cr) = bytes.iter().enumerate().find_map(|(index, byte)| {
         (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n')).then_some(index)

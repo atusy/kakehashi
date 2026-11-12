@@ -143,7 +143,7 @@ impl Kakehashi {
         )
         .is_some_and(|(offset, _, contiguous, injection_language)| {
             contiguous
-                && offset == crate::lsp::bridge::RegionOffset::from(&envelope.offset)
+                && envelope.offset.describes(&offset)
                 && injection_language == envelope.injection_language
         });
         geometry_is_current && lineage_is_current()

@@ -25,6 +25,7 @@ use url::Url;
 
 use crate::analysis::{LEGEND_MODIFIERS, LEGEND_TYPES};
 use crate::config::WorkspaceSettings;
+use crate::lsp::bridge::ResyncCause;
 use crate::lsp::client::check_semantic_tokens_refresh_support;
 use crate::lsp::{SettingsSource, load_settings};
 
@@ -94,6 +95,129 @@ enum ClientRoot<'a> {
     RootUri(&'a Uri),
     /// The deprecated `rootPath`, which is a filesystem path and not a URI.
     LegacyPath(&'a str),
+}
+
+/// Times a prepare resync pass is retried (with the prepare backoff: one
+/// second, doubling) before waiting for the next edit: one whose sends
+/// failed, or whose regions could not be looked at (see `after_resync_pass`).
+const MAX_RESYNC_RETRIES: u32 = 6;
+
+/// The resyncs an epoch move asks for: every open host, even with nothing
+/// looked up yet — a pair no candidate advertised the request for was never
+/// looked up, and the move may give it one. Their diagnostics are collected
+/// again only once something was looked up: before that, none was placed
+/// through a prepared text.
+fn resyncs_on_epoch_move(
+    open_hosts: impl IntoIterator<Item = Url>,
+    nothing_looked_up: bool,
+) -> Vec<crate::lsp::bridge::Resync> {
+    open_hosts
+        .into_iter()
+        .map(|host_uri| crate::lsp::bridge::Resync {
+            host_uri,
+            cause: if nothing_looked_up {
+                ResyncCause::Retry
+            } else {
+                ResyncCause::Recollect { edited: false }
+            },
+        })
+        .collect()
+}
+
+/// Hosts to sync again, each once: several documents of one host usually
+/// finish together. Their causes merge (see `ResyncCause::merge`).
+fn merge_resyncs(
+    resyncs: impl IntoIterator<Item = crate::lsp::bridge::Resync>,
+) -> std::collections::HashMap<Url, crate::lsp::bridge::Resync> {
+    let mut hosts: std::collections::HashMap<Url, crate::lsp::bridge::Resync> =
+        std::collections::HashMap::new();
+    for resync in resyncs {
+        match hosts.entry(resync.host_uri.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut merged) => {
+                let merged = merged.get_mut();
+                merged.cause = merged.cause.merge(resync.cause);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(resync);
+            }
+        }
+    }
+    hosts
+}
+
+/// How a host's diagnostics are collected after a resync pass synced it.
+#[derive(Debug, PartialEq, Eq)]
+enum CollectAfterResync {
+    /// At once: its servers hold texts other than those they diagnosed (an
+    /// open's first answer, an epoch move, an open's unusable answer).
+    AtOnce,
+    /// Through the edit's debounced collection: the answer, ready or
+    /// unusable, is an edit's, and the 500 ms debounce that keeps a burst of
+    /// keystrokes to one collection holds for it too.
+    Debounced,
+}
+
+fn collect_after_resync(resync: &crate::lsp::bridge::Resync) -> Option<CollectAfterResync> {
+    match (resync.cause.collects(), resync.cause.edited()) {
+        (false, _) => None,
+        (true, false) => Some(CollectAfterResync::AtOnce),
+        (true, true) => Some(CollectAfterResync::Debounced),
+    }
+}
+
+/// Collect `uri`'s diagnostics as [`collect_after_resync`] has it, after a
+/// resync pass synced it. Not in a one-shot CLI run: no editor reads them,
+/// as `did_open_impl` schedules no synthetic collection there (#489).
+fn collect_diagnostics_after_resync(
+    diagnostics: &super::coordinator::DiagnosticScheduler,
+    cli_mode: bool,
+    uri: Url,
+    resync: &crate::lsp::bridge::Resync,
+    synced: crate::lsp::bridge::HostRevision,
+) {
+    if cli_mode {
+        return;
+    }
+    match collect_after_resync(resync) {
+        Some(CollectAfterResync::AtOnce) => {
+            diagnostics.spawn_diagnostic_task_after_prepare(uri, synced);
+        }
+        Some(CollectAfterResync::Debounced) => {
+            diagnostics.schedule_debounced_diagnostic_after_prepare(uri, synced);
+        }
+        None => {}
+    }
+}
+
+/// What a resync pass over a host leads to.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterResyncPass {
+    /// Every send queued, every region looked at: its diagnostics follow.
+    Synced,
+    /// Sync it again after a backoff, the `failed`th consecutive time.
+    Retry { failed: u32 },
+    /// Retried enough: left to the next edit or save.
+    GiveUp,
+    /// Closed meanwhile: nothing to sync.
+    Closed,
+}
+
+/// A pass over a host that could not queue a send leaves its server on the
+/// text before, and the answer is cached, so no resync would come again:
+/// retried with backoff, a bounded number of times, while the host is open.
+/// So is a pass whose regions could not be looked at (a reload in
+/// progress), which deferred its work to a retry that only syncs
+/// documents. `failed` passes before this one failed in a row.
+fn after_resync_pass(synced: bool, open: bool, failed: u32) -> AfterResyncPass {
+    if synced {
+        AfterResyncPass::Synced
+    } else if !open {
+        AfterResyncPass::Closed
+    } else if failed < MAX_RESYNC_RETRIES {
+        AfterResyncPass::Retry { failed: failed + 1 }
+    } else {
+        AfterResyncPass::GiveUp
+    }
 }
 
 impl ClientRoot<'_> {
@@ -774,6 +898,8 @@ impl Kakehashi {
             ));
         }
 
+        self.spawn_prepare_resync_loop();
+
         // Ask a pull-capable client for its configuration now that the
         // handshake is complete. Editors that send `didChangeConfiguration`
         // with no usable `settings` have no other way to configure kakehashi
@@ -784,6 +910,95 @@ impl Kakehashi {
         // forwarding loops above. Nothing follows it, so the only thing such a
         // client delays is its own configuration.
         self.pull_client_configuration().await;
+    }
+
+    /// Sync hosts again whose virtual documents a prepare peer answered for
+    /// (`kakehashi/virtualDocument/prepare`): the finished attempt names the
+    /// host, and the injection pass re-run for it now finds the answer. An
+    /// unusable answer names it at once; an attempt that got no answer names
+    /// it again after its retry backoff. A move of the prepare epoch names
+    /// every open host: what each holds was prepared (or sent as is) under
+    /// the epoch before. Without the prepare layer, nothing is spawned.
+    fn spawn_prepare_resync_loop(&self) {
+        let Some((mut resync_rx, mut epochs)) = self.bridge.take_prepare_resyncs() else {
+            return;
+        };
+        let injection = self.injection_coordinator();
+        let diagnostics = self.diagnostic_scheduler();
+        let bridge = Arc::clone(&self.bridge);
+        let token = self.shutdown_token.clone();
+        // Marked before `initialize`, which spawns this loop.
+        let cli_mode = self.is_cli_mode();
+        tokio::spawn(async move {
+            // Consecutive passes per host that did not sync (sends failed, or
+            // regions not looked at).
+            let mut failures: std::collections::HashMap<Url, u32> =
+                std::collections::HashMap::new();
+            loop {
+                let first = tokio::select! {
+                    _ = token.cancelled() => return,
+                    resync = resync_rx.recv() => match resync {
+                        Some(resync) => vec![resync],
+                        None => return,
+                    },
+                    changed = epochs.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        resyncs_on_epoch_move(injection.open_host_uris(), bridge.prepare_unused())
+                    },
+                };
+                let hosts = merge_resyncs(
+                    first
+                        .into_iter()
+                        .chain(std::iter::from_fn(|| resync_rx.try_recv().ok())),
+                );
+                for (uri, resync) in hosts {
+                    let ready = resync.cause.ready();
+                    // A save the held regions missed is replayed by the
+                    // pass too; one it could not look at the regions for
+                    // keeps it, and is retried.
+                    let pass = injection.process_injections_for_resync(&uri).await;
+                    let synced = pass.synchronized && pass.looked;
+                    let open = injection.document_incarnation(&uri).is_some();
+                    let failed = failures.remove(&uri).unwrap_or_default();
+                    match after_resync_pass(synced, open, failed) {
+                        AfterResyncPass::Synced => {
+                            diagnostics.settle_pull_debt_after_prepare(&uri, ready);
+                            // The servers now hold the texts the answers
+                            // gave; what they diagnosed before was for other
+                            // texts.
+                            if let Some(revision) = pass.revision {
+                                collect_diagnostics_after_resync(
+                                    &diagnostics,
+                                    cli_mode,
+                                    uri,
+                                    &resync,
+                                    revision,
+                                );
+                            }
+                        }
+                        AfterResyncPass::Retry { failed } => {
+                            bridge.requeue_prepare_resync(
+                                resync,
+                                crate::lsp::bridge::prepare_retry_delay(failed),
+                            );
+                            failures.insert(uri, failed);
+                        }
+                        AfterResyncPass::GiveUp => {
+                            // Servers may still hold the text before, and
+                            // requests on it fail their wait, until the next
+                            // edit or save syncs the host.
+                            log::warn!(
+                                target: "kakehashi::bridge::prepare",
+                                "Gave up syncing the prepared virtual documents of {uri} after {MAX_RESYNC_RETRIES} retries; the next edit syncs them"
+                            );
+                        }
+                        AfterResyncPass::Closed => {}
+                    }
+                }
+            }
+        });
     }
 
     /// Arm a Unix-signal watcher that reaps the downstream server pool when
@@ -1125,11 +1340,13 @@ async fn deliver_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => pushes.push(DiagnosticPush {
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             }),
             barrier => {
@@ -1206,6 +1423,7 @@ fn coalesce_upstream_batch(
     batch: Vec<crate::lsp::bridge::UpstreamNotification>,
 ) -> Vec<crate::lsp::bridge::UpstreamNotification> {
     use crate::lsp::bridge::{ProgressConnectionId, UpstreamNotification};
+    use crate::lsp::diagnostic_cache::HeldStamp;
     use std::collections::HashMap;
 
     // Common case — a lone notification (no burst queued): nothing to coalesce, so
@@ -1228,11 +1446,30 @@ fn coalesce_upstream_batch(
                 uri,
                 server,
                 connection_id,
+                held,
                 diagnostics,
             } => {
+                // A push known stale from its stamp (see
+                // `HeldStamp::names_stale_version`) is dropped here, before it
+                // could supersede a valid one the publisher would keep.
+                if held.as_ref().is_some_and(HeldStamp::names_stale_version) {
+                    continue;
+                }
                 let idx = output.len();
                 let by_uri = pending.entry(connection_id).or_default();
                 if let Some(prev) = by_uri.get_mut(&uri) {
+                    // A push read under an older text than the pending one
+                    // (see `HeldStamp::read_before`) does not supersede it.
+                    if let Some(Some(UpstreamNotification::PublishDiagnostics {
+                        held: Some(kept),
+                        ..
+                    })) = output.get(*prev)
+                        && held
+                            .as_ref()
+                            .is_some_and(|incoming| incoming.read_before(kept))
+                    {
+                        continue;
+                    }
                     // Tombstone the earlier occurrence so only the latest survives, at
                     // its own later position (no `uri` clone on this hot repeat path).
                     output[*prev] = None;
@@ -1244,6 +1481,7 @@ fn coalesce_upstream_batch(
                     uri,
                     server,
                     connection_id,
+                    held,
                     diagnostics,
                 }));
             }
@@ -1963,6 +2201,7 @@ fn spawn_upstream_request(
             }
             UpstreamRequest::ShowDocument {
                 params,
+                held,
                 reply,
                 cancel,
             } => {
@@ -1973,7 +2212,12 @@ fn spawn_upstream_request(
                 // rebuilt); only a non-virtual/unresolvable URI is forwarded
                 // unchanged. See `ShowDocumentTranslator::translate`.
                 let params = match &translators {
-                    Some(translators) => translators.show_document.translate(params).await,
+                    Some(translators) => {
+                        translators
+                            .show_document
+                            .translate(params, held.as_ref())
+                            .await
+                    }
                     None => params,
                 };
                 let id = client.next_request_id();
@@ -1994,6 +2238,7 @@ fn spawn_upstream_request(
             UpstreamRequest::ApplyEdit {
                 params,
                 connection,
+                held,
                 reply,
                 cancel,
             } => {
@@ -2039,7 +2284,10 @@ fn spawn_upstream_request(
                     super::apply_edit_translation::document_change_count(&params);
                 let params = match &translators {
                     Some(translators) => {
-                        translators.apply_edit.translate(params, &connection).await
+                        translators
+                            .apply_edit
+                            .translate(params, &connection, held.as_ref())
+                            .await
                     }
                     None => Ok(params),
                 };
@@ -2172,6 +2420,7 @@ async fn deliver_upstream_notification(
             uri,
             server,
             connection_id,
+            held,
             diagnostics,
         } => {
             // Cache the downstream push and republish the merged host set
@@ -2184,7 +2433,7 @@ async fn deliver_upstream_notification(
                 delivery_context.map(|context| context.diagnostic_publisher.as_ref())
             {
                 publisher
-                    .publish_push(uri, server, connection_id, diagnostics)
+                    .publish_push(uri, server, connection_id, held, diagnostics)
                     .await;
             }
         }
@@ -2981,6 +3230,211 @@ async fn upstream_forwarding_loop_with_cancel(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_epoch_move_syncs_every_open_host_even_before_any_lookup() {
+        use crate::lsp::bridge::{Resync, ResyncCause};
+        let hosts =
+            || ["a", "b"].map(|name| url::Url::parse(&format!("file:///{name}.md")).unwrap());
+        let resync = |host: url::Url, cause| Resync {
+            host_uri: host,
+            cause,
+        };
+        let [a, b] = hosts();
+        assert_eq!(
+            super::resyncs_on_epoch_move(hosts(), true),
+            [
+                resync(a.clone(), ResyncCause::Retry),
+                resync(b.clone(), ResyncCause::Retry)
+            ]
+        );
+        let recollect = ResyncCause::Recollect { edited: false };
+        assert_eq!(
+            super::resyncs_on_epoch_move(hosts(), false),
+            [resync(a, recollect), resync(b, recollect)]
+        );
+    }
+
+    #[test]
+    fn a_host_is_synced_again_once_per_batch_of_resyncs() {
+        use crate::lsp::bridge::{Resync, ResyncCause};
+        let host = |name: &str| url::Url::parse(&format!("file:///{name}.md")).unwrap();
+        let hosts = super::merge_resyncs([
+            Resync {
+                host_uri: host("a"),
+                cause: ResyncCause::Ready { edited: false },
+            },
+            Resync {
+                host_uri: host("b"),
+                cause: ResyncCause::Retry,
+            },
+            Resync {
+                host_uri: host("a"),
+                cause: ResyncCause::Recollect { edited: false },
+            },
+        ]);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(
+            hosts[&host("a")].cause,
+            ResyncCause::Ready { edited: false }
+        );
+        assert_eq!(hosts[&host("b")].cause, ResyncCause::Retry);
+    }
+
+    /// The pass collects an edit's answer through the debounce, and any
+    /// other at once.
+    #[tokio::test]
+    async fn a_resync_pass_routes_an_edits_answer_to_the_debounce() {
+        use crate::lsp::bridge::{Resync, ResyncCause};
+        let (service, _socket) =
+            tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = url::Url::parse("file:///test/routed.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "# routed\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let diagnostics = server.diagnostic_scheduler();
+        let resync = |edited| Resync {
+            host_uri: uri.clone(),
+            cause: ResyncCause::Ready { edited },
+        };
+        super::collect_diagnostics_after_resync(
+            &diagnostics,
+            false,
+            uri.clone(),
+            &resync(false),
+            diagnostics.current_revision(&uri),
+        );
+        assert!(!server.debounced_diagnostics.has_active_timer(&uri));
+        super::collect_diagnostics_after_resync(
+            &diagnostics,
+            false,
+            uri.clone(),
+            &resync(true),
+            diagnostics.current_revision(&uri),
+        );
+        assert!(server.debounced_diagnostics.has_active_timer(&uri));
+        server.debounced_diagnostics.cancel_all();
+    }
+
+    /// A one-shot CLI run collects nothing after a resync pass, as its
+    /// didOpen schedules nothing (#489): no editor reads it.
+    #[tokio::test]
+    async fn a_cli_run_collects_nothing_after_a_resync_pass() {
+        use crate::lsp::bridge::{Resync, ResyncCause};
+        for cli_mode in [true, false] {
+            let (service, _socket) =
+                tower_lsp_server::LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+            let server = service.inner();
+            let uri = url::Url::parse("file:///test/cli-resync.md").unwrap();
+            server.documents.insert(
+                uri.clone(),
+                "# cli\n".to_string(),
+                Some("markdown".to_string()),
+                None,
+            );
+            let diagnostics = server.diagnostic_scheduler();
+            for edited in [false, true] {
+                let resync = Resync {
+                    host_uri: uri.clone(),
+                    cause: ResyncCause::Ready { edited },
+                };
+                super::collect_diagnostics_after_resync(
+                    &diagnostics,
+                    cli_mode,
+                    uri.clone(),
+                    &resync,
+                    diagnostics.current_revision(&uri),
+                );
+            }
+            assert_eq!(
+                server.debounced_diagnostics.has_active_timer(&uri)
+                    || server.synthetic_diagnostics.has_active_task(&uri),
+                !cli_mode,
+                "cli mode {cli_mode}"
+            );
+            server.debounced_diagnostics.cancel_all();
+        }
+    }
+
+    /// A keystroke's answer is collected by the edit's debounced collection,
+    /// not at once: an immediate collection per keystroke would bypass the
+    /// debounce. An open's first answer, an epoch move and an unusable
+    /// answer collect at once.
+    #[test]
+    fn an_edits_answer_waits_for_the_debounced_collection() {
+        use super::{CollectAfterResync, collect_after_resync, merge_resyncs};
+        use crate::lsp::bridge::{Resync, ResyncCause};
+        let host = url::Url::parse("file:///edited.md").unwrap();
+        let resync = |ready, recollect, edited| Resync {
+            host_uri: host.clone(),
+            cause: match (ready, recollect) {
+                (true, false) => ResyncCause::Ready { edited },
+                (false, true) => ResyncCause::Recollect { edited },
+                (false, false) => ResyncCause::Retry,
+                (true, true) => unreachable!("one cause per resync"),
+            },
+        };
+        let collect = |resyncs: Vec<Resync>| collect_after_resync(&merge_resyncs(resyncs)[&host]);
+        assert_eq!(
+            collect(vec![resync(true, false, true)]),
+            Some(CollectAfterResync::Debounced)
+        );
+        assert_eq!(
+            collect(vec![resync(true, false, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        assert_eq!(
+            collect(vec![resync(false, true, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // An edit's answer beside an open's: at once.
+        assert_eq!(
+            collect(vec![resync(true, false, true), resync(true, false, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // An edit's unusable answer waits too; beside an epoch move's
+        // recollection, at once.
+        assert_eq!(
+            collect(vec![resync(false, true, true)]),
+            Some(CollectAfterResync::Debounced)
+        );
+        assert_eq!(
+            collect(vec![resync(false, true, true), resync(false, true, false)]),
+            Some(CollectAfterResync::AtOnce)
+        );
+        // A retry's resync collects nothing, nor makes another's wait.
+        assert_eq!(
+            collect(vec![resync(true, false, true), resync(false, false, false)]),
+            Some(CollectAfterResync::Debounced)
+        );
+        // A retry's resync collects nothing.
+        assert_eq!(collect(vec![resync(false, false, false)]), None);
+    }
+
+    #[test]
+    fn a_failed_resync_pass_is_retried_a_bounded_number_of_times_while_open() {
+        use super::{AfterResyncPass, MAX_RESYNC_RETRIES, after_resync_pass};
+        assert_eq!(after_resync_pass(true, true, 3), AfterResyncPass::Synced);
+        assert_eq!(after_resync_pass(false, false, 0), AfterResyncPass::Closed);
+        assert_eq!(
+            after_resync_pass(false, true, 0),
+            AfterResyncPass::Retry { failed: 1 }
+        );
+        assert_eq!(
+            after_resync_pass(false, true, MAX_RESYNC_RETRIES - 1),
+            AfterResyncPass::Retry {
+                failed: MAX_RESYNC_RETRIES
+            }
+        );
+        assert_eq!(
+            after_resync_pass(false, true, MAX_RESYNC_RETRIES),
+            AfterResyncPass::GiveUp
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3345,6 +3799,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![Diagnostic {
                     message: msg.to_string(),
                     ..Default::default()
@@ -3358,6 +3813,7 @@ mod tests {
                 uri: uri.to_string(),
                 server: "srv".to_string(),
                 connection_id: ProgressConnectionId::for_test(conn),
+                held: None,
                 diagnostics: vec![],
             }
         }
@@ -3383,6 +3839,55 @@ mod tests {
                 }
                 other => panic!("expected PublishDiagnostics at {idx}, got {other:?}"),
             }
+        }
+
+        fn stamped(msg: &str, generation: u64, stale_version: bool) -> UpstreamNotification {
+            UpstreamNotification::PublishDiagnostics {
+                uri: "u".to_string(),
+                server: "srv".to_string(),
+                connection_id: ProgressConnectionId::for_test(1),
+                held: Some(crate::lsp::diagnostic_cache::HeldStamp {
+                    connection: crate::lsp::bridge::ConnectionKey::for_server("srv"),
+                    observed: crate::lsp::bridge::Observed::Read {
+                        generation: Some(generation),
+                        prepared: true,
+                        stale_version,
+                        incarnation: 0,
+                    },
+                    origin: None,
+                }),
+                diagnostics: vec![Diagnostic {
+                    message: msg.to_string(),
+                    ..Default::default()
+                }],
+            }
+        }
+
+        /// A push for the prepared text held, then in the same batch one
+        /// known stale (naming the version before, or read under an older
+        /// text): the stale one supersedes nothing, so the valid one reaches
+        /// the publisher rather than neither.
+        #[test]
+        fn a_stale_push_does_not_supersede_a_valid_one() {
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("stale version", 2, true),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "current");
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("older text", 1, false),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "current");
+            // A newer one still supersedes it.
+            let out = coalesce_upstream_batch(vec![
+                stamped("current", 2, false),
+                stamped("newer", 3, false),
+            ]);
+            assert_eq!(out.len(), 1);
+            assert_eq!(msg_at(&out, 0), "newer");
         }
 
         #[test]
@@ -4718,6 +5223,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ShowDocument {
+                held: None,
                 params: serde_json::from_value(serde_json::json!({ "uri": "file:///x.rs" }))
                     .unwrap(),
                 reply: reply_tx,
@@ -4780,6 +5286,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
                 }))
@@ -4861,6 +5368,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "changes": { "file:///x.rs": [] } }
@@ -4952,6 +5460,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [
@@ -4987,6 +5496,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 params: serde_json::from_value(serde_json::json!({
                     "edit": { "documentChanges": [real_edit] }
@@ -5063,6 +5573,7 @@ mod tests {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         request_tx
             .send(UpstreamRequest::ApplyEdit {
+                held: None,
                 connection: crate::lsp::bridge::ConnectionKey::for_server("test"),
                 // A NON-empty edit against a virtual URI that resolves to no open
                 // document: the translator can't map it, so the loop must reject

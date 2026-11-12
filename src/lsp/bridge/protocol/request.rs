@@ -136,6 +136,10 @@ pub(crate) fn build_whole_document_request_with_progress(
     JsonRpcRequest::new(request_id.as_i64(), method, params)
 }
 
+/// The version every didOpen sends a virtual document under: each
+/// connection's version counter for it starts there.
+pub(crate) const DIDOPEN_VERSION: i32 = 1;
+
 /// Build a JSON-RPC didOpen notification carrying a virtual document's initial
 /// content to a downstream language server.
 pub(crate) fn build_didopen_notification(
@@ -146,7 +150,7 @@ pub(crate) fn build_didopen_notification(
         text_document: TextDocumentItem::new(
             virtual_uri_to_lsp_uri(virtual_uri),
             virtual_uri.language().to_string(),
-            1,
+            DIDOPEN_VERSION,
             content.to_string(),
         ),
     };

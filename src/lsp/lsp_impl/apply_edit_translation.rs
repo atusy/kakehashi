@@ -85,7 +85,7 @@ use crate::lsp::bridge::{
     workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 
-use super::region_offset::resolve_region_offset;
+use super::region_offset::resolve_region_offset_for_held;
 
 /// Translates `workspace/applyEdit` params whose edit targets a virtual
 /// document back to the host document + host coordinates. Holds shared
@@ -126,6 +126,7 @@ impl ApplyEditTranslator {
         &self,
         mut params: ApplyWorkspaceEditParams,
         connection: &ConnectionKey,
+        held: Option<&crate::lsp::diagnostic_cache::HeldStamp>,
     ) -> Result<ApplyWorkspaceEditParams, String> {
         // A versioned virtual-document edit pins the content revision the
         // downstream computed against; validate it against the version this
@@ -171,12 +172,14 @@ impl ApplyEditTranslator {
                 "kakehashi: the virtual document's host URI is unmappable: {host_url}"
             ));
         };
-        let Some((offset, region_end, contiguous, _)) = resolve_region_offset(
+        let Some((offset, region_end, contiguous, _)) = resolve_region_offset_for_held(
             &self.documents,
             &self.language,
             &self.bridge,
             &host_url,
             &region_id,
+            virtual_uri,
+            held,
         ) else {
             // The region moved or was removed since the downstream produced
             // the edit; translating against a stale offset would edit the
@@ -187,6 +190,14 @@ impl ApplyEditTranslator {
             );
         };
         ensure_editable_region(contiguous)?;
+        if offset.prepared().is_some() {
+            // No edit is mapped back through a prepared document.
+            return Err(
+                "kakehashi: the edit targets a prepared virtual document; it cannot be \
+                 applied to the host document"
+                    .to_string(),
+            );
+        }
 
         transform_params_to_host(&mut params, virtual_uri, &host_uri, &offset, region_end)?;
         Ok(params)
@@ -548,7 +559,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original.clone(), &test_connection())
+            .translate(original.clone(), &test_connection(), None)
             .await
             .expect("real-file edit must pass through");
         assert_eq!(out, original);
@@ -569,7 +580,7 @@ mod tests {
         }))
         .unwrap();
         let out = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), None)
             .await
             .expect("real-file edit must pass through");
         match out.edit.document_changes.as_ref().unwrap() {
@@ -590,7 +601,7 @@ mod tests {
         let uri = virtual_uri("01ARZ3NDEKTSV4RRFFQ69G5FAV");
         let original = params_with_edit(json!({ "changes": { uri.clone(): [text_edit(0)] } }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), None)
             .await
             .expect_err("unknown virtual document must be rejected");
         assert!(
@@ -610,7 +621,7 @@ mod tests {
             }
         }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), None)
             .await
             .expect_err("multi-region edit must be rejected");
         assert!(
@@ -633,7 +644,7 @@ mod tests {
             }]
         }));
         let reason = translator()
-            .translate(original, &test_connection())
+            .translate(original, &test_connection(), None)
             .await
             .unwrap_err();
         assert!(
@@ -683,7 +694,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, None)
             .await
             .expect_err("a stale versioned edit must be rejected");
         assert!(
@@ -708,7 +719,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, None)
             .await
             .expect_err("a version ahead of the tracked one must be rejected");
         assert!(
@@ -735,7 +746,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), None)
             .await
             .expect_err(
                 "a versioned edit for a doc this connection no longer has must be rejected",
@@ -769,7 +780,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, None)
             .await
             .expect_err("empty document store cannot resolve the region");
         assert!(
@@ -804,7 +815,7 @@ mod tests {
         }));
 
         let reason = translator()
-            .translate(params, &connection)
+            .translate(params, &connection, None)
             .await
             .expect_err("a versioned no-op entry is a precondition and must be validated");
         assert!(
@@ -838,7 +849,7 @@ mod tests {
         }));
 
         let out = translator()
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), None)
             .await
             .expect("an unversioned no-op virtual entry must not trip anything");
         assert_eq!(
@@ -877,7 +888,7 @@ mod tests {
         }));
 
         let out = translator()
-            .translate(params, &test_connection())
+            .translate(params, &test_connection(), None)
             .await
             .expect("a removable no-op virtual entry must not fail the apply");
         assert_eq!(
@@ -914,7 +925,7 @@ mod tests {
         }));
 
         let reason = translator_with_bridge(bridge)
-            .translate(params, &connection)
+            .translate(params, &connection, None)
             .await
             .expect_err("conflicting versions for one document must be rejected");
         assert!(

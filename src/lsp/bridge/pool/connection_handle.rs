@@ -32,9 +32,10 @@ use crate::lsp::bridge::actor::{
 };
 use crate::lsp::bridge::connection::SplitConnectionWriter;
 use crate::lsp::bridge::protocol::{
-    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, ROUTING_METHOD,
-    ROUTING_TIMEOUT, RequestId, RoutingAnswer, RoutingParams, build_exit_notification,
-    build_shutdown_request, jsonrpc_error_code, parse_routing_response,
+    DID_CHANGE_WORKSPACE_FOLDERS_METHOD, JsonRpcNotification, JsonRpcRequest, PREPARE_METHOD,
+    PREPARE_TIMEOUT, PrepareParams, PrepareResult, ROUTING_METHOD, ROUTING_TIMEOUT, RequestId,
+    RoutingAnswer, RoutingParams, build_exit_notification, build_shutdown_request,
+    jsonrpc_error_code, parse_prepare_response, parse_routing_response,
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
@@ -157,6 +158,9 @@ pub(crate) struct ConnectionHandle {
     /// bridge-routing protocol. This starts false, is set from the initialize
     /// advertisement, and may be cleared after a downstream MethodNotFound.
     bridge_routing: AtomicBool,
+    /// Whether the downstream advertised `virtualDocumentPrepare` in
+    /// `initialize`; cleared by a `MethodNotFound` answer.
+    virtual_document_prepare: AtomicBool,
     type_hierarchy_provider: AtomicBool,
     /// Dynamic capability registrations from server-initiated `client/registerCapability` requests.
     ///
@@ -306,6 +310,7 @@ impl ConnectionHandle {
             next_request_id: AtomicI64::new(2),
             server_capabilities: OnceLock::new(),
             bridge_routing: AtomicBool::new(false),
+            virtual_document_prepare: AtomicBool::new(false),
             type_hierarchy_provider: AtomicBool::new(false),
             dynamic_capabilities,
             connection_key,
@@ -443,6 +448,15 @@ impl ConnectionHandle {
                 return NotificationSendResult::SerializationFailed;
             }
         };
+        self.send_serialized_notification(payload)
+    }
+
+    /// [`Self::send_notification`] of a payload serialized beforehand: only
+    /// the non-blocking enqueue, for a caller queueing under a lock.
+    pub(crate) fn send_serialized_notification(
+        &self,
+        payload: serde_json::Value,
+    ) -> NotificationSendResult {
         match self.tx.try_send(OutboundMessage::Untracked(payload)) {
             Ok(()) => NotificationSendResult::Queued,
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -483,6 +497,16 @@ impl ConnectionHandle {
                 return Err(BridgeError::SerializationFailed);
             }
         };
+        self.send_serialized_request(payload, request_id)
+    }
+
+    /// [`Self::send_request`] of a payload serialized beforehand: only the
+    /// non-blocking enqueue, for a caller queueing under a lock.
+    pub(crate) fn send_serialized_request(
+        &self,
+        payload: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<(), BridgeError> {
         match self.tx.try_send(OutboundMessage::Tracked {
             payload,
             request_id,
@@ -557,6 +581,96 @@ impl ConnectionHandle {
         parse_routing_response(&response)
     }
 
+    /// Ask an advertising peer how to present a virtual document
+    /// (`kakehashi/virtualDocument/prepare`).
+    ///
+    /// `Ok(None)` is the peer's `null` (present unchanged). Every failure —
+    /// no advertisement, an error response, a malformed result, a timeout —
+    /// is an `Err`: `Unsupported` without an advertisement (a `MethodNotFound`
+    /// answer also clears it until the next handshake), `InvalidData` for an
+    /// unusable answer, `Interrupted` for a cancellation LSP lets a client
+    /// retry, and another kind when no answer came.
+    pub(crate) async fn request_virtual_document_prepare(
+        &self,
+        params: &PrepareParams<'_>,
+    ) -> io::Result<Option<PrepareResult>> {
+        if !self.supports_virtual_document_prepare() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bridge: server does not advertise virtualDocumentPrepare",
+            ));
+        }
+        // Its own deadline, shorter than the liveness timer's, cancels it.
+        // But it is on that timer as any request is: a peer that stopped
+        // reading stdin mid-frame must fail its connection, or its answers
+        // never come and its documents stay held, retry after retry queued
+        // behind the stalled frame.
+        let request_id = RequestId::new(self.next_request_id());
+        let (response_rx, liveness_epoch) = self
+            .router()
+            .register_tracked_liveness(request_id)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(epoch) = liveness_epoch
+            && self.state() == ConnectionState::Ready
+        {
+            self.reader_handle.notify_liveness_start(epoch);
+        }
+        let mut cleanup = RouterCleanupGuard::new(Arc::clone(self.router()), request_id);
+        let request = JsonRpcRequest::new(request_id.as_i64(), PREPARE_METHOD, params);
+        self.send_request(request, request_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error))?;
+        let mut response_rx = response_rx;
+        let response = match tokio::time::timeout(PREPARE_TIMEOUT, &mut response_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "bridge: prepare response channel closed",
+                ));
+            }
+            Err(_) => {
+                // Retired as any request at its deadline: a frame still being
+                // written stays, so the liveness timer sees the stalled
+                // writer (see `ResponseRouter::retire_on_timeout`).
+                self.router().retire_on_timeout(request_id);
+                cleanup.disarm();
+                let cancel = JsonRpcNotification::new(
+                    "$/cancelRequest",
+                    serde_json::json!({"id": request_id.as_i64()}),
+                );
+                let _ = self.send_notification(cancel);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "bridge: prepare request timeout",
+                ));
+            }
+        };
+        cleanup.disarm();
+        // The router's own reply for a connection lost (or a write that
+        // timed out) is no answer from the peer: retried, not taken as an
+        // unusable one.
+        if let Some(failure) = self.router.take_failure(request_id) {
+            let kind = match failure {
+                super::super::actor::BridgeFailure::ConnectionLost => {
+                    io::ErrorKind::ConnectionAborted
+                }
+                super::super::actor::BridgeFailure::RequestTimeout => io::ErrorKind::TimedOut,
+            };
+            return Err(io::Error::new(
+                kind,
+                "bridge: the prepare peer gave no answer",
+            ));
+        }
+        if jsonrpc_error_code(&response) == Some(-32601) {
+            self.set_virtual_document_prepare(false);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bridge: server answered virtualDocumentPrepare with MethodNotFound",
+            ));
+        }
+        parse_prepare_response(&response)
+    }
+
     /// Queue an arbitrary JSON-RPC request for the downstream peer escape hatch.
     ///
     /// Unlike [`Self::send_request`], `method` is runtime data and `params` may
@@ -626,6 +740,13 @@ impl ConnectionHandle {
         } else {
             stored
         }
+    }
+
+    /// How many are subscribed to this connection's state, a wait for it to
+    /// be ready included.
+    #[cfg(test)]
+    pub(crate) fn state_subscribers_for_test(&self) -> usize {
+        self.state_watch.receiver_count()
     }
 
     /// Await `Ready` (up to `timeout`) instead of failing fast — used by
@@ -761,6 +882,17 @@ impl ConnectionHandle {
     pub(super) fn set_bridge_routing(&self, advertised: bool) {
         self.bridge_routing.store(advertised, Ordering::Release);
         debug_assert_eq!(self.supports_bridge_routing(), advertised);
+    }
+
+    /// Store whether the downstream advertised `virtualDocumentPrepare`.
+    pub(super) fn set_virtual_document_prepare(&self, advertised: bool) {
+        self.virtual_document_prepare
+            .store(advertised, Ordering::Release);
+    }
+
+    /// Whether the downstream answers `kakehashi/virtualDocument/prepare`.
+    pub(crate) fn supports_virtual_document_prepare(&self) -> bool {
+        self.virtual_document_prepare.load(Ordering::Acquire)
     }
 
     /// Whether the downstream advertised bridge routing during initialization.
@@ -1468,6 +1600,190 @@ mod tests {
     /// Create a default DynamicCapabilityRegistry for tests that don't need it.
     fn default_dynamic_caps() -> Arc<DynamicCapabilityRegistry> {
         Arc::new(DynamicCapabilityRegistry::new())
+    }
+
+    /// A prepare request whose connection is lost gets the router's
+    /// synthetic error, which is no answer from the peer: retryable, not an
+    /// unusable answer that holds the input failed until its next edit. A
+    /// peer's own internal error still is one.
+    #[tokio::test]
+    async fn a_lost_connection_is_no_prepare_answer() {
+        use crate::lsp::bridge::protocol::{
+            PrepareHostTextDocument, PrepareParams, PrepareTextDocument, VirtualLayout,
+        };
+        let layout = VirtualLayout::single("a");
+        let params = PrepareParams::new(
+            PrepareTextDocument {
+                uri: "file:///virtual.lua",
+                language_id: "lua",
+                version: 1,
+            },
+            PrepareHostTextDocument {
+                uri: "file:///host.md",
+                language_id: "markdown",
+            },
+            &layout,
+        );
+        for lost in [true, false] {
+            let handle = crate::lsp::bridge::pool::test_helpers::create_handle_with_state(
+                ConnectionState::Ready,
+            )
+            .await;
+            handle.set_virtual_document_prepare(true);
+            let request = handle.request_virtual_document_prepare(&params);
+            tokio::pin!(request);
+            let id = loop {
+                tokio::select! {
+                    _ = &mut request => panic!("answered before anything was routed"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if let Some(id) = handle.router().pending_ids().first().copied() {
+                    break id;
+                }
+            };
+            if lost {
+                handle.router().fail_all("bridge: connection lost");
+            } else {
+                let _ = handle.router().route(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id.as_i64(),
+                    "error": {"code": -32603, "message": "the peer failed"}
+                }));
+            }
+            let error = request.await.unwrap_err();
+            assert_eq!(
+                error.kind() == io::ErrorKind::InvalidData,
+                !lost,
+                "{lost}: {error}"
+            );
+        }
+    }
+
+    fn prepare_layout(text: &str) -> crate::lsp::bridge::protocol::VirtualLayout {
+        crate::lsp::bridge::protocol::VirtualLayout::single(text)
+    }
+
+    fn prepare_params<'a>(
+        layout: &'a crate::lsp::bridge::protocol::VirtualLayout,
+    ) -> crate::lsp::bridge::protocol::PrepareParams<'a> {
+        use crate::lsp::bridge::protocol::{
+            PrepareHostTextDocument, PrepareParams, PrepareTextDocument,
+        };
+        PrepareParams::new(
+            PrepareTextDocument {
+                uri: "file:///virtual.lua",
+                language_id: "lua",
+                version: 1,
+            },
+            PrepareHostTextDocument {
+                uri: "file:///host.md",
+                language_id: "markdown",
+            },
+            layout,
+        )
+    }
+
+    /// A prepare request is on the liveness timer as any request is: a peer
+    /// that reads its stdin but never answers fails its connection once the
+    /// timer runs out, and the attempt learns it got no answer (retried),
+    /// rather than each attempt only timing out on its own.
+    #[tokio::test]
+    async fn a_prepare_request_starts_the_liveness_timer() {
+        use crate::lsp::bridge::actor::spawn_reader_task_with_liveness;
+        use std::time::Duration;
+
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("should spawn process");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task_with_liveness(
+            reader,
+            Arc::clone(&router),
+            Some(Duration::from_millis(50)),
+        );
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("test"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
+        ));
+        handle.set_virtual_document_prepare(true);
+        let layout = prepare_layout("a");
+        let error = handle
+            .request_virtual_document_prepare(&prepare_params(&layout))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{error}");
+        assert_eq!(handle.state(), ConnectionState::Failed);
+    }
+
+    /// A prepare request timing out while its frame is still being written
+    /// keeps that frame for the liveness timer, as any request does: the
+    /// peer stopped reading stdin, and nothing else would show it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_prepare_timeout_keeps_a_frame_the_writer_is_still_writing() {
+        use crate::lsp::bridge::pool::test_helpers::{
+            FULL_PIPE_PAYLOAD_BYTES, create_handle_with_command,
+        };
+
+        let (handle, _pid) = create_handle_with_command(
+            ConnectionState::Ready,
+            ConnectionKey::for_server("wedged"),
+            vec!["sleep".to_string(), "30".to_string()],
+            None,
+        )
+        .await;
+        handle.set_virtual_document_prepare(true);
+        // Park the writer on a frame the child never reads, so the prepare
+        // frame waits in the queue for the claim below.
+        let huge = crate::lsp::bridge::protocol::JsonRpcNotification::new(
+            "blocked",
+            serde_json::json!({ "data": "x".repeat(FULL_PIPE_PAYLOAD_BYTES) }),
+        );
+        assert_eq!(
+            handle.send_notification(huge),
+            NotificationSendResult::Queued
+        );
+        let dequeued = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle.tx.capacity() < handle.tx.max_capacity() {
+            assert!(
+                std::time::Instant::now() < dequeued,
+                "the writer never picked up the frame"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let layout = prepare_layout("a");
+        let params = prepare_params(&layout);
+        let request = handle.request_virtual_document_prepare(&params);
+        tokio::pin!(request);
+        let id = loop {
+            tokio::select! {
+                _ = &mut request => panic!("answered before it was queued"),
+                _ = tokio::task::yield_now() => {}
+            }
+            if let Some(id) = handle.router().pending_ids().first().copied() {
+                break id;
+            }
+        };
+        // As the writer does once it reaches the frame.
+        assert!(handle.router().claim_for_write(id));
+        tokio::time::pause();
+        let error = request.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(handle.router().awaiting_downstream_count(), 1);
     }
 
     /// The generic timeout must not erase the one entry that proves the

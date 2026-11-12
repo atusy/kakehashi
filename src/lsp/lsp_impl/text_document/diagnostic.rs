@@ -78,6 +78,21 @@ pub(crate) async fn collect_region_diagnostics(
 // Pull diagnostics implementation (textDocument/diagnostic)
 // ============================================================================
 
+/// Whether a region its prepare answer left undiagnosed fails the pull. For
+/// the CLI (`counting`) always: the region goes undiagnosed, which it must
+/// not report as success. For an editor only while the answer may still
+/// come (a retry, a resync): one the peer answered unusably stays so until
+/// the text or the epoch changes, and counting it would keep every pull of
+/// the host from ever being clean.
+fn prepare_miss_fails_pull(miss: crate::lsp::bridge::PrepareMiss, counting: bool) -> bool {
+    counting || miss != crate::lsp::bridge::PrepareMiss::Failed
+}
+
+/// `(region_id, injection_language, current offset, virtual text)` of a
+/// region, for the pushFallback fold. The virtual text only when the pool
+/// prepares (see `fold_push_fallback_diagnostics`).
+type RegionPushMeta = (String, String, RegionOffset);
+
 impl Kakehashi {
     pub(crate) async fn diagnostic_impl(
         &self,
@@ -228,22 +243,6 @@ impl Kakehashi {
             .and_then(|snapshot| self.whole_document_regions(&uri, snapshot));
         let regions_unavailable = resolved_regions.is_none();
         let virt_regions = resolved_regions.unwrap_or_default();
-        // Lightweight per-region metadata `(region_id, injection_language,
-        // current offset)` for the pushFallback fold; the live pull below moves
-        // the regions themselves.
-        let region_meta: Vec<(String, String, RegionOffset)> = virt_regions
-            .iter()
-            .map(|r| {
-                (
-                    r.region.region_id.clone(),
-                    r.injection_language.clone(),
-                    RegionOffset::with_per_line_offsets(
-                        r.region.line_range.start,
-                        r.line_column_offsets.clone(),
-                    ),
-                )
-            })
-            .collect();
 
         // Pre-filter servers already known (a live, `Ready` connection) NOT to
         // answer pull diagnostics, so the per-region fan-out below never spawns a
@@ -263,8 +262,24 @@ impl Kakehashi {
         // Virt layer: 2-level aggregation —
         //   Inner: dispatch per region (fans out to all servers for that region)
         //   Outer: collect across regions
+        // A region left out because its peer's answer is not in (yet): the
+        // answer is incomplete until that document is sent. (One the peer
+        // answered unusably is not bridged at all, by design.)
+        let prepare_skipped = std::sync::atomic::AtomicBool::new(false);
+        // Before any region is looked up: an answer landing from here on may
+        // re-sync the host before this pull owes it a refresh.
+        let prepare_answers_then = self.bridge.prepare_host_answers(&uri);
         let virt_fut = async {
             let mut outer_join_set: JoinSet<Vec<Diagnostic>> = JoinSet::new();
+            // Every region's prepare attempt started before any is waited
+            // for: the waits in the loop below then share attempts already
+            // running, the pull waiting about the slowest, not one after
+            // another.
+            crate::lsp::lsp_impl::bridge_context::start_prepare_attempts(
+                &self.bridge,
+                language_name,
+                virt_regions.iter().map(|resolved| (&uri, resolved)),
+            );
             for resolved in virt_regions.iter() {
                 let mut configs = self.bridge_configs_for_injection_language(
                     language_name,
@@ -276,6 +291,38 @@ impl Kakehashi {
                     configs.retain(|c| !incapable_servers.contains(&c.server_name));
                 }
                 if configs.is_empty() {
+                    // Only push-driven servers: nothing to pull, but a region
+                    // the peer could not prepare never reached them either,
+                    // and its pushes are dropped — not a clean result. Only a
+                    // caller counting failures (CLI diagnose) waits for the
+                    // answer to find out; an editor's pull does not, but while
+                    // the answer for the current text is pending, the
+                    // region's pushes are left out of this result: it owes a
+                    // refresh once it is sent.
+                    if let Some(target) = self
+                        .bridge
+                        .prepare_target(language_name, &resolved.injection_language)
+                    {
+                        let input = crate::lsp::bridge::PrepareInput {
+                            host_uri: &uri,
+                            host_language: language_name,
+                            injection_language: &resolved.injection_language,
+                            region_id: &resolved.region.region_id,
+                            virtual_text: &resolved.virtual_content,
+                            gaps: &resolved.gaps,
+                        };
+                        if external_error_sink.is_none() {
+                            if matches!(
+                                self.bridge
+                                    .prepared_document_now_for_request(&target, input),
+                                crate::lsp::bridge::PrepareLookup::Pending
+                            ) {
+                                prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if self.bridge.prepared_document(&target, input).await.is_err() {
+                            count_request_errors(&request_error_sink, 1);
+                        }
+                    }
                     continue;
                 }
 
@@ -288,6 +335,7 @@ impl Kakehashi {
                 );
                 let strategy = agg.strategy;
                 let region_ctx = DocumentRequestContext {
+                    prepared: None,
                     uri: uri.clone(),
                     resolved: resolved.clone(),
                     region_end: None,
@@ -298,6 +346,27 @@ impl Kakehashi {
                     max_fan_out: agg.max_fan_out,
                     client_progress_token: None,
                 };
+                // Its attempt already running (see above): waiting for each
+                // in turn costs the slowest one.
+                let region_ctx =
+                    match crate::lsp::lsp_impl::bridge_context::prepare_request_context(
+                        &self.bridge,
+                        language_name,
+                        region_ctx,
+                    )
+                    .await
+                    {
+                        Ok(region_ctx) => region_ctx,
+                        Err(miss) => {
+                            if prepare_miss_fails_pull(miss, external_error_sink.is_some()) {
+                                count_request_errors(&request_error_sink, 1);
+                            }
+                            if miss == crate::lsp::bridge::PrepareMiss::Unanswered {
+                                prepare_skipped.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+                    };
                 let pool = Arc::clone(&pool);
                 let task_sink = request_error_sink.clone();
 
@@ -371,7 +440,7 @@ impl Kakehashi {
         self.fold_push_fallback_diagnostics(
             &uri,
             language_name,
-            region_meta,
+            &virt_regions,
             host_ctx.as_ref(),
             &mut virt_items,
             &mut host_items,
@@ -420,6 +489,12 @@ impl Kakehashi {
             // `DiagnosticAggregator::degraded_pulls`).
             self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
             self.recover_degraded_pull(&uri);
+        } else if prepare_skipped.load(std::sync::atomic::Ordering::Relaxed) {
+            // Owed a refresh once the region's prepared text is sent (the
+            // prepare resync settles the debt), not right away: a re-pull now
+            // would find the region still waiting on its peer.
+            self.bridge
+                .owe_pull_after_prepare(&uri, prepare_answers_then);
         } else {
             // A failed/partial fan-out (`!pull_clean`) still advances the
             // coverage version but clears neither the pull-view lag nor the
@@ -546,7 +621,7 @@ impl Kakehashi {
         &self,
         host: &Url,
         language_name: &str,
-        region_meta: Vec<(String, String, RegionOffset)>,
+        regions: &[crate::language::injection::ResolvedInjection],
         host_ctx: Option<&HostRequestContext>,
         virt_items: &mut Vec<Diagnostic>,
         host_items: &mut Vec<Diagnostic>,
@@ -562,6 +637,25 @@ impl Kakehashi {
         // Classify live (static caps + dynamic registrations); fold only the
         // push-driven ones so a pull-driven server is not double-counted.
         let pull_driven = self.bridge.pool().pull_driven_servers(&candidates).await;
+        // Per-region metadata `(region_id, injection_language, current
+        // offset)`. The regions are the pull's own, kept (shared, not copied)
+        // through its awaits: a cached push follows the text its connection
+        // held, checked against the region's virtual text here (see
+        // `BridgeCoordinator::place_held`), whether or not anything was
+        // prepared when the pull began.
+        let region_meta: Vec<RegionPushMeta> = regions
+            .iter()
+            .map(|r| {
+                (
+                    r.region.region_id.clone(),
+                    r.injection_language.clone(),
+                    RegionOffset::with_per_line_offsets(
+                        r.region.line_range.start,
+                        r.line_column_offsets.clone(),
+                    ),
+                )
+            })
+            .collect();
 
         // Load settings once: resolving per-region pushFallback in the loop and
         // the host gate below otherwise re-reads it N+1 times and could resolve
@@ -600,6 +694,9 @@ impl Kakehashi {
         }
 
         let mut region_offsets = HashMap::new();
+        // A slot places through the text its connection held (see
+        // `BridgeCoordinator::place_held`).
+        let place = self.bridge.push_placement(host, regions);
         let mut push_fallback_by_lang: HashMap<String, bool> = HashMap::new();
         for (region_id, injection_language, offset) in region_meta {
             // `get` on the common (cache-hit) path is a single lookup; only the
@@ -663,7 +760,7 @@ impl Kakehashi {
             }
         };
         let (region_push, host_push) =
-            cached_push_diagnostics(host, snapshot, &region_offsets, include);
+            cached_push_diagnostics(host, snapshot, &region_offsets, place, include);
         virt_items.extend(region_push);
         host_items.extend(host_push);
     }
@@ -993,6 +1090,21 @@ fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unusable_prepare_answer_fails_only_the_cli_pull() {
+        use crate::lsp::bridge::PrepareMiss;
+        assert!(super::prepare_miss_fails_pull(PrepareMiss::Failed, true));
+        assert!(super::prepare_miss_fails_pull(
+            PrepareMiss::Unanswered,
+            true
+        ));
+        assert!(!super::prepare_miss_fails_pull(PrepareMiss::Failed, false));
+        assert!(super::prepare_miss_fails_pull(
+            PrepareMiss::Unanswered,
+            false
+        ));
+    }
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
 
@@ -1097,14 +1209,7 @@ mod tests {
 
             let (mut virt, mut host) = (Vec::new(), Vec::new());
             server
-                .fold_push_fallback_diagnostics(
-                    &uri,
-                    "rust",
-                    Vec::new(),
-                    Some(&ctx),
-                    &mut virt,
-                    &mut host,
-                )
+                .fold_push_fallback_diagnostics(&uri, "rust", &[], Some(&ctx), &mut virt, &mut host)
                 .await;
             assert_eq!(
                 !host.is_empty(),
@@ -1112,6 +1217,126 @@ mod tests {
                 "host push with rust_ls excluded under {excluded_under}: {host:?}"
             );
         }
+    }
+
+    /// A pull folding an unprepared host's cached region pushes places them
+    /// through its regions' own text whenever any region anywhere is
+    /// prepared, read from the regions the pull kept rather than a copy taken
+    /// only if something was prepared when it began: another host starting
+    /// to prepare during the pull's awaits must not discard them.
+    #[tokio::test]
+    async fn a_pull_folds_an_unprepared_hosts_pushes_while_another_host_prepares() {
+        use std::sync::Arc;
+        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
+        let (service, _socket) = tower_lsp_server::LspService::new(|client| {
+            crate::lsp::lsp_impl::Kakehashi::with_cancel_forwarder(
+                client,
+                Arc::clone(&pool),
+                crate::lsp::CancelForwarder::new(Arc::clone(&pool)),
+            )
+        });
+        let server = service.inner();
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".into(), language.clone());
+        server.language.query_store().insert_injection_query(
+            "rust".into(),
+            Arc::new(
+                tree_sitter::Query::new(
+                    &language,
+                    r#"((string_literal) @injection.content (#set! injection.language "rust"))"#,
+                )
+                .unwrap(),
+            ),
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let uri = url::Url::parse("file:///hinted.rs").unwrap();
+        let text = r#"fn main() { let x = "a"; }"#;
+        server.documents.insert(
+            uri.clone(),
+            text.into(),
+            Some("rust".into()),
+            parser.parse(text, None),
+        );
+        let region = server
+            .injection_coordinator()
+            .resolve_injection_data(&uri, "rust")
+            .unwrap()
+            .remove(0);
+        // A push-only server bridged for the region's language.
+        server
+            .settings_manager
+            .apply_settings(crate::config::WorkspaceSettings {
+                auto_install: false,
+                language_servers: [(
+                    "pusher".to_string(),
+                    crate::lsp::bridge::test_helpers::devnull_config_for_language("rust"),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            });
+        server.diagnostics.record(
+            &uri,
+            crate::lsp::diagnostic_cache::DiagnosticSource::Region(region.region_id.clone()),
+            "pusher".to_string(),
+            None,
+            vec![Diagnostic {
+                message: "pushed".to_string(),
+                ..Default::default()
+            }],
+        );
+        // Another host's region is prepared.
+        let other = url::Url::parse("file:///other.rs").unwrap();
+        let target = crate::lsp::bridge::PrepareTarget {
+            candidates: vec![crate::lsp::bridge::ResolvedServerConfig {
+                server_name: "peer".to_string(),
+                config: Arc::new(crate::config::settings::BridgeServerConfig {
+                    cmd: Some(vec!["/nonexistent/kakehashi-prepare-peer".to_string()]),
+                    ..Default::default()
+                }),
+            }]
+            .into(),
+            epoch: pool.prepare_epoch(),
+        };
+        let answer =
+            serde_json::from_value(serde_json::json!({"segments": [{"type": "content"}]})).unwrap();
+        server.bridge.answer_prepare_for_test(
+            &target,
+            crate::lsp::bridge::PrepareInput {
+                host_uri: &other,
+                host_language: "rust",
+                injection_language: "rust",
+                region_id: "01J0000000000000000000000Z",
+                virtual_text: "a",
+                gaps: &[],
+            },
+            crate::lsp::bridge::PrepareAnswer::Prepared(Arc::new(
+                crate::lsp::bridge::apply_prepare_result(
+                    "a",
+                    &crate::lsp::bridge::VirtualLayout::single("a"),
+                    Some(answer),
+                )
+                .unwrap(),
+            )),
+            true,
+        );
+        assert!(!server.bridge.places_pushes_as_is());
+        let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot) = server
+            .wait_for_current_snapshot(&uri, Duration::from_millis(200))
+            .await
+        else {
+            panic!("parsed");
+        };
+        let regions = server.whole_document_regions(&uri, &snapshot).unwrap();
+        let (mut virt, mut host) = (Vec::new(), Vec::new());
+        server
+            .fold_push_fallback_diagnostics(&uri, "rust", &regions, None, &mut virt, &mut host)
+            .await;
+        assert_eq!(virt.len(), 1, "{virt:?}");
     }
 
     #[test]

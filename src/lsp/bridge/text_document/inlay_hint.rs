@@ -38,7 +38,9 @@ use serde_json::Value;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintLabel, Position, Range, Uri};
 use url::Url;
 
-use super::super::pool::{ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId};
+use super::super::pool::{
+    ConnectionKey, ConnectionState, HeldNote, LanguageServerPool, UpstreamId,
+};
 use super::host::{HostResolveContext, HostResolveReader};
 use tower_lsp_server::ls_types::{
     InlayHintParams, NumberOrString, TextDocumentIdentifier, WorkDoneProgressParams,
@@ -491,6 +493,11 @@ impl LanguageServerPool {
 
         let request = build_inlay_hint_resolve_request(&outgoing, request_id);
         let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+        // What the producer holds for the virtual document as the resolve
+        // is queued: the reply must be computed on that text.
+        let held = virt.as_ref().map_or_else(HeldNote::default, |virt| {
+            self.note_held(&virt.virtual_uri, connection_key)
+        });
         let send_result = if envelope.is_host_layer() {
             self.enqueue_host_resolve(
                 &handle,
@@ -565,7 +572,10 @@ impl LanguageServerPool {
                     && self.document_connection_generation(connection_key) == expected_generation
             })
         };
-        if !producer_is_still_live {
+        // Computed on another text than the one noted (a prepared one sent
+        // ahead of it after its pair gained a peer, say): its coordinates are
+        // not the envelope's.
+        if !producer_is_still_live || !self.held_unchanged(&held) {
             re_envelope_hint(&mut hint, &envelope);
             return hint;
         }
@@ -831,6 +841,11 @@ fn transform_inlay_hint_to_host(
 ) -> Vec<usize> {
     translate_virtual_position_to_host(&mut hint.position, offset);
 
+    // No edit is mapped back through a prepared document: the hint is
+    // shown, its edits are not offered.
+    if offset.prepared().is_some() {
+        hint.text_edits = None;
+    }
     if let Some(text_edits) = &mut hint.text_edits {
         for edit in text_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
@@ -1078,6 +1093,56 @@ mod tests {
     // ==========================================================================
     // Inlay hint request builder tests
     // ==========================================================================
+
+    /// A hint from a prepared document is placed through its map, and its
+    /// edits are dropped: none is mapped back through a prepared document.
+    /// From an unprepared one, its edits are kept and translated.
+    #[test]
+    fn a_prepared_hint_is_shown_without_its_edits() {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let host_uri: Uri = "file:///test.md".parse().unwrap();
+        // The peer strips the first two columns of "  a".
+        let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+        ]}]}))
+        .unwrap();
+        let map = apply_prepare_result("  a", &VirtualLayout::single("  a"), Some(answer))
+            .unwrap()
+            .map;
+        let hint = || -> InlayHint {
+            serde_json::from_value(json!({
+                "position": {"line": 0, "character": 1},
+                "label": ": x",
+                "textEdits": [{
+                    "range": {"start": {"line": 0, "character": 1}, "end": {"line": 0, "character": 1}},
+                    "newText": ": x"
+                }]
+            }))
+            .unwrap()
+        };
+        let transform = |hint: &mut InlayHint, offset: &RegionOffset| {
+            transform_inlay_hint_to_host(
+                hint,
+                "file:///test.md/kakehashi-virtual-uri-R.lua",
+                &host_uri,
+                offset,
+                Position::new(10, 0),
+                &ConnectionKey::for_server("lua"),
+                "textDocument/inlayHint",
+            );
+        };
+
+        let mut prepared = hint();
+        transform(&mut prepared, &RegionOffset::new(3, 2).with_prepared(map));
+        assert_eq!(prepared.position, Position::new(3, 5));
+        assert!(prepared.text_edits.is_none());
+
+        let mut as_is = hint();
+        transform(&mut as_is, &RegionOffset::new(3, 2));
+        assert_eq!(as_is.position, Position::new(3, 3));
+        let edits = as_is.text_edits.expect("edits of an unprepared hint stay");
+        assert_eq!(edits[0].range.start, Position::new(3, 3));
+    }
 
     #[test]
     fn inlay_hint_response_wraps_downstream_data_for_resolve_routing() {
@@ -1587,6 +1652,7 @@ mod tests {
                 line: 4,
                 column: 2,
                 line_column_offsets: Some(vec![2, 3, 0]),
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1663,6 +1729,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,
@@ -1718,6 +1785,7 @@ mod tests {
                 line: 4,
                 column: 0,
                 line_column_offsets: None,
+                prepared: false,
             },
             inner: None,
             host_layer: false,

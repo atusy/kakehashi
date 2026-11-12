@@ -85,11 +85,31 @@ pub(in crate::lsp::bridge) fn forward_push(
         }
     };
 
+    // Stamped as it is read, before it waits to be published: what the
+    // connection held then is what the push was computed for. Not stamped
+    // when the pool prepares nothing: every text is held as is.
+    let held = deps
+        .document_tracker
+        .as_ref()
+        .filter(|_| crate::lsp::bridge::VirtualDocumentUri::is_virtual_uri(&uri))
+        .map(|tracker| {
+            let version = params
+                .get("version")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|version| i32::try_from(version).ok());
+            crate::lsp::diagnostic_cache::HeldStamp {
+                connection: deps.connection_key.clone(),
+                observed: tracker.observe(&uri, &deps.connection_key, deps.incarnation, version),
+                // Filled in where the slot is recorded.
+                origin: None,
+            }
+        });
     let _ = deps.upstream_tx.send(
         crate::lsp::bridge::actor::UpstreamNotification::PublishDiagnostics {
             uri,
             server: server_name.to_owned(),
             connection_id: deps.progress_connection_id,
+            held,
             diagnostics,
         },
     );

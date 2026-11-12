@@ -207,6 +207,78 @@ impl DiagnosticScheduler {
     /// document state that triggered the change.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        self.schedule_debounced_diagnostic_as(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Change,
+        );
+    }
+
+    /// Collect `uri`'s diagnostics again after a resync pass sent its
+    /// servers the texts an edit's prepare answers gave, through the edit's
+    /// debounce: a burst of keystrokes still collects once. Ranked as a
+    /// collection after held regions are sent, since an earlier one of this
+    /// version (a save's, say) left them out. For `revision`, the one the
+    /// pass synced: a later edit's own pass and debounce collect that one.
+    pub(crate) fn schedule_debounced_diagnostic_after_prepare(
+        &self,
+        uri: Url,
+        revision: crate::lsp::bridge::HostRevision,
+    ) {
+        let current = self
+            .documents
+            .get(&uri)
+            .map(|document| crate::lsp::bridge::HostRevision {
+                incarnation: document.incarnation(),
+                content_version: document.content_version(),
+            });
+        if current != Some(revision) {
+            return;
+        }
+        let snapshot_data = self
+            .snapshot_preparer
+            .prepare_diagnostic_snapshot_when_current(
+                &uri,
+                revision.incarnation,
+                revision.content_version,
+            );
+        self.schedule_debounced_diagnostic_as(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Prepared,
+        );
+    }
+
+    /// `uri`'s current revision, as a pass that synced it now has it.
+    #[cfg(test)]
+    pub(crate) fn current_revision(&self, uri: &Url) -> crate::lsp::bridge::HostRevision {
+        let document = self.documents.get(uri).expect("open");
+        crate::lsp::bridge::HostRevision {
+            incarnation: document.incarnation(),
+            content_version: document.content_version(),
+        }
+    }
+
+    fn schedule_debounced_diagnostic_as(
+        &self,
+        uri: Url,
+        snapshot_data: Option<DiagnosticSnapshot>,
+        trigger: SyntheticDiagnosticTrigger,
+    ) {
+        // After prepare, the snapshot is taken again when the timer fires: a
+        // region still held now may be sent and collected at once before
+        // then, and a collection leaving it out would replace that one.
+        let resnapshot = (trigger == SyntheticDiagnosticTrigger::Prepared).then(|| {
+            let preparer = self.snapshot_preparer.clone();
+            let uri = uri.clone();
+            Box::new(move |incarnation, content_version| {
+                preparer.prepare_diagnostic_snapshot_when_current(
+                    &uri,
+                    incarnation,
+                    content_version,
+                )
+            }) as crate::lsp::debounced_diagnostics::Resnapshot
+        });
 
         // Apply the current `diagnostics_debounce_ms` setting (#533). The snapshot
         // is a cheap arc-swap clone, so reading it per schedule keeps the debounce
@@ -225,6 +297,8 @@ impl DiagnosticScheduler {
             std::sync::Arc::clone(&self.synthetic_diagnostics),
             std::sync::Arc::clone(&self.publisher),
             std::sync::Arc::clone(&self.documents),
+            trigger,
+            resnapshot,
         );
     }
 
@@ -236,7 +310,48 @@ impl DiagnosticScheduler {
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
         let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
+    }
+
+    /// Pull `uri`'s diagnostics again after a resync pass sent its servers
+    /// the texts their prepare answers gave: what they computed before was
+    /// for other texts, and a push-only collection never asks again. For
+    /// `revision`, the one the pass synced: a later edit's text may have
+    /// regions its own pass has yet to send, and a collection of it ranked
+    /// as one after they were sent would leave them out for good.
+    pub(crate) fn spawn_diagnostic_task_after_prepare(
+        &self,
+        uri: Url,
+        revision: crate::lsp::bridge::HostRevision,
+    ) {
+        let snapshot_data = self
+            .snapshot_preparer
+            .prepare_diagnostic_snapshot_when_current(
+                &uri,
+                revision.incarnation,
+                revision.content_version,
+            );
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Prepared,
+        );
+    }
+
+    /// Settle `uri`'s debt of an editor pull answered without documents then
+    /// waiting for their prepare answers, once a pass synced the host with
+    /// an answer in (`ready`), or with none pending any more: the editor is
+    /// asked to pull again. A debt is settled once.
+    pub(crate) fn settle_pull_debt_after_prepare(&self, uri: &Url, ready: bool) {
+        if (ready || !self.bridge.prepare_host_has_pending(uri))
+            && self.bridge.take_pull_debt_after_prepare(uri)
+        {
+            self.publisher.request_pull_diagnostic_refresh(true);
+        }
     }
 
     pub(crate) fn spawn_synthetic_diagnostic_task_for_parse(
@@ -251,13 +366,18 @@ impl DiagnosticScheduler {
                 parsed.incarnation,
                 parsed.content_version,
             );
-        self.spawn_prepared_synthetic_diagnostic_task(uri, snapshot_data);
+        self.spawn_prepared_synthetic_diagnostic_task(
+            uri,
+            snapshot_data,
+            SyntheticDiagnosticTrigger::Open,
+        );
     }
 
     fn spawn_prepared_synthetic_diagnostic_task(
         &self,
         uri: Url,
         snapshot_data: Option<DiagnosticSnapshot>,
+        trigger: SyntheticDiagnosticTrigger,
     ) {
         let Some(lineage) = snapshot_data.as_ref().map(|snapshot| snapshot.lineage) else {
             return;
@@ -286,7 +406,7 @@ impl DiagnosticScheduler {
             lineage.incarnation,
             lineage.content_version,
             lineage.settings_generation,
-            SyntheticDiagnosticTrigger::Open,
+            trigger,
             future,
         );
     }
@@ -427,6 +547,7 @@ impl DiagnosticSnapshotPreparer {
                 &language_name,
                 "textDocument/diagnostic",
             );
+        let mut prepare_pending = false;
         let mut narrower_than_editor_pull = layer_cfg.priorities != editor_layer_cfg.priorities
             || layer_cfg.strategy != editor_layer_cfg.strategy;
 
@@ -558,7 +679,8 @@ impl DiagnosticSnapshotPreparer {
                             continue;
                         };
 
-                        contexts.push(DocumentRequestContext {
+                        let ctx = DocumentRequestContext {
+                            prepared: None,
                             uri: uri.clone(),
                             resolved: resolved.clone(),
                             region_end: None,
@@ -568,7 +690,23 @@ impl DiagnosticSnapshotPreparer {
                             strategy: agg.strategy,
                             max_fan_out: agg.max_fan_out,
                             client_progress_token: None,
-                        });
+                        };
+                        // The snapshot is built without waiting: a document
+                        // still waiting for its prepare peer skips this cycle
+                        // (its host is collected again when the answer
+                        // arrives), and one its peer could not prepare is not
+                        // bridged.
+                        match crate::lsp::lsp_impl::bridge_context::prepare_request_context_now(
+                            &self.bridge,
+                            &language_name,
+                            ctx,
+                        ) {
+                            Ok(ctx) => contexts.push(ctx),
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Failed) => {}
+                            Err(crate::lsp::lsp_impl::bridge_context::PrepareSkip::Pending) => {
+                                prepare_pending = true;
+                            }
+                        }
                     }
                     contexts
                 })
@@ -659,6 +797,7 @@ impl DiagnosticSnapshotPreparer {
             virt_contexts,
             host_pull_enabled,
             narrower_than_editor_pull,
+            prepare_pending,
             host,
             layer_cfg,
         })
@@ -727,6 +866,96 @@ mod tests {
                 .await
                 .expect("tree publication must release the diagnostic waiter")
         );
+    }
+
+    /// An edit's prepare answer is collected through the debounce, yet ranks
+    /// as a collection after held regions are sent: a save of the same
+    /// version collected without those regions, and a change-ranked one
+    /// would yield to it.
+    #[tokio::test]
+    async fn a_debounced_collection_after_prepare_supersedes_the_versions_save() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/prepared-after-save.md").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "# saved\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let content_version = server.documents.get(&uri).unwrap().content_version();
+        let scheduler = DiagnosticScheduler::new(server);
+        let settings_generation = scheduler
+            .prepare_diagnostic_snapshot(&uri)
+            .map_or(0, |snapshot| snapshot.lineage.settings_generation);
+        let save = tokio::spawn(std::future::pending::<()>());
+        assert!(server.synthetic_diagnostics.register_task_for_lineage(
+            uri.clone(),
+            incarnation,
+            content_version,
+            settings_generation,
+            SyntheticDiagnosticTrigger::Save,
+            save.abort_handle(),
+        ));
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
+        let superseded = tokio::time::timeout(std::time::Duration::from_secs(5), save)
+            .await
+            .expect("the save's collection is superseded");
+        assert!(superseded.unwrap_err().is_cancelled());
+    }
+
+    /// An edit's debounce whose snapshot was captured before held regions
+    /// were sent does not replace the timer scheduled after they were, for
+    /// the same version: nothing else would collect those regions.
+    #[tokio::test]
+    async fn an_edits_debounce_keeps_the_timer_scheduled_after_prepare() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/prepared-then-edit-timer.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "# typed\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let scheduler = DiagnosticScheduler::new(server);
+        let timers = &server.debounced_diagnostics;
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
+        let prepared = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic(uri.clone());
+        assert_eq!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
+        assert!(!prepared.is_finished());
+        // A newer version's edit replaces it.
+        server.documents.insert(
+            uri.clone(),
+            "# typed more\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        scheduler.schedule_debounced_diagnostic(uri.clone());
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), prepared.id());
+        // And one scheduled after prepare replaces an edit's.
+        let edited = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), edited.id());
+        // As does a later one after prepare, for the same version: it
+        // snapshots when it fires, so nothing the first had is lost.
+        let first = timers.timer_abort_handle(&uri).unwrap();
+        scheduler.schedule_debounced_diagnostic_after_prepare(
+            uri.clone(),
+            scheduler.current_revision(&uri),
+        );
+        assert_ne!(timers.timer_abort_handle(&uri).unwrap().id(), first.id());
+        timers.cancel_all();
     }
 
     #[tokio::test]

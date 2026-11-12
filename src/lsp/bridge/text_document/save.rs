@@ -21,11 +21,21 @@ use super::super::pool::{
 };
 use super::super::protocol::{JsonRpcNotification, VirtualDocumentUri};
 
+/// Enqueue a didSave unless the didChange it follows (`None`: none needed)
+/// was not queued — refused, its text revoked (`Some(None)`), or dropped —
+/// or the text the save was admitted with is `revoked` since (or
+/// superseded by a newer answer for its input on the connection): no
+/// didChange tells, but the save (and the text it may carry) is of an
+/// answer the connection must not be given.
 fn enqueue_did_save_if_content_synced(
-    did_change: Option<NotificationSendResult>,
+    did_change: Option<Option<NotificationSendResult>>,
+    revoked: bool,
     enqueue_did_save: impl FnOnce() -> NotificationSendResult,
 ) -> Option<NotificationSendResult> {
-    if did_change.is_some_and(|outcome| !matches!(outcome, NotificationSendResult::Queued)) {
+    if revoked
+        || did_change
+            .is_some_and(|outcome| !matches!(outcome, Some(NotificationSendResult::Queued)))
+    {
         return None;
     }
     Some(enqueue_did_save())
@@ -57,14 +67,19 @@ impl LanguageServerPool {
     /// attaching the projected text when the server requests it. A failed
     /// didChange enqueue suppresses didSave for that target, so a queue becoming
     /// writable between the two cannot expose a stale save hook.
+    ///
+    /// Returns the regions whose save some connection was refused because
+    /// their answer was revoked or superseded there since it was looked up:
+    /// they still miss this save (empty without the prepare layer).
     pub(crate) async fn sync_and_forward_did_save_to_virtual_docs(
         &self,
         host_uri: &Url,
         incarnation: u64,
         injections: &[crate::lsp::bridge::coordinator::BridgeInjection],
-    ) {
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return;
+            return refused;
         };
 
         for injection in injections {
@@ -73,7 +88,7 @@ impl LanguageServerPool {
                 incarnation,
                 &injection.language,
                 &injection.region_id,
-                &injection.content,
+                injection.sent(),
             );
             let virtual_uri =
                 VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
@@ -108,32 +123,19 @@ impl LanguageServerPool {
                     continue;
                 }
 
-                let did_change = if let Some(version) = self
-                    .increment_version_if_content_changed(
-                        &virtual_uri,
-                        &connection_key,
-                        &injection.content,
-                    )
+                let content = injection.sent();
+                let did_change = self
+                    .increment_version_if_content_changed(&virtual_uri, &connection_key, content)
                     .await
-                {
-                    let outcome = Self::send_didchange_for_virtual_doc(
-                        &handle,
-                        &virtual_uri.to_uri_string(),
-                        &injection.content,
-                        version,
-                    );
-                    if matches!(outcome, NotificationSendResult::Queued) {
-                        self.record_sent_content_fingerprint(
+                    .map(|change| {
+                        self.send_didchange_recorded(
+                            &handle,
                             &virtual_uri,
                             &connection_key,
-                            &injection.content,
+                            content,
+                            change,
                         )
-                        .await;
-                    }
-                    Some(outcome)
-                } else {
-                    None
-                };
+                    });
 
                 let virtual_uri = virtual_uri.to_uri_string();
                 let params = if include_text {
@@ -145,13 +147,31 @@ impl LanguageServerPool {
                     serde_json::json!({ "textDocument": { "uri": virtual_uri } })
                 };
                 let notification = JsonRpcNotification::new("textDocument/didSave", params);
-                let _ = enqueue_did_save_if_content_synced(did_change, || {
+                // Read after every await, with none before the enqueue. An
+                // answer taken before the one the connection holds for the
+                // same input (sent meanwhile by a request opening the
+                // document under a newer epoch) is not sent, nor is its save.
+                let revoked = content.map.is_some_and(|map| map.revoked())
+                    || (content.map.is_some()
+                        && self
+                            .held_text(&virtual_uri, &connection_key)
+                            .is_some_and(|held| {
+                                crate::lsp::bridge::protocol::PreparedMap::taken_before(
+                                    content.map,
+                                    held.map.as_ref(),
+                                )
+                            }));
+                let _ = enqueue_did_save_if_content_synced(did_change, revoked, || {
                     handle.send_notification(notification)
                 });
                 drop(transition_guard);
                 drop(connections);
+                if revoked && refused.last() != Some(&injection.region_id) {
+                    refused.push(injection.region_id.clone());
+                }
             }
         }
+        refused
     }
 
     /// Shared fan-out: snapshot the host's open virtual docs and send `method`
@@ -230,17 +250,165 @@ mod tests {
     #[test]
     fn queue_full_did_change_suppresses_textless_did_save() {
         let did_save_enqueued = Cell::new(false);
-        let result =
-            enqueue_did_save_if_content_synced(Some(NotificationSendResult::QueueFull), || {
+        let result = enqueue_did_save_if_content_synced(
+            Some(Some(NotificationSendResult::QueueFull)),
+            false,
+            || {
                 did_save_enqueued.set(true);
                 NotificationSendResult::Queued
-            });
+            },
+        );
 
         assert!(result.is_none());
         assert!(
             !did_save_enqueued.get(),
             "didSave must not be attempted after its prerequisite didChange was dropped"
         );
+    }
+
+    /// A save whose text was revoked since it was admitted, unchanged since
+    /// the last sync (no didChange needed, none to refuse), sends no didSave:
+    /// it would follow, and may carry, an answer the peer no longer gives.
+    #[test]
+    fn a_revoked_text_suppresses_did_save_though_unchanged() {
+        let did_save_enqueued = Cell::new(false);
+        let enqueue = || {
+            did_save_enqueued.set(true);
+            NotificationSendResult::Queued
+        };
+        assert!(enqueue_did_save_if_content_synced(None, true, enqueue).is_none());
+        assert!(!did_save_enqueued.get());
+        assert!(enqueue_did_save_if_content_synced(None, false, enqueue).is_some());
+        assert!(did_save_enqueued.get());
+    }
+
+    /// The save loop sends no didSave for a text its peer revoked since it
+    /// was taken, unchanged since the last sync (no didChange either), and
+    /// does for one that stands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_sends_no_did_save_for_a_revoked_unchanged_text() {
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result};
+        for revoked in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("save");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test/save-revoked.md").unwrap();
+            let revocation = Arc::new(Revocation::default());
+            let mut map =
+                apply_prepare_result("print(1)", &VirtualLayout::single("print(1)"), None)
+                    .unwrap()
+                    .map;
+            Arc::get_mut(&mut map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: ulid::Ulid::generate().to_string(),
+                content: "print(1)".to_string(),
+                held: false,
+                prepared: Some(Arc::clone(&map)),
+            };
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                &injection.language,
+                &injection.region_id,
+            );
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            pool.record_sent_for_test(&virtual_uri, &key, injection.sent());
+            if revoked {
+                revocation.revoke(u64::MAX);
+            }
+            let _ = pool
+                .sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
+                .await;
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert!(!sent.contains("textDocument/didChange"), "{sent}");
+            assert_eq!(sent.contains("textDocument/didSave"), !revoked, "{sent}");
+        }
+    }
+
+    /// A save carrying an older answer for the same input than the one its
+    /// connection holds (taken before the epoch moved, while a request
+    /// opened the document with the newer one) sends neither its text nor
+    /// its didSave: the input's answer never moves backwards. A newer
+    /// answer is sent, its save too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_save_sends_nothing_for_an_older_answer_than_the_one_held() {
+        use crate::lsp::bridge::protocol::{Revocation, VirtualLayout, apply_prepare_result_at};
+        for save_is_older in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let wire = dir.path().join("wire");
+            let pool = Arc::new(LanguageServerPool::preparing());
+            let key = ConnectionKey::for_server("save");
+            let handle = test_helpers::create_recording_handle(key.clone(), &wire).await;
+            pool.insert_connection(Arc::clone(&handle)).await;
+            let host_uri = Url::parse("file:///test/save-older.md").unwrap();
+            // Both answers are for one input: they share what revokes them.
+            let revocation = Arc::new(Revocation::default());
+            let answer = |text: &str, taken| {
+                let mut map =
+                    apply_prepare_result_at(text, &VirtualLayout::single(text), None, taken)
+                        .unwrap()
+                        .map;
+                Arc::get_mut(&mut map)
+                    .unwrap()
+                    .set_revocation(Arc::clone(&revocation));
+                map
+            };
+            let older = ("print(1)", answer("print(1)", 10));
+            let newer = ("print(2)", answer("print(2)", 30));
+            let (held, saved) = if save_is_older {
+                (newer, older)
+            } else {
+                (older, newer)
+            };
+            let region_id = ulid::Ulid::generate().to_string();
+            let virtual_uri = VirtualDocumentUri::new(
+                &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+                "lua",
+                &region_id,
+            );
+            pool.register_opened_document(&host_uri, &virtual_uri, &key)
+                .await;
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                crate::lsp::bridge::pool::SentText {
+                    text: held.0,
+                    map: Some(&held.1),
+                },
+            );
+            let injection = BridgeInjection {
+                language: "lua".to_string(),
+                region_id: region_id.clone(),
+                content: saved.0.to_string(),
+                held: false,
+                prepared: Some(Arc::clone(&saved.1)),
+            };
+            let refused = pool
+                .sync_and_forward_did_save_to_virtual_docs(&host_uri, 1, &[injection])
+                .await;
+            // The refused region still misses the save.
+            let expected: &[String] = if save_is_older { &[region_id] } else { &[] };
+            assert_eq!(refused, expected);
+            let sent = test_helpers::sent_before_marker(&handle, &wire).await;
+            assert_eq!(
+                sent.contains("textDocument/didChange"),
+                !save_is_older,
+                "{sent}"
+            );
+            assert_eq!(
+                sent.contains("textDocument/didSave"),
+                !save_is_older,
+                "{sent}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -255,14 +423,15 @@ mod tests {
             language: "lua".to_string(),
             region_id: ulid::Ulid::generate().to_string(),
             content: "print(1)".to_string(),
+            held: false,
+            prepared: None,
         };
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap();
         let virtual_uri =
             VirtualDocumentUri::new(&host_uri_lsp, &injection.language, &injection.region_id);
         pool.register_opened_document(&host_uri, &virtual_uri, &key)
             .await;
-        pool.record_sent_content_fingerprint(&virtual_uri, &key, &injection.content)
-            .await;
+        pool.record_sent_for_test(&virtual_uri, &key, (&injection.content).into());
 
         let transition = pool.open_transition_lock(&virtual_uri, &key);
         let transition_guard = transition.lock().await;
