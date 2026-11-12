@@ -58,6 +58,7 @@ mod references;
 mod rename;
 mod save;
 mod signature_help;
+mod snippet;
 #[cfg(test)]
 pub(in crate::lsp::bridge) mod test_helpers;
 mod type_definition;
