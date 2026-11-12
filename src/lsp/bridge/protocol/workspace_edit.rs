@@ -2093,6 +2093,13 @@ mod tests {
             host_after(&after_delimiter, &[text_edit((0, 0), (1, 0), "c")]),
             None
         );
+        // Nor is it a prefix to repeat: a line break put right behind the
+        // delimiter leaves what follows on a line of its own, which would
+        // need the text that stood ahead of it.
+        assert_eq!(
+            host_after(&after_delimiter, &[text_edit((0, 0), (0, 0), "\n")]),
+            None
+        );
         // Lines below it are placed as anywhere else.
         assert_eq!(
             host_after(&after_delimiter, &[text_edit((1, 1), (1, 1), "\nc")]).as_deref(),
