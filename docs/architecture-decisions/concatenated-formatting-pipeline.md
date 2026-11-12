@@ -146,10 +146,11 @@ opt-in to a sequential formatter pipeline driven by `priorities`.
    **must re-apply the region's host prefix/indentation to every output line** —
    not just the first line's offset. The virtual `newText` starts
    at column 0 of the embedded language, so emitting it verbatim would strip those
-   prefixes and corrupt blockquoted/indented injections — the single-edit
-   limitation noted in `src/lsp/bridge/text_document/formatting.rs` ("multi-line
-   edits drop host indentation"), which the pipeline's full-region output must
-   resolve. The host prefix is tracked **per line** (`RegionOffset::columns`) and
+   prefixes and corrupt blockquoted/indented injections. (The per-edit path
+   of `preferred` formatting gives each edit its line prefixes by a rule of
+   its own, language-server-bridge-request-strategies "Line prefixes in
+   edits"; the pipeline has one whole-region text to prefix instead.)
+   The host prefix is tracked **per line** (`RegionOffset::columns`) and
    can differ line to line (e.g. nested blockquote levels). When the formatter
    preserves the line count, each output line takes its original per-line offset
    (a 1:1 mapping). When the formatter changes the line count, new lines have no
