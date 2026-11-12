@@ -573,6 +573,46 @@ fn a_snippet_completion_on_a_prepared_document_keeps_its_tabstops() {
     }
 }
 
+#[test]
+fn a_snippet_breaking_a_line_is_kept_on_a_document_the_peer_left_as_it_is() {
+    // The same snippets in a fence with nothing for the peer to remove.
+    // The document is asked about and declined, so it is a prepared one,
+    // yet no indentation was removed that a snippet engine could double:
+    // `block` comes back with its lines and its tab, as with experimental
+    // features off (below).
+    let (mut client, _dir) = Setup {
+        capabilities: json!({ "textDocument": { "completion": { "completionItem": {
+            "snippetSupport": true
+        }}}}),
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/snippet-left-as-it-is.md";
+    let text = "# t\n\n```lua\nlocal SNIPPET_EDIT = 1\n```\n";
+    open(&mut client, uri, text);
+    hover_with_retry(&mut client, uri, 3, 4);
+    let response = client.send_request(
+        "textDocument/completion",
+        json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 22 } }),
+    );
+    let at = json!({
+        "start": { "line": 3, "character": 22 },
+        "end": { "line": 3, "character": 22 }
+    });
+    assert_eq!(
+        response["result"]["items"],
+        json!([
+            {"label": "call", "insertTextFormat": 2, "textEdit": {
+                "range": at, "newText": "f(${1:x})$0"
+            }},
+            {"label": "block", "insertTextFormat": 2, "textEdit": {
+                "range": at, "newText": "do\n\t${1:body}\n$0end"
+            }}
+        ]),
+        "{response}"
+    );
+}
+
 /// Apply LSP `TextEdit`s to `text`, fixtures being ASCII (a UTF-16 column
 /// is a byte), end-first.
 fn apply_edits(text: &str, edits: &[Value]) -> String {
