@@ -642,7 +642,12 @@ fn keep_line_prefixes(
         if end_line == start_line {
             // The range is empty, at this line's start: the line's prefix
             // stands ahead of it and now opens the first added line. What
-            // was behind it needs the same prefix again.
+            // was behind it needs the same prefix again — if it is a prefix:
+            // a region opening after a delimiter on its line has the host's
+            // own text there, which is not this edit's to repeat.
+            if !uniform.starts_with(own) {
+                return None;
+            }
             new_text.push_str(own);
         } else {
             e.range.end.character = 0;
