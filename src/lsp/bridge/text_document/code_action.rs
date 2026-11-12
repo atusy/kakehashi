@@ -36,11 +36,10 @@ use super::super::pool::{
     ConnectionHandle, ConnectionKey, ConnectionState, LanguageServerPool, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
+    JsonRpcRequest, RegionEditRefusal, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, translate_host_range_to_virtual,
+    transform_workspace_edit_into_region, translate_host_range_to_virtual,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
 };
 use super::completion::EnvelopeOffset;
 use super::host::{HostResolveContext, HostResolveReader};
@@ -358,8 +357,8 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
 ///   not "cannot be represented in the host document".
 /// - [`REASON_PREFIXED_REGION`] — the translated edit would corrupt the host
 ///   structure around the region: it spans/inserts lines in a line-prefixed
-///   (e.g. blockquote) region whose prefixes the verbatim newText would strip,
-///   or it merges content into the closing fence.
+///   (e.g. blockquote) region and could not be given the prefixes its lines
+///   need, or it merges content into the closing fence.
 ///
 /// Used by BOTH the initial-response policy and the codeAction/resolve path so
 /// these are rejected uniformly, never partially applied.
@@ -373,21 +372,19 @@ fn translate_edit_host_ward_strict(
     if workspace_edit_touches_foreign_region(edit, request_virtual_uri) {
         return Err(REASON_CROSS_REGION);
     }
-    if !transform_workspace_edit_to_host(edit, request_virtual_uri, host_uri, offset) {
-        return Err(REASON_CROSS_REGION);
-    }
+    transform_workspace_edit_into_region(edit, request_virtual_uri, host_uri, offset, region_end)
+        .map_err(|refusal| match refusal {
+        RegionEditRefusal::VirtualFileOperation | RegionEditRefusal::OutsideRegion => {
+            REASON_CROSS_REGION
+        }
+        RegionEditRefusal::BreaksLinePrefixes => REASON_PREFIXED_REGION,
+    })?;
     // Reached directly by the client-driven resolve path (which bypasses
     // bridge_code_action's own strip): versions on OTHER real files are
     // bridge-local too and must not reach the editor.
     strip_bridge_local_versions(edit);
     if workspace_edit_is_empty(edit) {
         return Err(REASON_RESOLVE);
-    }
-    if !workspace_edit_within_region(edit, host_uri, offset, region_end) {
-        return Err(REASON_CROSS_REGION);
-    }
-    if !workspace_edit_preserves_line_prefixes(edit, host_uri, offset, region_end) {
-        return Err(REASON_PREFIXED_REGION);
     }
     Ok(())
 }
@@ -640,7 +637,7 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
-        region_end: Position,
+        region: ResolveRegion,
         read_host: HostResolveReader<'_>,
     ) -> CodeAction {
         let Some(envelope) = strip_code_action_envelope(&mut action) else {
@@ -697,7 +694,7 @@ impl LanguageServerPool {
             envelope,
             upstream_caps,
             upstream_id,
-            region_end,
+            region,
         )
         .await
     }
@@ -828,7 +825,7 @@ impl LanguageServerPool {
         envelope: CodeActionEnvelope,
         upstream_caps: UpstreamCodeActionCaps,
         upstream_id: Option<UpstreamId>,
-        region_end: Position,
+        region: ResolveRegion,
     ) -> CodeAction {
         let server_name = &envelope.origin;
         // Client-supplied `host_uri` (see the host path): a malformed value must
@@ -887,7 +884,10 @@ impl LanguageServerPool {
             return action;
         }
 
-        let offset = RegionOffset::from(&envelope.offset);
+        let region_end = region.end;
+        let offset = region
+            .live_offset
+            .unwrap_or_else(|| RegionOffset::from(&envelope.offset));
         let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(&host_url).ok();
 
         // Forward with the ORIGINAL (unsuffixed) title restored and any
@@ -1343,6 +1343,20 @@ impl VirtLayerContext<'_> {
             content_version: self.content_version,
         }
     }
+}
+
+/// The injection region a lazily resolved virt-layer action's edit goes into,
+/// as the resolve handler's freshness gate just rebuilt it from the live
+/// parse. A host-layer action has none: its edit is relayed verbatim.
+#[derive(Default)]
+pub(crate) struct ResolveRegion {
+    /// The region's end-of-content in the host document, bounding the edit.
+    pub(crate) end: Position,
+    /// The region's offset — equal to the envelope's, or the gate would have
+    /// refused. It is what the resolved edit is translated with when given:
+    /// unlike the envelope's, it knows what the region's line prefixes say,
+    /// so an edit that adds lines can be given them.
+    pub(crate) live_offset: Option<RegionOffset>,
 }
 
 /// Upstream client capabilities that gate the bridge action policy
@@ -3374,7 +3388,7 @@ mod tests {
                 &settings,
                 caps_resolve(),
                 None,
-                Position::default(),
+                ResolveRegion::default(),
                 &|_| None,
             )
             .await;
@@ -3399,7 +3413,7 @@ mod tests {
                 &settings,
                 caps_resolve(),
                 None,
-                Position::default(),
+                ResolveRegion::default(),
                 &|_| None,
             )
             .await;

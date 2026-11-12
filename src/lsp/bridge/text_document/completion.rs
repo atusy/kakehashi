@@ -15,14 +15,14 @@ use serde_json::Value;
 
 use crate::config::settings::BridgeServerConfig;
 use crate::lsp::bridge::envelope::{ENVELOPE_KEY, should_envelope, wrap_envelope};
-use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionList, Position, TextEdit};
 use url::Url;
 
 use super::super::pool::{LanguageServerPool, UpstreamId};
 use super::super::protocol::translate_virtual_range_to_host;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, build_position_based_request,
-    response_has_jsonrpc_error, text_edit_safe_in_region,
+    place_text_edits_in_region, response_has_jsonrpc_error, text_edit_safe_in_region,
 };
 use tower_lsp_server::ls_types::TextDocumentPositionParams;
 
@@ -168,11 +168,13 @@ fn transform_completion_response_to_host(
     // under the same policy as the host layer.
     let before = list.items.len();
     list.items.retain_mut(|item| {
+        let written = additional_edits_as_written(item, offset);
         if !transform_completion_item(item, offset, region_end, request_host_line) {
             return false;
         }
         if should_envelope(item.data.as_ref(), server_resolves) {
-            envelope_item_data(item, envelope_ctx);
+            let written = rewritten_additional_edits(written, item, offset);
+            envelope_item_data(item, envelope_ctx, written);
         }
         true
     });
@@ -200,6 +202,15 @@ fn transform_completion_response_to_host(
 /// An unsafe `additionalTextEdits` member drops the whole array instead:
 /// the primary insertion still applies, though possibly semantically
 /// incomplete (e.g. without its auto-import) — availability over fidelity.
+///
+/// The two differ in a line-prefixed region. `additionalTextEdits` are
+/// applied as written, so one that adds lines is given the region's prefix
+/// on them ([`place_text_edits_in_region`]) and is unsafe only when that
+/// cannot be done. The primary insertion is not applied as written: the
+/// editor indents its lines after the first by its own rule
+/// (`insertTextMode`, whose default is the client's), so no text this
+/// transform could put there is right for every client, and an insertion
+/// that breaks a line stays unsafe.
 pub(super) fn transform_completion_item(
     item: &mut CompletionItem,
     offset: &RegionOffset,
@@ -289,21 +300,20 @@ pub(super) fn transform_completion_item(
         }
     }
 
-    // Transform additional_text_edits if present. ALL-OR-NOTHING: the array
-    // can carry paired halves of one operation (a deletion plus a
-    // reinsertion), so stripping only the unsafe member could apply half and
-    // lose content — if any member is unsafe, drop the whole array. The item
-    // is kept: its primary insertion still applies, though possibly
-    // semantically incomplete (e.g. without its auto-import) — availability
-    // over fidelity, never corruption.
+    // Transform additional_text_edits if present. The editor applies them
+    // verbatim, so one that adds or joins lines behind host line prefixes (an
+    // import line in a blockquoted or list-item fence) is given those
+    // prefixes. ALL-OR-NOTHING: the array can carry paired halves of one
+    // operation (a deletion plus a reinsertion), so stripping only the unsafe
+    // member could apply half and lose content — if any member is unsafe,
+    // drop the whole array. The item is kept: its primary insertion still
+    // applies, though possibly semantically incomplete (e.g. without its
+    // auto-import) — availability over fidelity, never corruption.
     if let Some(ref mut additional_edits) = item.additional_text_edits {
         for edit in additional_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
-        if !additional_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-        {
+        if place_text_edits_in_region(additional_edits.iter_mut(), offset, region_end).is_err() {
             log::warn!(
                 target: "kakehashi::bridge",
                 "completion: dropped an item's additionalTextEdits ({}): a member is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
@@ -441,6 +451,17 @@ pub(crate) struct KakehashiEnvelope {
     /// fully fail-closed guard in prefixed regions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_end: Option<(u32, u32)>,
+    /// The item's `additionalTextEdits` as the server wrote them, in virtual
+    /// coordinates — present only when the bridge rewrote them to keep the
+    /// region's line prefixes. `completionItem/resolve` sends the item back
+    /// to the server, and a server that resolves by filling fields into what
+    /// it was sent answers with these edits again. Sending the served edits
+    /// would hand the server text it never wrote, and the answer, placed
+    /// like any other, would get the prefixes a second time: the rewrite
+    /// cannot be told apart from text that starts its lines with whitespace
+    /// of its own, so it cannot be undone or skipped by looking at the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_additional_text_edits: Option<Vec<TextEdit>>,
     /// Host-layer item (`bridge._self`, #958): it is already in host
     /// coordinates, so `completionItem/resolve` routes to the host server
     /// VERBATIM — no virtual URI, region, or offset translation.
@@ -531,7 +552,15 @@ pub(crate) struct EnvelopeContext<'a> {
 ///
 /// The original `data` value is moved into `inner`, and the envelope is
 /// serialized as `{"kakehashi": {...}}`.
-pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContext) {
+///
+/// `written` is the item's `additionalTextEdits` as the server wrote them when
+/// the bridge rewrote them ([`rewritten_additional_edits`]), kept for the
+/// item's resolve; `None` for every other item.
+pub(crate) fn envelope_item_data(
+    item: &mut CompletionItem,
+    ctx: &EnvelopeContext,
+    written: Option<Vec<TextEdit>>,
+) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: ctx.server_name.to_string(),
@@ -542,9 +571,42 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         inner: None,
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
+        written_additional_text_edits: written,
         host_layer: ctx.host_layer,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
+}
+
+/// The item's `additionalTextEdits` as the server wrote them, set aside
+/// before [`transform_completion_item`] when the region's lines carry
+/// prefixes the offset knows — the only case in which the transform can
+/// rewrite them.
+pub(super) fn additional_edits_as_written(
+    item: &CompletionItem,
+    offset: &RegionOffset,
+) -> Option<Vec<TextEdit>> {
+    offset.line_prefixes()?;
+    item.additional_text_edits.clone()
+}
+
+/// `written` if [`transform_completion_item`] rewrote the edits rather than
+/// only translating their ranges: what the item's envelope must remember
+/// ([`KakehashiEnvelope::written_additional_text_edits`]). `None` when the
+/// item keeps no edits, or keeps them as plain translation would leave them.
+pub(super) fn rewritten_additional_edits(
+    written: Option<Vec<TextEdit>>,
+    item: &CompletionItem,
+    offset: &RegionOffset,
+) -> Option<Vec<TextEdit>> {
+    let written = written?;
+    let served = item.additional_text_edits.as_ref()?;
+    let rewritten = written.len() != served.len()
+        || written.iter().zip(served).any(|(written, served)| {
+            let mut range = written.range;
+            translate_virtual_range_to_host(&mut range, offset);
+            written.new_text != served.new_text || range != served.range
+        });
+    rewritten.then_some(written)
 }
 
 /// Apply the HOST-layer completion policy to a host response (#958): envelope
@@ -609,6 +671,7 @@ pub(super) fn envelope_host_item(
             line_column_offsets: None,
         },
         region_end: None,
+        written_additional_text_edits: None,
         host_layer: true,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
@@ -1260,7 +1323,7 @@ mod tests {
             region_end: Some(TEST_REGION_END),
             host_layer: false,
         };
-        envelope_item_data(&mut item, &ctx);
+        envelope_item_data(&mut item, &ctx, None);
 
         // data should now be wrapped
         let envelope = extract_envelope(&item).expect("should extract envelope");
@@ -1468,6 +1531,7 @@ mod tests {
                 region_end: Some(TEST_REGION_END),
                 host_layer: true,
             },
+            None,
         );
 
         let envelope = extract_envelope(&item).expect("should extract envelope");
@@ -1492,6 +1556,7 @@ mod tests {
                 region_end: Some(TEST_REGION_END),
                 host_layer: false,
             },
+            None,
         );
         let wire = virt.data.expect("enveloped");
         assert!(
@@ -1518,7 +1583,7 @@ mod tests {
             region_end: Some(TEST_REGION_END),
             host_layer: false,
         };
-        envelope_item_data(&mut item, &ctx);
+        envelope_item_data(&mut item, &ctx, None);
 
         let envelope = extract_envelope(&item).expect("should extract envelope");
         assert_eq!(envelope.inner, None);
@@ -1561,6 +1626,7 @@ mod tests {
                 region_end: Some(TEST_REGION_END),
                 host_layer: false,
             },
+            None,
         );
 
         assert_eq!(
@@ -1717,6 +1783,166 @@ mod tests {
             "an unsafe member drops the whole additionalTextEdits array \
              (halves of one operation must not apply separately)"
         );
+    }
+
+    #[test]
+    fn transform_gives_an_added_import_line_the_prefix_when_the_offset_knows_it() {
+        // The same import, in a region whose offset was built from the host
+        // text: the line it adds takes the `> `, and the item keeps it.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_line_prefixes(
+            Some(std::sync::Arc::new(
+                crate::language::injection::LinePrefixes::for_test("> ", &[]),
+            )),
+        );
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "item",
+                  "additionalTextEdits": [
+                      { "range": { "start": { "line": 0, "character": 0 },
+                                   "end": { "line": 0, "character": 0 } },
+                        "newText": "import x\n" }
+                  ] }
+            ]
+        });
+
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
+
+        let edits = list.items[0]
+            .additional_text_edits
+            .as_ref()
+            .expect("the import stays with the item");
+        assert_eq!(edits[0].new_text, "import x\n> ");
+        assert_eq!(
+            edits[0].range.start,
+            Position {
+                line: 3,
+                character: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_envelope_remembers_additional_edits_only_when_they_were_rewritten() {
+        let prefixed = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_line_prefixes(
+            Some(std::sync::Arc::new(
+                crate::language::injection::LinePrefixes::for_test("> ", &[]),
+            )),
+        );
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let item_with = |new_text: &str| -> CompletionItem {
+            serde_json::from_value(json!({
+                "label": "item",
+                "additionalTextEdits": [
+                    { "range": { "start": { "line": 0, "character": 0 },
+                                 "end": { "line": 0, "character": 0 } },
+                      "newText": new_text }
+                ]
+            }))
+            .unwrap()
+        };
+        let remembered = |new_text: &str, offset: &RegionOffset| {
+            let mut item = item_with(new_text);
+            let written = additional_edits_as_written(&item, offset);
+            assert!(transform_completion_item(
+                &mut item, offset, region_end, None
+            ));
+            rewritten_additional_edits(written, &item, offset)
+        };
+
+        // A line added behind a prefix: the edits as the server wrote them.
+        assert_eq!(
+            remembered("import x\n", &prefixed),
+            item_with("import x\n").additional_text_edits
+        );
+        // Only translated: the served edits map back to what was written.
+        assert_eq!(remembered("x", &prefixed), None);
+        // A fence without prefixes, or an offset that does not know them.
+        let plain = RegionOffset::with_per_line_offsets(3, vec![0, 0, 0]);
+        assert_eq!(remembered("import x\n", &plain), None);
+        let widths_only = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]);
+        assert_eq!(remembered("import x\n", &widths_only), None);
+    }
+
+    #[test]
+    fn written_additional_edits_ride_in_the_envelope_only_when_present() {
+        let offset = RegionOffset::new(3, 0);
+        let ctx = EnvelopeContext {
+            server_name: "lua-ls",
+            injection_language: "lua",
+            incarnation: Some(1),
+            host_uri: "file:///test.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            offset: &offset,
+            region_end: None,
+            host_layer: false,
+        };
+        let written: Vec<TextEdit> = serde_json::from_value(json!([
+            { "range": { "start": { "line": 0, "character": 0 },
+                         "end": { "line": 0, "character": 0 } },
+              "newText": "import x\n" }
+        ]))
+        .unwrap();
+
+        let mut bare = CompletionItem::default();
+        envelope_item_data(&mut bare, &ctx, None);
+        assert!(
+            bare.data.as_ref().unwrap()[ENVELOPE_KEY]
+                .get("written_additional_text_edits")
+                .is_none(),
+            "an item nothing was rewritten for pays nothing on the wire"
+        );
+        assert_eq!(
+            extract_envelope(&bare)
+                .unwrap()
+                .written_additional_text_edits,
+            None
+        );
+
+        let mut rewritten = CompletionItem::default();
+        envelope_item_data(&mut rewritten, &ctx, Some(written.clone()));
+        assert_eq!(
+            extract_envelope(&rewritten)
+                .unwrap()
+                .written_additional_text_edits,
+            Some(written)
+        );
+    }
+
+    #[test]
+    fn transform_still_drops_an_item_whose_own_text_breaks_a_line() {
+        // What the item itself inserts is not given prefixes even when they
+        // are known: how its lines after the first are indented is the
+        // editor's doing (`insertTextMode`), which this transform cannot see.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_line_prefixes(
+            Some(std::sync::Arc::new(
+                crate::language::injection::LinePrefixes::for_test("> ", &[]),
+            )),
+        );
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": [
+                { "label": "multi",
+                  "textEdit": { "range": { "start": { "line": 0, "character": 0 },
+                                           "end": { "line": 0, "character": 3 } },
+                                "newText": "multi\nline" } }
+            ]
+        });
+
+        let list = transform_for_non_resolving_server(response, &offset, region_end, None).unwrap();
+
+        assert!(list.items.is_empty(), "{:?}", list.items);
     }
 
     #[test]

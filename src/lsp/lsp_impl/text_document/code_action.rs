@@ -35,8 +35,8 @@ use crate::lsp::aggregation::server::{
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
-    CodeActionEnvelope, HostDocument, RegionOffset, UpstreamCodeActionCaps, bridge_code_actions,
-    extract_code_action_envelope, parse_code_actions_leniently,
+    CodeActionEnvelope, HostDocument, RegionOffset, ResolveRegion, UpstreamCodeActionCaps,
+    bridge_code_actions, extract_code_action_envelope, parse_code_actions_leniently,
 };
 
 const METHOD: &str = "textDocument/codeAction";
@@ -214,11 +214,14 @@ impl Kakehashi {
         // (the envelope round-trips through unprotected client `data`, so a client
         // could clear `region_id` too) — it guards against accidental bypass, and
         // the host path fails soft anyway.
-        let region_end = if envelope.is_host_layer() {
-            Position::default()
+        let region = if envelope.is_host_layer() {
+            ResolveRegion::default()
         } else {
             match self.code_action_region_end_if_fresh(&envelope).await {
-                Ok(region_end) => region_end,
+                Ok((end, live_offset)) => ResolveRegion {
+                    end,
+                    live_offset: Some(live_offset),
+                },
                 Err(RegionEndUnavailable::MalformedEnvelope) => {
                     // Already warned with the malformed field; no stale-debug.
                     return Err(code_action_resolve_failed());
@@ -253,7 +256,7 @@ impl Kakehashi {
             &settings,
             upstream_caps,
             upstream_id,
-            region_end,
+            region,
             &read_host,
         );
         // The cancel arm DROPS the in-flight dispatch, which then never
@@ -300,12 +303,15 @@ impl Kakehashi {
         Ok(resolved)
     }
 
-    /// The region's current content-precise host-document END position if the
-    /// region is still FRESH — i.e. re-resolving it from the live parse yields
-    /// the SAME offset the action was minted with — else `RegionEndUnavailable`.
+    /// The region's current content-precise host-document END position and
+    /// its live offset if the region is still FRESH — i.e. re-resolving it
+    /// from the live parse yields the SAME offset the action was minted with
+    /// — else `RegionEndUnavailable`.
     ///
-    /// The resolve path translates the resolved edit using the envelope's
-    /// SNAPSHOT offset (`RegionOffset::from(&envelope.offset)`). Re-resolve the
+    /// The resolve path translates the resolved edit with that live offset,
+    /// which places the region as the envelope's SNAPSHOT offset
+    /// (`RegionOffset::from(&envelope.offset)`) does and also knows what its
+    /// line prefixes say. Re-resolve the
     /// live offset and compare the WHOLE thing, not just the start: if any
     /// per-line column offset diverged (e.g. an interior blockquote-prefix edit
     /// left the start line intact) translating with the stale offset would bind
@@ -322,7 +328,7 @@ impl Kakehashi {
     async fn code_action_region_end_if_fresh(
         &self,
         envelope: &CodeActionEnvelope,
-    ) -> std::result::Result<Position, RegionEndUnavailable> {
+    ) -> std::result::Result<(Position, RegionOffset), RegionEndUnavailable> {
         // A malformed envelope is NOT staleness — the bridge only mints valid
         // URLs/ULIDs, so warn (mirroring the bridge-side host_uri warn) rather
         // than letting it hide under the "stale region" debug line; the
@@ -358,7 +364,7 @@ impl Kakehashi {
         &self,
         envelope: &CodeActionEnvelope,
         host_url: &Url,
-    ) -> Option<Position> {
+    ) -> Option<(Position, RegionOffset)> {
         // Re-resolve the region from the LIVE parse (the same construction the
         // goto/showDocument/applyEdit offset paths use), yielding the current
         // per-line offset and the exact mapped host end.
@@ -391,7 +397,7 @@ impl Kakehashi {
         if live_offset != RegionOffset::from(&envelope.offset) {
             return None;
         }
-        Some(region_end)
+        Some((region_end, live_offset))
     }
 
     /// Virt layer: bridge the injection region under the requested range.

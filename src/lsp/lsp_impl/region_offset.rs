@@ -212,7 +212,8 @@ pub(super) fn resolved_region_geometry(
     resolved: ResolvedInjection,
 ) -> (RegionOffset, Position, bool, String) {
     let start_line = resolved.region.line_range.start;
-    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets);
+    let offset = RegionOffset::with_per_line_offsets(start_line, resolved.line_column_offsets)
+        .with_line_prefixes(resolved.line_prefixes);
     let region_end = region_host_end(&resolved.virtual_content, &offset);
     (
         offset,
@@ -241,11 +242,42 @@ mod tests {
             injection_language: "rust".to_string(),
             virtual_content: "x".to_string(),
             line_column_offsets: vec![3],
+            line_prefixes: None,
             contiguous: true,
         };
 
         let (_, region_end, _, _) = resolved_region_geometry(resolved);
 
         assert_eq!(region_end, Position::new(2, 4));
+    }
+
+    #[test]
+    fn geometry_offset_knows_what_the_line_prefixes_say() {
+        // The resolve paths and applyEdit place edits with this offset, so
+        // it must carry the text of the region's prefixes, not only their
+        // widths.
+        let prefixes = std::sync::Arc::new(crate::language::injection::LinePrefixes::for_test(
+            "> ",
+            &[(1, ">")],
+        ));
+        let resolved = ResolvedInjection {
+            region: CacheableInjectionRegion {
+                language: "lua".to_string(),
+                byte_range: 10..99,
+                line_range: 2..5,
+                start_column: 2,
+                region_id: "region".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "lua".to_string(),
+            virtual_content: "a\n\nb\n".to_string(),
+            line_column_offsets: vec![2, 1, 2, 0],
+            line_prefixes: Some(std::sync::Arc::clone(&prefixes)),
+            contiguous: true,
+        };
+
+        let (offset, _, _, _) = resolved_region_geometry(resolved);
+
+        assert_eq!(offset.line_prefixes(), Some(&*prefixes));
     }
 }

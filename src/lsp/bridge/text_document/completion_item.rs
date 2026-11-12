@@ -32,8 +32,8 @@ use super::super::protocol::{
     translate_host_range_to_virtual,
 };
 use super::completion::{
-    EnvelopeContext, KakehashiEnvelope, envelope_item_data, strip_envelope,
-    transform_completion_item,
+    EnvelopeContext, KakehashiEnvelope, additional_edits_as_written, envelope_item_data,
+    rewritten_additional_edits, strip_envelope, transform_completion_item,
 };
 use super::host::{HostDocument, sync_host_document};
 use crate::config::settings::WorkspaceSettings;
@@ -311,21 +311,31 @@ impl LanguageServerPool {
         // later blockquote marker edited from `> ` to `>` changes a later
         // line's column while the start stays) belongs to the reply, which
         // the downstream computes against the virtual text as it is now.
-        let outgoing =
+        let mut outgoing =
             prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset));
+        // Edits the bridge rewrote to keep the region's line prefixes go
+        // back as the server wrote them, not as they were served.
+        if let Some(written) = &envelope.written_additional_text_edits {
+            outgoing.additional_text_edits = Some(written.clone());
+        }
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id, &envelope, document)
             .await
         {
             Some(mut resolved) => {
+                let written = additional_edits_as_written(&resolved, &offset);
                 if transform_completion_item(&mut resolved, &offset, region_end, None) {
                     // A client may resolve this result again. Its ranges now
                     // use the live geometry, so their next inverse mapping
-                    // must use that same geometry rather than the producer's.
+                    // must use that same geometry rather than the producer's
+                    // — and the edits it was answered with, if they were
+                    // rewritten, are the ones to send back then.
                     let mut resolved_envelope = envelope;
                     resolved_envelope.offset = (&offset).into();
                     resolved_envelope.region_end = Some((region_end.line, region_end.character));
+                    resolved_envelope.written_additional_text_edits =
+                        rewritten_additional_edits(written, &resolved, &offset);
                     re_envelope_item(&mut resolved, &resolved_envelope);
                     resolved
                 } else {
@@ -609,7 +619,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         // must still take the host path on the client's NEXT resolve of it.
         host_layer: envelope.host_layer,
     };
-    envelope_item_data(item, &ctx);
+    envelope_item_data(item, &ctx, envelope.written_additional_text_edits.clone());
 }
 
 #[cfg(test)]
@@ -636,6 +646,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            written_additional_text_edits: None,
             host_layer: false,
         }
     }
@@ -1029,6 +1040,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            written_additional_text_edits: None,
             host_layer: false,
         };
         let mut item = CompletionItem {

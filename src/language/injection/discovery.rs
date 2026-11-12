@@ -2,12 +2,15 @@
 //! cacheable, virtual-document-ready form for the LSP bridge.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use tree_sitter::{Node, Query, QueryCapture, QueryCursor, QueryMatch, StreamingIterator, Tree};
 use ulid::Ulid;
 use url::Url;
 
-use super::content::{compute_line_column_offsets, extract_clean_content};
+use super::content::{
+    LinePrefixes, compute_line_column_offsets, compute_line_prefixes, extract_clean_content,
+};
 use super::language::extract_injection_language;
 use super::offset::InjectionOffset;
 use super::ranges::{
@@ -261,16 +264,17 @@ pub(crate) fn effective_content_range(info: &InjectionRegionInfo<'_>, text: &str
     start..end
 }
 
-/// Compute clean virtual content and per-line column offsets for an injection region.
+/// Compute clean virtual content, per-line column offsets and the text of
+/// the line prefixes for an injection region.
 ///
-/// This combines `compute_included_ranges`, `extract_clean_content`, and
-/// `compute_line_column_offsets` into a single call, avoiding duplication
-/// across resolve methods.
+/// This combines `compute_included_ranges`, `extract_clean_content`,
+/// `compute_line_column_offsets` and `compute_line_prefixes` into a single
+/// call, avoiding duplication across resolve methods.
 fn extract_virtual_content_and_offsets(
     region: &InjectionRegionInfo,
     cacheable: &CacheableInjectionRegion,
     text: &str,
-) -> Option<(String, Vec<u32>)> {
+) -> Option<(String, Vec<u32>, Option<Arc<LinePrefixes>>)> {
     // Child-exclusion gaps restricted to the effective window (#186):
     // cacheable.byte_range already reflects any #offset! directive (applied
     // and char-boundary-aligned by from_region_info), so gaps are clipped to
@@ -301,7 +305,14 @@ fn extract_virtual_content_and_offsets(
         cacheable.start_column,
         included_ranges.as_deref(),
     );
-    Some((virtual_content, line_column_offsets))
+    let line_prefixes = compute_line_prefixes(
+        text,
+        cacheable.byte_range.clone(),
+        cacheable.start_column,
+        included_ranges.as_deref(),
+    )
+    .map(Arc::new);
+    Some((virtual_content, line_column_offsets, line_prefixes))
 }
 
 impl CacheableInjectionRegion {
@@ -945,6 +956,11 @@ pub(crate) struct ResolvedInjection {
     /// Per-virtual-line column offsets for coordinate translation.
     /// Each entry is the UTF-16 column offset for that virtual line.
     pub line_column_offsets: Vec<u32>,
+    /// What those offsets skip, when it is one prefix on every line of text
+    /// (a blockquote's `> `, a list item's indentation): the text an edit
+    /// must put in front of each line it adds. `None` for a region with no
+    /// such prefix, and for a document combined from several captures.
+    pub line_prefixes: Option<Arc<LinePrefixes>>,
     /// Whether `virtual_content` maps through the ordinary single-region path.
     /// For a multi-capture combined document this is `false` whenever the union
     /// of included ranges leaves uncovered host bytes, including inter-capture
@@ -1130,7 +1146,7 @@ impl InjectionResolver {
         let region_id_str = region_id.to_string();
         let cacheable_region =
             CacheableInjectionRegion::from_region_info(region, &region_id_str, text, lone_crs);
-        let (virtual_content, line_column_offsets) =
+        let (virtual_content, line_column_offsets, line_prefixes) =
             extract_virtual_content_and_offsets(region, &cacheable_region, text)?;
         let resolved_language =
             Self::resolve_language(coordinator, &region.language, &virtual_content);
@@ -1139,6 +1155,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            line_prefixes,
             contiguous: true,
         })
     }
@@ -1181,7 +1198,7 @@ impl InjectionResolver {
         if regions.len() == 1 {
             let first = regions[0];
             let first_cacheable = cacheable[0];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, line_prefixes) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1192,6 +1209,7 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                line_prefixes,
                 contiguous: true,
             });
         }
@@ -1222,7 +1240,7 @@ impl InjectionResolver {
             let index = active_indices[0];
             let first = regions[index];
             let first_cacheable = cacheable[index];
-            let (virtual_content, line_column_offsets) =
+            let (virtual_content, line_column_offsets, line_prefixes) =
                 extract_virtual_content_and_offsets(first, first_cacheable, text)?;
             let injection_language =
                 Self::resolve_language(coordinator, &first.language, &virtual_content);
@@ -1233,6 +1251,7 @@ impl InjectionResolver {
                 injection_language,
                 virtual_content,
                 line_column_offsets,
+                line_prefixes,
                 contiguous: true,
             });
         }
@@ -1289,6 +1308,7 @@ impl InjectionResolver {
             injection_language: resolved_language,
             virtual_content,
             line_column_offsets,
+            line_prefixes: None,
             contiguous,
         })
     }
@@ -1498,7 +1518,7 @@ impl InjectionResolver {
             };
             let region = &regions[index];
             if let Some(cacheable) = prebuilt {
-                let Some((virtual_content, line_column_offsets)) =
+                let Some((virtual_content, line_column_offsets, line_prefixes)) =
                     extract_virtual_content_and_offsets(region, &cacheable[index], text)
                 else {
                     continue;
@@ -1510,6 +1530,7 @@ impl InjectionResolver {
                     injection_language: resolved_language,
                     virtual_content,
                     line_column_offsets,
+                    line_prefixes,
                     contiguous: true,
                 });
             } else {

@@ -117,6 +117,208 @@ pub(super) fn compute_line_column_offsets(
     }
 }
 
+/// The text of the host prefix in front of each line of an injection region:
+/// a blockquote's `> `, a list item's indentation — whatever the host keeps
+/// ahead of the region's content on a line. [`compute_line_column_offsets`]
+/// records only how wide each prefix is; this records what it says, so that
+/// an edit adding lines to the region can be given the prefix those lines
+/// need.
+///
+/// It exists only for a region where that prefix is one text, made of
+/// container markers (`>`) and indentation: every line holding text carries
+/// the same prefix. A blank line may carry another one (a blockquote keeps a
+/// bare `>` there, a list item nothing at all) and is recorded on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinePrefixes {
+    /// The prefix of every line that holds text. Never empty.
+    uniform: Box<str>,
+    /// The blank lines whose prefix is not `uniform`, by virtual line,
+    /// ascending.
+    blank_lines: Vec<(u32, Box<str>)>,
+}
+
+impl LinePrefixes {
+    /// The prefix of every line that holds text.
+    pub(crate) fn uniform(&self) -> &str {
+        &self.uniform
+    }
+
+    /// The prefix the host has on `virtual_line`.
+    ///
+    /// The line after the region's final line break is not a line of the
+    /// region: the host continues there with text of its own (a closing
+    /// fence behind its own prefix), and this answers the blank line the
+    /// region ends with — nothing.
+    pub(crate) fn of_line(&self, virtual_line: u32) -> &str {
+        match self
+            .blank_lines
+            .binary_search_by_key(&virtual_line, |(line, _)| *line)
+        {
+            Ok(index) => &self.blank_lines[index].1,
+            Err(_) => &self.uniform,
+        }
+    }
+
+    /// Whether `virtual_line` carries the prefix of the lines holding text.
+    pub(crate) fn is_uniform_at(&self, virtual_line: u32) -> bool {
+        self.blank_lines
+            .binary_search_by_key(&virtual_line, |(line, _)| *line)
+            .is_err()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(uniform: &str, blank_lines: &[(u32, &str)]) -> Self {
+        Self {
+            uniform: uniform.into(),
+            blank_lines: blank_lines
+                .iter()
+                .map(|(line, prefix)| (*line, (*prefix).into()))
+                .collect(),
+        }
+    }
+}
+
+/// Read the text of a region's line prefixes from the host, or `None` when
+/// the region has no single prefix to speak of.
+///
+/// The region must be made of whole lines behind their prefixes: each
+/// included range opens a line, right after the host bytes excluded ahead of
+/// it, and runs to a line end (the last one may stop short). A range that
+/// resumes a line the previous one left — a child excluded mid-line — makes
+/// the excluded bytes something other than a line prefix, and two lines of
+/// text with different prefixes leave no telling which one a new line takes.
+/// Both answer `None`, as does a region with no included ranges (nothing is
+/// excluded), one whose prefix is empty (nothing to add), and one whose
+/// prefix holds anything but `>` markers and whitespace: text a query left
+/// out of the region, like a comment's `// `, is not a prefix the host's
+/// structure gives every line.
+///
+/// Lines are LSP lines, as in [`compute_line_column_offsets`]: a lone CR
+/// ends one too.
+pub(super) fn compute_line_prefixes(
+    host_text: &str,
+    byte_range: std::ops::Range<usize>,
+    start_column: u32,
+    included_ranges: Option<&[tree_sitter::Range]>,
+) -> Option<LinePrefixes> {
+    let ranges = included_ranges?;
+    let bytes = host_text.as_bytes();
+    // Whether the byte at `at` is the last of a line break.
+    let ends_line = |at: usize| match bytes.get(at) {
+        Some(b'\n') => true,
+        Some(b'\r') => bytes.get(at + 1) != Some(&b'\n'),
+        _ => false,
+    };
+    let is_blank = |line: &str| {
+        line.bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    };
+
+    let mut uniform: Option<&str> = None;
+    let mut blank_lines: Vec<(u32, &str)> = Vec::new();
+    let mut line: u32 = 0;
+    let mut previous_end: Option<usize> = None;
+    for (index, range) in ranges.iter().enumerate() {
+        let start = byte_range.start.checked_add(range.start_byte)?;
+        let end = byte_range.start.checked_add(range.end_byte)?;
+        if start > end || end > bytes.len() {
+            return None;
+        }
+        let last = index + 1 == ranges.len();
+        if start == end && !last {
+            return None;
+        }
+        // The excluded bytes ahead of the range: from the line's start for
+        // the first range, from the end of the previous range for the others
+        // — which must then have ended its line.
+        let prefix_start = match previous_end {
+            None => {
+                let mut at = start;
+                while at > 0 && !ends_line(at - 1) {
+                    at -= 1;
+                }
+                at
+            }
+            Some(previous) => {
+                if previous == 0 || !ends_line(previous - 1) {
+                    return None;
+                }
+                previous
+            }
+        };
+        let prefix = host_text.get(prefix_start..start)?;
+        if prefix.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+            return None;
+        }
+        if previous_end.is_none() && prefix.encode_utf16().count() as u64 != start_column as u64 {
+            return None;
+        }
+
+        // A blank line is kept with whatever prefix it has; a line of text
+        // must have the one every other line of text has.
+        let mut record = |line: u32, prefix_start: usize, prefix_end: usize, content: &str| {
+            let Some(prefix) = host_text.get(prefix_start..prefix_end) else {
+                return false;
+            };
+            if is_blank(content) {
+                blank_lines.push((line, prefix));
+                true
+            } else {
+                *uniform.get_or_insert(prefix) == prefix
+            }
+        };
+        let mut line_start = start;
+        // A line the range opens has the excluded bytes ahead of it for a
+        // prefix; a line it runs into has none.
+        let mut line_prefix = prefix_start..start;
+        for at in start..end {
+            if ends_line(at) {
+                if !record(
+                    line,
+                    line_prefix.start,
+                    line_prefix.end,
+                    host_text.get(line_start..=at)?,
+                ) {
+                    return None;
+                }
+                line = line.checked_add(1)?;
+                line_start = at + 1;
+                line_prefix = line_start..line_start;
+            }
+        }
+        // What the range holds after its last line break: a line the region
+        // ends in the middle of, or — the range being empty — one it ends at
+        // the start of. A range that ends with a line break leaves nothing.
+        if (line_start < end || start == end)
+            && !record(
+                line,
+                line_prefix.start,
+                line_prefix.end,
+                host_text.get(line_start..end)?,
+            )
+        {
+            return None;
+        }
+        previous_end = Some(end);
+    }
+
+    // A line prefix is made of container markers and indentation, as the
+    // formatting pipeline reads one: any other text ahead of a line (a
+    // comment leader a query left out, a delimiter the region opens after)
+    // is the host's own, and nothing says the lines an edit adds repeat it.
+    let uniform = uniform.filter(|prefix| {
+        !prefix.is_empty() && prefix.chars().all(|c| c == '>' || c.is_whitespace())
+    })?;
+    Some(LinePrefixes {
+        uniform: uniform.into(),
+        blank_lines: blank_lines
+            .into_iter()
+            .filter(|(_, prefix)| *prefix != uniform)
+            .map(|(line, prefix)| (line, prefix.into()))
+            .collect(),
+    })
+}
+
 /// Per-parse wall-clock budget for every native parse that runs on the
 /// bounded compute pool — the single source of truth: the parse
 /// coordinator's `PARSE_TIMEOUT` is defined as this constant, so host and
@@ -520,6 +722,145 @@ mod tests {
             offsets[..2],
             [2, 2],
             "line 1 must mint the UTF-16 width (2), not the 4-byte width"
+        );
+    }
+
+    /// The prefixes of the first fence in `text`, as discovery reads them.
+    fn line_prefixes_of(text: &str) -> Option<LinePrefixes> {
+        let (byte_range, start_column, included_ranges) = blockquote_injection_data(text);
+        compute_line_prefixes(text, byte_range, start_column, included_ranges.as_deref())
+    }
+
+    /// Included ranges over the given byte spans. The points are unused.
+    fn ranges(spans: &[std::ops::Range<usize>]) -> Vec<tree_sitter::Range> {
+        spans
+            .iter()
+            .map(|span| tree_sitter::Range {
+                start_byte: span.start,
+                end_byte: span.end,
+                start_point: tree_sitter::Point { row: 0, column: 0 },
+                end_point: tree_sitter::Point { row: 0, column: 0 },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_prefixes_read_a_blockquote_marker_from_every_line() {
+        let prefixes = line_prefixes_of("> ```lua\n> local x = 1\n> local y = 2\n> ```\n")
+            .expect("one prefix on every line");
+
+        assert_eq!(prefixes, LinePrefixes::for_test("> ", &[]));
+        assert_eq!(prefixes.uniform(), "> ");
+        assert_eq!(prefixes.of_line(0), "> ");
+        assert_eq!(prefixes.of_line(1), "> ");
+    }
+
+    #[test]
+    fn line_prefixes_keep_what_a_blank_line_carries_instead() {
+        // A blockquote keeps a bare `>` on a blank line.
+        let quoted = line_prefixes_of("> ```lua\n> local x = 1\n>\n> local y = 2\n> ```\n")
+            .expect("the lines holding text share a prefix");
+        assert_eq!(quoted, LinePrefixes::for_test("> ", &[(1, ">")]));
+        assert_eq!(quoted.of_line(1), ">");
+        assert!(!quoted.is_uniform_at(1));
+        assert!(quoted.is_uniform_at(2));
+
+        // A list item keeps nothing at all.
+        let listed =
+            line_prefixes_of("- item\n\n  ```lua\n  local x = 1\n\n  local y = 2\n  ```\n")
+                .expect("the lines holding text share a prefix");
+        assert_eq!(listed, LinePrefixes::for_test("  ", &[(1, "")]));
+    }
+
+    #[test]
+    fn line_prefixes_follow_lsp_lines_and_non_ascii_prefixes() {
+        let crlf = line_prefixes_of("> ```lua\r\n> local x = 1\r\n>\r\n> local y = 2\r\n> ```\r\n")
+            .expect("CRLF lines share a prefix");
+        assert_eq!(crlf, LinePrefixes::for_test("> ", &[(1, ">")]));
+
+        // A lone CR ends the first line; the prefix is 3 bytes, 1 UTF-16 unit.
+        let text = "\u{3000}let x = 1;\r\u{3000}let y = 2;\n";
+        assert_eq!(
+            compute_line_prefixes(text, 0..28, 1, Some(&ranges(&[3..14, 17..28]))),
+            Some(LinePrefixes::for_test("\u{3000}", &[]))
+        );
+    }
+
+    #[test]
+    fn line_prefixes_need_excluded_bytes_to_be_line_prefixes() {
+        // Nothing excluded: nothing to read.
+        assert_eq!(compute_line_prefixes("ab\ncd\n", 0..6, 0, None), None);
+        // Nothing but line starts excluded: no prefix to add.
+        assert_eq!(
+            compute_line_prefixes("ab\ncd\n", 0..6, 0, Some(&ranges(&[0..3, 3..6]))),
+            None
+        );
+        // A child excluded in the middle of a line.
+        assert_eq!(
+            compute_line_prefixes(
+                "> ab${x}cd\n> ef\n",
+                0..16,
+                2,
+                Some(&ranges(&[2..4, 8..11, 13..16]))
+            ),
+            None
+        );
+        // The first line's prefix is not what its column offset measures.
+        assert_eq!(
+            compute_line_prefixes("> ab\n> cd\n", 0..10, 0, Some(&ranges(&[2..5, 7..10]))),
+            None
+        );
+    }
+
+    #[test]
+    fn line_prefixes_need_one_prefix_for_every_line_of_text() {
+        // A lazy continuation line: text behind no prefix at all.
+        assert_eq!(
+            compute_line_prefixes("> ab\ncd\n> ef\n", 0..13, 2, Some(&ranges(&[2..8, 10..13]))),
+            None
+        );
+        // Two markers of different widths.
+        assert_eq!(
+            compute_line_prefixes("> ab\n>cd\n", 0..9, 2, Some(&ranges(&[2..5, 6..9]))),
+            None
+        );
+        // No line of text to take the prefix from.
+        assert_eq!(
+            compute_line_prefixes(">\n>\n", 0..4, 1, Some(&ranges(&[1..2, 3..4]))),
+            None
+        );
+    }
+
+    #[test]
+    fn line_prefixes_are_container_markers_and_indentation_only() {
+        // A comment leader a query left out of the region is on every line,
+        // but it is the host's text: nothing says a new line repeats it.
+        assert_eq!(
+            compute_line_prefixes("// ab\n// cd\n", 0..12, 3, Some(&ranges(&[3..6, 9..12]))),
+            None
+        );
+        assert_eq!(
+            compute_line_prefixes(
+                ">\t> ab\n>\t> cd\n",
+                0..14,
+                4,
+                Some(&ranges(&[4..7, 11..14]))
+            ),
+            Some(LinePrefixes::for_test(">\t> ", &[]))
+        );
+    }
+
+    #[test]
+    fn line_prefixes_cover_a_line_the_region_ends_inside() {
+        // The region stops before the host's closing delimiter on its line...
+        assert_eq!(
+            compute_line_prefixes("> ab\n> cd'''\n", 0..9, 2, Some(&ranges(&[2..5, 7..9]))),
+            Some(LinePrefixes::for_test("> ", &[]))
+        );
+        // ... or at the start of that line, right behind its prefix.
+        assert_eq!(
+            compute_line_prefixes("> ab\n> '''\n", 0..7, 2, Some(&ranges(&[2..5, 7..7]))),
+            Some(LinePrefixes::for_test("> ", &[]))
         );
     }
 

@@ -348,6 +348,7 @@ mod tests {
                 injection_language: "rust".to_string(),
                 virtual_content: String::new(),
                 line_column_offsets: vec![],
+                line_prefixes: None,
                 contiguous: true,
             },
             region_end: None,

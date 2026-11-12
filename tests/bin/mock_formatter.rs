@@ -405,7 +405,10 @@ fn main() {
                         "inlayHintProvider": { "resolveProvider": false },
                         "textDocumentSync": 1
                     }),
-                    "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
+                    "code-action"
+                    | "code-action-preferred"
+                    | "code-action-reopen-order"
+                    | "code-action-add-line" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
                         "textDocumentSync": 1
@@ -434,6 +437,7 @@ fn main() {
                     | "code-action-lazy-multistep"
                     | "code-action-lazy-fileop"
                     | "code-action-lazy-oob"
+                    | "code-action-lazy-add-line"
                     | "code-action-lazy-delayed-resolve" => {
                         json!({
                             "codeActionProvider": { "resolveProvider": true },
@@ -480,11 +484,12 @@ fn main() {
                     | "completion-resolve-text"
                     | "completion-resolve-reopen-delayed"
                     | "completion-resolve-delayed"
-                    | "completion-resolve-additional-edit" => json!({
+                    | "completion-resolve-additional-edit"
+                    | "completion-resolve-additional-line" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
-                    "completion-no-resolve" => json!({
+                    "completion-no-resolve" | "completion-additional-line" => json!({
                         "completionProvider": {},
                         "textDocumentSync": 1
                     }),
@@ -1052,6 +1057,25 @@ fn main() {
                         if stamp_resolve_process {
                             result["items"][0]["data"]["mockPid"] = json!(std::process::id());
                         }
+                        // `completion-additional-line`: the item brings a
+                        // whole new line at the top of the document with it
+                        // (the auto-import shape), so a test can see where a
+                        // line-prefixed region puts that line.
+                        // `completion-resolve-additional-line` brings the
+                        // same line and also resolves: its resolve echoes the
+                        // item it is sent, so a test can see what the bridge
+                        // sends back and what it makes of the echo.
+                        if mode == "completion-additional-line"
+                            || mode == "completion-resolve-additional-line"
+                        {
+                            result["items"][0]["additionalTextEdits"] = json!([{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 0 }
+                                },
+                                "newText": "-- import\n"
+                            }]);
+                        }
                         if mode == "completion-resolve-echo-edit" {
                             let position = &message["params"]["position"];
                             result["items"][0]["textEdit"] = json!({
@@ -1129,6 +1153,7 @@ fn main() {
                     && mode != "completion-resolve-reopen-delayed"
                     && mode != "completion-resolve-delayed"
                     && mode != "completion-resolve-additional-edit"
+                    && mode != "completion-resolve-additional-line"
                 {
                     item["textEdit"] = json!({
                         "range": {
@@ -1166,6 +1191,7 @@ fn main() {
                             || mode == "code-action-lazy-multistep"
                             || mode == "code-action-lazy-fileop"
                             || mode == "code-action-lazy-oob"
+                            || mode == "code-action-lazy-add-line"
                             || mode == "code-action-lazy-delayed-resolve"
                         {
                             // One LAZY action: data only, no edit. The payload is
@@ -1179,6 +1205,25 @@ fn main() {
                                 actions[0]["data"]["mockPid"] = json!(std::process::id());
                             }
                             actions
+                        } else if mode == "code-action-add-line" {
+                            // One quickfix that adds a whole line above the
+                            // document's first one, so a test can see where a
+                            // line-prefixed region puts that line.
+                            json!([{
+                                "title": "Add a line",
+                                "kind": "quickfix",
+                                "edit": {
+                                    "changes": {
+                                        _uri: [{
+                                            "range": {
+                                                "start": { "line": 0, "character": 0 },
+                                                "end": { "line": 0, "character": 0 }
+                                            },
+                                            "newText": "-- added\n"
+                                        }]
+                                    }
+                                }
+                            }])
                         } else if mode == "code-action-preferred" {
                             // One isPreferred quickfix — two of these servers let
                             // a test prove the cross-source isPreferred collapse
@@ -1325,6 +1370,33 @@ fn main() {
                                 "documentChanges": [
                                     { "kind": "create", "uri": target_uri }
                                 ]
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                if mode == "code-action-lazy-add-line" {
+                    // Resolve to an edit that adds a whole line above the
+                    // document's first one, so a test can see where a
+                    // line-prefixed region puts that line when the edit
+                    // arrives through resolve.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "title": title,
+                            "kind": "source.organizeImports",
+                            "data": data,
+                            "edit": {
+                                "changes": {
+                                    target_uri: [{
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 0 }
+                                        },
+                                        "newText": "-- added\n"
+                                    }]
+                                }
                             }
                         }),
                     );

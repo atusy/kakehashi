@@ -41,7 +41,6 @@ pub(crate) use routing::*;
 pub(crate) use translation::*;
 pub(crate) use virtual_uri::VirtualDocumentUri;
 pub(crate) use workspace_edit::{
-    region_host_end, strip_bridge_local_versions, text_edit_safe_in_region,
-    transform_workspace_edit_to_host, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    RegionEditRefusal, place_text_edits_in_region, region_host_end, strip_bridge_local_versions,
+    text_edit_safe_in_region, transform_workspace_edit_into_region, workspace_edit_has_effect,
 };

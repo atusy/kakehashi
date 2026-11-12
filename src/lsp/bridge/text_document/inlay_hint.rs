@@ -46,7 +46,7 @@ use tower_lsp_server::ls_types::{
 
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, decode_command, encode_command,
-    response_has_jsonrpc_error, text_edit_safe_in_region, translate_host_position_to_virtual,
+    place_text_edits_in_region, response_has_jsonrpc_error, translate_host_position_to_virtual,
     translate_host_range_to_virtual, translate_virtual_position_to_host,
     translate_virtual_range_to_host, virtual_uri_to_lsp_uri,
 };
@@ -835,10 +835,7 @@ fn transform_inlay_hint_to_host(
         for edit in text_edits.iter_mut() {
             translate_virtual_range_to_host(&mut edit.range, offset);
         }
-        if !text_edits
-            .iter()
-            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
-        {
+        if place_text_edits_in_region(text_edits.iter_mut(), offset, region_end).is_err() {
             log::warn!(
                 target: "kakehashi::bridge",
                 "{method}: dropped a hint's textEdits ({}): an edit is unsafe for the injection region (escapes it, breaks line prefixes, or merges content into the closing fence)",
@@ -2411,6 +2408,54 @@ mod tests {
             "one unsafe edit drops the WHOLE accept-edit set (it applies atomically): {:?}",
             hints[0].text_edits
         );
+    }
+
+    #[test]
+    fn inlay_hint_text_edits_keep_the_prefix_when_the_offset_knows_it() {
+        // The same accept set, in a region whose offset was built from the
+        // host text: the line the first edit ends on gets its `> ` back.
+        let offset = RegionOffset::with_per_line_offsets(3, vec![2, 2, 0]).with_line_prefixes(
+            Some(std::sync::Arc::new(
+                crate::language::injection::LinePrefixes::for_test("> ", &[]),
+            )),
+        );
+        let region_end = Position {
+            line: 5,
+            character: 0,
+        };
+        let response = json!({
+            "jsonrpc": "2.0", "id": 42,
+            "result": [
+                {
+                    "position": { "line": 1, "character": 4 },
+                    "label": ": number",
+                    "textEdits": [
+                        { "range": { "start": { "line": 0, "character": 0 },
+                                     "end": { "line": 1, "character": 2 } },
+                          "newText": "a\nb" },
+                        { "range": { "start": { "line": 1, "character": 5 },
+                                     "end": { "line": 1, "character": 5 } },
+                          "newText": ": number" }
+                    ]
+                }
+            ]
+        });
+
+        let hints = transform_inlay_hint_response_to_host(
+            response,
+            &make_virtual_uri_string(),
+            &make_host_uri(),
+            &offset,
+            region_end,
+        )
+        .unwrap();
+
+        let edits = hints[0]
+            .text_edits
+            .as_ref()
+            .expect("the accept set is kept");
+        assert_eq!(edits[0].new_text, "a\n> b");
+        assert_eq!(edits[1].new_text, ": number");
     }
 
     #[test]

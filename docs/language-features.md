@@ -129,12 +129,17 @@ Additional details for a highlighted item (documentation, extra edits) are resol
 on demand from the server that produced it. Because the language server only sees
 the isolated snippet, any edits it returns — including auto-import edits — are
 placed relative to the embedded block, so file-level imports may not land where they
-would in a standalone file. Edits that would corrupt the host document around the
+would in a standalone file. In a block nested in a blockquote or a list item, an
+auto-import that adds a line gets the block's line prefix (`> `, the item's
+indentation) on it. Edits that would corrupt the host document around the
 embedded block (escape the region, break blockquote `> ` prefixes, or merge content
 into the closing fence) are dropped fail-closed: an unsafe primary edit drops
 the item (at resolve time, the unsafe resolved response is discarded and the
 unresolved item is served instead), while an unsafe auto-import set — at either
-stage — is dropped whole and the completion itself still applies. A resolve
+stage — is dropped whole and the completion itself still applies. An item whose
+own text breaks a line is such an unsafe primary edit in a blockquote or a list
+item: the editor, not kakehashi, indents its later lines, so they cannot be
+given the prefix. A resolve
 is refused, and the item returned unchanged, when the host document was
 closed and reopened since the item was produced (the list is meant to outlive
 ordinary edits: the editor filters it locally while the user keeps typing and
@@ -197,10 +202,14 @@ translated with stale coordinates.
 [`textDocument/rename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_rename)
 and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_prepareRename)
 
-Renames a symbol within its embedded block. Edits that the server addresses
-to OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
-cross-file rename from a project-aware server, or host-URI edits — not
-containment-checked) pass through. Default combine strategy: `preferred`.
+Renames a symbol within its embedded block. An edit that adds or joins lines
+in a block nested in a blockquote or a list item keeps the block's line prefix
+on them, as in formatting. Edits that the server addresses
+to OTHER regions' virtual URIs are filtered out; edits to other real files
+(e.g. a cross-file rename from a project-aware server) pass through. An edit
+the server addresses to the host document itself must stay inside the block
+and keep its line prefixes as it comes, or the whole rename is refused.
+Default combine strategy: `preferred`.
 
 ### Formatting
 
@@ -216,11 +225,18 @@ pipeline requires explicitly named servers — `"*"` is ignored there, since a
 reproducible pipeline needs a deterministic order. It runs at most 64 named
 servers per region; `maxFanOut` can set a lower limit.
 
-A response whose edits would corrupt the host document around the embedded
-block (escape the region, break blockquote `> ` prefixes, or merge content
-into the closing fence) is dropped **whole** — a formatter answer is one
-atomic diff, so applying only its safe edits could duplicate or lose content.
-The same rule covers range and on-type formatting.
+In a block nested in a blockquote or a list item, every line has text in
+front of it that the formatter never sees: `> `, or the item's indentation.
+An edit that adds, joins or removes lines there is rewritten to keep it. Each
+line it adds starts with that prefix; a line added empty gets the prefix
+without its trailing whitespace (`>`, or nothing in a list item).
+
+A response whose edits would still corrupt the host document around the
+embedded block (escape the region, write onto the closing fence's line, or
+break line prefixes that cannot be restored — the block's lines do not all
+share one prefix made of `>` markers and indentation) is dropped **whole** — a
+formatter answer is one atomic diff, so applying only its safe edits could
+duplicate or lose content. The same rules cover range and on-type formatting.
 
 #### Host text on lines a formatter adds
 
@@ -264,7 +280,7 @@ indentation, as a blockquote's line prefix does.
 
 Under the default `preferred` server strategy, and for range and on-type
 formatting, an answer that adds line breaks to this region is dropped whole,
-like one that breaks a `> ` prefix, and the line is left as it was: the region
+and the line is left as it was: the region
 ends on the line it starts on, so a line break would split that host line.
 This guard does not cover a region that also takes its line break, such as one
 from a query capturing the text of a Rust `///` doc comment. There a formatter
@@ -272,9 +288,9 @@ can add lines without the `///` under either server strategy, and in range and
 on-type formatting, as long as the answer passes the other checks above.
 
 This differs from a fenced code block inside a Markdown blockquote. There the
-text before each line holds only `>` markers and indentation, so the sequential
-pipeline reads it as a line prefix and puts it back on the lines a formatter
-adds.
+text before each line holds only `>` markers and indentation, so it is read as
+a line prefix and put back on the lines a formatter adds, under either server
+strategy and in range and on-type formatting.
 
 ### Range formatting
 
@@ -289,7 +305,9 @@ selection, and always combined with `preferred` — the sequential
 [`textDocument/inlayHint`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_inlayHint)
 
 Shows inline hints (types, parameter names) for the embedded block overlapping the
-requested range. A hint whose accept-time text edits would corrupt the host
+requested range. Accept-time text edits that add lines in a block nested in a
+blockquote or a list item keep the block's line prefix, as in formatting. A
+hint whose accept-time text edits would still corrupt the host
 document around the embedded block is served without them (the edits drop as
 one atomic set). Label-part commands are re-keyed so `workspace/executeCommand`
 routes them back to the producing server (the re-keyed names are not
@@ -364,8 +382,12 @@ document was edited (even a same-size edit inside the block) or reopened
 since the action was produced. Request fresh actions to recover.
 
 Edit safety differs by layer and direction. An INJECTION-layer action edit
+that adds or joins lines in a block nested in a blockquote or a list item keeps
+the block's line prefix on them, as in formatting — in the initial response,
+after `codeAction/resolve`, and in a relayed `workspace/applyEdit` alike. One
 that cannot be represented in the host document (touching another injection
-region, virtual-document file operations, or escaping the block) is
+region, virtual-document file operations, escaping the block, or breaking line
+prefixes that cannot be restored) is
 rejected: in the initial response it surfaces as a disabled action where the
 client declares `disabledSupport` and is dropped otherwise; during `codeAction/resolve`
 (where a response cannot be dropped) the unsafe payload is removed and the
@@ -758,8 +780,8 @@ virtual URI is translated against that region even if it differs from the
 block that prompted the server's request (edits spanning multiple virtual
 URIs are rejected on cardinality grounds; single-target requests can still
 be rejected on the usual grounds — unknown/stale URI, virtual-URI file
-operation, region escape). Real-file and — for navigation/references/rename — host-URI
-results pass through, while injection-layer code actions (and applyEdit
+operation, region escape). Real-file and — for navigation/references — host-URI
+results pass through, while rename, injection-layer code actions (and applyEdit
 requests that also touch a virtual document) constrain host-URI edits to
 the region.
 The surrounding host document can be bridged to the host language's own

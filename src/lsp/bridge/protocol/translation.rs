@@ -3,7 +3,11 @@
 //! All translation functions use in-place `&mut` mutation and saturating arithmetic
 //! for race-condition safety (stale region data after document edits).
 
+use std::sync::Arc;
+
 use tower_lsp_server::ls_types::{Position, Range};
+
+use crate::language::injection::LinePrefixes;
 
 /// The starting offset of an injection region in the host document.
 ///
@@ -20,14 +24,32 @@ use tower_lsp_server::ls_types::{Position, Range};
 /// row where the included ranges end (the closing-fence line). That row's
 /// real prefix is unrecorded; `workspace_edit_preserves_line_prefixes`
 /// derives its boundary semantics from the region end instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// An offset built from a live parse of the host can also carry the TEXT of
+/// those prefixes ([`RegionOffset::with_line_prefixes`]), which is what lets
+/// an edit that adds lines be given them. Two offsets are equal when they
+/// place the region the same way — same line, same columns — whether or not
+/// either knows what the prefixes say: an offset that crossed the wire in a
+/// resolve envelope never does.
+#[derive(Debug, Clone)]
 pub(crate) struct RegionOffset {
     /// The starting line of the injection region in the host document.
     line: u32,
     /// Per-virtual-line column offsets (UTF-16 code units).
     /// Index = virtual line number, value = column offset for that line.
     columns: Vec<u32>,
+    /// The text those columns skip, when the region has one prefix on every
+    /// line of text.
+    line_prefixes: Option<Arc<LinePrefixes>>,
 }
+
+impl PartialEq for RegionOffset {
+    fn eq(&self, other: &Self) -> bool {
+        self.line == other.line && self.columns == other.columns
+    }
+}
+
+impl Eq for RegionOffset {}
 
 impl RegionOffset {
     /// Construct a `RegionOffset` with a single column offset (non-blockquote case).
@@ -35,12 +57,29 @@ impl RegionOffset {
         Self {
             line,
             columns: vec![column],
+            line_prefixes: None,
         }
     }
 
     /// Construct a `RegionOffset` with per-line column offsets (blockquote case).
     pub(crate) fn with_per_line_offsets(line: u32, columns: Vec<u32>) -> Self {
-        Self { line, columns }
+        Self {
+            line,
+            columns,
+            line_prefixes: None,
+        }
+    }
+
+    /// The same offset, knowing what its lines' prefixes say.
+    pub(crate) fn with_line_prefixes(mut self, line_prefixes: Option<Arc<LinePrefixes>>) -> Self {
+        self.line_prefixes = line_prefixes;
+        self
+    }
+
+    /// The text of the region's line prefixes, when it has one prefix on
+    /// every line of text and this offset was built from the host text.
+    pub(crate) fn line_prefixes(&self) -> Option<&LinePrefixes> {
+        self.line_prefixes.as_deref()
     }
 
     /// Get the starting line of the injection region.

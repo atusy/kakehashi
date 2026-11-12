@@ -10,13 +10,12 @@
 //! This handler uses `send_request()` to queue requests via the channel-based
 //! writer task, ensuring FIFO ordering with other messages.
 //!
-//! # Multi-line edit limitation
+//! # Multi-line edits
 //!
-//! Same caveat as full formatting: a multi-line edit's `new_text` inside a
-//! prefixed injection is not re-prefixed, so the shared guard DROPS the WHOLE
-//! response (one atomic formatter diff) when any edit is unsafe, instead of
-//! corrupting the host document. All-safe responses — the common case for
-//! "format the selected range" — are unaffected.
+//! As in full formatting: a multi-line edit's `new_text` inside a prefixed
+//! injection is given the region's line prefix where it can be, and the WHOLE
+//! response (one atomic formatter diff) is dropped when any edit stays
+//! unsafe, instead of corrupting the host document.
 
 use std::io;
 

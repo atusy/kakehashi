@@ -80,9 +80,8 @@ use tower_lsp_server::ls_types::{
 use crate::document::DocumentStore;
 use crate::language::LanguageCoordinator;
 use crate::lsp::bridge::{
-    BridgeCoordinator, ConnectionKey, RegionOffset, VirtualDocumentUri,
-    strip_bridge_local_versions, transform_workspace_edit_to_host,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    BridgeCoordinator, ConnectionKey, RegionEditRefusal, RegionOffset, VirtualDocumentUri,
+    strip_bridge_local_versions, transform_workspace_edit_into_region,
 };
 
 use super::region_offset::resolve_region_offset;
@@ -395,35 +394,40 @@ fn transform_params_to_host(
     offset: &RegionOffset,
     region_end: Position,
 ) -> Result<(), String> {
-    if !transform_workspace_edit_to_host(&mut params.edit, virtual_uri, host_uri, offset) {
-        return Err(
-            "kakehashi: the edit performs file operations on a virtual document".to_string(),
-        );
-    }
-    // Bound the edit to the region on both ends, per line, so a pass-through
-    // host-URI edit can't reach host text above/below the region or into a
-    // line's prefix (blockquote `> `).
-    if !workspace_edit_within_region(&params.edit, host_uri, offset, region_end) {
-        return Err(
-            "kakehashi: the edit extends outside the injected region; it cannot be applied to the \
-             host document without corrupting surrounding text"
-                .to_string(),
-        );
-    }
-    // The transform translates ranges but emits newText verbatim: an edit that
-    // spans or inserts lines in a line-prefixed (e.g. blockquote) region would
-    // strip the prefixes it overlaps and leave the inserted lines unprefixed;
-    // an edit reaching a character-0 region end without a trailing newline
-    // would merge content into the closing fence.
-    if !workspace_edit_preserves_line_prefixes(&params.edit, host_uri, offset, region_end) {
-        return Err(
-            "kakehashi: the edit would break the host document's structure around the \
-             injected region (its line prefixes, e.g. a blockquote's, or the closing \
-             fence); it cannot be applied without corrupting the host document"
-                .to_string(),
-        );
-    }
-    Ok(())
+    transform_workspace_edit_into_region(
+        &mut params.edit,
+        virtual_uri,
+        host_uri,
+        offset,
+        region_end,
+    )
+    .map_err(|refusal| {
+        match refusal {
+            RegionEditRefusal::VirtualFileOperation => {
+                "kakehashi: the edit performs file operations on a virtual document"
+            }
+            // Bound the edit to the region on both ends, per line, so a
+            // pass-through host-URI edit can't reach host text above/below
+            // the region or into a line's prefix (blockquote `> `).
+            RegionEditRefusal::OutsideRegion => {
+                "kakehashi: the edit extends outside the injected region; it cannot be \
+                     applied to the host document without corrupting surrounding text"
+            }
+            // An edit that spans or inserts lines in a line-prefixed
+            // (blockquote, list item) region is given the prefixes of
+            // the lines it leaves behind. This is one that could not be:
+            // the region has no single prefix to give, or the edit would
+            // write onto the closing fence's line — e.g. reach a
+            // character-0 region end without a trailing newline, merging
+            // content into the fence.
+            RegionEditRefusal::BreaksLinePrefixes => {
+                "kakehashi: the edit would break the host document's structure around the \
+                     injected region (its line prefixes, e.g. a blockquote's, or the closing \
+                     fence); it cannot be applied without corrupting the host document"
+            }
+        }
+        .to_string()
+    })
 }
 
 /// Collect the distinct virtual-document URIs an edit touches, across the

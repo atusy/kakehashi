@@ -65,6 +65,7 @@ mod e2e_nonblocking_init;
 mod e2e_notification_timeout;
 mod e2e_on_type_formatting;
 mod e2e_organize_imports;
+mod e2e_prefixed_region_edits;
 mod e2e_push_diagnostics;
 mod e2e_resolve_reconnect;
 mod e2e_selection_range;

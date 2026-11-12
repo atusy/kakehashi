@@ -172,6 +172,69 @@ No position information in response—pass through directly.
 
 These methods return edits that must be carefully validated.
 
+#### Line prefixes in edits
+
+A region nested in a host container has host text ahead of its content on
+every line: a blockquote's `> `, a list item's indentation. Range translation
+skips that text, but an edit's new text is the server's, written for a
+document without it. A new text that adds a line would leave the line outside
+the container, and a range spanning lines takes the prefix of every line after
+its first with it.
+
+Such an edit is rewritten, not refused, when the region has **one prefix**:
+every line holding text carries the same host text ahead of it, made of `>`
+markers and whitespace only — the reading the formatting pipeline uses
+(concatenated-formatting-pipeline). Text of any other kind ahead of a line,
+such as a comment leader a query left out of the region, is the host's own and
+is never repeated. With one prefix:
+
+- A line the edit adds takes the prefix. Left empty, it takes the prefix
+  without its trailing whitespace (`>`, or nothing in a list item), as the host
+  writes its own blank lines.
+- The line the edit's range ends on takes the prefix as well. When the new
+  text ends with a line break right at that line's start, the line is left as
+  it was instead, behind the prefix it had.
+- Text landing on a blank line whose prefix is that shorter form brings the
+  rest of the prefix with it.
+- The line after the region's final line break is the host's (a closing fence
+  behind a prefix the region does not record). An edit reaching it must end
+  with a line break, lines added right there take the prefix from their first
+  character, and an edit removing whole lines up to it takes their first prefix
+  out too.
+
+The rewrite applies wherever the editor applies an edit's new text as written:
+the formatting family under `preferred`, completion `additionalTextEdits`,
+inlay-hint `textEdits`, and the request's own edits in a `WorkspaceEdit`
+(rename, code actions including `codeAction/resolve`, `workspace/applyEdit`).
+The edits of one array are rewritten one by one, each against the document as
+it stands. Two rewrites lean on a line's prefix being in the host as it is —
+completing a blank line's prefix, and taking a prefix out with trailing whole
+lines — and are refused when another edit of the array is on that line.
+
+Everywhere else the earlier rule stands — an edit that would break a prefix is
+refused whole, never clamped:
+
+- **A completion item's own insertion** (and a color presentation's edits).
+  The editor indents the lines after the first by `insertTextMode`, whose
+  default is the client's, so no rewritten text is right for every client.
+- **An edit a server addressed to the host document itself.** It is in host
+  coordinates, and nothing tells whether its text already carries the
+  prefixes.
+- **Edits spread over several `TextDocumentEdit`s for the document.** Those
+  apply one after another, so the later ones are not positioned in the
+  document the prefixes were read from.
+- **The request's own edits beside ones the server addressed to the host
+  document.** They would share an array or a sequence with edits the rewrite
+  never read.
+- **A region without one prefix** (lines of text behind different prefixes,
+  such as a lazy continuation line), and **an offset that knows only the
+  widths** — one echoed back in a resolve envelope and not rebuilt from the
+  live parse, as on `inlayHint/resolve`.
+
+Refusal was the only rule at first, because a region's offsets recorded how
+wide each prefix is and not what it says. The text now travels with an offset
+built from a live parse.
+
 #### textDocument/completion
 
 ```
@@ -217,17 +280,18 @@ whether it is what the user wants depends on the injection.
   whole item at completion time; at `completionItem/resolve` time the unsafe
   resolved response is discarded and the original (already-validated)
   unresolved item is served instead.
-- `additionalTextEdits` are validated as one atomic set: any unsafe member
-  drops the entire array (never a subset — the array can carry paired halves
-  of one operation). The item is kept; its primary insertion stays
-  mechanically applicable, though possibly semantically incomplete without
-  its auto-import (availability over fidelity, with a warn log).
-- The same guards apply to inlay-hint `textEdits` (the hint is kept, its
+- `additionalTextEdits` are given their line prefixes (above) and validated
+  as one atomic set: any member that stays unsafe drops the entire array
+  (never a subset — the array can carry paired halves of one operation). The
+  item is kept; its primary insertion stays mechanically applicable, though
+  possibly semantically incomplete without its auto-import (availability over
+  fidelity, with a warn log).
+- The same holds for inlay-hint `textEdits` (the hint is kept, its
   accept-edit set drops whole; lazily materialized edits from
-  `inlayHint/resolve` pass the same guard, and a rejected set leaves the
-  eager one in place) and color presentations (an unsafe explicit or
-  implicit label-replacement edit drops the presentation; unsafe
-  additionalTextEdits drop as an array).
+  `inlayHint/resolve` pass the guard without the rewrite, and a rejected set
+  leaves the eager one in place). Color presentations are only guarded (an
+  unsafe explicit or implicit label-replacement edit drops the presentation;
+  unsafe additionalTextEdits drop as an array).
 
 #### textDocument/rename
 
@@ -235,14 +299,15 @@ whether it is what the user wants depends on the injection.
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | Real-file edits preserved (shared WorkspaceEdit transform, incl. host-URI edits — not containment-checked on this path); edits keyed to OTHER regions' virtual URIs filtered |
+| Cross-file | Edits of other real files preserved (shared WorkspaceEdit transform); host-URI edits relayed as they come when they stay inside the region and keep its line prefixes, else the result is rejected; edits keyed to OTHER regions' virtual URIs filtered |
 | Position mapping | Own-virtual-URI TextEdit ranges: virtual → host; real/host-URI edits keep their ranges unchanged |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
 cross-file rename) are preserved — content and ranges untouched, though
 bridge-local `TextDocumentEdit.version` values are cleared before relaying —
 while entries addressed to other regions' virtual URIs (meaningless to the
-editor) are FILTERED out with usable siblings surviving. The whole result is
+editor) are FILTERED out with usable siblings surviving. The request's own
+edits are given their line prefixes (above). The whole result is
 rejected only when an edit fails the region-safety guards or the edit carries
 a create/rename/delete file operation referencing ANY virtual URI (including
 the request's own) — dropping just the op would misdirect the ordered
@@ -268,9 +333,10 @@ the request's own) — dropping just the op would misdirect the ordered
 | Multi-server | full formatting: `preferred` by default, `concatenated` opts into a sequential pipeline over `priorities` (also the membership allowlist — unlisted servers do not run). `textDocument/rangeFormatting`: `preferred` only |
 
 Formatting responses are validated per edit (virtual-EOF bounds, region
-containment, prefix preservation, fence-boundary rule) and dropped **whole**
-when any edit is unsafe — a formatter answer is one atomic diff, so applying
-only its safe edits could duplicate or lose content.
+containment, line prefixes — given where the rule above applies —,
+fence-boundary rule) and dropped **whole** when any edit stays unsafe — a
+formatter answer is one atomic diff, so applying only its safe edits could
+duplicate or lose content.
 For multiple servers, the `concatenated`
 behavior does **not** concatenate edit lists (that would overlap); it runs a
 sequential formatter pipeline over `priorities`, which is both the

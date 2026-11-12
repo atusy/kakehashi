@@ -2042,6 +2042,7 @@ mod tests {
             injection_language: language.to_string(),
             virtual_content: String::new(),
             line_column_offsets: vec![0],
+            line_prefixes: None,
             contiguous: true,
         }
     }
