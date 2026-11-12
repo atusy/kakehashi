@@ -6,9 +6,9 @@
 //! (concatenated-formatting-pipeline) feeds each server's output into the next,
 //! which requires materializing the post-edit text — this module does that.
 
-use tower_lsp_server::ls_types::TextEdit;
+use tower_lsp_server::ls_types::{Position, TextEdit};
 
-use super::position::PositionMapper;
+use super::position::positions_to_bytes_clamped;
 
 /// Apply `edits` to `text`, returning the resulting string.
 ///
@@ -27,16 +27,19 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
         return text.to_string();
     }
 
-    let mapper = PositionMapper::new(text);
+    // Every position converted in one pass (each one on its own rescans its
+    // line, quadratic in the edits on one long line), clamped and floored
+    // to char boundaries, so a buggy out-of-range or mid-codepoint position
+    // can't make the slices below panic.
+    let positions: Vec<Position> = edits
+        .iter()
+        .flat_map(|e| [e.range.start, e.range.end])
+        .collect();
+    let bytes = positions_to_bytes_clamped(text, &positions);
     let mut byte_edits: Vec<(usize, usize, &str)> = edits
         .iter()
-        .map(|e| {
-            // `floor_char_boundary` clamps an index past the end down to
-            // `text.len()` and floors a mid-codepoint offset to a char boundary,
-            // so a buggy out-of-range/mid-codepoint offset can't make the slices
-            // below panic.
-            let a = text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.start));
-            let b = text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.end));
+        .zip(bytes.as_chunks::<2>().0)
+        .map(|(e, &[a, b])| {
             let (start, end) = if a <= b { (a, b) } else { (b, a) };
             (start, end, e.new_text.as_str())
         })
@@ -73,7 +76,101 @@ pub(crate) fn apply_text_edits(text: &str, edits: &[TextEdit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use tower_lsp_server::ls_types::Range;
+
+    #[test]
+    fn many_edits_on_one_long_line_apply_in_one_pass() {
+        // 20,000 insertions after each comma of one line of `"あ"`: the
+        // positions convert in one pass over the text, none one at a time.
+        use crate::text::position::{ONE_AT_A_TIME, STEPPED};
+        let count = 20_000;
+        let text = format!("[{}]", vec!["\"\u{3042}\""; count].join(","));
+        let mut column = 1;
+        let edits: Vec<TextEdit> = (1..count)
+            .map(|_| {
+                column += 4;
+                edit(0, column, 0, column, " ")
+            })
+            .collect();
+        ONE_AT_A_TIME.with(|count| count.set(0));
+        STEPPED.with(|stepped| stepped.set(0));
+        let applied = apply_text_edits(&text, &edits);
+        assert_eq!(
+            applied,
+            format!("[{}]", vec!["\"\u{3042}\""; count].join(", "))
+        );
+        assert_eq!(ONE_AT_A_TIME.with(|count| count.get()), 0);
+        let stepped = STEPPED.with(|stepped| stepped.get());
+        assert!(stepped <= text.chars().count(), "{stepped}");
+    }
+
+    #[test]
+    fn positions_converted_in_one_pass_apply_as_one_at_a_time() {
+        // Each position clamped through the line index on its own, as the
+        // one-pass conversion must reproduce, for every caller.
+        fn one_at_a_time(text: &str, edits: &[TextEdit]) -> Vec<(usize, usize)> {
+            let mapper = crate::text::PositionMapper::new(text);
+            edits
+                .iter()
+                .map(|e| {
+                    (
+                        text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.start)),
+                        text.floor_char_boundary(mapper.position_to_byte_clamped(e.range.end)),
+                    )
+                })
+                .collect()
+        }
+        let pieces = [
+            "a",
+            " ",
+            "\u{e9}",
+            "\u{1F600}",
+            "\u{3042}",
+            "\n",
+            "\r",
+            "\r\n",
+        ];
+        let mut seed: u64 = 11;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        for _ in 0..500 {
+            let text: String = (0..next(30)).map(|_| pieces[next(pieces.len())]).collect();
+            let position = |next: &mut dyn FnMut(usize) -> usize| {
+                let character = if next(8) == 0 {
+                    u32::MAX
+                } else {
+                    next(12) as u32
+                };
+                Position::new(next(8) as u32, character)
+            };
+            let count = next(6);
+            let edits: Vec<TextEdit> = (0..count)
+                .map(|_| TextEdit {
+                    range: Range {
+                        start: position(&mut next),
+                        end: position(&mut next),
+                    },
+                    new_text: "x".to_string(),
+                })
+                .collect();
+            let positions: Vec<Position> = edits
+                .iter()
+                .flat_map(|e| [e.range.start, e.range.end])
+                .collect();
+            let bytes = positions_to_bytes_clamped(&text, &positions);
+            let pairs: Vec<(usize, usize)> = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[a, b]| (a, b))
+                .collect();
+            assert_eq!(pairs, one_at_a_time(&text, &edits), "{text:?} {edits:?}");
+        }
+    }
 
     fn edit(sl: u32, sc: u32, el: u32, ec: u32, new_text: &str) -> TextEdit {
         TextEdit {

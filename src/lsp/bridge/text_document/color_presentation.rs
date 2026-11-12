@@ -20,7 +20,8 @@ use super::super::protocol::{
     EditMode, JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     host_range_in_prepared_gap, response_has_jsonrpc_error, text_edit_safe_in_region,
     translate_host_range_to_virtual, translate_virtual_main_and_additional_edits_to_host,
-    translate_virtual_text_edits_to_host, virtual_uri_to_lsp_uri,
+    translate_virtual_text_edit_to_host, translate_virtual_text_edits_to_host,
+    virtual_uri_to_lsp_uri,
 };
 use super::keep_additional_edits_if_safe;
 
@@ -152,13 +153,13 @@ fn transform_color_presentation_response_to_host(
     // back before the gap's host text.
     if offset.prepared().is_some() {
         // A color's text: within one line, never clearing it.
-        let mut probe = [tower_lsp_server::ls_types::TextEdit {
+        let mut probe = tower_lsp_server::ls_types::TextEdit {
             range: host_request_range,
             new_text: "#".to_string(),
-        }];
-        translate_host_range_to_virtual(&mut probe[0].range, offset);
-        if !translate_virtual_text_edits_to_host(&mut probe, offset, EditMode::Extent)
-            || probe[0].range != host_request_range
+        };
+        translate_host_range_to_virtual(&mut probe.range, offset);
+        if !translate_virtual_text_edit_to_host(&mut probe, offset)
+            || probe.range != host_request_range
         {
             return vec![];
         }
@@ -214,7 +215,6 @@ fn transform_color_presentation_response_to_host(
             presentation.text_edit.as_mut_slice(),
             presentation.additional_text_edits.as_mut().filter(|_| prepared),
             offset,
-            EditMode::Extent,
         ) else {
             return false;
         };

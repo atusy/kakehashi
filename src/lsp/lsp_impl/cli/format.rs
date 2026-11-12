@@ -123,10 +123,11 @@ impl Kakehashi {
         })
         .await;
 
-        // An Err from formatting_impl is currently unreachable in CLI mode
-        // (it only signals upstream cancellation, and there is no upstream
-        // request id here) — but if a future code path introduces one, a
-        // silent "no change" would hide it, so surface it in the log.
+        // An Err from formatting_impl signals upstream cancellation
+        // (unreachable in CLI mode: there is no upstream request id here) or
+        // a prepared answer dropped at its final check, which the counter
+        // below has already counted. A silent "no change" would hide any
+        // other, so surface it in the log.
         let formatted = result
             .inspect_err(|e| {
                 log::warn!(target: "kakehashi::cli", "formatting failed for {url}: {e}");
