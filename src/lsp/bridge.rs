@@ -75,6 +75,7 @@ pub(crate) use pool::test_helpers;
 pub(crate) use pool::{ConnectionHandle, ConnectionKey};
 pub(crate) use pool::{RecoveryDecision, Reservation};
 pub(crate) use progress_registry::{ProgressConnectionId, ProgressRegistry};
+pub(crate) use protocol::RegionEditRefusal;
 pub(crate) use protocol::RegionOffset;
 pub(crate) use protocol::RequestId;
 pub(crate) use protocol::VirtualDocumentUri;
@@ -83,23 +84,22 @@ pub(crate) use protocol::host_position_within_region_bounds;
 pub(crate) use protocol::location_link_to_location;
 pub(crate) use protocol::region_host_end;
 pub(crate) use protocol::strip_bridge_local_versions;
-pub(crate) use protocol::transform_workspace_edit_to_host;
+pub(crate) use protocol::transform_workspace_edit_into_region;
 pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
-pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
-pub(crate) use protocol::workspace_edit_within_region;
 pub(crate) use text_document::completion_item::CompletionResolveDocument;
 pub(crate) use text_document::host::HostResolveSnapshot;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CallHierarchyDocumentRevision, CallHierarchyEnvelope, CodeActionEnvelope, EnvelopeOffset,
-    InlayHintDocumentRevision, InlayHintEnvelope, KakehashiEnvelope, TypeHierarchyDocumentRevision,
-    TypeHierarchyEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
-    bridge_host_completion_items, envelope_host_call_hierarchy_items, envelope_host_code_lenses,
-    envelope_host_document_links, envelope_host_inlay_hints, envelope_host_type_hierarchy_items,
-    extract_call_hierarchy_envelope, extract_code_action_envelope, extract_code_lens_envelope,
-    extract_document_link_envelope, extract_envelope, extract_inlay_hint_envelope,
-    extract_type_hierarchy_envelope, parse_code_actions_leniently, parse_type_hierarchy_items,
+    InlayHintDocumentRevision, InlayHintEnvelope, KakehashiEnvelope, ResolveRegion,
+    TypeHierarchyDocumentRevision, TypeHierarchyEnvelope, UpstreamCodeActionCaps,
+    bridge_code_actions, bridge_host_completion_items, envelope_host_call_hierarchy_items,
+    envelope_host_code_lenses, envelope_host_document_links, envelope_host_inlay_hints,
+    envelope_host_type_hierarchy_items, extract_call_hierarchy_envelope,
+    extract_code_action_envelope, extract_code_lens_envelope, extract_document_link_envelope,
+    extract_envelope, extract_inlay_hint_envelope, extract_type_hierarchy_envelope,
+    parse_code_actions_leniently, parse_type_hierarchy_items,
 };
 pub(crate) use text_document::{OpenExpectation, OpenOutcome, OpenRevision};
 pub(crate) use workspace::{ClientWorkspace, ClientWorkspaceSnapshot, WorkspaceFolderSet};

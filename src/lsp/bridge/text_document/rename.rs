@@ -22,8 +22,7 @@ use tower_lsp_server::ls_types::RenameParams;
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri,
     build_text_document_position_params, response_has_jsonrpc_error, strip_bridge_local_versions,
-    transform_workspace_edit_to_host, workspace_edit_has_effect,
-    workspace_edit_preserves_line_prefixes, workspace_edit_within_region,
+    transform_workspace_edit_into_region, workspace_edit_has_effect,
 };
 
 impl LanguageServerPool {
@@ -159,21 +158,20 @@ fn transform_workspace_edit_response_to_host_bounded(
     // Parse into typed WorkspaceEdit
     let mut edit: WorkspaceEdit = serde_json::from_value(result).ok()?;
 
-    if !transform_workspace_edit_to_host(&mut edit, request_virtual_uri, host_uri, offset) {
-        return None;
-    }
+    // The region's own edits must stay inside it and keep its lines' host
+    // prefixes; one that adds or joins lines is given them.
+    transform_workspace_edit_into_region(
+        &mut edit,
+        request_virtual_uri,
+        host_uri,
+        offset,
+        region_end,
+    )
+    .ok()?;
     // A multi-file rename's OTHER real files can carry versioned entries;
     // those versions are bridge-local (the downstream's own counters) and
     // would read as stale to version-checking editors.
     strip_bridge_local_versions(&mut edit);
-
-    if !workspace_edit_within_region(&edit, host_uri, offset, region_end) {
-        return None;
-    }
-
-    if !workspace_edit_preserves_line_prefixes(&edit, host_uri, offset, region_end) {
-        return None;
-    }
 
     workspace_edit_has_effect(&edit).then_some(edit)
 }

@@ -5,9 +5,12 @@
 //! Per LSP spec a WorkspaceEdit may carry edits via `changes` (URI→TextEdit
 //! map) or `documentChanges`; both are handled.
 //!
-//! The guards below ([`workspace_edit_within_region`],
-//! [`workspace_edit_preserves_line_prefixes`]) are enforced by codeAction,
-//! rename, and applyEdit.
+//! codeAction, rename, and applyEdit all go through
+//! [`transform_workspace_edit_into_region`], which also holds every edit of
+//! the host document to the injection region: inside it
+//! ([`workspace_edit_within_region`]) and keeping its lines' host prefixes
+//! ([`workspace_edit_preserves_line_prefixes`],
+//! [`place_text_edits_in_region`]).
 
 use std::collections::HashMap;
 
@@ -20,44 +23,115 @@ use super::translation::{RegionOffset, translate_virtual_range_to_host};
 use super::virtual_uri::VirtualDocumentUri;
 use crate::language::injection::LinePrefixes;
 
-/// Transform a WorkspaceEdit in place from virtual to host document coordinates.
+/// Transform a WorkspaceEdit in place from virtual to host document
+/// coordinates, holding every edit of the host document to the injection
+/// region.
 ///
 /// For text edits: real-file URIs pass through, the request's own virtual URI
 /// is re-keyed to the host URI (ranges translated, stale virtual-doc versions
 /// dropped), and other (cross-region) virtual URIs are filtered out.
 ///
-/// Returns `false` when the edit cannot be represented in host coordinates:
-/// a file operation (create/rename/delete) references a virtual URI. The
-/// spec applies `documentChanges` in order, so dropping just the op (e.g. a
+/// The request's own edits are placed in the region
+/// ([`place_text_edits_in_region`]): one that adds or joins lines behind host
+/// line prefixes is given those prefixes. That reads the edits against the
+/// document as it stands, so it is done only for an edit that holds them in
+/// one array; spread over several `TextDocumentEdit`s, which apply one after
+/// another, they are only checked. So is an edit the server addressed to the
+/// host document itself ([`workspace_edit_within_region`],
+/// [`workspace_edit_preserves_line_prefixes`]): it is in host coordinates
+/// already and relayed verbatim — the server wrote its text against the
+/// host, and nothing tells whether that text carries the prefixes. Edits of
+/// other real files keep their own extents.
+///
+/// On `Err` the edit may be half transformed: the caller must discard it
+/// whole, never apply what is left. [`RegionEditRefusal::VirtualFileOperation`]
+/// is a file operation (create/rename/delete) on a virtual URI: the spec
+/// applies `documentChanges` in order, so dropping just the op (e.g. a
 /// virtual→real rename) would misdirect later edits at an unrelated existing
-/// file — the caller must discard the whole edit instead.
-pub(crate) fn transform_workspace_edit_to_host(
+/// file.
+pub(crate) fn transform_workspace_edit_into_region(
     edit: &mut WorkspaceEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
     offset: &RegionOffset,
-) -> bool {
+    region_end: Position,
+) -> Result<(), RegionEditRefusal> {
     if let Some(DocumentChanges::Operations(ops)) = &edit.document_changes {
         let has_virtual_file_op = ops.iter().any(|op| match op {
             DocumentChangeOperation::Op(op) => !resource_op_targets_real_files_only(op),
             DocumentChangeOperation::Edit(_) => false,
         });
         if has_virtual_file_op {
-            return false;
+            return Err(RegionEditRefusal::VirtualFileOperation);
         }
     }
 
+    // Before the request's own edits are re-keyed to it, the host URI holds
+    // only what the server addressed to the host document itself.
+    if !workspace_edit_within_region(edit, host_uri, offset, region_end) {
+        return Err(RegionEditRefusal::OutsideRegion);
+    }
+    if !workspace_edit_preserves_line_prefixes(edit, host_uri, offset, region_end) {
+        return Err(RegionEditRefusal::BreaksLinePrefixes);
+    }
+
+    let one_array = arrays_of(edit, request_virtual_uri) == 1;
+    let mut refusal = None;
+    let mut place = |edits: &mut dyn Iterator<Item = &mut TextEdit>| {
+        let mut edits: Vec<&mut TextEdit> = edits.collect();
+        for text_edit in edits.iter_mut() {
+            translate_virtual_range_to_host(&mut text_edit.range, offset);
+        }
+        if refusal.is_some() {
+            return;
+        }
+        refusal = if one_array {
+            place_text_edits_in_region(edits, offset, region_end).err()
+        } else if !edits
+            .iter()
+            .all(|e| text_edit_within_region(e, offset, region_end))
+        {
+            Some(RegionEditRefusal::OutsideRegion)
+        } else if !edits
+            .iter()
+            .all(|e| text_edit_preserves_line_prefixes(e, offset, region_end))
+        {
+            Some(RegionEditRefusal::BreaksLinePrefixes)
+        } else {
+            None
+        };
+    };
+
     // Transform changes map: { [uri: string]: TextEdit[] }
     if let Some(changes) = &mut edit.changes {
-        transform_changes_map(changes, request_virtual_uri, host_uri, offset);
+        transform_changes_map(changes, request_virtual_uri, host_uri, &mut place);
     }
 
     // Transform documentChanges array
     if let Some(doc_changes) = &mut edit.document_changes {
-        transform_document_changes(doc_changes, request_virtual_uri, host_uri, offset);
+        transform_document_changes(doc_changes, request_virtual_uri, host_uri, &mut place);
     }
 
-    true
+    refusal.map_or(Ok(()), Err)
+}
+
+/// How many arrays of text edits `edit` holds for `uri`: its entry in the
+/// `changes` map, and each `TextDocumentEdit` naming it.
+fn arrays_of(edit: &WorkspaceEdit, uri: &str) -> usize {
+    let in_changes = edit
+        .changes
+        .as_ref()
+        .is_some_and(|changes| changes.keys().any(|key| key.as_str() == uri));
+    let names_it = |e: &TextDocumentEdit| e.text_document.uri.as_str() == uri;
+    let in_document_changes = match &edit.document_changes {
+        None => 0,
+        Some(DocumentChanges::Edits(edits)) => edits.iter().filter(|e| names_it(e)).count(),
+        Some(DocumentChanges::Operations(ops)) => ops
+            .iter()
+            .filter(|op| matches!(op, DocumentChangeOperation::Edit(e) if names_it(e)))
+            .count(),
+    };
+    usize::from(in_changes) + in_document_changes
 }
 
 /// Whether a `WorkspaceEdit` contains at least one actual change.
@@ -81,6 +155,10 @@ pub(crate) fn workspace_edit_has_effect(edit: &WorkspaceEdit) -> bool {
     changes_has_edit || doc_changes_has_edit
 }
 
+/// Brings one array of the request's own edits to the host document:
+/// translates the ranges and holds the edits to the region.
+type PlaceEdits<'a> = dyn FnMut(&mut dyn Iterator<Item = &mut TextEdit>) + 'a;
+
 /// Transform the `changes` map in a WorkspaceEdit.
 ///
 /// Re-keys virtual URIs to host URI and transforms TextEdit ranges.
@@ -89,7 +167,7 @@ fn transform_changes_map(
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
+    place: &mut PlaceEdits<'_>,
 ) {
     // Filter and translate in one allocation-free pass, extracting the
     // request's own edits for re-keying afterwards (keys can't change in place).
@@ -104,9 +182,7 @@ fn transform_changes_map(
 
         // Case 2: Same virtual URI → transform ranges, re-key to host URI
         if uri_str == request_virtual_uri {
-            for edit in edits.iter_mut() {
-                translate_virtual_range_to_host(&mut edit.range, offset);
-            }
+            place(&mut edits.iter_mut());
             rekeyed_edits = Some(std::mem::take(edits));
             return false;
         }
@@ -136,18 +212,18 @@ fn transform_document_changes(
     doc_changes: &mut DocumentChanges,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
+    place: &mut PlaceEdits<'_>,
 ) {
     match doc_changes {
         DocumentChanges::Edits(edits) => {
             edits.retain_mut(|edit| {
-                transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
+                transform_text_document_edit(edit, request_virtual_uri, host_uri, place)
             });
         }
         DocumentChanges::Operations(ops) => {
             ops.retain_mut(|op| match op {
                 DocumentChangeOperation::Edit(edit) => {
-                    transform_text_document_edit(edit, request_virtual_uri, host_uri, offset)
+                    transform_text_document_edit(edit, request_virtual_uri, host_uri, place)
                 }
                 DocumentChangeOperation::Op(_) => true, // Pre-validated real-file ops
             });
@@ -174,7 +250,7 @@ fn transform_text_document_edit(
     edit: &mut TextDocumentEdit,
     request_virtual_uri: &str,
     host_uri: &Uri,
-    offset: &RegionOffset,
+    place: &mut PlaceEdits<'_>,
 ) -> bool {
     let uri_str = edit.text_document.uri.as_str();
 
@@ -189,13 +265,10 @@ fn transform_text_document_edit(
         // The version counted the virtual document; against the host URI it
         // would make clients reject the edit as stale.
         edit.text_document.version = None;
-        for one_of in &mut edit.edits {
-            let text_edit = match one_of {
-                OneOf::Left(text_edit) => text_edit,
-                OneOf::Right(annotated_edit) => &mut annotated_edit.text_edit,
-            };
-            translate_virtual_range_to_host(&mut text_edit.range, offset);
-        }
+        place(&mut edit.edits.iter_mut().map(|one_of| match one_of {
+            OneOf::Left(text_edit) => text_edit,
+            OneOf::Right(annotated_edit) => &mut annotated_edit.text_edit,
+        }));
         return true;
     }
 
@@ -266,7 +339,9 @@ pub(crate) fn region_host_end(virtual_content: &str, offset: &RegionOffset) -> P
 /// `WorkspaceEdit` is CONTAINED in the injection region — bounded above by
 /// `region_end` and below, PER LINE, by the region's line offset (`offset`).
 ///
-/// Call this AFTER `transform_workspace_edit_to_host`. Two escape vectors:
+/// Call this on host-coordinate edits ([`transform_workspace_edit_into_region`]
+/// does, for the edits a server addressed to the host document itself). Two
+/// escape vectors:
 /// - a position PAST `region_end`: a stale/malformed downstream edit whose
 ///   virtual range runs beyond the (possibly shrunk) region content translates
 ///   to a plausible host range AFTER the fence — into unrelated host text.
@@ -351,10 +426,13 @@ pub(crate) fn text_edit_safe_in_region(
         && text_edit_preserves_line_prefixes(e, offset, region_end)
 }
 
-/// Why an edit produced against a virtual document cannot be handed to the
-/// editor as an edit of the host document.
+/// Why an edit produced against a virtual document — a `WorkspaceEdit`, or a
+/// bare array of text edits — cannot be handed to the editor as an edit of
+/// the host document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegionEditRefusal {
+    /// A file operation (create/rename/delete) references a virtual URI.
+    VirtualFileOperation,
     /// An edit of the host document reaches outside the injection region
     /// ([`text_edit_within_region`]).
     OutsideRegion,
@@ -805,6 +883,22 @@ mod tests {
 
     fn make_virtual_uri_string() -> String {
         VirtualDocumentUri::new(&make_host_uri(), "lua", "region-0").to_uri_string()
+    }
+
+    /// The transform with a region that bounds nothing: `false` only for a
+    /// file operation on a virtual URI.
+    fn transform_workspace_edit_to_host(
+        edit: &mut WorkspaceEdit,
+        request_virtual_uri: &str,
+        host_uri: &Uri,
+        offset: &RegionOffset,
+    ) -> bool {
+        let unbounded = Position {
+            line: u32::MAX,
+            character: u32::MAX,
+        };
+        transform_workspace_edit_into_region(edit, request_virtual_uri, host_uri, offset, unbounded)
+            != Err(RegionEditRefusal::VirtualFileOperation)
     }
 
     fn parse_workspace_edit(value: serde_json::Value) -> WorkspaceEdit {
@@ -2081,6 +2175,178 @@ mod tests {
             Ok(())
         );
         assert_eq!(edit, before);
+    }
+
+    // ---------------------------------------------------------------------
+    // transform_workspace_edit_into_region
+    // ---------------------------------------------------------------------
+
+    /// The new texts `edit` ends up holding for the host document, in order.
+    fn host_new_texts(edit: &WorkspaceEdit, host_uri: &Uri) -> Vec<String> {
+        let mut texts = Vec::new();
+        if let Some(edits) = edit
+            .changes
+            .as_ref()
+            .and_then(|changes| changes.get(host_uri))
+        {
+            texts.extend(edits.iter().map(|e| e.new_text.clone()));
+        }
+        if let Some(DocumentChanges::Edits(document_edits)) = &edit.document_changes {
+            for document_edit in document_edits {
+                assert_eq!(&document_edit.text_document.uri, host_uri);
+                texts.extend(document_edit.edits.iter().map(|one_of| match one_of {
+                    OneOf::Left(text_edit) => text_edit.new_text.clone(),
+                    OneOf::Right(annotated) => annotated.text_edit.new_text.clone(),
+                }));
+            }
+        }
+        texts
+    }
+
+    /// A line added above the document's first one, in virtual coordinates.
+    fn adds_a_line() -> serde_json::Value {
+        json!({ "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+                "newText": "x\n" })
+    }
+
+    #[test]
+    fn transform_into_region_gives_the_requests_own_edits_the_line_prefixes() {
+        let region = quoted_ab();
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let shapes = [
+            json!({ "changes": { virtual_uri.clone(): [adds_a_line()] } }),
+            json!({ "documentChanges": [
+                { "textDocument": { "uri": virtual_uri, "version": 1 }, "edits": [adds_a_line()] }
+            ] }),
+            json!({ "documentChanges": [
+                { "textDocument": { "uri": virtual_uri, "version": 1 }, "edits": [{
+                    "range": adds_a_line()["range"], "newText": "x\n", "annotationId": "a"
+                }] }
+            ] }),
+        ];
+
+        for shape in shapes {
+            let mut edit = parse_workspace_edit(shape.clone());
+            assert_eq!(
+                transform_workspace_edit_into_region(
+                    &mut edit,
+                    &virtual_uri,
+                    &host_uri,
+                    &region.offset,
+                    region.region_end,
+                ),
+                Ok(()),
+                "{shape}"
+            );
+            assert_eq!(host_new_texts(&edit, &host_uri), ["x\n> "], "{shape}");
+        }
+    }
+
+    #[test]
+    fn transform_into_region_only_checks_edits_spread_over_several_arrays() {
+        // `TextDocumentEdit`s apply one after another: the second one's
+        // positions are in a document the first has changed, where this
+        // offset's lines no longer tell which prefix is where.
+        let region = quoted_ab();
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let two_arrays = |second: serde_json::Value| {
+            let mut edit = parse_workspace_edit(json!({ "documentChanges": [
+                { "textDocument": { "uri": virtual_uri, "version": 1 }, "edits": [
+                    { "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+                      "newText": "A" }
+                ] },
+                { "textDocument": { "uri": virtual_uri, "version": 2 }, "edits": [second] }
+            ] }));
+            transform_workspace_edit_into_region(
+                &mut edit,
+                &virtual_uri,
+                &host_uri,
+                &region.offset,
+                region.region_end,
+            )
+            .map(|()| host_new_texts(&edit, &host_uri))
+        };
+
+        assert_eq!(
+            two_arrays(adds_a_line()),
+            Err(RegionEditRefusal::BreaksLinePrefixes)
+        );
+        assert_eq!(
+            two_arrays(json!({
+                "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}},
+                "newText": "B"
+            })),
+            Ok(vec!["A".to_string(), "B".to_string()])
+        );
+    }
+
+    #[test]
+    fn transform_into_region_only_checks_edits_addressed_to_the_host_document() {
+        // Written against the host, in host coordinates: whether its text
+        // already carries the prefixes is not ours to tell, so it is relayed
+        // as it came or not at all.
+        let region = quoted_ab();
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_edit = |new_text: &str| {
+            let mut edit = parse_workspace_edit(json!({ "changes": { host_uri.as_str(): [
+                { "range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 3}},
+                  "newText": new_text }
+            ] } }));
+            transform_workspace_edit_into_region(
+                &mut edit,
+                &virtual_uri,
+                &host_uri,
+                &region.offset,
+                region.region_end,
+            )
+            .map(|()| host_new_texts(&edit, &host_uri))
+        };
+
+        assert_eq!(host_edit("A"), Ok(vec!["A".to_string()]));
+        assert_eq!(
+            host_edit("A\n> x"),
+            Err(RegionEditRefusal::BreaksLinePrefixes)
+        );
+    }
+
+    #[test]
+    fn transform_into_region_says_why_it_refuses() {
+        let region = quoted_ab();
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let refusal = |value: serde_json::Value| {
+            transform_workspace_edit_into_region(
+                &mut parse_workspace_edit(value),
+                &virtual_uri,
+                &host_uri,
+                &region.offset,
+                region.region_end,
+            )
+        };
+
+        assert_eq!(
+            refusal(json!({ "documentChanges": [
+                { "kind": "create", "uri": virtual_uri }
+            ] })),
+            Err(RegionEditRefusal::VirtualFileOperation)
+        );
+        assert_eq!(
+            refusal(json!({ "changes": { virtual_uri.clone(): [
+                { "range": {"start": {"line": 0, "character": 0}, "end": {"line": 7, "character": 0}},
+                  "newText": "x" }
+            ] } })),
+            Err(RegionEditRefusal::OutsideRegion)
+        );
+        assert_eq!(
+            refusal(json!({ "changes": { virtual_uri.clone(): [
+                { "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 0}},
+                  "newText": "x" }
+            ] } })),
+            Err(RegionEditRefusal::BreaksLinePrefixes)
+        );
     }
 
     mod round_trip {
