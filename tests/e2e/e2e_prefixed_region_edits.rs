@@ -275,3 +275,44 @@ fn a_completion_that_brings_a_line_into_a_list_item_fence_indents_that_line() {
         "# Test\n\n- item\n\n  ```lua\n  -- import\n  local x = 1\n  ```\n"
     );
 }
+
+#[test]
+fn resolving_a_completion_keeps_the_line_it_brings_indented_once() {
+    // The server resolves by filling `detail` into the item it is sent and
+    // answering with it: the line the item brought at completion comes back
+    // in the answer, and must be placed as it was the first time.
+    let capabilities = json!({ "textDocument": { "completion": { "completionItem": {
+        "resolveSupport": { "properties": ["detail"] }
+    }}}});
+    let (mut client, _config_dir) =
+        open_with_mock("completion-resolve-additional-line", capabilities, LIST);
+
+    let item = request_until(
+        &mut client,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": URI },
+            "position": { "line": 5, "character": 13 }
+        }),
+        |result| {
+            result["items"]
+                .as_array()
+                .and_then(|items| items.first().cloned())
+        },
+    );
+    let resolved = client.send_request("completionItem/resolve", item);
+    shutdown_client(&mut client);
+
+    let resolved = &resolved["result"];
+    assert!(
+        resolved["detail"].is_string(),
+        "the resolve must have reached the server: {resolved}"
+    );
+    let edits = resolved["additionalTextEdits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the resolved item lost the line it brings: {resolved}"));
+    assert_eq!(
+        apply_edits(LIST, edits),
+        "# Test\n\n- item\n\n  ```lua\n  -- import\n  local x = 1\n  ```\n"
+    );
+}

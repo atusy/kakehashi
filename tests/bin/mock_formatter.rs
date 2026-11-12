@@ -484,7 +484,8 @@ fn main() {
                     | "completion-resolve-text"
                     | "completion-resolve-reopen-delayed"
                     | "completion-resolve-delayed"
-                    | "completion-resolve-additional-edit" => json!({
+                    | "completion-resolve-additional-edit"
+                    | "completion-resolve-additional-line" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -1060,7 +1061,13 @@ fn main() {
                         // whole new line at the top of the document with it
                         // (the auto-import shape), so a test can see where a
                         // line-prefixed region puts that line.
-                        if mode == "completion-additional-line" {
+                        // `completion-resolve-additional-line` brings the
+                        // same line and also resolves: its resolve echoes the
+                        // item it is sent, so a test can see what the bridge
+                        // sends back and what it makes of the echo.
+                        if mode == "completion-additional-line"
+                            || mode == "completion-resolve-additional-line"
+                        {
                             result["items"][0]["additionalTextEdits"] = json!([{
                                 "range": {
                                     "start": { "line": 0, "character": 0 },
@@ -1146,6 +1153,7 @@ fn main() {
                     && mode != "completion-resolve-reopen-delayed"
                     && mode != "completion-resolve-delayed"
                     && mode != "completion-resolve-additional-edit"
+                    && mode != "completion-resolve-additional-line"
                 {
                     item["textEdit"] = json!({
                         "range": {
