@@ -159,6 +159,96 @@ fn formatting_that_adds_a_line_to_a_list_item_fence_indents_that_line() {
 }
 
 #[test]
+fn a_code_action_that_adds_a_line_to_a_blockquoted_fence_quotes_that_line() {
+    let capabilities = json!({ "textDocument": { "codeAction": {
+        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } },
+        "disabledSupport": true
+    }}});
+    let (mut client, _config_dir) =
+        open_with_mock("code-action-add-line", capabilities, BLOCKQUOTE);
+
+    let action = request_until(
+        &mut client,
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": URI },
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 7 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+        |result| {
+            result
+                .as_array()
+                .and_then(|actions| actions.first().cloned())
+        },
+    );
+    shutdown_client(&mut client);
+
+    assert!(
+        action.get("disabled").is_none(),
+        "the action must stay usable: {action}"
+    );
+    let edits = action["edit"]["changes"][URI]
+        .as_array()
+        .unwrap_or_else(|| panic!("the action carries no edit of the host document: {action}"));
+    assert_eq!(
+        apply_edits(BLOCKQUOTE, edits),
+        "# Test\n\n> ```lua\n> -- added\n> local x = 1\n> ```\n"
+    );
+}
+
+#[test]
+fn a_resolved_code_action_that_adds_a_line_to_a_blockquoted_fence_quotes_that_line() {
+    let capabilities = json!({ "textDocument": { "codeAction": {
+        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [] } },
+        "disabledSupport": true,
+        "dataSupport": true,
+        "resolveSupport": { "properties": ["edit"] }
+    }}});
+    let (mut client, _config_dir) =
+        open_with_mock("code-action-lazy-add-line", capabilities, BLOCKQUOTE);
+
+    let lazy = request_until(
+        &mut client,
+        "textDocument/codeAction",
+        json!({
+            "textDocument": { "uri": URI },
+            "range": {
+                "start": { "line": 3, "character": 2 },
+                "end": { "line": 3, "character": 7 }
+            },
+            "context": { "diagnostics": [] }
+        }),
+        |result| {
+            result
+                .as_array()
+                .and_then(|actions| actions.first().cloned())
+        },
+    );
+    assert!(
+        lazy.get("edit").is_none(),
+        "the edit must come from resolve: {lazy}"
+    );
+    let resolved = client.send_request("codeAction/resolve", lazy);
+    shutdown_client(&mut client);
+
+    let action = &resolved["result"];
+    assert!(
+        action.get("disabled").is_none(),
+        "the action must stay usable: {resolved}"
+    );
+    let edits = action["edit"]["changes"][URI]
+        .as_array()
+        .unwrap_or_else(|| panic!("the action carries no edit of the host document: {resolved}"));
+    assert_eq!(
+        apply_edits(BLOCKQUOTE, edits),
+        "# Test\n\n> ```lua\n> -- added\n> local x = 1\n> ```\n"
+    );
+}
+
+#[test]
 fn a_completion_that_brings_a_line_into_a_list_item_fence_indents_that_line() {
     let (mut client, _config_dir) = open_with_mock("completion-additional-line", json!({}), LIST);
 
