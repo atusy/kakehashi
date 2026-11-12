@@ -974,6 +974,65 @@ mod tests {
         assert_eq!(item.additional_text_edits, Some(placed));
     }
 
+    /// On a document the peer left as it is (`null`, or an answer changing
+    /// nothing) the edits a resolve adds are the virtual document's own:
+    /// they are placed as a document as is places them, beside a main edit
+    /// or without one, and dropped whole where a member is unsafe for the
+    /// region.
+    #[rstest::rstest]
+    #[case::declined(None)]
+    #[case::answered_unchanged(Some(json!({"segments": [{"type": "content"}]})))]
+    fn edits_a_resolve_adds_on_a_document_left_as_it_is_are_placed_as_is(
+        #[case] answer: Option<serde_json::Value>,
+    ) {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let text = "a\npa\n";
+        let map = apply_prepare_result(
+            text,
+            &VirtualLayout::single(text),
+            answer.map(|answer| serde_json::from_value(answer).unwrap()),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let region_end = Position::new(12, 0);
+        let import = text_edit((0, 0), (0, 0), "import a\n");
+        let placed = Some(vec![text_edit((10, 0), (10, 0), "import a\n")]);
+
+        // No main edit: the editor inserts the item's text where it asked,
+        // as on a document never prepared.
+        let mut item = CompletionItem {
+            label: "Path".to_string(),
+            ..Default::default()
+        };
+        place_added_edits(&mut item, Some(vec![import.clone()]), &offset, region_end);
+        assert_eq!(item.additional_text_edits, placed);
+
+        // Beside a main edit.
+        let served = CompletionItem {
+            label: "Path".to_string(),
+            text_edit: Some(CompletionTextEdit::Edit(text_edit(
+                (11, 0),
+                (11, 2),
+                "Path",
+            ))),
+            ..Default::default()
+        };
+        let mut item = served.clone();
+        place_added_edits(&mut item, Some(vec![import.clone()]), &offset, region_end);
+        assert_eq!(item.additional_text_edits, placed);
+
+        // One member past the region drops them all, the item kept.
+        let mut item = served.clone();
+        place_added_edits(
+            &mut item,
+            Some(vec![import, text_edit((7, 0), (7, 0), "x")]),
+            &offset,
+            region_end,
+        );
+        assert_eq!(item, served);
+    }
+
     /// What a resolve adds stays out, the item kept as it was served, when
     /// it cannot be placed beside the item's own edits.
     #[rstest::rstest]

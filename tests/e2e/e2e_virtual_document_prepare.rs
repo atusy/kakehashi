@@ -2456,6 +2456,36 @@ fn a_resolve_on_a_prepared_document_takes_no_edit_from_its_answer() {
     assert!(resolved["result"].get("textEdit").is_none(), "{resolved}");
 }
 
+#[test]
+fn a_resolve_on_a_document_the_peer_left_as_it_is_takes_the_edit_its_answer_adds() {
+    // The same item and resolve in a fence with nothing for the peer to
+    // remove: the document went through the peer and is the virtual
+    // document still, so the added edit is that text's own and lands on
+    // the block's second line, as on a document never prepared.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-additional-edit",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-edit-left-as-it-is.md";
+    open(&mut client, uri, "# t\n\n```lua\nlocal x = 1\nprin\n```\n");
+    let item = resolvable_item(&mut client, uri);
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    let detail = resolved["result"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("mock-resolved:"), "{resolved}");
+    assert_eq!(
+        resolved["result"]["additionalTextEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 4, "character": 0 },
+                "end": { "line": 4, "character": 0 }
+            },
+            "newText": "--[[resolved]] "
+        }]),
+        "{resolved}"
+    );
+}
+
 /// The item a resolving mock completes at `line`, column 4, in `uri`, once
 /// the peer and the mock are up.
 fn resolvable_item_on(client: &mut LspClient, uri: &str, line: u32) -> Value {
