@@ -138,7 +138,8 @@ where
                 let offset = RegionOffset::with_per_line_offsets(
                     ctx.resolved.region.line_range.start,
                     ctx.resolved.line_column_offsets.clone(),
-                );
+                )
+                .read_at(ctx.host_revision);
                 match &ctx.prepared {
                     Some(map) => offset.with_prepared(std::sync::Arc::clone(map)),
                     None => offset,

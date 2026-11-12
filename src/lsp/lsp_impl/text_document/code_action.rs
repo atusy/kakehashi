@@ -27,7 +27,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::super::Kakehashi;
-use super::super::bridge_context::{RangeRequestContext, Sourced};
+use super::super::bridge_context::{RangeRequestContext, Sourced, Verdict};
 use super::super::region_offset::resolve_region_offset;
 use crate::config::settings::AggregationStrategy;
 use crate::error::LockResultExt;
@@ -84,7 +84,7 @@ fn actions_answer(actions: &[CodeActionOrCommand], prepared: bool) -> bool {
 
 /// Whether a layer's `parts` answer a cross-layer `preferred` walk (see
 /// [`actions_answer`]): a prepared part only by an enabled action, and
-/// only while it may still be kept (`may_keep`, read as the race decides):
+/// only while it is still current (`may_keep`, read as the race decides):
 /// one moved or stale is no answer, and the race falls through to the next
 /// layer's rather than choosing actions the final check drops.
 fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) -> bool {
@@ -98,9 +98,9 @@ fn parts_answer(parts: &ActionParts, may_keep: impl Fn(&Sourced<()>) -> bool) ->
 /// came, though none answered (on a prepared document, all disabled:
 /// refused by its map) — as the walk would choose them were the document
 /// unprepared, so a client showing disabled actions shows why the fix is
-/// refused. Unlike the stale fallback, what it keeps may still be kept,
-/// and it stands in for a layer's error only while the final check keeps
-/// it.
+/// refused. What it keeps is still current as it is kept (a moved or stale
+/// answer is passed over, never kept aside), and it stands in for a
+/// layer's error only while the final check keeps it.
 #[derive(Default)]
 struct RefusedActionsFallback(std::sync::Mutex<Option<ActionParts>>);
 
@@ -133,8 +133,7 @@ impl RefusedActionsFallback {
     /// The walk's `result`, or, when it found no answer (nothing, or only
     /// a layer's error, which an answer would have outranked), the actions
     /// kept aside, with the error they displace: the answer still if they
-    /// are dropped at the final check (see [`judged_or_displaced`]). A
-    /// cancel stays a cancel.
+    /// are dropped at the final check. A cancel stays a cancel.
     fn or_kept(
         self,
         result: Result<Option<ActionParts>>,
@@ -158,91 +157,42 @@ impl RefusedActionsFallback {
     }
 }
 
-/// The answer once the actions chosen are judged: those kept, or, none
-/// left, the error kept-aside actions displaced (`displaced`), if any —
-/// they never turn a layer's error into an empty answer.
-fn judged_or_displaced(
-    judged: std::result::Result<CodeActionResponse, ()>,
-    displaced: Option<tower_lsp_server::jsonrpc::Error>,
-) -> Result<Option<CodeActionResponse>> {
-    match (judged, displaced) {
-        (Ok(actions), _) => Ok(Some(actions)),
-        (Err(()), Some(error)) => Err(error),
-        (Err(()), None) => Ok(None),
-    }
-}
-
-/// The actions of `parts` judged kept, in order: `Err` when judging emptied
-/// the answer (none left of a stale region's actions). An answer that came
-/// empty stays the empty answer it was (a concatenated walk's `[]`).
-fn current_actions(
-    parts: Vec<(CodeActionResponse, bool)>,
-) -> std::result::Result<CodeActionResponse, ()> {
+/// The actions of `parts` still current, in order: each prepared part
+/// judged by the same final check as the other answers mapped through
+/// prepared regions ([`Sourced::verdict`]), against the host as it is
+/// `now`, read once for all parts and only with a prepared one.
+///
+/// - The host moved: every part goes, the unprepared ones too (the host
+///   layer's, under `concatenated`), read for the text it moved from.
+/// - A part stale on an unmoved host goes alone, the others stay; none
+///   left, the answer is dropped as stale.
+/// - An answer that came empty stays the empty answer it was (a
+///   concatenated walk's `[]`).
+fn judged_actions(
+    now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
+    parts: ActionParts,
+) -> std::result::Result<CodeActionResponse, Verdict> {
+    let now = parts
+        .iter()
+        .any(|(_, source)| source.is_some())
+        .then(now)
+        .flatten();
     let mut kept: CodeActionResponse = Vec::new();
-    let mut dropped = false;
-    for (actions, keep) in parts {
-        if keep {
-            kept.extend(actions);
-        } else {
-            dropped = true;
+    let mut dropped = None;
+    for (actions, source) in parts {
+        match source
+            .as_ref()
+            .map_or(Verdict::Current, |source| source.verdict(now))
+        {
+            Verdict::Current => kept.extend(actions),
+            Verdict::Moved => return Err(Verdict::Moved),
+            Verdict::Stale => dropped = Some(Verdict::Stale),
         }
     }
-    if dropped && kept.is_empty() {
-        return Err(());
+    match dropped {
+        Some(verdict) if kept.is_empty() => Err(verdict),
+        _ => Ok(kept),
     }
-    Ok(kept)
-}
-
-/// [`current_actions`], each prepared part judged by the same final check
-/// as the other answers mapped through prepared regions
-/// ([`sources_verdict`](super::super::bridge_context::sources_verdict)): kept when
-/// current, which it reads at once in the common case; waited on only
-/// while the host's last edit is settling or its region held for its
-/// answer (an edit to another fence just before the request, say), all
-/// parts within one prepare timeout; dropped at once when moved or stale.
-/// Every part kept is read again once the last wait ends, together: one
-/// judged current before another's wait may no longer be (the host
-/// edited, a region re-prepared to other coordinates). The others are kept
-/// as they are.
-async fn judged_actions(
-    pool: &crate::lsp::bridge::LanguageServerPool,
-    tracker: &crate::language::NodeTracker,
-    current_version: impl Fn() -> Option<u64>,
-    parts: ActionParts,
-) -> std::result::Result<CodeActionResponse, ()> {
-    // One wait for all parts, not one for each: what is left of it bounds
-    // each part's.
-    let deadline = tokio::time::Instant::now() + crate::lsp::bridge::PREPARE_TIMEOUT;
-    let mut judged = Vec::with_capacity(parts.len());
-    for (actions, source) in parts {
-        let keep = match &source {
-            None => true,
-            Some(source) => super::super::bridge_context::sources_verdict_within(
-                pool,
-                tracker,
-                &current_version,
-                std::iter::once(source),
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .keeps(),
-        };
-        judged.push((actions, source, keep));
-    }
-    // A part judged current before another was waited on may not be by
-    // now (the host edited during that wait): every part kept is read
-    // once more, together, with no await between that read and the answer.
-    let judged = judged
-        .into_iter()
-        .map(|(actions, source, keep)| {
-            let keep = keep
-                && source
-                    .as_ref()
-                    .is_none_or(|source| source.still_current(pool, tracker, &current_version));
-            (actions, keep)
-        })
-        .collect();
-    current_actions(judged)
 }
 
 /// Collapse the cross-server `isPreferred` collision on a concatenated menu:
@@ -278,6 +228,8 @@ impl Kakehashi {
         let context = params.context;
         let upstream_caps = self.upstream_code_action_caps();
 
+        // Before any layer reads the host's text (see `PreparedRace`).
+        let race = self.prepared_race(&lsp_uri);
         let virt =
             self.code_action_virt_layer(&lsp_uri, range, context, work_done_token, upstream_caps);
         let host = async {
@@ -287,7 +239,7 @@ impl Kakehashi {
             Ok(actions.map(|actions| vec![(actions, None)]))
         };
         let passed_over = RefusedActionsFallback::default();
-        let may_keep = |source: &Sourced<()>| self.answer_may_keep(&lsp_uri, source);
+        let may_keep = |source: &Sourced<()>| race.keeps(std::iter::once(source));
         // Cross-layer strategy (`layers.aggregation."textDocument/codeAction"`),
         // resolved once inside the walk: `preferred` returns the highest-priority
         // non-empty layer; `concatenated` merges every layer's actions in priority
@@ -308,35 +260,43 @@ impl Kakehashi {
             )
             .await;
         let (result, displaced) = passed_over.or_kept(result);
-        // The final answer chosen: each prepared region's actions checked
-        // once more against the host text, which may have moved while they
-        // were held (see `judged_actions`). A stale region's actions are
-        // dropped; the others in the answer chosen stay (under
-        // `concatenated`, the host layer's and other regions'). Under a
-        // cross-layer `preferred` a virt answer already moved or stale as
-        // the race decided lost it to the host layer's (`parts_answer`);
-        // the host layer's answer is not in the one chosen, so a virt
-        // answer that was settling then and is dropped here, or that the
-        // host moved under since, leaves none, until the editor asks again.
+        // The final answer chosen, by the rule every prepared answer
+        // follows (see `PreparedRace`): each prepared region's actions
+        // checked once more against the host, which may have moved while
+        // they were held (see `judged_actions`); the host layer's standing
+        // in for a virt answer the race passed over only while the host is
+        // still the text the request read; and what is dropped with nothing
+        // left answered `ContentModified`, or the error kept-aside refused
+        // actions displaced.
+        let dropped = |verdict| {
+            super::super::bridge_context::dropped_answer_error(
+                &lsp_uri,
+                "codeAction",
+                verdict,
+                log::Level::Debug,
+            )
+        };
         let result = match result {
-            Ok(Some(parts)) => judged_or_displaced(
-                judged_actions(
-                    self.bridge.pool(),
-                    self.bridge.node_tracker(),
-                    || self.host_content_version(&lsp_uri),
-                    parts,
-                )
-                .await
-                .inspect_err(|()| {
-                    log::debug!(
-                        target: "kakehashi::bridge",
-                        "codeAction results for {} dropped: a prepared virtual document they were mapped through is no longer the host's text",
-                        lsp_uri.as_str()
-                    );
-                }),
-                displaced,
-            ),
-            other => other.map(|_| None),
+            Ok(Some(parts)) => {
+                match judged_actions(|| self.prepared_request_revision(&lsp_uri), parts) {
+                    Ok(actions) => match race.stand_in_dropped() {
+                        Some(verdict) => Err(dropped(verdict)),
+                        None => Ok(Some(actions)),
+                    },
+                    Err(verdict) => Err(displaced.unwrap_or_else(|| dropped(verdict))),
+                }
+            }
+            Ok(None) => race
+                .passed_over()
+                .map_or(Ok(None), |verdict| Err(dropped(verdict))),
+            Err(error) => Err(match race.passed_over() {
+                Some(verdict)
+                    if error.code != tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+                {
+                    dropped(verdict)
+                }
+                _ => error,
+            }),
         };
         // Collapse the cross-source isPreferred collision on the FINAL menu,
         // regardless of the cross-layer strategy: WITHIN-layer concatenation can
@@ -718,12 +678,7 @@ impl Kakehashi {
             for mut ctx in contexts {
                 // The work-done progress token is single-use → first region only.
                 ctx.document.client_progress_token = progress_token.take();
-                let source = Sourced::from_region(
-                    &ctx.document,
-                    (),
-                    self.bridge.node_tracker(),
-                    prepared_revision,
-                );
+                let source = Sourced::from_region(&ctx.document, (), prepared_revision);
                 if let Some(actions) = self
                     .dispatch_virt_region_code_action(ctx, &context, upstream_caps, revision)
                     .await?
@@ -1013,115 +968,43 @@ mod tests {
     use super::*;
     use tower_lsp_server::ls_types::Command;
 
-    /// A region's actions judged current before another region's were
-    /// waited on (held for its prepare answer) are judged again once that
-    /// wait ends: the host edited during it, or the first region
-    /// re-prepared to other coordinates (an epoch move, no edit), the first
-    /// region's are not kept. Every part waits within one prepare timeout.
-    #[tokio::test(start_paused = true)]
-    async fn actions_judged_before_another_regions_wait_are_judged_again_after_it() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
+    /// Each prepared part is judged against the host as its request read
+    /// it, read once for all parts and at once: all dropped once the host
+    /// moved, one whose map was revoked dropped alone. Unprepared parts
+    /// stay as they are, and nothing is read for an answer of them only.
+    #[test]
+    fn prepared_parts_are_judged_by_the_revision_their_request_read() {
+        use crate::lsp::bridge::{HostRevision, Revocation, VirtualLayout, apply_prepare_result};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let dedented = |text: &str| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{
-                "type": "content", "changes": [{
-                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                    "newText": ""
-                }]
-            }]}))
-            .unwrap();
-            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        let map = || {
+            let mut prepared =
+                apply_prepare_result("red\n", &VirtualLayout::single("red\n"), None).unwrap();
+            let revocation = Arc::new(Revocation::default());
+            Arc::get_mut(&mut prepared.map)
+                .unwrap()
+                .set_revocation(Arc::clone(&revocation));
+            (prepared.map, revocation)
         };
-        let prepared = Arc::new(dedented("  red\n"));
-        // What happens while the held regions' part waits: the host edited,
-        // the first region re-prepared and the held one answered, or
-        // nothing at all.
-        for case in ["edited", "re-prepared", "never answered"] {
-            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-            // The prepare layer's table, which holds are kept in.
-            pool.prepare_failures_for_test();
-            let host = url::Url::parse("file:///test/regions.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let regions: Vec<String> = [(0, 6), (10, 16), (20, 26)]
-                .into_iter()
-                .map(|(start, end)| {
-                    tracker
-                        .get_or_create_for_incarnation(&host, start, end, "block", 1)
-                        .unwrap()
-                        .to_string()
-                })
-                .collect();
-            pool.open_host_incarnation(&host, 1).await;
-            for region in &regions {
-                pool.record_latest_prepared_for_test(&host, 1, "lua", region, &prepared);
-            }
-            // The second and third held for their answers.
-            for region in &regions[1..] {
-                pool.hold_latest_virtual_content(&host, 1, "lua", region);
-            }
-            let part = |region: &str| {
-                (
-                    vec![CodeActionOrCommand::CodeAction(CodeAction {
-                        title: region.into(),
-                        ..Default::default()
-                    })],
-                    Some(
-                        crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
-                            (),
-                            &host,
-                            "lua",
-                            region,
-                            &prepared.map,
-                            1,
-                            1,
-                        ),
-                    ),
-                )
-            };
-            let version = Arc::new(AtomicU64::new(1));
-            let during = {
-                let (pool, host, version, regions, prepared) = (
-                    Arc::clone(&pool),
-                    host.clone(),
-                    Arc::clone(&version),
-                    regions.clone(),
-                    Arc::clone(&prepared),
-                );
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    match case {
-                        "edited" => version.store(2, Ordering::SeqCst),
-                        "re-prepared" => {
-                            let other = dedented("  blue\n");
-                            pool.record_latest_prepared_for_test(
-                                &host,
-                                1,
-                                "lua",
-                                &regions[0],
-                                &other,
-                            );
-                            for region in &regions[1..] {
-                                pool.record_latest_prepared_for_test(
-                                    &host, 1, "lua", region, &prepared,
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-            };
-            let started = tokio::time::Instant::now();
-            let answer = judged_actions(
-                &pool,
-                &tracker,
-                || Some(version.load(Ordering::SeqCst)),
-                regions.iter().map(|region| part(region)).collect(),
+        let (first, _) = map();
+        let (second, revocation) = map();
+        let part = |title: &str, map: Option<&Arc<crate::lsp::bridge::PreparedMap>>| {
+            (
+                vec![CodeActionOrCommand::CodeAction(CodeAction {
+                    title: title.into(),
+                    ..Default::default()
+                })],
+                map.map(|map| Sourced::prepared_for_test((), map, 1, 1)),
             )
-            .await;
-            during.await.unwrap();
-            let titles = answer.map(|actions| {
+        };
+        let parts = || {
+            vec![
+                part("host", None),
+                part("first", Some(&first)),
+                part("second", Some(&second)),
+            ]
+        };
+        let titles = |answer: std::result::Result<CodeActionResponse, Verdict>| {
+            answer.map(|actions| {
                 actions
                     .into_iter()
                     .map(|action| match action {
@@ -1129,21 +1012,46 @@ mod tests {
                         CodeActionOrCommand::Command(command) => command.title,
                     })
                     .collect::<Vec<_>>()
-            });
-            match case {
-                "edited" => assert_eq!(titles, Err(()), "{case}"),
-                "re-prepared" => assert_eq!(titles, Ok(regions[1..].to_vec()), "{case}"),
-                // The held ones never current: the first's stay.
-                _ => assert_eq!(titles, Ok(regions[..1].to_vec()), "{case}"),
-            }
-            // One wait for all, however many parts wait.
-            assert!(
-                started.elapsed()
-                    <= crate::lsp::bridge::PREPARE_TIMEOUT + std::time::Duration::from_millis(50),
-                "{case}: waited {:?}",
-                started.elapsed()
-            );
-        }
+            })
+        };
+        let at = |content_version| {
+            Some(HostRevision {
+                incarnation: 1,
+                content_version,
+            })
+        };
+        let reads = std::cell::Cell::new(0);
+        let judged = |content_version, parts| {
+            titles(judged_actions(
+                || {
+                    reads.set(reads.get() + 1);
+                    at(content_version)
+                },
+                parts,
+            ))
+        };
+        assert_eq!(
+            judged(1, parts()),
+            Ok(vec!["host".into(), "first".into(), "second".into()])
+        );
+        assert_eq!(reads.get(), 1, "read once for all parts");
+        // Moved: every part goes, the host layer's too, read for the text
+        // the host moved from.
+        assert_eq!(judged(2, parts()), Err(Verdict::Moved));
+        // Revoked, the host unmoved: that part alone.
+        revocation.revoke(u64::MAX);
+        assert_eq!(judged(1, parts()), Ok(vec!["host".into(), "first".into()]));
+        // None left: dropped as stale.
+        assert_eq!(judged(1, parts().split_off(2)), Err(Verdict::Stale));
+        // An answer that came empty stays the empty answer it was.
+        assert_eq!(
+            titles(judged_actions(|| unreachable!(), vec![(vec![], None)])),
+            Ok(vec![])
+        );
+        assert_eq!(
+            titles(judged_actions(|| unreachable!(), vec![part("host", None)])),
+            Ok(vec!["host".into()])
+        );
     }
 
     /// Under `preferred`, a prepared document's actions whose edits the map
@@ -1201,8 +1109,7 @@ mod tests {
     /// Under a cross-layer `preferred`, a prepared region's actions that may
     /// no longer be kept (moved, stale) are no answer of the virt layer: the
     /// race falls through to the host layer's, waited for when it is still
-    /// running. Ones that may be (current, or settling and waited on after)
-    /// win as ever.
+    /// running. Ones still current win as ever.
     #[tokio::test]
     async fn actions_that_may_not_be_kept_fall_through_to_the_host_layers() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
@@ -1214,7 +1121,6 @@ mod tests {
             })]
         };
         let prepared_source = || {
-            let host = url::Url::parse("file:///test/race.md").unwrap();
             let map = crate::lsp::bridge::apply_prepare_result(
                 "a",
                 &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -1222,17 +1128,7 @@ mod tests {
             )
             .unwrap()
             .map;
-            Some(
-                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
-                    (),
-                    &host,
-                    "lua",
-                    "r",
-                    &map,
-                    1,
-                    0,
-                ),
-            )
+            Some(crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test((), &map, 1, 0))
         };
         for (may_keep, host_delay_ms) in [(true, 0), (false, 0), (false, 20)] {
             let virt: ActionParts = vec![(action("virt"), prepared_source())];
@@ -1284,7 +1180,6 @@ mod tests {
         .join();
         assert!(fallback.0.is_poisoned());
 
-        let host_uri = url::Url::parse("file:///test/poisoned.md").unwrap();
         let map = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -1298,15 +1193,7 @@ mod tests {
                 disabled: Some(crate::lsp::bridge::prepared_map_refusal_for_test()),
                 ..Default::default()
             })],
-            Some(Sourced::prepared_for_test(
-                (),
-                &host_uri,
-                "lua",
-                "r",
-                &map,
-                1,
-                0,
-            )),
+            Some(Sourced::prepared_for_test((), &map, 1, 0)),
         )];
         assert!(!fallback.answers(&refused, |_| true));
         let fallback = std::sync::Arc::try_unwrap(fallback)
@@ -1334,7 +1221,6 @@ mod tests {
                 ..Default::default()
             })]
         };
-        let host_uri = url::Url::parse("file:///test/refused.md").unwrap();
         let map = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -1348,9 +1234,6 @@ mod tests {
                 Some(
                     crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
                         (),
-                        &host_uri,
-                        "lua",
-                        "r",
                         &map,
                         1,
                         0,
@@ -1416,16 +1299,14 @@ mod tests {
         );
     }
 
-    /// A virt answer passed over as moved or stale is not kept aside: with
-    /// the host layer erring, the walk answers that error, not actions the
-    /// final check drops. Kept-aside actions dropped there leave the error
-    /// they displaced.
+    /// A virt answer passed over as moved or stale is not kept aside as
+    /// refused actions are: with the host layer erring, the walk hands back
+    /// that error and nothing displaced.
     #[tokio::test]
     async fn a_stale_answer_passed_over_never_displaces_a_layers_error() {
         use crate::config::settings::LayerSource::{Host, Native, Virt};
         use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
         use tower_lsp_server::jsonrpc::Error;
-        let host_uri = url::Url::parse("file:///test/stale-error.md").unwrap();
         let map = crate::lsp::bridge::apply_prepare_result(
             "a",
             &crate::lsp::bridge::VirtualLayout::single("a"),
@@ -1438,17 +1319,7 @@ mod tests {
                 title: "stale".into(),
                 ..Default::default()
             })],
-            Some(
-                crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
-                    (),
-                    &host_uri,
-                    "lua",
-                    "r",
-                    &map,
-                    1,
-                    0,
-                ),
-            ),
+            Some(crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test((), &map, 1, 0)),
         )];
         let passed_over = RefusedActionsFallback::default();
         let result = race_layers_preferred(
@@ -1462,123 +1333,6 @@ mod tests {
         let (result, displaced) = passed_over.or_kept(result);
         assert_eq!(result.map(|_| ()).unwrap_err(), Error::internal_error());
         assert!(displaced.is_none());
-        // Kept aside, then dropped: the error they displaced.
-        assert_eq!(
-            judged_or_displaced(Err(()), Some(Error::internal_error())).unwrap_err(),
-            Error::internal_error()
-        );
-        assert_eq!(judged_or_displaced(Err(()), None).unwrap(), None);
-        assert_eq!(judged_or_displaced(Ok(vec![]), None).unwrap(), Some(vec![]));
-    }
-
-    /// The final check drops only a stale prepared region's actions; an
-    /// answer that came empty stays the empty answer it was.
-    #[test]
-    fn the_final_check_drops_only_stale_regions_actions() {
-        let action = |title: &str| {
-            CodeActionOrCommand::CodeAction(CodeAction {
-                title: title.into(),
-                ..Default::default()
-            })
-        };
-        let titles = |answer: std::result::Result<CodeActionResponse, ()>| {
-            answer.map(|actions| {
-                actions
-                    .into_iter()
-                    .map(|action| match action {
-                        CodeActionOrCommand::CodeAction(action) => action.title,
-                        CodeActionOrCommand::Command(command) => command.title,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        // A host layer answering `[]`, nothing else: `[]`.
-        assert_eq!(titles(current_actions(vec![(vec![], true)])), Ok(vec![]));
-        // A stale region beside the host layer's actions: those stay.
-        assert_eq!(
-            titles(current_actions(vec![
-                (vec![action("virt")], false),
-                (vec![action("host")], true)
-            ])),
-            Ok(vec!["host".to_string()])
-        );
-        // Only stale actions: none.
-        assert_eq!(
-            titles(current_actions(vec![(vec![action("virt")], false)])),
-            Err(())
-        );
-    }
-
-    /// A region's actions answered before the host's last edit (to another
-    /// fence, the region's text unchanged) settled are kept once it
-    /// settles, not dropped; those the host moved under are dropped.
-    #[tokio::test(start_paused = true)]
-    async fn actions_answered_before_the_hosts_last_edit_settles_are_judged_once_it_does() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let answer = serde_json::from_value(serde_json::json!({"segments": [{
-            "type": "content", "changes": [{
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                "newText": ""
-            }]
-        }]}))
-        .unwrap();
-        let prepared =
-            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
-                .unwrap();
-        for moves in [false, true] {
-            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-            let host = url::Url::parse("file:///test/settle.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let region = tracker
-                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-                .unwrap()
-                .to_string();
-            pool.open_host_incarnation(&host, 1).await;
-            pool.record_latest_prepared_for_test(&host, 1, "lua", &region, &prepared);
-            pool.note_host_edited(&host, 1, 1);
-            let source = crate::lsp::lsp_impl::bridge_context::Sourced::prepared_for_test(
-                (),
-                &host,
-                "lua",
-                &region,
-                &prepared.map,
-                1,
-                1,
-            );
-            let version = Arc::new(AtomicU64::new(1));
-            let settle = {
-                let (pool, host, version) = (Arc::clone(&pool), host.clone(), Arc::clone(&version));
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    if moves {
-                        version.store(2, Ordering::SeqCst);
-                    } else {
-                        pool.note_host_settled(&host, 1, 1);
-                    }
-                })
-            };
-            let answer = judged_actions(
-                &pool,
-                &tracker,
-                || Some(version.load(Ordering::SeqCst)),
-                vec![(
-                    vec![CodeActionOrCommand::CodeAction(CodeAction {
-                        title: "fix".into(),
-                        ..Default::default()
-                    })],
-                    Some(source),
-                )],
-            )
-            .await;
-            settle.await.unwrap();
-            assert_eq!(
-                answer.map(|actions| actions.len()),
-                if moves { Err(()) } else { Ok(1) }
-            );
-        }
     }
 
     /// An action resolved while its region went from as is to prepared (an

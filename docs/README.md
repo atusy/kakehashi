@@ -965,10 +965,15 @@ that cannot be placed counts as its server failing, and
 `kakehashi format` exits 2 when no other server formats the region; an
 on-type result that cannot be placed is no result, logged at debug). If the
 document is edited while a request is in flight, its answer brings no
-edits: the editor's next request answers for the edited text (a rename
-overtaken so is answered as `ContentModified`, which an editor showing
-the error lets the user retry; a server's `workspace/applyEdit` is answered `applied: false` when
-it is versioned or seen to be stale). Linked
+edits: the editor's next request answers for the edited text (a
+formatting request, rename, rename range, code action, color presentation
+or linked-editing request overtaken so is answered as `ContentModified`,
+which an editor showing the error lets the user retry; completion offers
+no items and inlay hints keep only their labels; a server's
+`workspace/applyEdit` is answered `applied: false` when it is versioned or
+seen to be stale). Nothing waits for such an answer to become usable: it
+is judged at once by whether the document is still the text the request
+read. Linked
 editing ranges and a rename's range are offered only where they cover in
 the host exactly the text the server saw. On a region the prepare server
 dedented unevenly (a line left at its own indentation), a rename, code

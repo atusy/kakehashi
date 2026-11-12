@@ -46,9 +46,8 @@ impl Kakehashi {
         };
         // The final answer is chosen as whole formatting's is: its edits
         // checked once more against the host text, which may have moved
-        // while it was held, once the host's last edit settled, and a
-        // prepared one dropped as stale or unsettled gives way to the host
-        // layer's while the host is unedited. Dropped with nothing standing
+        // while it was held, and a prepared one dropped as stale gives way
+        // to the host layer's while the host is unedited. Dropped with nothing standing
         // in, it is answered `ContentModified`, logged at debug only: trigger
         // keystrokes would warn each time.
         let (edits, refused) = self
@@ -126,8 +125,6 @@ impl Kakehashi {
         let edits = result
             .handle(&self.notifier(), "onTypeFormatting", None, Ok)
             .await?;
-        Ok(edits.map(|edits| {
-            Sourced::from_region(&ctx.document, edits, self.bridge.node_tracker(), revision)
-        }))
+        Ok(edits.map(|edits| Sourced::from_region(&ctx.document, edits, revision)))
     }
 }

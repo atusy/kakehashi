@@ -4,12 +4,11 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{Color, ColorPresentation, ColorPresentationParams, Range, Uri};
 
 use super::super::Kakehashi;
-use crate::error::LockResultExt;
 use crate::lsp::aggregation::server::{
     HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::HostDocument;
-use crate::lsp::lsp_impl::bridge_context::{Sourced, parse_host_verbatim, sources_verdict};
+use crate::lsp::lsp_impl::bridge_context::{Sourced, Verdict, parse_host_verbatim};
 
 const METHOD: &str = "textDocument/colorPresentation";
 
@@ -20,12 +19,16 @@ impl Kakehashi {
     ) -> Result<Vec<ColorPresentation>> {
         let raw_params = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
         let lsp_uri = params.text_document.uri;
-        // Before either layer reads the text: what a stand-in for an answer
-        // kept aside must still be (see `PassedOver::resolve`).
-        let revision = self.prepared_request_revision(&lsp_uri);
+        // Before either layer reads the host's text (see `PreparedRace`).
+        let race = self.prepared_race(&lsp_uri);
         let virt = async {
             let presentations = self
-                .color_presentation_virt_layer(&lsp_uri, params.range, params.color)
+                .color_presentation_virt_layer(
+                    &lsp_uri,
+                    params.range,
+                    params.color,
+                    race.revision(),
+                )
                 .await?;
             Ok(presentations.map(ColorAnswer::from_layer))
         };
@@ -35,33 +38,54 @@ impl Kakehashi {
                 .await?;
             Ok(presentations.map(ColorAnswer::unprepared))
         };
-        let pool = self.bridge.pool();
-        let tracker = self.bridge.node_tracker();
-        let current_version = || self.host_content_version(&lsp_uri);
-        let passed_over = PassedOver::default();
-        let race = self.walk_layers_by_strategy(
-            &lsp_uri,
-            METHOD,
-            METHOD,
-            virt,
-            host,
-            std::future::ready(Ok(None)),
-            // Under `preferred`, read as the race decides (see
-            // `PassedOver::answers`).
-            |answer: &ColorAnswer| passed_over.answers(answer, pool, tracker, current_version),
-            ColorAnswer::combine,
-        );
-        // The final answer chosen: a prepared part's edits checked once
-        // more against the host text, which may have moved while it was
-        // held, once the host's last edit settles (a picker asks once per
-        // interaction, not on every keystroke).
-        passed_over
-            .resolve(race, pool, tracker, current_version, || {
-                // Read only once a prepared answer was kept aside or
-                // dropped, which only a pool that prepares has.
-                revision.is_some() && self.prepared_request_revision(&lsp_uri) == revision
-            })
-            .await
+        let chosen = self
+            .walk_layers_by_strategy(
+                &lsp_uri,
+                METHOD,
+                METHOD,
+                virt,
+                host,
+                std::future::ready(Ok(None)),
+                // Under `preferred`, read as the race decides: a prepared
+                // answer no longer current is no answer of its layer.
+                |answer: &ColorAnswer| {
+                    answer.has_result(|source| race.keeps(std::iter::once(source)))
+                },
+                ColorAnswer::combine,
+            )
+            .await;
+        // The final answer chosen, by the rule every prepared answer
+        // follows (see `PreparedRace`): a prepared part's edits checked once
+        // more against the host, which may have moved while it was held;
+        // the parts left, or another layer's standing in for one passed
+        // over, answering only while the host is still the text the request
+        // read; and what is dropped with nothing left `ContentModified`.
+        let chosen = match chosen {
+            Ok(chosen) => chosen,
+            Err(error)
+                if race.passed_over().is_none()
+                    || error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled =>
+            {
+                return Err(error);
+            }
+            Err(_) => None,
+        };
+        let judged = match chosen {
+            Some(answer) => answer.final_presentations(
+                || self.prepared_request_revision(&lsp_uri),
+                race.passed_over(),
+                || race.unchanged(),
+            ),
+            None => race.passed_over().map_or(Ok(Vec::new()), Err),
+        };
+        judged.map_err(|verdict| {
+            crate::lsp::lsp_impl::bridge_context::dropped_answer_error(
+                &lsp_uri,
+                "colorPresentation",
+                verdict,
+                log::Level::Debug,
+            )
+        })
     }
 
     async fn color_presentation_virt_layer(
@@ -69,9 +93,8 @@ impl Kakehashi {
         lsp_uri: &Uri,
         range: Range,
         color: Color,
+        revision: Option<crate::lsp::bridge::HostRevision>,
     ) -> Result<Option<Sourced<Vec<ColorPresentation>>>> {
-        // Before the text is read: see `Sourced::from_region`.
-        let revision = self.prepared_request_revision(lsp_uri);
         let Some(ctx) = self
             .resolve_bridge_contexts_for_range(lsp_uri, range, METHOD)
             .await
@@ -115,9 +138,7 @@ impl Kakehashi {
                 Ok((!items.is_empty()).then_some(items))
             })
             .await?;
-        Ok(presentations.map(|items| {
-            Sourced::from_region(&ctx.document, items, self.bridge.node_tracker(), revision)
-        }))
+        Ok(presentations.map(|items| Sourced::from_region(&ctx.document, items, revision)))
     }
 
     async fn color_presentation_host_layer(
@@ -203,15 +224,14 @@ impl ColorAnswer {
     }
 
     /// Whether the answer is one a `preferred` race may choose: it has
-    /// presentations, and a prepared part may still be kept (`may_keep`):
-    /// its edits still land where they were mapped, or may once the host's
-    /// last edit settles.
-    fn has_result(&self, may_keep: impl Fn(&Sourced<()>) -> bool) -> bool {
+    /// presentations, and a prepared part is still `current`: its edits
+    /// still land where they were mapped.
+    fn has_result(&self, current: impl Fn(&Sourced<()>) -> bool) -> bool {
         !self.items.is_empty()
             && self
                 .prepared
                 .as_ref()
-                .is_none_or(|(source, _)| may_keep(source))
+                .is_none_or(|(source, _)| current(source))
     }
 
     fn combine(mut self, mut next: Self) -> Self {
@@ -223,31 +243,34 @@ impl ColorAnswer {
         self
     }
 
-    /// [`Self::still_current`], the prepared part judged once the host's
-    /// last edit settles (see `bridge_context::sources_verdict`). Dropped,
-    /// the parts left (the host layer's, under `concatenated`) were read
-    /// for the text the request read: they answer only while the host is
-    /// still that text (`unchanged`).
-    async fn settled_presentations(
+    /// [`Self::still_current`], the prepared part judged against the host
+    /// as it is `now` (see `Sourced::verdict`), or the verdict that drops
+    /// the whole answer:
+    ///
+    /// - The prepared part dropped, the parts left (the host layer's, under
+    ///   `concatenated`) were read for the text the request read: they
+    ///   answer only while the host is still that text (`unchanged`). So
+    ///   does an answer standing in for a prepared one a `preferred` race
+    ///   passed over (`passed_over`).
+    /// - Dropped with nothing left, it is dropped by the part's verdict.
+    fn final_presentations(
         self,
-        pool: &crate::lsp::bridge::LanguageServerPool,
-        tracker: &crate::language::NodeTracker,
-        current_version: impl Fn() -> Option<u64>,
+        now: impl FnOnce() -> Option<crate::lsp::bridge::HostRevision>,
+        passed_over: Option<Verdict>,
         unchanged: impl Fn() -> bool,
-    ) -> Vec<ColorPresentation> {
-        let keeps = match &self.prepared {
-            Some((source, _)) => {
-                sources_verdict(pool, tracker, current_version, std::iter::once(source))
-                    .await
-                    .keeps()
-            }
-            None => true,
-        };
-        let presentations = self.still_current(|_| keeps);
-        if !keeps && !presentations.is_empty() && !unchanged() {
-            return Vec::new();
+    ) -> std::result::Result<Vec<ColorPresentation>, Verdict> {
+        let verdict = self
+            .prepared
+            .as_ref()
+            .map_or(Verdict::Current, |(source, _)| source.verdict(now()));
+        let presentations = self.still_current(|_| verdict.keeps());
+        let dropped = Some(verdict).filter(|verdict| !verdict.keeps());
+        match dropped.or(passed_over) {
+            None => Ok(presentations),
+            Some(verdict) if presentations.is_empty() => Err(verdict),
+            Some(_) if !unchanged() => Err(Verdict::Moved),
+            Some(_) => Ok(presentations),
         }
-        presentations
     }
 
     /// The presentations, the prepared part kept only while its edits still
@@ -263,417 +286,159 @@ impl ColorAnswer {
     }
 }
 
-/// A prepared answer a `preferred` race passed over while its host's last
-/// edit was still settling: a part the final check may keep or drop, so
-/// the race goes on to the next layer's answer, which stands in for it
-/// when it is dropped, instead of none. A current one wins at once.
-#[derive(Default)]
-struct PassedOver {
-    kept: std::sync::Mutex<Option<ColorAnswer>>,
-    /// Signalled as an answer is kept aside, so its settle is waited on
-    /// while the race goes on.
-    kept_aside: tokio::sync::Notify,
-}
-
-impl PassedOver {
-    /// Whether `answer` wins the race: it has presentations and its
-    /// prepared part, if any, is current. One that may still be kept once
-    /// the host's last edit settles is kept aside instead: asked in
-    /// priority order, never of a layer before the ones above it have
-    /// come, the one kept outranks any answer the race goes on to choose.
-    fn answers(
-        &self,
-        answer: &ColorAnswer,
-        pool: &crate::lsp::bridge::LanguageServerPool,
-        tracker: &crate::language::NodeTracker,
-        current_version: impl Fn() -> Option<u64>,
-    ) -> bool {
-        // Current read first: a settle landing between the two reads keeps
-        // aside an answer then current, which the final check keeps.
-        if answer.has_result(|source| source.still_current(pool, tracker, &current_version)) {
-            return true;
-        }
-        if answer.has_result(|source| {
-            super::super::bridge_context::source_may_keep(source, pool, tracker, &current_version)
-        }) {
-            let mut kept = self
-                .kept
-                .lock()
-                .recover_poison("PassedOver::answers (color presentation answer kept aside)");
-            if kept.is_none() {
-                *kept = Some(answer.clone());
-                // A permit stored: the wait never misses it.
-                self.kept_aside.notify_one();
-            }
-        }
-        false
-    }
-
-    /// The presentations of the answer kept aside, judged as the host's
-    /// last edit settles, while `race` goes on: kept any, they answer at
-    /// once, the race's answers dropped unawaited; else those of the
-    /// race's chosen answer (none, or a layer's error, which the answer
-    /// kept aside outranked). A cancel the race returns first stays a
-    /// cancel.
-    ///
-    /// Such a stand-in waited for the settle, and answers only while the
-    /// host is still the text the request read (`unchanged`): neither
-    /// edited nor closed and reopened meanwhile, as its edits were read for
-    /// that text. Nothing kept aside, nothing is waited for, and the
-    /// race's answer goes out as it came.
-    async fn resolve(
-        &self,
-        race: impl Future<Output = Result<Option<ColorAnswer>>>,
-        pool: &crate::lsp::bridge::LanguageServerPool,
-        tracker: &crate::language::NodeTracker,
-        current_version: impl Fn() -> Option<u64>,
-        unchanged: impl Fn() -> bool,
-    ) -> Result<Vec<ColorPresentation>> {
-        let mut race = std::pin::pin!(race);
-        let mut settled = std::pin::pin!(self.settled(pool, tracker, &current_version, &unchanged));
-        let chosen = tokio::select! {
-            chosen = &mut race => {
-                let cancelled = matches!(
-                    &chosen,
-                    Err(error) if error.code == tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
-                );
-                if !cancelled && self.has_kept() {
-                    let presentations = settled.await;
-                    if !presentations.is_empty() {
-                        return Ok(presentations);
-                    }
-                }
-                chosen
-            }
-            presentations = &mut settled => {
-                if !presentations.is_empty() {
-                    return Ok(presentations);
-                }
-                race.await
-            }
-        };
-        match chosen? {
-            Some(_) if self.has_kept() && !unchanged() => Ok(Vec::new()),
-            Some(answer) => Ok(answer
-                .settled_presentations(pool, tracker, &current_version, &unchanged)
-                .await),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    fn has_kept(&self) -> bool {
-        self.kept
-            .lock()
-            .recover_poison("PassedOver::has_kept (color presentation answer kept aside)")
-            .is_some()
-    }
-
-    /// The presentations of the answer kept aside, judged once the host's
-    /// last edit settles: pending until one is kept aside.
-    async fn settled(
-        &self,
-        pool: &crate::lsp::bridge::LanguageServerPool,
-        tracker: &crate::language::NodeTracker,
-        current_version: impl Fn() -> Option<u64>,
-        unchanged: impl Fn() -> bool,
-    ) -> Vec<ColorPresentation> {
-        self.kept_aside.notified().await;
-        let kept = self
-            .kept
-            .lock()
-            .recover_poison("PassedOver::settled (color presentation answer kept aside)")
-            .clone();
-        match kept {
-            Some(kept) => {
-                kept.settled_presentations(pool, tracker, current_version, unchanged)
-                    .await
-            }
-            None => Vec::new(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::HostRevision;
 
-    /// A presentation whose reply came before the host's last edit settled
-    /// (another fence edited, this region's text unchanged) is kept once
-    /// the edit settles, not dropped: a picker asks once per interaction.
-    #[tokio::test(start_paused = true)]
-    async fn a_presentation_is_kept_once_the_hosts_last_edit_settles() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        use std::sync::Arc;
-        let answer = serde_json::from_value(serde_json::json!({"segments": [{
-            "type": "content", "changes": [{
-                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                "newText": ""
-            }]
-        }]}))
-        .unwrap();
-        let prepared =
-            apply_prepare_result("  red\n", &VirtualLayout::single("  red\n"), Some(answer))
-                .unwrap();
-        let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-        let host = url::Url::parse("file:///test/color-settle.md").unwrap();
-        let tracker = crate::language::NodeTracker::new();
-        tracker.open_incarnation(&host, 1);
-        let region = tracker
-            .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-            .unwrap()
-            .to_string();
-        pool.open_host_incarnation(&host, 1).await;
-        pool.record_latest_prepared_for_test(&host, 1, "css", &region, &prepared);
-        pool.note_host_edited(&host, 1, 1);
-        let presentation = ColorPresentation {
-            label: "red".to_string(),
-            text_edit: None,
-            additional_text_edits: None,
-        };
-        let answer = ColorAnswer::from_layer(Sourced::prepared_for_test(
-            vec![presentation.clone()],
-            &host,
-            "css",
-            &region,
-            &prepared.map,
-            1,
-            1,
-        ));
-        {
-            let (pool, host) = (Arc::clone(&pool), host.clone());
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                pool.note_host_settled(&host, 1, 1);
-            });
-        }
-        assert_eq!(
-            answer
-                .settled_presentations(&pool, &tracker, || Some(1), || true)
-                .await,
-            vec![presentation]
-        );
-    }
-
-    /// Under a cross-layer `preferred`, a prepared presentation still
-    /// settling as the race decides outranks the host layer's, and is the
-    /// answer when the settle keeps it; dropped then (re-prepared to other
-    /// coordinates as it settled), the host layer's presentations answer,
-    /// not none, unless the host changed meanwhile: they were read for the
-    /// text it left. A current one, or one kept as it settles, answers
-    /// without waiting on the host layer.
-    #[tokio::test(start_paused = true)]
-    async fn a_settling_presentation_dropped_at_settle_falls_back_to_the_host_layers() {
-        use crate::config::settings::LayerSource::{Host, Virt};
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        use crate::lsp::lsp_impl::bridge_context::race_layers_preferred;
-        use std::sync::Arc;
-        let prepare = |text: &str| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{
-                "type": "content", "changes": [{
-                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                    "newText": ""
-                }]
-            }]}))
-            .unwrap();
-            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
-        };
-        let presentation = |label: &str| ColorPresentation {
+    fn presentation(label: &str) -> ColorPresentation {
+        ColorPresentation {
             label: label.to_string(),
             text_edit: None,
             additional_text_edits: None,
-        };
-        for case in [
-            "current",
-            "settling, kept",
-            "settling, kept, host hung",
-            "settling, dropped",
-            "settling, dropped, host reopened",
-        ] {
-            let prepared = prepare("  red\n");
-            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-            let host = url::Url::parse("file:///test/color-fallback.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let region = tracker
-                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-                .unwrap()
-                .to_string();
-            pool.open_host_incarnation(&host, 1).await;
-            pool.record_latest_prepared_for_test(&host, 1, "css", &region, &prepared);
-            if case != "current" {
-                pool.note_host_edited(&host, 1, 1);
-                let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
-                let dropped = case.contains("dropped");
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if dropped {
-                        let other = prepare("  blue\n");
-                        pool.record_latest_prepared_for_test(&host, 1, "css", &region, &other);
-                    }
-                    pool.note_host_settled(&host, 1, 1);
-                });
-            }
-            let virt = ColorAnswer::from_layer(Sourced::prepared_for_test(
-                vec![presentation("virt")],
-                &host,
-                "css",
-                &region,
-                &prepared.map,
-                1,
-                1,
-            ));
-            let host_answer = async {
-                if case == "current" || case.ends_with("host hung") {
-                    // A host layer hung until the request would time out:
-                    // a current answer, or one kept once it settles, never
-                    // waits on it.
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                Ok(Some(ColorAnswer::unprepared(vec![presentation("host")])))
-            };
-            let passed_over = PassedOver::default();
-            let started = tokio::time::Instant::now();
-            let race = race_layers_preferred(
-                &[Virt, Host],
-                std::future::ready(Ok(Some(virt))),
-                host_answer,
-                std::future::ready(Ok(None)),
-                |answer: &ColorAnswer| passed_over.answers(answer, &pool, &tracker, || Some(1)),
-            );
-            let labels = passed_over
-                .resolve(
-                    race,
-                    &pool,
-                    &tracker,
-                    || Some(1),
-                    || case != "settling, dropped, host reopened",
-                )
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|presentation| presentation.label)
-                .collect::<Vec<_>>();
-            let expected: &[&str] = match case {
-                // Read for the text the host left while the prepared answer
-                // settled: no stand-in.
-                "settling, dropped, host reopened" => &[],
-                "settling, dropped" => &["host"],
-                _ => &["virt"],
-            };
-            assert_eq!(labels, expected, "{case}");
-            match case {
-                "current" => assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{case}"),
-                // Settled at 500ms, judged as the settle is seen.
-                "settling, kept, host hung" => assert!(
-                    started.elapsed() < std::time::Duration::from_secs(1),
-                    "{case}: answered as it settled, not after {:?}",
-                    started.elapsed()
-                ),
-                _ => {}
-            }
         }
     }
 
-    /// Under `concatenated`, a prepared part dropped as the host's last
-    /// edit settles leaves the host layer's part, read for the text the
-    /// request read: it answers only while the host is still that text.
-    #[tokio::test(start_paused = true)]
-    async fn a_merged_host_part_outlives_a_dropped_prepared_part_only_on_unchanged_text() {
-        use crate::lsp::bridge::{VirtualLayout, apply_prepare_result};
-        use std::sync::Arc;
-        let prepare = |text: &str| {
-            let answer = serde_json::from_value(serde_json::json!({"segments": [{
-                "type": "content", "changes": [{
-                    "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}},
-                    "newText": ""
-                }]
-            }]}))
-            .unwrap();
-            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
-        };
-        let presentation = |label: &str| ColorPresentation {
-            label: label.to_string(),
-            text_edit: None,
-            additional_text_edits: None,
-        };
-        for unchanged in [true, false] {
-            let prepared = prepare("  red\n");
-            let pool = Arc::new(crate::lsp::bridge::LanguageServerPool::preparing());
-            let host = url::Url::parse("file:///test/color-merged.md").unwrap();
-            let tracker = crate::language::NodeTracker::new();
-            tracker.open_incarnation(&host, 1);
-            let region = tracker
-                .get_or_create_for_incarnation(&host, 0, 6, "block", 1)
-                .unwrap()
-                .to_string();
-            pool.open_host_incarnation(&host, 1).await;
-            pool.record_latest_prepared_for_test(&host, 1, "css", &region, &prepared);
-            pool.note_host_edited(&host, 1, 1);
-            {
-                let (pool, host, region) = (Arc::clone(&pool), host.clone(), region.clone());
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    let other = prepare("  blue\n");
-                    pool.record_latest_prepared_for_test(&host, 1, "css", &region, &other);
-                    pool.note_host_settled(&host, 1, 1);
-                });
-            }
-            let merged = ColorAnswer::unprepared(vec![presentation("host")]).combine(
-                ColorAnswer::from_layer(Sourced::prepared_for_test(
-                    vec![presentation("virt")],
-                    &host,
-                    "css",
-                    &region,
-                    &prepared.map,
-                    1,
-                    1,
-                )),
-            );
-            let labels = merged
-                .settled_presentations(&pool, &tracker, || Some(1), || unchanged)
-                .await
-                .into_iter()
-                .map(|presentation| presentation.label)
-                .collect::<Vec<_>>();
-            let expected: &[&str] = if unchanged { &["host"] } else { &[] };
-            assert_eq!(labels, expected, "unchanged: {unchanged}");
-        }
+    fn labels(presentations: Vec<ColorPresentation>) -> Vec<String> {
+        presentations
+            .into_iter()
+            .map(|presentation| presentation.label)
+            .collect()
     }
 
-    #[test]
-    fn a_stale_part_answers_nothing_and_the_others_stay() {
-        let presentation = |label: &str| ColorPresentation {
-            label: label.to_string(),
-            text_edit: None,
-            additional_text_edits: None,
-        };
-        let host = url::Url::parse("file:///test/color.md").unwrap();
-        let map = crate::lsp::bridge::apply_prepare_result(
+    /// A map whose text its peer can fail, and the handle that revokes it.
+    fn revocable_map() -> (
+        std::sync::Arc<crate::lsp::bridge::PreparedMap>,
+        std::sync::Arc<crate::lsp::bridge::Revocation>,
+    ) {
+        let mut prepared = crate::lsp::bridge::apply_prepare_result(
             "red",
             &crate::lsp::bridge::VirtualLayout::single("red"),
             None,
         )
-        .unwrap()
-        .map;
+        .unwrap();
+        let revocation = std::sync::Arc::new(crate::lsp::bridge::Revocation::default());
+        std::sync::Arc::get_mut(&mut prepared.map)
+            .unwrap()
+            .set_revocation(std::sync::Arc::clone(&revocation));
+        (prepared.map, revocation)
+    }
+
+    fn at(content_version: u64) -> Option<HostRevision> {
+        Some(HostRevision {
+            incarnation: 1,
+            content_version,
+        })
+    }
+
+    /// A presentation is judged at once by the revision its request read:
+    /// kept while the host is that revision, whatever the lifecycle pass is
+    /// doing meanwhile (a picker asks once per interaction, so one answered
+    /// right after an edit to another fence must not be lost), dropped once
+    /// the host moved.
+    #[test]
+    fn a_presentation_is_kept_while_the_host_is_the_revision_its_request_read() {
+        let (map, _) = revocable_map();
+        let answer = || {
+            ColorAnswer::from_layer(Sourced::prepared_for_test(
+                vec![presentation("virt")],
+                &map,
+                1,
+                1,
+            ))
+        };
+        assert_eq!(
+            answer()
+                .final_presentations(|| at(1), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["virt".to_string()])
+        );
+        assert_eq!(
+            answer().final_presentations(|| at(2), None, || false),
+            Err(Verdict::Moved)
+        );
+    }
+
+    /// Under `preferred`, the host layer's answer chosen after a prepared
+    /// one was passed over stands in for it only while the host is still
+    /// the text the request read.
+    #[test]
+    fn a_host_answer_stands_in_for_one_passed_over_only_on_unchanged_text() {
+        let host = || ColorAnswer::unprepared(vec![presentation("host")]);
+        assert_eq!(
+            host()
+                .final_presentations(|| unreachable!(), Some(Verdict::Stale), || true)
+                .map(labels),
+            Ok(vec!["host".to_string()])
+        );
+        // The host moved: the host layer's was read for the text it moved
+        // from too.
+        assert_eq!(
+            host().final_presentations(|| unreachable!(), Some(Verdict::Moved), || false),
+            Err(Verdict::Moved)
+        );
+        // Nothing passed over, the host layer's answer goes out as it came.
+        assert_eq!(
+            host()
+                .final_presentations(|| unreachable!(), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["host".to_string()])
+        );
+    }
+
+    /// Under `concatenated`, a dropped prepared part leaves the host
+    /// layer's, which answers only while the host is still the text the
+    /// request read; nothing left, the answer is dropped by the part's
+    /// verdict.
+    #[test]
+    fn a_merged_host_part_outlives_a_dropped_prepared_part_only_on_unchanged_text() {
+        let (map, revocation) = revocable_map();
+        let virt = || {
+            ColorAnswer::from_layer(Sourced::prepared_for_test(
+                vec![presentation("virt")],
+                &map,
+                1,
+                1,
+            ))
+        };
+        let merged = || ColorAnswer::unprepared(vec![presentation("host")]).combine(virt());
+        assert_eq!(
+            merged()
+                .final_presentations(|| at(1), None, || unreachable!())
+                .map(labels),
+            Ok(vec!["host".to_string(), "virt".to_string()])
+        );
+        // Moved: every part was read for the text the host moved from.
+        assert_eq!(
+            merged().final_presentations(|| at(2), None, || false),
+            Err(Verdict::Moved)
+        );
+        // Revoked, the host unmoved: the prepared part alone goes.
+        revocation.revoke(u64::MAX);
+        assert_eq!(
+            merged()
+                .final_presentations(|| at(1), None, || true)
+                .map(labels),
+            Ok(vec!["host".to_string()])
+        );
+        assert_eq!(
+            virt().final_presentations(|| at(1), None, || unreachable!()),
+            Err(Verdict::Stale)
+        );
+    }
+
+    #[test]
+    fn a_stale_part_answers_nothing_and_the_others_stay() {
+        let (map, _) = revocable_map();
         let answer = || {
             ColorAnswer::unprepared(vec![presentation("host")]).combine(ColorAnswer::from_layer(
                 Sourced::prepared_for_test(
                     vec![presentation("virt"), presentation("virt2")],
-                    &host,
-                    "css",
-                    "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                     &map,
                     1,
                     0,
                 ),
             ))
-        };
-        let labels = |presentations: Vec<ColorPresentation>| {
-            presentations
-                .into_iter()
-                .map(|presentation| presentation.label)
-                .collect::<Vec<_>>()
         };
         assert_eq!(
             labels(answer().still_current(|_| true)),
@@ -685,9 +450,6 @@ mod tests {
         let virt_only = || {
             ColorAnswer::from_layer(Sourced::prepared_for_test(
                 vec![presentation("virt")],
-                &host,
-                "css",
-                "01ARZ3NDEKTSV4RRFFQ69G5FAV",
                 &map,
                 1,
                 0,
@@ -704,21 +466,5 @@ mod tests {
             ),
             ["host"]
         );
-    }
-
-    /// A panic while the answer kept aside was held poisons its lock; the
-    /// race still reads it (recovered with a `kakehashi::lock_recovery`
-    /// warning) instead of panicking in turn.
-    #[test]
-    fn a_poisoned_kept_answer_is_still_read() {
-        let passed_over = std::sync::Arc::new(PassedOver::default());
-        let poisoner = std::sync::Arc::clone(&passed_over);
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.kept.lock().unwrap();
-            panic!("poison the kept answer");
-        })
-        .join();
-        assert!(passed_over.kept.is_poisoned());
-        assert!(!passed_over.has_kept());
     }
 }

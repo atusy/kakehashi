@@ -365,13 +365,9 @@ pub(crate) struct HostVirtualContents {
     promoted_language: Option<HostLanguageAdmission>,
     contents: DashMap<String, DashMap<String, LatestText>>,
     /// The host's content version as of its last edit (see
-    /// [`LanguageServerPool::note_host_edited`]), and the one the lifecycle
-    /// pass last finished publishing holds and texts for (see
-    /// [`LanguageServerPool::note_host_settled`]): while the second is
-    /// behind, this container may describe an older host text. Kept only
-    /// by a pool that prepares.
+    /// [`LanguageServerPool::note_host_edited`]). Kept only by a pool that
+    /// prepares.
     edited: AtomicU64,
-    settled: AtomicU64,
 }
 
 /// What a text meets for one region of one host, read at once from the
@@ -3445,120 +3441,11 @@ impl LanguageServerPool {
         self.prepare_failures.get_or_init(Default::default)
     }
 
-    /// Whether [`RegionAdmission`] holds `region_id` (under `language`) of
-    /// `host_uri`, read under a reference to `host` (its entry in
-    /// `latest_virtual_contents`) already held: a withheld mark is for the
-    /// incarnation it was set under, read off `host` itself, where
-    /// [`Self::region_admission`] would look the host up again under that
-    /// reference.
-    fn host_withholds(
-        &self,
-        host_uri: &Url,
-        host: &HostVirtualContents,
-        language: &str,
-        region_id: &str,
-    ) -> bool {
-        self.prepare_failures.get().is_some_and(|failures| {
-            failures
-                .admission(host_uri, language, region_id, self.prepare_epoch())
-                .withheld
-                == Some(host.incarnation)
-        })
-    }
-
-    /// Whether the host text a prepared request's map describes is still
-    /// the region's current host text, read from the region's latest
-    /// recorded content in one step: whether it is settled, its hold, then
-    /// its map — once the map itself is not revoked.
-    ///
-    /// - Revoked (its peer failed its input since: see
-    ///   `PreparedMap::revoked`): an answer it no longer gives — no. The
-    ///   executor refuses such a reply whole once it arrives (see
-    ///   [`Self::prepare_failed`]); read here too, a revocation landing
-    ///   after that check still places no edit through the map.
-    /// - Not settled (the host edited, the lifecycle pass for the edit not
-    ///   finished, so the recorded content may predate it; see
-    ///   [`Self::note_host_edited`]): the host moved, to a map not known
-    ///   yet — no.
-    /// - Held (a newer input's answer pending, or failed): the host moved,
-    ///   to a map not known yet — no.
-    /// - The latest text is the request's very text in the very same
-    ///   coordinates (see `PreparedMap::same_coordinates`) — yes.
-    /// - Any other text, typed on, re-indented, or sent as is — no. How an
-    ///   edit maps depends on the whole text (which lines are blank, what
-    ///   an inserted line joins), so no text but the request's is known to
-    ///   place it alike. An answer overtaken by a later edit is dropped; the
-    ///   client asks again for the latest text, whose answer is kept.
-    /// - The region recorded under another language: rerouted — no.
-    /// - Nothing recorded for it: an open no pass recorded yet — yes. (A
-    ///   region forgotten since is no longer live, which the final check
-    ///   reads off the region tracker: see `Sourced::still_current`.)
-    ///
-    /// The hold is read first: [`Self::record_latest_virtual_content`]
-    /// stores a text before it clears the hold, so with the hold read clear
-    /// the content read next is at least that text; one seen with the hold
-    /// still set is refused either way.
-    pub(crate) fn host_text_still_current(
-        &self,
-        host_uri: &Url,
-        language: &str,
-        region_id: &str,
-        request_map: &super::protocol::PreparedMap,
-    ) -> bool {
-        if request_map.revoked() {
-            return false;
-        }
-        let Some(host) = self.latest_virtual_contents.get(host_uri) else {
-            return true;
-        };
-        // The edit first: a pass settling at least that version published
-        // its holds and texts before it settled, so with it read settled the
-        // hold and content read next are at least that pass's.
-        let edited = host.edited.load(Ordering::Acquire);
-        if host.settled.load(Ordering::Acquire) < edited {
-            return false;
-        }
-        if self.host_withholds(host_uri, &host, language, region_id) {
-            return false;
-        }
-        let latest = host.contents.get(language).and_then(|regions| {
-            regions
-                .get(region_id)
-                .map(|latest| latest.value().map().cloned())
-        });
-        match latest {
-            Some(latest) => {
-                super::protocol::PreparedMap::same_coordinates(latest.as_deref(), Some(request_map))
-            }
-            // Recorded under another language, the region was rerouted (a
-            // shebang edit, say): its text is no longer the request's.
-            // Recorded under none, it is open but no pass recorded it yet.
-            None => !host.contents.iter().any(|regions| {
-                regions.key().as_str() != language && regions.value().contains_key(region_id)
-            }),
-        }
-    }
-
-    /// Whether something may still change whether an answer made on
-    /// `region_id` of `host_uri` is current while the host's content
-    /// version stays put: the host's last edit not settled yet (its pass
-    /// may still record the region's text anew), or the region held for its
-    /// prepare answer. Read only; with neither, what
-    /// [`Self::host_text_still_current`] says holds until the host is
-    /// edited again. A host this pool keeps nothing for is settled.
-    pub(crate) fn host_settling(&self, host_uri: &Url, language: &str, region_id: &str) -> bool {
-        let Some(host) = self.latest_virtual_contents.get(host_uri) else {
-            return false;
-        };
-        host.settled.load(Ordering::Acquire) < host.edited.load(Ordering::Acquire)
-            || self.host_withholds(host_uri, &host, language, region_id)
-    }
-
-    /// Note that `host_uri`'s text was edited to `content_version`: from
-    /// now until the lifecycle pass settles that version, its regions'
-    /// latest texts may describe the text before the edit (see
-    /// [`Self::host_text_still_current`]). Called as the edit is applied,
-    /// before any await. Nothing is kept by a pool that prepares nothing.
+    /// Note that `host_uri`'s text was edited to `content_version`: a
+    /// request built on an older revision whose text its servers do not
+    /// hold is not waited for any more (see [`Self::host_moved_past`]).
+    /// Called as the edit is applied, before any await. Nothing is kept by
+    /// a pool that prepares nothing.
     pub(crate) fn note_host_edited(&self, host_uri: &Url, incarnation: u64, content_version: u64) {
         if !self.prepares() {
             return;
@@ -3568,20 +3455,21 @@ impl LanguageServerPool {
         {
             host.edited.fetch_max(content_version, Ordering::AcqRel);
         }
+        // A request waiting for the text before this edit gives up now.
+        self.wake_request_text_waiters();
     }
 
-    /// Note that a lifecycle pass that looked finished publishing
-    /// `host_uri`'s holds for `content_version`, and, forwarding, its
-    /// regions' texts (see [`Self::note_host_edited`]).
-    pub(crate) fn note_host_settled(&self, host_uri: &Url, incarnation: u64, content_version: u64) {
-        if !self.prepares() {
-            return;
-        }
-        if let Some(host) = self.latest_virtual_contents.get(host_uri)
-            && host.incarnation == incarnation
-        {
-            host.settled.fetch_max(content_version, Ordering::AcqRel);
-        }
+    /// Whether `host_uri` is no longer at `revision`, the one a request read
+    /// its text at: edited past it (see [`Self::note_host_edited`]), or
+    /// open under another lifetime. A host this pool keeps nothing for
+    /// (closed, or never opened here) has not moved, for all it knows.
+    pub(crate) fn host_moved_past(&self, host_uri: &Url, revision: super::HostRevision) -> bool {
+        self.latest_virtual_contents
+            .get(host_uri)
+            .is_some_and(|host| {
+                host.incarnation != revision.incarnation
+                    || host.edited.load(Ordering::Acquire) > revision.content_version
+            })
     }
 
     /// The document's lifecycle lock, created on first use. Transitions lock it
@@ -3664,7 +3552,6 @@ impl LanguageServerPool {
                 promoted_language: None,
                 contents: DashMap::new(),
                 edited: AtomicU64::new(0),
-                settled: AtomicU64::new(0),
             },
         );
     }

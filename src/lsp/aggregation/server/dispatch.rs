@@ -349,6 +349,7 @@ mod tests {
 
         DocumentRequestContext {
             prepared: None,
+            host_revision: None,
             uri: url::Url::parse("file:///suppression.md").expect("valid URI"),
             resolved: ResolvedInjection {
                 region: CacheableInjectionRegion {

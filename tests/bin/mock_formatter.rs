@@ -1336,6 +1336,9 @@ fn main() {
                 );
             }
             "textDocument/completion" if mode == "echo-document" => {
+                // With `MOCK_COMPLETION_AFTER_RELEASE` set, once the file
+                // `MOCK_RELEASE_FILE` names exists (or a minute later).
+                wait_for_release("MOCK_COMPLETION_AFTER_RELEASE");
                 let position = message["params"]["position"].clone();
                 let result = json!({"isIncomplete": false, "items": [{ "label": "echo-plain" }, {
                     "label": "echo-edit",
@@ -2521,6 +2524,9 @@ fn main() {
                 {
                     respond(&mut writer, pending_id, pending_result);
                 }
+                // With `MOCK_INLAY_AFTER_RELEASE` set, once the file
+                // `MOCK_RELEASE_FILE` names exists (or a minute later).
+                wait_for_release("MOCK_INLAY_AFTER_RELEASE");
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
