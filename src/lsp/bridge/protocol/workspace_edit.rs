@@ -2313,6 +2313,53 @@ mod tests {
     }
 
     #[test]
+    fn transform_into_region_only_checks_beside_edits_addressed_to_the_host_document() {
+        // The request's own edits end up in one array with the ones the
+        // server addressed to the host document — or, as `TextDocumentEdit`s,
+        // apply one after another with them. A rewrite reads its edit alone
+        // against the document as it stands, so beside such edits there is
+        // none: removing the last line would take that line's prefix out
+        // from under the insertion the server put right behind it.
+        let region = quoted_ab();
+        let virtual_uri = make_virtual_uri_string();
+        let host_uri = make_host_uri();
+        let host_insertion = json!({
+            "range": {"start": {"line": 2, "character": 2}, "end": {"line": 2, "character": 2}},
+            "newText": "B"
+        });
+        let removes_the_last_line = json!({
+            "range": {"start": {"line": 1, "character": 0}, "end": {"line": 2, "character": 0}},
+            "newText": ""
+        });
+        let shapes = [
+            json!({ "changes": {
+                host_uri.as_str(): [host_insertion],
+                virtual_uri.clone(): [removes_the_last_line],
+            } }),
+            json!({ "documentChanges": [
+                { "textDocument": { "uri": virtual_uri, "version": 1 },
+                  "edits": [removes_the_last_line] },
+                { "textDocument": { "uri": host_uri.as_str(), "version": 1 },
+                  "edits": [host_insertion] },
+            ] }),
+        ];
+
+        for shape in shapes {
+            assert_eq!(
+                transform_workspace_edit_into_region(
+                    &mut parse_workspace_edit(shape.clone()),
+                    &virtual_uri,
+                    &host_uri,
+                    &region.offset,
+                    region.region_end,
+                ),
+                Err(RegionEditRefusal::BreaksLinePrefixes),
+                "{shape}"
+            );
+        }
+    }
+
+    #[test]
     fn transform_into_region_says_why_it_refuses() {
         let region = quoted_ab();
         let virtual_uri = make_virtual_uri_string();
