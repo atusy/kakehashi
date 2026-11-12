@@ -223,6 +223,9 @@ refused whole, never clamped:
 - **Edits spread over several `TextDocumentEdit`s for the document.** Those
   apply one after another, so the later ones are not positioned in the
   document the prefixes were read from.
+- **The request's own edits beside ones the server addressed to the host
+  document.** They would share an array or a sequence with edits the rewrite
+  never read.
 - **A region without one prefix** (lines of text behind different prefixes,
   such as a lazy continuation line), and **an offset that knows only the
   widths** — one echoed back in a resolve envelope and not rebuilt from the

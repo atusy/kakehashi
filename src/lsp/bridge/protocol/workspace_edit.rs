@@ -34,10 +34,13 @@ use crate::language::injection::LinePrefixes;
 /// The request's own edits are placed in the region
 /// ([`place_text_edits_in_region`]): one that adds or joins lines behind host
 /// line prefixes is given those prefixes. That reads the edits against the
-/// document as it stands, so it is done only for an edit that holds them in
-/// one array; spread over several `TextDocumentEdit`s, which apply one after
-/// another, they are only checked. So is an edit the server addressed to the
-/// host document itself ([`workspace_edit_within_region`],
+/// document as it stands, and against each other, so it is done only when
+/// they are all the edit holds for the document, in one array. Spread over
+/// several `TextDocumentEdit`s, which apply one after another, they are only
+/// checked; so they are beside edits the server addressed to the host
+/// document itself, which they would share an array or a sequence with.
+/// Such a host-addressed edit is only ever checked
+/// ([`workspace_edit_within_region`],
 /// [`workspace_edit_preserves_line_prefixes`]): it is in host coordinates
 /// already and relayed verbatim — the server wrote its text against the
 /// host, and nothing tells whether that text carries the prefixes. Edits of
@@ -75,7 +78,10 @@ pub(crate) fn transform_workspace_edit_into_region(
         return Err(RegionEditRefusal::BreaksLinePrefixes);
     }
 
-    let one_array = arrays_of(edit, request_virtual_uri) == 1;
+    // Counted before the transform re-keys anything: afterwards the two
+    // kinds share the host URI.
+    let one_array =
+        arrays_of(edit, request_virtual_uri) == 1 && arrays_of(edit, host_uri.as_str()) == 0;
     let mut refusal = None;
     let mut place = |edits: &mut dyn Iterator<Item = &mut TextEdit>| {
         let mut edits: Vec<&mut TextEdit> = edits.collect();
