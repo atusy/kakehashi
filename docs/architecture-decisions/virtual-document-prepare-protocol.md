@@ -1005,8 +1005,9 @@ editors keep a snippet as is.
   `workspace/applyEdit` is available on a prepared document with gaps;
   completion items resolve only their `documentation` and `detail`.
 - A snippet completion breaking a line or holding a tab is refused on a
-  prepared document, whatever the editor declares (a literal one goes out
-  as plain text): snippet engines rewrite both whatever `insertTextMode`
+  document the peer changed, whatever the editor declares (a literal one
+  goes out as plain text; a document the peer left as it is keeps its
+  snippets): snippet engines rewrite both whatever `insertTextMode`
   asks. Neovim's `vim.snippet.expand` (`runtime/lua/vim/snippet.lua`)
   prefixes every line after the first with the cursor line's indentation
   and, under `expandtab`, turns every tab into spaces; mini.snippets
