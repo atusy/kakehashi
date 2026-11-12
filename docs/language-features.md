@@ -205,9 +205,11 @@ and [`textDocument/prepareRename`](https://microsoft.github.io/language-server-p
 Renames a symbol within its embedded block. An edit that adds or joins lines
 in a block nested in a blockquote or a list item keeps the block's line prefix
 on them, as in formatting. Edits that the server addresses
-to OTHER regions' virtual URIs are filtered out; edits to real files (e.g. a
-cross-file rename from a project-aware server, or host-URI edits — not
-containment-checked) pass through. Default combine strategy: `preferred`.
+to OTHER regions' virtual URIs are filtered out; edits to other real files
+(e.g. a cross-file rename from a project-aware server) pass through. An edit
+the server addresses to the host document itself must stay inside the block
+and keep its line prefixes as it comes, or the whole rename is refused.
+Default combine strategy: `preferred`.
 
 ### Formatting
 
@@ -778,8 +780,8 @@ virtual URI is translated against that region even if it differs from the
 block that prompted the server's request (edits spanning multiple virtual
 URIs are rejected on cardinality grounds; single-target requests can still
 be rejected on the usual grounds — unknown/stale URI, virtual-URI file
-operation, region escape). Real-file and — for navigation/references/rename — host-URI
-results pass through, while injection-layer code actions (and applyEdit
+operation, region escape). Real-file and — for navigation/references — host-URI
+results pass through, while rename, injection-layer code actions (and applyEdit
 requests that also touch a virtual document) constrain host-URI edits to
 the region.
 The surrounding host document can be bridged to the host language's own

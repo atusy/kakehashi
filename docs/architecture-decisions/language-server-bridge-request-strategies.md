@@ -299,7 +299,7 @@ whether it is what the user wants depends on the injection.
 |--------|----------|
 | Input | Position + newName |
 | Output | WorkspaceEdit (changes across files) |
-| Cross-file | Real-file edits preserved (shared WorkspaceEdit transform, incl. host-URI edits — not containment-checked on this path); edits keyed to OTHER regions' virtual URIs filtered |
+| Cross-file | Edits of other real files preserved (shared WorkspaceEdit transform); host-URI edits relayed as they come when they stay inside the region and keep its line prefixes, else the result is rejected; edits keyed to OTHER regions' virtual URIs filtered |
 | Position mapping | Own-virtual-URI TextEdit ranges: virtual → host; real/host-URI edits keep their ranges unchanged |
 
 Rename can affect multiple files. Real-file edits (a project-aware server's
