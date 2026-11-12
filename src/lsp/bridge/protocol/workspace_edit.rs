@@ -137,8 +137,8 @@ impl EditTranslation for Ranges<'_> {
 /// An entry holding annotated edits, which must keep their identity, is
 /// taken only where replaying maps one for each (every edit within one
 /// line, apart from the others: [`EditMode::InLine`]); one whose edits add,
-/// remove or rewrite lines is refused, since no edit of a replayed diff is
-/// any one of them.
+/// remove or rewrite lines is refused, since no edit of a replayed group
+/// is any one of them.
 struct Replayed<'a> {
     offset: &'a RegionOffset,
     /// The host ranges the `changes` form's mapped edits came out at.

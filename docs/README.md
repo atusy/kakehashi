@@ -961,8 +961,7 @@ snippets are offered only on one line, without a tab, and in the forms
 every editor expands alike — tabstops and placeholders written plainly,
 no choices or variables — since editors re-indent, retab and parse
 snippets differently whatever the item asks; a formatting result
-that cannot be placed, or that rewrites a large region too heavily to
-compare within the work its size allows, counts as its server failing, and
+that cannot be placed counts as its server failing, and
 `kakehashi format` exits 2 when no other server formats the region; an
 on-type result that cannot be placed is no result, logged at debug). If the
 document is edited while a request is in flight, its answer brings no
