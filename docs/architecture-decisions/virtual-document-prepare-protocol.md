@@ -240,11 +240,23 @@ hierarchy item minted from one answer its follow-ups
 (`callHierarchy/incomingCalls`, `outgoingCalls`,
 `typeHierarchy/supertypes`, `subtypes`): the map it was minted through is
 not carried.
-A completion item's resolve is the exception for what holds no position: it
-is forwarded while the item's server holds the text prepared from the
-region's current one, the item going without its edits, and only the
-`documentation` and `detail` of the answer are taken. An edit the server
-adds on resolve (an auto-import) is not.
+A completion item's resolve is the exception: it is forwarded while the
+item's server holds the text prepared from the region's current one, the
+item going without its edits. The `documentation` and `detail` of the
+answer are taken, which hold no position. The `additionalTextEdits` it adds
+(an auto-import, deferred as the editor's `resolveSupport` lets a server)
+are taken only where the answer was computed on the text the item was
+listed on: the envelope records the host's content version and the
+generation of the text the item's server held as the list was read (not
+the map), and the edits are mapped, through the map that server holds,
+while the host is still that revision, the server holds that generation
+both before the resolve is queued and once its reply is in, and the map
+was not revoked since. They are mapped beside the item's main edit as it
+went out (see Edits). Otherwise they are dropped and the item still
+resolves what holds no position: once the user typed on after the list
+came, neither the item's own edit nor the answer's is in a text the map
+describes. Nothing else of the answer is read: LSP lets no resolve change
+the main edit, and a command's arguments are opaque.
 
 ### Edits
 
@@ -304,6 +316,27 @@ edited V. It is refused, and dropped like any unsafe set, when:
 
 No edit in P reaches into the deleted edge lines or the closing indent
 deleted with them: P has no position inside them.
+
+The `additionalTextEdits` a completion item's resolve adds form such a set
+with a main edit that already went out, mapped alone. Its extent in P is
+still told by its extent in V (whatever the peer deleted around either end
+sits at one offset of P), but its text as the server wrote it is not: it
+was re-indented, and a snippet stands where its expansion was checked. So
+the set is held to the rules above with one of them made stricter: an
+added edit overlapping or touching the main edit in P is refused whatever
+the texts say — but for lines inserted at a line start right before it,
+where the text sent on tells enough (it starts with text of its own, not
+indentation the map may have written, at the place the lines map to).
+What this accepts, mapping the set together accepts and maps alike. The
+added edits are dropped whole when the item was served with additional
+edits of its own (it deferred none, and its request went without them, so
+whether the answer's stand for them or beside them is not told), or
+without a main edit (the editor inserts its text over a range it picks,
+which nothing can be checked beside, as at listing). On a document the
+peer left as it is, nothing is mapped beside anything: the added edits
+are the virtual document's own and are placed as a document as is places
+them, with a main edit or without one; only an item served with
+additional edits of its own goes without them.
 
 A formatter's answer (formatting, range and on-type formatting, and the
 concatenated pipeline's result) is read as the text it leaves, not edit for
@@ -967,7 +1000,7 @@ editors keep a snippet as is.
   does.
 - No edit-producing method (those listed in Coordinates) nor inbound
   `workspace/applyEdit` is available on a prepared document with gaps;
-  completion items resolve only their `documentation` and `detail`.
+  completion items resolve only their `documentation` and `detail` there.
 - A snippet completion breaking a line or holding a tab is refused on a
   document the peer changed, whatever the editor declares (a literal one
   goes out as plain text; a document the peer left as it is keeps its
@@ -1058,16 +1091,30 @@ editors keep a snippet as is.
   unsent, so servers may see unprepared text until it is up.
 - A document the peer leaves as it is costs less than one it changes,
   not nothing: it waits for the peer's answer like any other, and what
-  is listed from it resolves as from a prepared document. Only its
-  completion items go as a document as is sends them (see Edits).
+  is listed from it resolves as from a prepared document (a completion
+  item only while nothing was typed since its list came). Only its
+  completion items, and the edits their resolve adds, go as a document
+  as is sends them (see Edits).
 - A peer bridged for every language (`"*"`) prepares every injection it
   can under the default `priorities`, and declining with `null` still
   makes a document prepared; restricting it takes `priorities = []` where
   it should not apply.
 - `*/resolve` for items from prepared documents is refused (stale), as are
   call and type hierarchy follow-ups for their items. A completion item
-  resolves its `documentation` and `detail` only: edits its server defers
-  to resolve, as the editor's `resolveSupport` lets it, are lost.
+  resolves its `documentation` and `detail`, and the edits its server
+  defers to resolve (an auto-import) only while nothing was typed since
+  its list came and its server still holds the text it listed it from. An
+  editor that resolves an item as it is highlighted, as LSP describes the
+  request, gets them for a list just shown; one that resolves only once
+  the item is accepted and its text inserted (Neovim's built-in
+  completion) never does, nor does any editor for an item resolved after
+  the user typed on to filter the list. Lifting that takes the resolve
+  waiting for the text prepared from the edited one, and a rule telling
+  which of the answer's positions an edit left alone, for a server that
+  computed them as it listed the item; neither is here.
+- An edit a resolve adds right where the item's main edit starts or ends
+  is dropped, but for lines inserted before it at a line start: mapped
+  after the main edit went out, nothing tells how the two read together.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
 - An interpolation with nothing injected before it on its host line takes

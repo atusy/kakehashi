@@ -2431,8 +2431,9 @@ fn a_completion_item_from_a_prepared_document_resolves_what_holds_no_position() 
 #[test]
 fn a_resolve_on_a_prepared_document_takes_no_edit_from_its_answer() {
     // This mock's resolve adds an additional edit on the prepared text's
-    // second line, with a `detail`: the map the item came through is not
-    // carried, so only the `detail` is taken.
+    // second line, with a `detail`, to an item that came without an edit of
+    // its own: the editor inserts it over a range it picks, which the added
+    // edit cannot be checked beside, so only the `detail` is taken.
     let (mut client, _dir) = Setup {
         echo: "completion-resolve-additional-edit",
         ..Setup::default()
@@ -2453,6 +2454,164 @@ fn a_resolve_on_a_prepared_document_takes_no_edit_from_its_answer() {
         "{resolved}"
     );
     assert!(resolved["result"].get("textEdit").is_none(), "{resolved}");
+}
+
+#[test]
+fn a_resolve_on_a_document_the_peer_left_as_it_is_takes_the_edit_its_answer_adds() {
+    // The same item and resolve in a fence with nothing for the peer to
+    // remove: the document went through the peer and is the virtual
+    // document still, so the added edit is that text's own and lands on
+    // the block's second line, as on a document never prepared.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-additional-edit",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-edit-left-as-it-is.md";
+    open(&mut client, uri, "# t\n\n```lua\nlocal x = 1\nprin\n```\n");
+    let item = resolvable_item(&mut client, uri);
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    let detail = resolved["result"]["detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("mock-resolved:"), "{resolved}");
+    assert_eq!(
+        resolved["result"]["additionalTextEdits"],
+        json!([{
+            "range": {
+                "start": { "line": 4, "character": 0 },
+                "end": { "line": 4, "character": 0 }
+            },
+            "newText": "--[[resolved]] "
+        }]),
+        "{resolved}"
+    );
+}
+
+/// The item a resolving mock completes at `line`, column 4, in `uri`, once
+/// the peer and the mock are up.
+fn resolvable_item_on(client: &mut LspClient, uri: &str, line: u32) -> Value {
+    for _ in 0..300 {
+        let response = client.send_request(
+            "textDocument/completion",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": 4 } }),
+        );
+        if let Some(item) = result_items(&response).into_iter().next() {
+            return item;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out waiting for a completion through the prepared document");
+}
+
+/// `text` once an editor accepted `item`: its edit and its additional
+/// edits applied together.
+fn accepted(text: &str, item: &Value) -> String {
+    let mut edits = vec![item["textEdit"].clone()];
+    edits.extend(
+        item["additionalTextEdits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    );
+    apply_edits(text, &edits)
+}
+
+#[test]
+fn a_resolve_on_a_prepared_document_places_the_edits_its_answer_adds() {
+    // This mock's item rewrites `pr`, and its resolve adds a line at the
+    // start of the prepared text (an auto-import): while its server holds
+    // the text the item was listed on, the line maps back above the block's
+    // first, regaining the indentation the peer removed.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-import",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-import.md";
+    let text = "# t\n\n```lua\n  local x = 1\n  pr\n```\n";
+    open(&mut client, uri, text);
+    let item = resolvable_item_on(&mut client, uri, 4);
+    assert!(item.get("additionalTextEdits").is_none(), "{item}");
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    let resolved = &resolved["result"];
+    assert_eq!(resolved["textEdit"], item["textEdit"], "{resolved}");
+    assert_eq!(
+        accepted(text, resolved),
+        "# t\n\n```lua\n  local p = print\n  local x = 1\n  print\n```\n",
+        "{resolved}"
+    );
+    // Resolved again, as a client does on every selection move: the edits
+    // placed stay.
+    let again = client.send_request("completionItem/resolve", resolved.clone());
+    assert_eq!(
+        again["result"]["additionalTextEdits"], resolved["additionalTextEdits"],
+        "{again}"
+    );
+}
+
+#[test]
+fn a_resolve_places_a_line_added_above_the_line_its_item_rewrites() {
+    // The block's only line is the one the item rewrites from its start:
+    // the line the resolve adds lands at the same place, before it.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-import",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-import-first-line.md";
+    let text = "# t\n\n```lua\n  pr\n```\n";
+    open(&mut client, uri, text);
+    let item = resolvable_item_on(&mut client, uri, 3);
+    let resolved = client.send_request("completionItem/resolve", item.clone());
+    assert_eq!(
+        accepted(text, &resolved["result"]),
+        "# t\n\n```lua\n  local p = print\n  print\n```\n",
+        "{resolved}"
+    );
+}
+
+#[test]
+fn a_resolve_places_no_edit_once_the_host_moved_from_what_its_item_was_listed_on() {
+    // The heading is edited after the list was computed: the block reads
+    // the same, so its server still holds the text the item was listed on
+    // and answers the resolve, but the item's own edit is in the host text
+    // of before. Only what holds no position is taken.
+    let (mut client, _dir) = Setup {
+        echo: "completion-resolve-import",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/resolve-import-moved.md";
+    open(
+        &mut client,
+        uri,
+        "# t\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    let item = resolvable_item_on(&mut client, uri, 4);
+    change(
+        &mut client,
+        uri,
+        2,
+        "# u\n\n```lua\n  local x = 1\n  pr\n```\n",
+    );
+    // Until the pass after the edit has looked the block up again, the
+    // item comes back as it went.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let resolved = loop {
+        let resolved = client.send_request("completionItem/resolve", item.clone());
+        if resolved["result"].get("detail").is_some() {
+            break resolved;
+        }
+        assert!(Instant::now() < deadline, "never resolved: {resolved}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        resolved["result"].get("additionalTextEdits").is_none(),
+        "{resolved}"
+    );
+    assert_eq!(
+        resolved["result"]["textEdit"], item["textEdit"],
+        "{resolved}"
+    );
 }
 
 #[test]

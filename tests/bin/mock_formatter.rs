@@ -111,6 +111,8 @@
 //!   `document-link-delayed-resolve` / `completion-resolve-delayed` /
 //!   `completion-resolve-additional-edit` (lazy `additionalTextEdits` on the
 //!   second virtual line) /
+//!   `completion-resolve-import` (an item rewriting its line up to the caret,
+//!   with a lazy line inserted at the document's start; not delayed) /
 //!   `completion-resolve-reopen-delayed` /
 //!   `code-lens-reopen-delayed-resolve` / `document-link-reopen-delayed-resolve`
 //!   — like their base modes, but park the resolve reply (after a
@@ -576,7 +578,8 @@ fn main() {
                     | "completion-resolve-text"
                     | "completion-resolve-reopen-delayed"
                     | "completion-resolve-delayed"
-                    | "completion-resolve-additional-edit" => json!({
+                    | "completion-resolve-additional-edit"
+                    | "completion-resolve-import" => json!({
                         "completionProvider": { "resolveProvider": true },
                         "textDocumentSync": 1
                     }),
@@ -1385,6 +1388,18 @@ fn main() {
                                 "newText": "x"
                             });
                         }
+                        // The item rewrites its line up to the caret; what
+                        // it needs above (an import) comes on resolve.
+                        if mode == "completion-resolve-import" {
+                            let position = &message["params"]["position"];
+                            result["items"][0]["textEdit"] = json!({
+                                "range": {
+                                    "start": { "line": position["line"], "character": 0 },
+                                    "end": position
+                                },
+                                "newText": "print"
+                            });
+                        }
                         result
                     })
                     .unwrap_or(Value::Null);
@@ -1449,7 +1464,19 @@ fn main() {
                         "newText": "--[[resolved]] "
                     }]);
                 }
+                // `completion-resolve-import`: a lazy line at the document's
+                // start, as an auto-import is added.
+                if mode == "completion-resolve-import" {
+                    item["additionalTextEdits"] = json!([{
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 0 }
+                        },
+                        "newText": "local p = print\n"
+                    }]);
+                }
                 if mode != "completion-resolve-plain"
+                    && mode != "completion-resolve-import"
                     && mode != "completion-resolve-echo-edit"
                     && mode != "completion-resolve-text"
                     && mode != "completion-resolve-reopen-delayed"

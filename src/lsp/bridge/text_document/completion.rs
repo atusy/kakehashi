@@ -120,12 +120,41 @@ impl LanguageServerPool {
                         offset: ctx.offset,
                         region_end: Some(region_end),
                         host_layer: false,
+                        listed_on: self.listed_on(
+                            &ctx.virtual_uri_string,
+                            origin.key(),
+                            ctx.offset,
+                            host_incarnation,
+                        ),
                     },
                     insert_mode,
                 )
             },
         )
         .await
+    }
+
+    /// What a list computed through `offset` is listed on, read as its
+    /// reply is: the host revision its request read (of the lifetime its
+    /// envelopes name) and the generation of the text its server holds,
+    /// while that is still the one `offset`'s map describes. `None` for a
+    /// document as is, and once another text was sent: no envelope can
+    /// then name the text the list was computed on.
+    fn listed_on(
+        &self,
+        virtual_uri: &str,
+        connection_key: &super::super::pool::ConnectionKey,
+        offset: &RegionOffset,
+        incarnation: Option<u64>,
+    ) -> Option<ListedOn> {
+        let prepared = offset.prepared()?;
+        let revision = offset
+            .host_revision()
+            .filter(|revision| Some(revision.incarnation) == incarnation)?;
+        Some(ListedOn {
+            content_version: revision.content_version,
+            generation: self.generation_held_under(virtual_uri, connection_key, prepared)?,
+        })
     }
 }
 
@@ -921,6 +950,29 @@ pub(crate) struct KakehashiEnvelope {
     /// virt items pay nothing for a marker only host items use.
     #[serde(default, skip_serializing_if = "is_false")]
     pub host_layer: bool,
+    /// For an item minted from a prepared document (`offset.prepared`),
+    /// what it was listed on, while its server held the text the list was
+    /// computed on: a resolve places the edits its answer adds only while
+    /// both still stand (see [`ListedOn`]). The map itself is not carried.
+    /// Skipped on the wire for every other item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listed_on: Option<ListedOn>,
+}
+
+/// What an item minted from a prepared document was listed on: the host
+/// text its ranges are in, and the prepared text its server computed it on.
+/// A list is otherwise meant to outlive edits (the editor filters it while
+/// the user types), so neither refuses a resolve; they decide only whether
+/// the edits a resolve adds, which the server writes in the coordinates of
+/// the text it holds, can be placed beside the item's own.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ListedOn {
+    /// The host's text revision (mutation count since open) the list was
+    /// computed against.
+    pub content_version: u64,
+    /// The generation of the prepared text the item's server held as the
+    /// list was read (see `HeldText::generation`).
+    pub generation: u64,
 }
 
 /// `skip_serializing_if` predicate for a `bool` that defaults to `false`.
@@ -962,7 +1014,8 @@ pub(crate) struct EnvelopeOffset {
     /// carry: it never resolves through these offsets alone, whatever the
     /// region reads as by then (after its pair lost its peer, the offsets
     /// alone compare equal) — a code action's resolves through the text its
-    /// server held as it was listed (see `CodeActionEnvelope`), other items
+    /// server held as it was listed (see `CodeActionEnvelope`), as do the
+    /// edits a completion item's resolve adds (see `ListedOn`), other items
     /// not at all.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prepared: bool,
@@ -1027,6 +1080,8 @@ pub(crate) struct EnvelopeContext<'a> {
     /// once must still route through the host path on the NEXT resolve.
     /// Minting sites use `false` (virt) or [`envelope_host_item`].
     pub host_layer: bool,
+    /// See [`KakehashiEnvelope::listed_on`]; carried through a re-envelope.
+    pub listed_on: Option<ListedOn>,
 }
 
 /// Wrap `item.data` in a Kakehashi envelope for origin tracking.
@@ -1045,6 +1100,7 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
         host_layer: ctx.host_layer,
+        listed_on: ctx.listed_on,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
 }
@@ -1113,6 +1169,7 @@ pub(super) fn envelope_host_item(
         },
         region_end: None,
         host_layer: true,
+        listed_on: None,
     };
     item.data = Some(wrap_envelope(&envelope, inner));
 }
@@ -2605,6 +2662,123 @@ mod tests {
         assert!(!round_trip.describes(&live));
     }
 
+    /// A prepared list names the text it was listed on — the host revision
+    /// its request read and the generation its server holds — only while
+    /// its server still holds the text the list was computed on, and only
+    /// for the host lifetime its envelopes name.
+    #[test]
+    fn a_prepared_list_names_what_it_was_listed_on_only_while_its_text_is_held() {
+        use crate::lsp::bridge::pool::{ConnectionKey, SentText};
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        use crate::lsp::bridge::{HostRevision, LanguageServerPool};
+        let dedented = |text: &str| {
+            let answer = serde_json::from_value(json!({"segments": [{"type": "content", "changes": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 2}}, "newText": ""}
+            ]}]}))
+            .unwrap();
+            apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+        };
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("pyright");
+        let host = url::Url::parse("file:///test.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            "python",
+            "01JPMQ8ZYYQA1W3AVPW4JDRZFR",
+        );
+        let uri = virtual_uri.to_uri_string();
+        let listed = dedented("  a");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &listed.text,
+                map: Some(&listed.map),
+            },
+        );
+        let generation = pool.held_text(&uri, &key).unwrap().generation;
+        let revision = HostRevision {
+            incarnation: 4,
+            content_version: 7,
+        };
+        let offset = RegionOffset::new(3, 0)
+            .with_prepared(std::sync::Arc::clone(&listed.map))
+            .read_at(Some(revision));
+        assert_eq!(
+            pool.listed_on(&uri, &key, &offset, Some(4)),
+            Some(ListedOn {
+                content_version: 7,
+                generation,
+            })
+        );
+        // Another lifetime than the one the envelopes name, a request that
+        // read no revision, a document as is: nothing to name.
+        assert_eq!(pool.listed_on(&uri, &key, &offset, Some(5)), None);
+        assert_eq!(
+            pool.listed_on(&uri, &key, &offset.clone().read_at(None), Some(4)),
+            None
+        );
+        assert_eq!(
+            pool.listed_on(
+                &uri,
+                &key,
+                &RegionOffset::new(3, 0).read_at(Some(revision)),
+                Some(4)
+            ),
+            None
+        );
+        // Another text sent since the request was: the list was computed on
+        // one no envelope can name.
+        let other = dedented("  b");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &other.text,
+                map: Some(&other.map),
+            },
+        );
+        assert_eq!(pool.listed_on(&uri, &key, &offset, Some(4)), None);
+    }
+
+    /// What an item was listed on rides in its envelope and survives the
+    /// round trip through the client; an item that names none pays nothing
+    /// for it on the wire.
+    #[test]
+    fn what_an_item_was_listed_on_rides_only_in_the_envelopes_that_name_it() {
+        let offset = RegionOffset::new(3, 4);
+        let ctx = |listed_on| EnvelopeContext {
+            server_name: "pyright",
+            injection_language: "python",
+            incarnation: Some(1),
+            host_uri: "file:///test/doc.md",
+            region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            offset: &offset,
+            region_end: Some(TEST_REGION_END),
+            host_layer: false,
+            listed_on,
+        };
+        let listed_on = ListedOn {
+            content_version: 7,
+            generation: 12,
+        };
+        let mut item = item(json!({"label": "Path", "data": 1}));
+        envelope_item_data(&mut item, &ctx(Some(listed_on)));
+        assert_eq!(
+            item.data.as_ref().unwrap()[ENVELOPE_KEY]["listed_on"],
+            json!({"content_version": 7, "generation": 12})
+        );
+        assert_eq!(extract_envelope(&item).unwrap().listed_on, Some(listed_on));
+        let mut bare = self::item(json!({"label": "Path", "data": 1}));
+        envelope_item_data(&mut bare, &ctx(None));
+        assert!(
+            bare.data.as_ref().unwrap()[ENVELOPE_KEY]
+                .get("listed_on")
+                .is_none()
+        );
+        assert_eq!(extract_envelope(&bare).unwrap().listed_on, None);
+    }
+
     /// Run the virt transform for a NON-resolving origin, the shape most
     /// coordinate tests want: ranges translate, `data` passes through bare.
     /// (The codeLens and documentLink twins default the other way — their
@@ -2640,6 +2814,7 @@ mod tests {
                 offset,
                 region_end: Some(region_end),
                 host_layer: false,
+                listed_on: None,
             },
             ClientInsertMode::default(),
         )
@@ -2713,6 +2888,7 @@ mod tests {
                     offset: &offset,
                     region_end: Some(Position::new(11, 0)),
                     host_layer: false,
+                    listed_on: None,
                 },
                 ClientInsertMode::default(),
             )
@@ -3330,6 +3506,7 @@ mod tests {
             offset: &offset,
             region_end: Some(TEST_REGION_END),
             host_layer: false,
+            listed_on: None,
         };
         envelope_item_data(&mut item, &ctx);
 
@@ -3539,6 +3716,7 @@ mod tests {
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
                 host_layer: true,
+                listed_on: None,
             },
         );
 
@@ -3563,6 +3741,7 @@ mod tests {
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
                 host_layer: false,
+                listed_on: None,
             },
         );
         let wire = virt.data.expect("enveloped");
@@ -3589,6 +3768,7 @@ mod tests {
             offset: &offset,
             region_end: Some(TEST_REGION_END),
             host_layer: false,
+            listed_on: None,
         };
         envelope_item_data(&mut item, &ctx);
 
@@ -3632,6 +3812,7 @@ mod tests {
                 offset: &offset,
                 region_end: Some(TEST_REGION_END),
                 host_layer: false,
+                listed_on: None,
             },
         );
 

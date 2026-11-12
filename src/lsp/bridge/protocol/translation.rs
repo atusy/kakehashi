@@ -486,6 +486,54 @@ pub(crate) fn translate_virtual_main_and_additional_edits_to_host(
     }
 }
 
+/// Translate, in place, the additional edits a server gives for a main
+/// edit that was translated and sent on before them (a completion item's,
+/// added on resolve), each keeping its extent. `mains` is that main edit in
+/// host coordinates as it went out, once per range the client may apply it
+/// through (an insert/replace edit has two).
+///
+/// Only a prepared document's: `false` — the caller drops the additional
+/// edits — without a map or a main edit to check them beside (as
+/// [`translate_virtual_main_and_additional_edits_to_host`] refuses a set
+/// with no main edit), when a main edit lies outside the region, when the
+/// map refuses the edits beside one (see `PreparedMap::map_edits_beside`),
+/// or when they map otherwise beside another.
+pub(crate) fn translate_virtual_edits_beside_host_mains(
+    additional: &mut Vec<TextEdit>,
+    mains: &[TextEdit],
+    offset: &RegionOffset,
+) -> bool {
+    let Some(prepared) = offset.prepared() else {
+        return false;
+    };
+    let mut agreed: Option<Vec<TextEdit>> = None;
+    for main in mains {
+        if !host_position_within_region(main.range.start, offset)
+            || !host_position_within_region(main.range.end, offset)
+        {
+            return false;
+        }
+        let mut beside = main.clone();
+        translate_host_position_to_unprepared_virtual(&mut beside.range.start, offset);
+        translate_host_position_to_unprepared_virtual(&mut beside.range.end, offset);
+        let Some(mut mapped) = prepared.map_edits_beside(additional, &beside) else {
+            return false;
+        };
+        shift_to_host(&mut mapped, offset);
+        if agreed.as_ref().is_some_and(|agreed| *agreed != mapped) {
+            return false;
+        }
+        agreed = Some(mapped);
+    }
+    match agreed {
+        Some(mapped) => {
+            *additional = mapped;
+            true
+        }
+        None => false,
+    }
+}
+
 // =============================================================================
 // Host -> Virtual (request direction)
 // =============================================================================
@@ -873,6 +921,63 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn edits_added_later_translate_beside_a_main_edit_already_in_host_coordinates() {
+        let offset = prepared_offset();
+        let edit = |start: (u32, u32), end: (u32, u32), new_text: &str| TextEdit {
+            range: Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            new_text: new_text.to_string(),
+        };
+        // A completion rewriting `y` (P (1, 2)), with a line added at the
+        // top: together as they are listed, or the line later, on resolve,
+        // beside the main edit as it went out.
+        let added = vec![edit((0, 0), (0, 0), "import a\n")];
+        let mut mains = [edit((1, 2), (1, 3), "yield")];
+        let mut together = added.clone();
+        assert_eq!(
+            translate_virtual_main_and_additional_edits_to_host(
+                &mut mains,
+                Some(&mut together),
+                &offset
+            ),
+            Some(true)
+        );
+        assert_eq!(mains[0].range.start, Position::new(11, 4));
+        let mut later = added.clone();
+        assert!(translate_virtual_edits_beside_host_mains(
+            &mut later, &mains, &offset
+        ));
+        assert_eq!(later, together);
+        // After the first line's removed indent, in the host's columns
+        // (the region starts at column 4), giving the indent back after it.
+        assert_eq!(later, vec![edit((10, 6), (10, 6), "import a\n  ")]);
+
+        // Beside both ranges of an insert/replace edit, mapping alike.
+        let both = [
+            edit((11, 4), (11, 4), "yield"),
+            edit((11, 4), (11, 5), "yield"),
+        ];
+        let mut later = added.clone();
+        assert!(translate_virtual_edits_beside_host_mains(
+            &mut later, &both, &offset
+        ));
+        assert_eq!(later, together);
+
+        // Refused, the edits left as they came: no main edit to check them
+        // beside, one outside the region, one they meet, or no map.
+        let refused = |added: &[TextEdit], mains: &[TextEdit], offset: &RegionOffset| {
+            let mut later = added.to_vec();
+            let kept = translate_virtual_edits_beside_host_mains(&mut later, mains, offset);
+            assert_eq!(later, added);
+            !kept
+        };
+        assert!(refused(&added, &[], &offset));
+        assert!(refused(&added, &[edit((9, 0), (9, 1), "yield")], &offset));
+        assert!(refused(&added, &[edit((10, 2), (10, 3), "yield")], &offset));
+        assert!(refused(&[edit((1, 3), (1, 3), "z")], &mains, &offset));
+        assert!(refused(&added, &mains, &RegionOffset::new(10, 4)));
     }
 
     #[test]

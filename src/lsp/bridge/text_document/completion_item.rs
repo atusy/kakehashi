@@ -8,6 +8,12 @@
 //! waiting for the reply. This prevents a resolve from overtaking the edit's
 //! deferred downstream synchronization.
 //!
+//! An item served from a prepared document goes without its edits and takes
+//! back only what holds no position — and the additional edits its answer
+//! adds (an auto-import), while the host is the text the item was listed
+//! on and its server still holds the text it listed it from (see
+//! `LanguageServerPool::text_listed_on`).
+//!
 //! Two paths share that degradation. The VIRT path translates coordinates and
 //! additionally serves the unresolved item when the resolved primary edit is
 //! unsafe for the injection region — escapes it, breaks per-line prefixes, or
@@ -20,16 +26,17 @@ use std::io;
 use std::sync::Arc;
 
 use log::{debug, warn};
-use tower_lsp_server::ls_types::{CompletionItem, Position};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionTextEdit, Position, TextEdit};
 use url::Url;
 
 use super::super::pool::{
-    ConnectionHandle, ConnectionHandleSender, ConnectionState, LanguageServerPool,
+    ConnectionHandle, ConnectionHandleSender, ConnectionKey, ConnectionState, LanguageServerPool,
     NotificationSendResult, SentText, UpstreamId,
 };
 use super::super::protocol::{
-    JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
-    translate_host_range_to_virtual,
+    JsonRpcRequest, PreparedMap, RegionOffset, RequestId, response_has_jsonrpc_error,
+    text_edit_safe_in_region, translate_host_range_to_virtual,
+    translate_virtual_edits_beside_host_mains, translate_virtual_range_to_host,
 };
 use super::completion::{KakehashiEnvelope, strip_envelope, transform_completion_item};
 use super::host::{HostDocument, sync_host_document};
@@ -317,15 +324,28 @@ impl LanguageServerPool {
         } else {
             prepare_completion_resolve_item(&item, &RegionOffset::from(&envelope.offset))
         };
+        // What its answer adds is placed only through the text the item was
+        // listed on, read here under the edit lock `document` holds: the
+        // host cannot move before the request is queued.
+        let listed = prepared
+            .then(|| self.text_listed_on(&host_uri, &envelope, handle.key(), document.revision))
+            .flatten();
 
         match self
             .send_completion_resolve_on_handle(&handle, outgoing, upstream_id, &envelope, document)
             .await
         {
-            // Nor is anything its answer says of positions read: the item
-            // served stays, with what the answer fills in beside them.
+            // Nothing else its answer says of positions is read: the item
+            // served stays, with what the answer fills in beside its edits.
             Some(resolved) if prepared => {
-                take_position_free_fields(&mut item, resolved);
+                self.take_prepared_answer(
+                    &mut item,
+                    resolved,
+                    listed,
+                    handle.key(),
+                    offset,
+                    region_end,
+                );
                 re_envelope_item(&mut item, &envelope);
                 item
             }
@@ -365,6 +385,73 @@ impl LanguageServerPool {
                 item
             }
         }
+    }
+
+    /// The prepared text an item minted from a prepared document was
+    /// listed on, while its edits can still be read beside what a resolve
+    /// adds: the host is the text the list was computed against (`now`,
+    /// read with the text the resolve syncs), and the item's server still
+    /// holds the text it computed the list on. `None` otherwise, and for
+    /// an item whose envelope names neither: the resolve then brings only
+    /// what holds no position.
+    fn text_listed_on(
+        &self,
+        host_uri: &Url,
+        envelope: &KakehashiEnvelope,
+        connection_key: &ConnectionKey,
+        now: HostRevision,
+    ) -> Option<ListedText> {
+        let listed_on = envelope.listed_on?;
+        if envelope.incarnation != Some(now.incarnation)
+            || listed_on.content_version != now.content_version
+        {
+            return None;
+        }
+        let host = crate::lsp::lsp_impl::url_to_uri(host_uri).ok()?;
+        let virtual_uri =
+            VirtualDocumentUri::new(&host, &envelope.injection_language, &envelope.region_id)
+                .to_uri_string();
+        let map = self.map_held_at(&virtual_uri, connection_key, Some(listed_on.generation))?;
+        Some(ListedText {
+            virtual_uri,
+            generation: listed_on.generation,
+            map,
+        })
+    }
+
+    /// Take from `resolved`, the answer to the resolve of `item` served
+    /// from a prepared document, what it fills in: what holds no position
+    /// (see [`take_position_free_fields`]), and the additional edits it
+    /// adds, placed beside the item's own (see [`place_added_edits`]) — the
+    /// latter only when the answer was computed on `listed`, the text the
+    /// item was listed on: read before the request was queued, held as it
+    /// was queued, and still held now its reply is in (generations only
+    /// grow), its map not revoked since. `offset` places the region in the
+    /// host as it is now.
+    fn take_prepared_answer(
+        &self,
+        item: &mut CompletionItem,
+        mut resolved: CompletionItem,
+        listed: Option<ListedText>,
+        connection_key: &ConnectionKey,
+        offset: RegionOffset,
+        region_end: Position,
+    ) {
+        let added = resolved.additional_text_edits.take();
+        take_position_free_fields(item, resolved);
+        if let Some(listed) = listed.filter(|listed| self.still_holds(listed, connection_key)) {
+            place_added_edits(item, added, &offset.with_prepared(listed.map), region_end);
+        }
+    }
+
+    /// Whether `connection_key` still holds `listed`, its map not revoked:
+    /// read once a resolve's reply is in, it tells the reply was computed
+    /// on that text.
+    fn still_holds(&self, listed: &ListedText, connection_key: &ConnectionKey) -> bool {
+        !listed.map.revoked()
+            && self
+                .map_held_at(&listed.virtual_uri, connection_key, Some(listed.generation))
+                .is_some()
     }
 
     /// Transport half of `completionItem/resolve`, shared by the virt and host
@@ -612,9 +699,8 @@ fn prepare_completion_resolve_item(item: &CompletionItem, offset: &RegionOffset)
 /// Build the outgoing `completionItem/resolve` item from one served from a
 /// prepared document: a clone without its edits. Their ranges are host
 /// positions the prepared text's map gave them, and their text was
-/// re-indented on the way; the map is not carried to undo either, and
-/// ranges of another text are not what the server sent. It resolves from
-/// its own `data`.
+/// re-indented on the way; no map undoes either, and ranges of another
+/// text are not what the server sent. It resolves from its own `data`.
 fn prepared_completion_resolve_item(item: &CompletionItem) -> CompletionItem {
     let mut outgoing = item.clone();
     outgoing.text_edit = None;
@@ -624,9 +710,11 @@ fn prepared_completion_resolve_item(item: &CompletionItem) -> CompletionItem {
 
 /// Take from a resolve's answer what it fills in that holds no position:
 /// `documentation` and `detail`, the two LSP lets every server defer.
-/// Everything else stays as the item was served: edits and a command's
-/// arguments would be read in the prepared text's coordinates, and the
-/// insert format and mode were settled against the map when it was minted.
+/// Everything else stays as the item was served: its main edit must not
+/// change on resolve, a command's arguments would be read in the prepared
+/// text's coordinates, and the insert format and mode were settled against
+/// the map when it was minted. (The additional edits an answer adds are
+/// the caller's to place, see `place_added_edits`.)
 fn take_position_free_fields(item: &mut CompletionItem, resolved: CompletionItem) {
     if resolved.documentation.is_some() {
         item.documentation = resolved.documentation;
@@ -634,6 +722,104 @@ fn take_position_free_fields(item: &mut CompletionItem, resolved: CompletionItem
     if resolved.detail.is_some() {
         item.detail = resolved.detail;
     }
+}
+
+/// The prepared text a completion item was listed on (see
+/// `LanguageServerPool::text_listed_on`): where its server holds it, its
+/// generation, and the map it was held with.
+struct ListedText {
+    virtual_uri: String,
+    generation: u64,
+    map: Arc<PreparedMap>,
+}
+
+/// Give `item`, served from a prepared document, the additional edits its
+/// resolve's answer `added`, mapped back through `offset`'s map beside the
+/// main edit it went out with (see
+/// `translate_virtual_edits_beside_host_mains`), as the one set the editor
+/// applies. All or nothing, as at listing: they stay out when
+///
+/// - the item was served with additional edits of its own — it deferred
+///   none, and whether the answer's stand for them or beside them is not
+///   told (the request went without them);
+/// - it has no main edit: the editor inserts its text over a range it
+///   picks, which nothing can be checked beside;
+/// - the map refuses them beside the main edit, or a member is unsafe for
+///   the injection region.
+///
+/// On a document the peer left as it is (see
+/// `PreparedMap::changes_nothing`) only the first and the region's checks
+/// hold: nothing there is mapped beside anything.
+///
+/// The item is kept either way: its main edit still applies, though
+/// possibly without its auto-import — availability over fidelity, never an
+/// edit placed where its server did not mean it.
+fn place_added_edits(
+    item: &mut CompletionItem,
+    added: Option<Vec<TextEdit>>,
+    offset: &RegionOffset,
+    region_end: Position,
+) {
+    let Some(mut added) = added.filter(|added| !added.is_empty()) else {
+        return;
+    };
+    if item
+        .additional_text_edits
+        .as_ref()
+        .is_some_and(|served| !served.is_empty())
+    {
+        return;
+    }
+    // A document the peer left as it is: the added edits are the virtual
+    // document's own, with no indentation to regain and no main edit whose
+    // mapping they could disagree with. They go as a document as is sends
+    // them, all or nothing by the region's checks.
+    if offset
+        .prepared()
+        .is_some_and(|prepared| prepared.changes_nothing())
+    {
+        for edit in added.iter_mut() {
+            translate_virtual_range_to_host(&mut edit.range, offset);
+        }
+        if added
+            .iter()
+            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+        {
+            item.additional_text_edits = Some(added);
+        } else {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: dropped the additionalTextEdits ({}) an item's resolve added: a member is unsafe for the injection region",
+                added.len()
+            );
+        }
+        return;
+    }
+    let mains: Vec<TextEdit> = match &item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => vec![edit.clone()],
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => [edit.insert, edit.replace]
+            .into_iter()
+            .map(|range| TextEdit {
+                range,
+                new_text: edit.new_text.clone(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    if !mains.is_empty()
+        && translate_virtual_edits_beside_host_mains(&mut added, &mains, offset)
+        && added
+            .iter()
+            .all(|edit| text_edit_safe_in_region(edit, offset, region_end))
+    {
+        item.additional_text_edits = Some(added);
+        return;
+    }
+    warn!(
+        target: "kakehashi::bridge",
+        "completionItem/resolve: dropped the additionalTextEdits ({}) an item's resolve added: the item has no edit of its own to place them beside, or a member does not map back through its prepared document beside it or is unsafe for the injection region",
+        added.len()
+    );
 }
 
 /// Translate a served (host-coordinate) item's edit ranges back to virtual
@@ -680,6 +866,7 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         offset,
         region_end: envelope.region_end,
         host_layer: envelope.host_layer,
+        listed_on: envelope.listed_on,
     };
     let inner = item.data.take();
     item.data = Some(crate::lsp::bridge::envelope::wrap_envelope(&rebuilt, inner));
@@ -711,13 +898,19 @@ mod tests {
             },
             region_end: Some((9, 0)),
             host_layer: false,
+            listed_on: None,
         }
     }
 
     #[test]
     fn a_refused_resolve_keeps_the_prepared_mark() {
+        use crate::lsp::bridge::text_document::completion::ListedOn;
         let mut envelope = test_envelope();
         envelope.offset.prepared = true;
+        envelope.listed_on = Some(ListedOn {
+            content_version: 7,
+            generation: 12,
+        });
         let mut item = CompletionItem {
             label: "x".to_string(),
             data: Some(json!({"resolve_id": 99})),
@@ -726,6 +919,8 @@ mod tests {
         re_envelope_item(&mut item, &envelope);
         let back = extract_envelope(&item).expect("re-enveloped");
         assert!(back.offset.prepared);
+        // With what it was listed on: a later resolve still reads it.
+        assert_eq!(back.listed_on, envelope.listed_on);
         // As is, the envelope is written as before.
         let mut item = CompletionItem {
             label: "x".to_string(),
@@ -736,6 +931,345 @@ mod tests {
         let back = extract_envelope(&item).expect("re-enveloped");
         assert!(!back.offset.prepared);
         assert_eq!(back.offset.line_column_offsets, Some(vec![0]));
+        assert!(item.data.unwrap()[ENVELOPE_KEY].get("listed_on").is_none());
+    }
+
+    /// `text`, every line indented by two spaces, as a peer dedents it.
+    fn dedented(text: &str) -> crate::lsp::bridge::protocol::PreparedDocument {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let changes: Vec<_> = text
+            .split('\n')
+            .enumerate()
+            .filter(|(_, line)| line.starts_with("  "))
+            .map(|(line, _)| {
+                json!({"range": {
+                    "start": {"line": line, "character": 0},
+                    "end": {"line": line, "character": 2}
+                }, "newText": ""})
+            })
+            .collect();
+        let answer =
+            serde_json::from_value(json!({"segments": [{"type": "content", "changes": changes}]}))
+                .unwrap();
+        apply_prepare_result(text, &VirtualLayout::single(text), Some(answer)).unwrap()
+    }
+
+    fn text_edit(start: (u32, u32), end: (u32, u32), new_text: &str) -> TextEdit {
+        TextEdit {
+            range: tower_lsp_server::ls_types::Range::new(
+                Position::new(start.0, start.1),
+                Position::new(end.0, end.1),
+            ),
+            new_text: new_text.to_string(),
+        }
+    }
+
+    /// A fenced block at host line 10, `  a\n  pa\n` dedented, and the
+    /// item rewriting `pa` as it was served: its edit in host coordinates.
+    fn served_from_a_prepared_block() -> (RegionOffset, Position, CompletionItem) {
+        let offset = RegionOffset::new(10, 0).with_prepared(dedented("  a\n  pa\n").map);
+        let item = CompletionItem {
+            label: "Path".to_string(),
+            text_edit: Some(CompletionTextEdit::Edit(text_edit(
+                (11, 2),
+                (11, 4),
+                "Path",
+            ))),
+            ..Default::default()
+        };
+        (offset, Position::new(12, 0), item)
+    }
+
+    /// The edits a resolve's answer adds are placed beside the item as it
+    /// was served: mapped back through the prepared text, re-indented.
+    #[test]
+    fn edits_a_resolve_adds_are_placed_beside_the_item_as_served() {
+        let (offset, region_end, mut item) = served_from_a_prepared_block();
+        let import = text_edit((0, 0), (0, 0), "import a\n");
+        place_added_edits(&mut item, Some(vec![import.clone()]), &offset, region_end);
+        let placed = vec![text_edit((10, 2), (10, 2), "import a\n  ")];
+        assert_eq!(item.additional_text_edits, Some(placed.clone()));
+
+        // Beside both ranges of an insert/replace edit.
+        let (_, _, mut item) = served_from_a_prepared_block();
+        item.text_edit = Some(CompletionTextEdit::InsertAndReplace(
+            tower_lsp_server::ls_types::InsertReplaceEdit {
+                new_text: "Path".to_string(),
+                insert: text_edit((11, 2), (11, 3), "").range,
+                replace: text_edit((11, 2), (11, 4), "").range,
+            },
+        ));
+        place_added_edits(&mut item, Some(vec![import]), &offset, region_end);
+        assert_eq!(item.additional_text_edits, Some(placed));
+    }
+
+    /// On a document the peer left as it is (`null`, or an answer changing
+    /// nothing) the edits a resolve adds are the virtual document's own:
+    /// they are placed as a document as is places them, beside a main edit
+    /// or without one, and dropped whole where a member is unsafe for the
+    /// region.
+    #[rstest::rstest]
+    #[case::declined(None)]
+    #[case::answered_unchanged(Some(json!({"segments": [{"type": "content"}]})))]
+    fn edits_a_resolve_adds_on_a_document_left_as_it_is_are_placed_as_is(
+        #[case] answer: Option<serde_json::Value>,
+    ) {
+        use crate::lsp::bridge::protocol::{VirtualLayout, apply_prepare_result};
+        let text = "a\npa\n";
+        let map = apply_prepare_result(
+            text,
+            &VirtualLayout::single(text),
+            answer.map(|answer| serde_json::from_value(answer).unwrap()),
+        )
+        .unwrap()
+        .map;
+        let offset = RegionOffset::new(10, 0).with_prepared(map);
+        let region_end = Position::new(12, 0);
+        let import = text_edit((0, 0), (0, 0), "import a\n");
+        let placed = Some(vec![text_edit((10, 0), (10, 0), "import a\n")]);
+
+        // No main edit: the editor inserts the item's text where it asked,
+        // as on a document never prepared.
+        let mut item = CompletionItem {
+            label: "Path".to_string(),
+            ..Default::default()
+        };
+        place_added_edits(&mut item, Some(vec![import.clone()]), &offset, region_end);
+        assert_eq!(item.additional_text_edits, placed);
+
+        // Beside a main edit.
+        let served = CompletionItem {
+            label: "Path".to_string(),
+            text_edit: Some(CompletionTextEdit::Edit(text_edit(
+                (11, 0),
+                (11, 2),
+                "Path",
+            ))),
+            ..Default::default()
+        };
+        let mut item = served.clone();
+        place_added_edits(&mut item, Some(vec![import.clone()]), &offset, region_end);
+        assert_eq!(item.additional_text_edits, placed);
+
+        // One member past the region drops them all, the item kept.
+        let mut item = served.clone();
+        place_added_edits(
+            &mut item,
+            Some(vec![import, text_edit((7, 0), (7, 0), "x")]),
+            &offset,
+            region_end,
+        );
+        assert_eq!(item, served);
+    }
+
+    /// What a resolve adds stays out, the item kept as it was served, when
+    /// it cannot be placed beside the item's own edits.
+    #[rstest::rstest]
+    // Nothing added.
+    #[case::none(None, |_: &mut CompletionItem| {}, 12)]
+    #[case::empty(Some(vec![]), |_: &mut CompletionItem| {}, 12)]
+    // Served with additional edits of its own: it deferred none.
+    #[case::served_with_its_own(
+        Some(vec![text_edit((0, 0), (0, 0), "import a\n")]),
+        |item: &mut CompletionItem| {
+            item.additional_text_edits = Some(vec![text_edit((10, 2), (10, 2), "import b\n  ")]);
+        },
+        12
+    )]
+    // No main edit: the editor inserts over a range it picks.
+    #[case::no_main_edit(
+        Some(vec![text_edit((0, 0), (0, 0), "import a\n")]),
+        |item: &mut CompletionItem| item.text_edit = None,
+        12
+    )]
+    // Meeting the main edit, which the map refuses.
+    #[case::meets_the_main_edit(
+        Some(vec![text_edit((1, 2), (1, 2), "z")]),
+        |_: &mut CompletionItem| {},
+        12
+    )]
+    // One member refused drops them all.
+    #[case::one_member_refused(
+        Some(vec![
+            text_edit((0, 0), (0, 0), "import a\n"),
+            text_edit((7, 0), (7, 0), "x"),
+        ]),
+        |_: &mut CompletionItem| {},
+        12
+    )]
+    // Mapped, but past the region's end (it shrank to its first line).
+    #[case::past_the_region(
+        Some(vec![text_edit((1, 2), (1, 2), "z")]),
+        |item: &mut CompletionItem| {
+            item.text_edit = Some(CompletionTextEdit::Edit(text_edit((10, 2), (10, 3), "b")));
+        },
+        11
+    )]
+    fn edits_a_resolve_adds_stay_out_where_they_cannot_be_placed(
+        #[case] added: Option<Vec<TextEdit>>,
+        #[case] serve: fn(&mut CompletionItem),
+        #[case] region_end_line: u32,
+    ) {
+        let (offset, _, mut item) = served_from_a_prepared_block();
+        serve(&mut item);
+        let served = item.clone();
+        place_added_edits(&mut item, added, &offset, Position::new(region_end_line, 0));
+        assert_eq!(item, served);
+    }
+
+    /// The text an item was listed on is read only while the host is the
+    /// revision the list was computed against and its server still holds
+    /// the text it computed the list on, unrevoked.
+    #[test]
+    fn the_text_an_item_was_listed_on_is_read_only_while_host_and_server_hold_it() {
+        use crate::lsp::bridge::protocol::Revocation;
+        use crate::lsp::bridge::text_document::completion::ListedOn;
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("lua-ls");
+        let mut envelope = test_envelope();
+        envelope.offset.prepared = true;
+        let host = Url::parse(&envelope.host_uri).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        let mut listed = dedented("  a\n  pa\n");
+        let revocation = Arc::new(Revocation::default());
+        Arc::get_mut(&mut listed.map)
+            .unwrap()
+            .set_revocation(Arc::clone(&revocation));
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &listed.text,
+                map: Some(&listed.map),
+            },
+        );
+        let generation = pool
+            .held_text(&virtual_uri.to_uri_string(), &key)
+            .unwrap()
+            .generation;
+        let now = HostRevision {
+            incarnation: 1,
+            content_version: 7,
+        };
+        // An item naming nothing it was listed on (its server held another
+        // text as the list was read, or it was minted before this was
+        // recorded).
+        assert!(pool.text_listed_on(&host, &envelope, &key, now).is_none());
+        envelope.listed_on = Some(ListedOn {
+            content_version: 7,
+            generation,
+        });
+        let text = pool
+            .text_listed_on(&host, &envelope, &key, now)
+            .expect("the text it was listed on");
+        assert!(Arc::ptr_eq(&text.map, &listed.map));
+        assert!(pool.still_holds(&text, &key));
+        // The host edited since, or closed and reopened.
+        for moved in [
+            HostRevision {
+                content_version: 8,
+                ..now
+            },
+            HostRevision {
+                incarnation: 2,
+                ..now
+            },
+        ] {
+            assert!(
+                pool.text_listed_on(&host, &envelope, &key, moved).is_none(),
+                "{moved:?}"
+            );
+        }
+        // Its peer failed the text since the reply was asked for.
+        revocation.revoke(u64::MAX);
+        assert!(!pool.still_holds(&text, &key));
+        // Another text sent since: neither read nor still held.
+        let other = dedented("  a\n  pat\n");
+        pool.record_sent_for_test(
+            &virtual_uri,
+            &key,
+            SentText {
+                text: &other.text,
+                map: Some(&other.map),
+            },
+        );
+        assert!(pool.text_listed_on(&host, &envelope, &key, now).is_none());
+        let unrevoked = ListedText {
+            virtual_uri: text.virtual_uri.clone(),
+            generation: text.generation,
+            map: dedented("  a\n  pa\n").map,
+        };
+        assert!(!pool.still_holds(&unrevoked, &key));
+    }
+
+    /// A prepared item's resolve brings what holds no position whatever
+    /// its server holds by then, and the edits it adds only when it was
+    /// answered on the text the item was listed on.
+    #[test]
+    fn a_prepared_answer_brings_its_added_edits_only_from_the_text_listed_on() {
+        let pool = LanguageServerPool::preparing();
+        let key = ConnectionKey::for_server("lua-ls");
+        let envelope = test_envelope();
+        let host = Url::parse(&envelope.host_uri).unwrap();
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host).unwrap(),
+            &envelope.injection_language,
+            &envelope.region_id,
+        );
+        let listed = dedented("  a\n  pa\n");
+        let send = |document: &crate::lsp::bridge::protocol::PreparedDocument| {
+            pool.record_sent_for_test(
+                &virtual_uri,
+                &key,
+                SentText {
+                    text: &document.text,
+                    map: Some(&document.map),
+                },
+            );
+        };
+        send(&listed);
+        let listed_text = || ListedText {
+            virtual_uri: virtual_uri.to_uri_string(),
+            generation: pool
+                .held_text(&virtual_uri.to_uri_string(), &key)
+                .unwrap()
+                .generation,
+            map: Arc::clone(&listed.map),
+        };
+        let answer = || CompletionItem {
+            label: "Path".to_string(),
+            detail: Some("class Path".to_string()),
+            additional_text_edits: Some(vec![text_edit((0, 0), (0, 0), "import a\n")]),
+            ..Default::default()
+        };
+        let take = |listed: Option<ListedText>| {
+            let (_, region_end, mut item) = served_from_a_prepared_block();
+            pool.take_prepared_answer(
+                &mut item,
+                answer(),
+                listed,
+                &key,
+                RegionOffset::new(10, 0),
+                region_end,
+            );
+            assert_eq!(item.detail.as_deref(), Some("class Path"));
+            item.additional_text_edits
+        };
+        // Answered on the text listed on.
+        let held = listed_text();
+        assert_eq!(
+            take(Some(listed_text())),
+            Some(vec![text_edit((10, 2), (10, 2), "import a\n  ")])
+        );
+        // The item named no text, or its server was sent another while the
+        // reply was awaited: the answer's edits are in no coordinates read.
+        assert_eq!(take(None), None);
+        send(&dedented("  a\n  pat\n"));
+        assert_eq!(take(Some(held)), None);
     }
 
     #[cfg(unix)]
@@ -1428,6 +1962,7 @@ mod tests {
             },
             region_end: Some((9, 0)),
             host_layer: false,
+            listed_on: None,
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
