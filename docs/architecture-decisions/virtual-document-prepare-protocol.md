@@ -137,12 +137,15 @@ type VirtualDocumentPrepareResult = {
 The segments cover the virtual document in order. A **content** segment is
 injected text, and its `content` is that text. A **gap** is host text inside
 the document's span that is not injected — the text between captures of an
-`injection.combined` pattern — and its `content` is the original host text,
-which the virtual document itself only carries as coordinate-preserving
-whitespace. Host text the virtual document strips altogether (a blockquote's
-`> `) is not presented on its own: between content, downstream servers never
-see it, so there is nothing to replace; next to a gap it is part of that
-gap's `content`. An isolated injection is a single content segment.
+`injection.combined` pattern, and what a capture among them leaves out —
+and its `content` is the original host text, whatever the virtual document
+itself carries for it: coordinate-preserving whitespace, or nothing where
+it strips the text altogether. All of that host text is presented. Stripped
+text next to a gap the virtual document shows is part of that gap's
+`content`; between content, or opening or ending the document, it is a gap
+of its own, with no width in the virtual document. An isolated injection —
+and a combined pattern matching a single capture — is a single content
+segment: what it strips (a quoted fence's `> `) is recorded nowhere.
 
 A peer does not see the virtual document, whose lines the rules below
 name, but the segments spell it. Its text is each segment's in order: a
@@ -160,20 +163,29 @@ host text there —
   just as much the `}` closing an interpolation opened on a line above.
 
 So content after a gap that holds a line break starts a line of the
-virtual document, and content after a gap on one line goes on with the
-line the gap is on. (One document is spelled apart: where its span ends
-between a CR and its LF, that CR — the last character of a gap ending
-the document — stands as a space, since no line ends there.)
+virtual document, content after a gap that continues a line goes on with
+that line, and content after a gap that opens a line and holds no line
+break starts that line: the gap stands as nothing, and the content's
+leading whitespace is a line's, which the peer may delete as below
+whatever it puts in the gap. (One document is spelled apart: where its
+span ends between a CR and its LF, that CR — the last character of a gap
+ending the document — stands as a space, since no line ends there.)
 
-A gap that opens a line and has content after it on that line is the one
-case with nothing left to present: an interpolation with nothing injected
-before it on its host line (`${pkgs.hello}/bin/hello` written at column
-0) is stripped as a line prefix is, so it is no segment, takes no
-placeholder, and its line reaches servers as `/bin/hello` — as it does
-without a peer. kakehashi knows which text is injected, not what the text
-before it is. Where the host injects the line's indentation too, as a Nix
-string indented in its file does, the interpolation continues a line and
-is a gap like any other.
+A gap of no width is host text with nothing injected before it on its
+line: an interpolation written at column 0 (`${pkgs.hello}/bin/hello`),
+whose line reaches servers as `/bin/hello` without a placeholder, and just
+as much a line prefix lying between captures (the `///` of doc comments
+combined line by line, a quoted fence's `> ` in a document combined from
+several fences). kakehashi knows which text is injected, not what the text
+before it is, so it presents both and the peer tells them apart by the
+gap's `content`: a placeholder for the one, nothing for the other. Left
+alone — its `content` omitted or empty — such a gap is in neither
+document, and every rule below reads through it as if it were not
+presented: the content on both its sides is one stretch of content, and
+the document is prepared exactly as it would be without the gap. Where
+the host injects the line's indentation too, as a Nix string indented in
+its file does, the interpolation continues a line and is masked like any
+other.
 
 The answer has the same length and the same `type` order:
 
@@ -182,19 +194,24 @@ The answer has the same length and the same `type` order:
   means unchanged.
   - Leading whitespace of a line: the dedent case.
   - Whole blank lines, line start to line start, at the **document's
-    edges**: the lines opening the first segment, or those ending the last.
+    edges**: the lines opening its first stretch of content, or those
+    ending its last, with nothing before or after it but a gap left with
+    nothing. A change stays in its segment, so blank lines that gaps of
+    no width part take a change each.
     When the last ends in a line holding only indentation (the indent
     before a closing `''`), deleting the lines before it takes deleting
     all of that indentation too, as a change of its own. That is what a
     host string drops from its value: the line break after a Nix `''`, Lua
     `[[` or `indoc!`, the closing line, and the blank lines a YAML `|` block
     clips. Without it, a shebang, a Dockerfile parser directive or an XML
-    declaration sits on line 2. Blank lines beside a gap are inside the
-    document, so they stay. A blank line and the next line's indent are two
-    changes, not one.
+    declaration sits on line 2. Blank lines beside a gap that stands for
+    anything in the prepared document (its whitespace kept, or a
+    replacement) are inside the document, so they stay; beside one of no
+    width left alone they are where they would be without it. A blank line
+    and the next line's indent are two changes, not one.
 - A gap's `content` is its replacement, of **any length** — a placeholder,
-  nothing, or the default. Omitted keeps the coordinate-preserving
-  whitespace.
+  nothing, or the default. Omitted keeps what the virtual document carries
+  for it: the coordinate-preserving whitespace, or nothing.
 - `null` keeps every segment.
 
 kakehashi validates the whole answer; a wrong length or order, or a content
@@ -204,7 +221,11 @@ lines that stay, and blank lines ending or opening a segment beside a gap
 answer whose prepared text would join a lone CR and a LF the virtual
 document keeps apart into one line break (a dedent down to the line break
 after a lone CR, or a placeholder completing a CRLF): P would have a line
-fewer than V there. A change's position follows LSP: a `character` past
+fewer than V there. The reverse is refused as well: a gap of no width may
+lie between a CR and a LF the virtual document reads as one line break (a
+host line ended by a lone CR, then stripped text before a line holding only
+its LF); it takes no replacement, and that line break is deleted in both its
+segments or in neither. A change's position follows LSP: a `character` past
 its line's length defaults back to that length (so none falls between a
 CRLF's CR and LF), while a `line` past the segment's last refuses the
 answer.
@@ -219,7 +240,11 @@ translated through P ↔ V ↔ host. Deleted edge blank lines stay in V: P's
 start maps after the leading ones and P's end before the trailing ones. A
 request is not made at all at a host position with no corresponding
 position in P, such as one strictly inside a gap or on a deleted edge line,
-since the server would answer it for another place. A position inside
+since the server would answer it for another place. A replacement given to
+a gap of no width is text of P alone: every position inside it names the
+start of the content after it, the host position past the stripped text,
+and a host position inside the stripped text lies before its line's
+content, where no request is made with or without a peer. A position inside
 indentation the peer removed names the start of its line in P (completion
 alone refuses it, see Edits): on-type formatting typed there answers for
 that line. A range-formatting selection of only what the peer removed
@@ -909,20 +934,24 @@ spaces the downstream server then sees (trailing whitespace after a token,
 columns shifted in what it reports), and it cannot express removing a Nix
 escape or collapsing a fence.
 
-### Presenting stripped host text as gaps
+### A segment type of its own for host text opening a line
 
-Stripped text presented as a gap of no width could take a placeholder,
-which an interpolation opening a host line cannot (see The Request). But
-kakehashi cannot present those interpolations alone: text stripped before
-a line's first injected character is as often a line prefix (a
-blockquote's `> `, a list item's indentation), and nothing in the
-injection tells the two apart. Presenting both would hand a peer every
-prefix of a quoted document as a gap to leave alone, and split that
-document's content at each line: no blank line would be at the
-document's edge any more, each lying beside a gap, so the edge rule would
-have to tell gaps of no width from the others. The cost falls on every
-prefixed document for the sake of a line that starts with an
-interpolation, which reads to servers as it does without a peer.
+Host text with nothing injected before it on its line was first left out
+of the request, since kakehashi cannot tell an interpolation there from a
+line prefix, and then considered as a third segment type, so that a peer
+replacing every gap would not touch prefixes. The type would name where
+the text stands, not what it is: a `///` and a `${…}` at column 0 would
+carry it alike, and the peer would still decide by the text. Where a gap
+stands is already told by the segments (see The Request), so it is a gap.
+
+### Telling line prefixes from interpolations by the syntax tree
+
+A prefix is often a child of the captured node (a blockquote's
+continuation) and an interpolation a sibling of the captures, but not
+always: doc comments combined line by line leave their `///` between
+captures, and a string captured whole leaves its interpolations inside
+it. A guess would present some prefixes and hide some interpolations by a
+rule no peer could read from the request.
 
 ### The downstream server prepares its own documents
 
@@ -1117,9 +1146,17 @@ editors keep a snippet as is.
   after the main edit went out, nothing tells how the two read together.
 - Host text the injection query includes in content cannot be protected as
   a gap; only text outside the captured content is.
-- An interpolation with nothing injected before it on its host line takes
-  no placeholder: stripped like a line prefix, it is no gap (see The
-  Request).
+- Which host text opening a line a peer is shown follows the grammar's
+  shape, not the text's meaning. Between the captures of a combined
+  pattern every line prefix (a doc comment's `///`) is a gap of its own —
+  two segments more per line — which the peer must tell from an
+  interpolation by its `content`: one that replaces every gap puts its
+  placeholder before each such line. A region of a single capture strips
+  its prefixes unseen, and an interpolation a capture's own child leaves
+  out there is not presented either.
+- A replacement for a gap of no width has no host text on its line to
+  stand over: what a server reports inside it lands at the start of the
+  content after it.
 - A request issued right after an edit waits for the new prepared text to
   reach its server, and fails if a newer edit supersedes it first: as soon
   as the host is edited past the revision the request's text was read at

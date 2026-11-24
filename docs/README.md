@@ -920,9 +920,10 @@ injected text) and `gap` (host text between `injection.combined` captures,
 such as an interpolation). The answer may delete leading whitespace from
 content lines, delete whole blank lines at the document's edges (the line
 break after a Nix `''`, say, so a shebang is the first line), and replace
-any gap with text of any length (an interpolation with nothing injected
-before it on its line is not one: kakehashi strips it as it strips a line
-prefix, with or without a peer):
+any gap with text of any length. Every such host text is a gap, a line
+prefix between captures (a doc comment's `///`) as much as an
+interpolation, so a peer decides by the gap's text and leaves alone what
+needs no placeholder:
 
 ```ts
 // tsudoi.config.ts
@@ -941,7 +942,11 @@ export default async () => ({
       Promise.resolve({
         result: {
           segments: params.segments.map((segment: any) =>
-            segment.type === "gap" ? { type: "gap", content: "null" } : { type: "content" }
+            segment.type !== "gap"
+              ? { type: "content" }
+              : segment.content.startsWith("${")
+                ? { type: "gap", content: "null" }
+                : { type: "gap" }
           ),
         },
       }),
