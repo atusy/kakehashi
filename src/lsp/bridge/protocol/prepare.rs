@@ -2248,13 +2248,13 @@ mod tests {
     }
 
     #[test]
-    fn layout_presents_gap_host_text_and_merges_stripped_prefixes() {
+    fn layout_presents_gap_host_text_and_merges_stripped_text_into_visible_gaps() {
         let virtual_text = "a\nb\n  c";
         let layout = VirtualLayout::from_pieces(
             virtual_text,
             [
                 (SegmentKind::Content, 0..2, String::new()),
-                // A stripped blockquote prefix: empty in V, not presented.
+                // A stripped blockquote prefix: empty in V, a gap of its own.
                 (SegmentKind::Gap, 2..2, "> ".to_string()),
                 (SegmentKind::Content, 2..4, String::new()),
                 (SegmentKind::Gap, 4..6, "${".to_string()),
@@ -2270,21 +2270,23 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                (SegmentKind::Content, 0..4, "a\nb\n"),
+                (SegmentKind::Content, 0..2, "a\n"),
+                (SegmentKind::Gap, 2..2, "> "),
+                (SegmentKind::Content, 2..4, "b\n"),
                 (SegmentKind::Gap, 4..6, "${}"),
                 (SegmentKind::Content, 6..7, "c"),
             ]
         );
     }
 
-    /// An interpolation with nothing injected before it on its host line is
-    /// stripped as a line prefix is (discovery cannot tell the two apart),
-    /// so it is no segment: the peer has no gap to give a placeholder, and
-    /// the line starts where the content after it does. One with injected
-    /// text before it on its line -- the line's indentation is enough -- is
-    /// a gap.
+    /// Host text with nothing injected before it on its line stands as
+    /// nothing in the virtual document, and is a gap all the same: an
+    /// interpolation written at column 0 is one the peer may give a
+    /// placeholder, as one after the line's injected indentation is. A line
+    /// prefix between captures reads the same to discovery, so it is a gap
+    /// too, which a peer leaves alone.
     #[test]
-    fn host_text_opening_a_line_before_content_is_no_gap() {
+    fn host_text_opening_a_line_before_content_is_a_gap() {
         use crate::language::injection::build_combined_virtual_content;
         let segments = |text: &str, included: &[Range<usize>]| {
             let (virtual_text, _, gaps) =
@@ -2293,28 +2295,469 @@ mod tests {
             layout
                 .segments()
                 .iter()
-                .map(|segment| (segment.kind, segment.text.clone()))
+                .map(|segment| {
+                    (
+                        segment.kind,
+                        segment.virtual_range.clone(),
+                        segment.text.clone(),
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         // `${x}` at column 0, between two string fragments.
         assert_eq!(
             segments("a\n${x}/bin\n", &[0..2, 6..11]),
-            vec![(SegmentKind::Content, "a\n/bin\n".to_string())]
+            vec![
+                (SegmentKind::Content, 0..2, "a\n".to_string()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                (SegmentKind::Content, 2..7, "/bin\n".to_string()),
+            ]
         );
-        // The same after an injected indent.
+        // The same after an injected indent: masked, as before.
         assert_eq!(
             segments("a\n  ${x}/bin\n", &[0..4, 8..13]),
             vec![
-                (SegmentKind::Content, "a\n  ".to_string()),
-                (SegmentKind::Gap, "${x}".to_string()),
-                (SegmentKind::Content, "/bin\n".to_string()),
+                (SegmentKind::Content, 0..4, "a\n  ".to_string()),
+                (SegmentKind::Gap, 4..8, "${x}".to_string()),
+                (SegmentKind::Content, 8..13, "/bin\n".to_string()),
             ]
         );
         // A blockquote's prefix reads the same to discovery as the first.
         assert_eq!(
             segments("a\n> b\n", &[0..2, 4..6]),
-            vec![(SegmentKind::Content, "a\nb\n".to_string())]
+            vec![
+                (SegmentKind::Content, 0..2, "a\n".to_string()),
+                (SegmentKind::Gap, 2..2, "> ".to_string()),
+                (SegmentKind::Content, 2..4, "b\n".to_string()),
+            ]
         );
+        // Opening the document, and ending it.
+        assert_eq!(
+            segments("${x}a\n", &[4..6]),
+            vec![
+                (SegmentKind::Gap, 0..0, "${x}".to_string()),
+                (SegmentKind::Content, 0..2, "a\n".to_string()),
+            ]
+        );
+        assert_eq!(
+            segments("a\n${x}", &[0..2]),
+            vec![
+                (SegmentKind::Content, 0..2, "a\n".to_string()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+            ]
+        );
+        // Before a line with nothing injected but its line break, the
+        // break is content and the text before it a gap of its own.
+        assert_eq!(
+            segments("a\n{{ if }}\nb\n", &[0..2, 10..13]),
+            vec![
+                (SegmentKind::Content, 0..2, "a\n".to_string()),
+                (SegmentKind::Gap, 2..2, "{{ if }}".to_string()),
+                (SegmentKind::Content, 2..5, "\nb\n".to_string()),
+            ]
+        );
+    }
+
+    /// `a\n${x}/bin\n` with the interpolation at column 0: a gap of no
+    /// width in V.
+    fn line_opening() -> (String, VirtualLayout) {
+        let virtual_text = "a\n/bin\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                (SegmentKind::Content, 2..7, String::new()),
+            ],
+        );
+        (virtual_text, layout)
+    }
+
+    /// A gap of no width left alone -- by `null`, an omitted `content` or
+    /// an empty one -- leaves the document as it is: P is V, and nothing
+    /// says a gap is there.
+    #[test]
+    fn a_line_opening_gap_left_alone_changes_nothing() {
+        let (virtual_text, layout) = line_opening();
+        for answer in [
+            None,
+            result(
+                json!({"segments": [{"type": "content"}, {"type": "gap"}, {"type": "content"}]}),
+            ),
+            result(
+                json!({"segments": [{"type": "content"}, {"type": "gap", "content": ""}, {"type": "content"}]}),
+            ),
+        ] {
+            let prepared = apply_prepare_result(&virtual_text, &layout, answer).unwrap();
+            assert_eq!(prepared.text, virtual_text);
+            assert!(prepared.map.changes_nothing());
+            assert_eq!(prepared.map.to_prepared(pos(1, 0), Bias::Start), pos(1, 0));
+            assert_eq!(prepared.map.to_virtual(pos(1, 2), Bias::End), pos(1, 2));
+        }
+    }
+
+    /// A placeholder for a gap of no width stands at its line's start in P.
+    /// The line's content maps past it both ways; inside it P has positions
+    /// V has none for, which name the content's start.
+    #[test]
+    fn a_line_opening_gap_takes_a_placeholder_its_line_maps_past() {
+        let (virtual_text, layout) = line_opening();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content"}, {"type": "gap", "content": "PH"}, {"type": "content"}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\nPH/bin\n");
+        let map = prepared.map;
+        assert!(!map.changes_nothing());
+        for bias in [Bias::Start, Bias::End] {
+            assert_eq!(map.to_prepared(pos(0, 1), bias), pos(0, 1));
+            assert_eq!(map.to_prepared(pos(1, 0), bias), pos(1, 2));
+            assert_eq!(map.to_prepared(pos(1, 3), bias), pos(1, 5));
+            assert_eq!(map.to_prepared(pos(2, 0), bias), pos(2, 0));
+            assert_eq!(map.to_virtual(pos(1, 0), bias), pos(1, 0));
+            assert_eq!(map.to_virtual(pos(1, 1), bias), pos(1, 0));
+            assert_eq!(map.to_virtual(pos(1, 2), bias), pos(1, 0));
+            assert_eq!(map.to_virtual(pos(1, 5), bias), pos(1, 3));
+        }
+        // V has no position inside the gap: none is refused a request.
+        assert!(!map.virtual_position_in_gap(pos(1, 0)));
+        // A V range across the line start spans the host text.
+        assert!(map.virtual_range_in_gap(tower_lsp_server::ls_types::Range {
+            start: pos(0, 1),
+            end: pos(1, 1),
+        }));
+        assert!(
+            !map.virtual_range_in_gap(tower_lsp_server::ls_types::Range {
+                start: pos(1, 0),
+                end: pos(1, 1),
+            })
+        );
+    }
+
+    /// The same where the gap is the document's first segment, its last,
+    /// and where only a line break follows it on its line.
+    #[test]
+    fn a_placeholder_opens_ends_or_fills_a_line() {
+        let fill = |virtual_text: &str,
+                    pieces: Vec<(SegmentKind, Range<usize>, String)>,
+                    segments: serde_json::Value| {
+            let layout = VirtualLayout::from_pieces(virtual_text, pieces);
+            apply_prepare_result(virtual_text, &layout, result(json!({"segments": segments})))
+                .unwrap()
+        };
+        let opening = fill(
+            "/bin\n",
+            vec![
+                (SegmentKind::Gap, 0..0, "${x}".to_string()),
+                (SegmentKind::Content, 0..5, String::new()),
+            ],
+            json!([{"type": "gap", "content": "PH"}, {"type": "content"}]),
+        );
+        assert_eq!(opening.text, "PH/bin\n");
+        assert_eq!(opening.map.to_prepared(pos(0, 0), Bias::Start), pos(0, 2));
+        assert_eq!(opening.map.to_virtual(pos(0, 1), Bias::Start), pos(0, 0));
+
+        let ending = fill(
+            "a\n",
+            vec![
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+            ],
+            json!([{"type": "content"}, {"type": "gap", "content": "PH"}]),
+        );
+        assert_eq!(ending.text, "a\nPH");
+        assert_eq!(ending.map.to_prepared(pos(1, 0), Bias::Start), pos(1, 0));
+        assert_eq!(ending.map.to_prepared(pos(1, 0), Bias::End), pos(1, 2));
+        assert_eq!(ending.map.to_virtual(pos(1, 2), Bias::End), pos(1, 0));
+
+        let alone = fill(
+            "a\n\nb\n",
+            vec![
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..2, "{{ if }}".to_string()),
+                (SegmentKind::Content, 2..5, String::new()),
+            ],
+            json!([{"type": "content"}, {"type": "gap", "content": "# if"}, {"type": "content"}]),
+        );
+        assert_eq!(alone.text, "a\n# if\nb\n");
+        assert_eq!(alone.map.to_prepared(pos(2, 0), Bias::Start), pos(2, 0));
+        assert_eq!(alone.map.to_virtual(pos(1, 4), Bias::End), pos(1, 0));
+    }
+
+    /// A placeholder's line break must not complete a CRLF with the content
+    /// beside it, as no gap's may: P would have a line fewer than V there.
+    #[test]
+    fn a_line_opening_placeholder_fusing_a_cr_and_a_lf_is_refused() {
+        for (virtual_text, pieces, placeholder) in [
+            // After a lone CR, a placeholder opening with a LF.
+            (
+                "a\rb",
+                vec![
+                    (SegmentKind::Content, 0..2, String::new()),
+                    (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                    (SegmentKind::Content, 2..3, String::new()),
+                ],
+                "\nPH",
+            ),
+            // Before a line holding only its LF, one ending with a CR.
+            (
+                "a\n\nb",
+                vec![
+                    (SegmentKind::Content, 0..2, String::new()),
+                    (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                    (SegmentKind::Content, 2..4, String::new()),
+                ],
+                "PH\r",
+            ),
+        ] {
+            let layout = VirtualLayout::from_pieces(virtual_text, pieces);
+            assert_eq!(
+                apply_prepare_result(
+                    virtual_text,
+                    &layout,
+                    result(json!({"segments": [
+                        {"type": "content"}, {"type": "gap", "content": placeholder}, {"type": "content"}
+                    ]})),
+                ),
+                Err(PrepareError::FusedLineBreak),
+                "{virtual_text:?} with {placeholder:?}"
+            );
+        }
+    }
+
+    /// Doc comments combined line by line (` # Usage`, a blank line, ` Call
+    /// it.`, a blank line), each `///` a gap of no width between them.
+    fn prefixed() -> (String, VirtualLayout) {
+        let virtual_text = " # Usage\n\n Call it.\n\n".to_string();
+        let layout = VirtualLayout::from_pieces(
+            &virtual_text,
+            [
+                (SegmentKind::Content, 0..9, String::new()),
+                (SegmentKind::Gap, 9..9, "///".to_string()),
+                (SegmentKind::Content, 9..10, String::new()),
+                (SegmentKind::Gap, 10..10, "///".to_string()),
+                (SegmentKind::Content, 10..20, String::new()),
+                (SegmentKind::Gap, 20..20, "///".to_string()),
+                (SegmentKind::Content, 20..21, String::new()),
+            ],
+        );
+        (virtual_text, layout)
+    }
+
+    fn delete(from: (u32, u32), to: (u32, u32)) -> serde_json::Value {
+        json!({"range": {
+            "start": {"line": from.0, "character": from.1},
+            "end": {"line": to.0, "character": to.1}
+        }, "newText": ""})
+    }
+
+    /// The document's edge reads through gaps that leave nothing in the
+    /// prepared text: a blank line beside one is as much at the edge as it
+    /// was while the gap was not presented.
+    #[test]
+    fn edge_lines_beside_a_gap_that_leaves_nothing_go() {
+        let (virtual_text, layout) = prefixed();
+        let prepared = apply_prepare_result(
+            &virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "content", "changes": [delete((0, 0), (0, 1))]},
+                {"type": "gap"},
+                {"type": "content"},
+                {"type": "gap", "content": ""},
+                {"type": "content", "changes": [delete((0, 0), (0, 1))]},
+                {"type": "gap"},
+                {"type": "content", "changes": [delete((0, 0), (1, 0))]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "# Usage\n\nCall it.\n");
+        // P's end maps before the deleted closing line, as ever.
+        assert_eq!(prepared.map.to_virtual(pos(3, 0), Bias::End), pos(3, 0));
+        assert!(prepared.map.virtual_position_in_removed_lines(pos(3, 0)));
+
+        // Several blank lines opening the document, each its own segment.
+        let virtual_text = "\n\n a\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Gap, 0..0, "///".to_string()),
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..1, "///".to_string()),
+                (SegmentKind::Content, 1..2, String::new()),
+                (SegmentKind::Gap, 2..2, "///".to_string()),
+                (SegmentKind::Content, 2..5, String::new()),
+            ],
+        );
+        let whole = || json!({"type": "content", "changes": [delete((0, 0), (1, 0))]});
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout,
+            result(json!({"segments": [
+                {"type": "gap"}, whole(), {"type": "gap"}, whole(), {"type": "gap"},
+                {"type": "content", "changes": [delete((0, 0), (0, 1))]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        assert_eq!(prepared.map.to_virtual(pos(0, 0), Bias::Start), pos(2, 1));
+
+        // Only from the edge: the second blank line alone is inside.
+        assert_eq!(
+            apply_prepare_result(
+                virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "gap"}, {"type": "content"}, {"type": "gap"}, whole(),
+                    {"type": "gap"}, {"type": "content"}
+                ]})),
+            ),
+            Err(PrepareError::InvalidChange {
+                index: 1,
+                reason: "content changes may only delete blank lines at the document's edges"
+            })
+        );
+    }
+
+    /// The closing line's indentation still goes with the closing lines,
+    /// read through a gap that leaves nothing.
+    #[test]
+    fn closing_lines_read_through_a_gap_that_leaves_nothing() {
+        let virtual_text = "a\n\n  ";
+        let layout = || {
+            VirtualLayout::from_pieces(
+                virtual_text,
+                [
+                    (SegmentKind::Content, 0..2, String::new()),
+                    (SegmentKind::Gap, 2..2, "///".to_string()),
+                    (SegmentKind::Content, 2..5, String::new()),
+                ],
+            )
+        };
+        let prepared = apply_prepare_result(
+            virtual_text,
+            &layout(),
+            result(json!({"segments": [
+                {"type": "content"}, {"type": "gap"},
+                {"type": "content", "changes": [delete((0, 0), (1, 0)), delete((1, 0), (1, 2))]}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(prepared.text, "a\n");
+        assert_eq!(
+            apply_prepare_result(
+                virtual_text,
+                &layout(),
+                result(json!({"segments": [
+                    {"type": "content"}, {"type": "gap"},
+                    {"type": "content", "changes": [delete((0, 0), (1, 0))]}
+                ]})),
+            ),
+            Err(PrepareError::InvalidChange {
+                index: 0,
+                reason: "content changes may only delete closing blank lines with all of the closing line's indentation"
+            })
+        );
+    }
+
+    /// A gap the peer gave a placeholder is text in the prepared document:
+    /// the blank lines beside it are inside the document and stay, as
+    /// beside any gap.
+    #[test]
+    fn blank_lines_beside_a_filled_line_opening_gap_stay() {
+        let refused = Err(PrepareError::InvalidChange {
+            index: 2,
+            reason: "content changes may only delete blank lines at the document's edges",
+        });
+        // A closing blank line, alone after the placeholder.
+        let virtual_text = "a\n\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                (SegmentKind::Content, 2..3, String::new()),
+            ],
+        );
+        let closing = |gap: serde_json::Value| {
+            apply_prepare_result(
+                virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "content"}, gap,
+                    {"type": "content", "changes": [delete((0, 0), (1, 0))]}
+                ]})),
+            )
+            .map(|prepared| prepared.text)
+        };
+        assert_eq!(closing(json!({"type": "gap", "content": "PH"})), refused);
+        assert_eq!(closing(json!({"type": "gap"})), Ok("a\n".to_string()));
+
+        // An opening blank line, alone before the placeholder.
+        let virtual_text = "\na\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..1, String::new()),
+                (SegmentKind::Gap, 1..1, "${x}".to_string()),
+                (SegmentKind::Content, 1..3, String::new()),
+            ],
+        );
+        let opening = |gap: serde_json::Value| {
+            apply_prepare_result(
+                virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "content", "changes": [delete((0, 0), (1, 0))]}, gap,
+                    {"type": "content"}
+                ]})),
+            )
+            .map(|prepared| prepared.text)
+        };
+        assert_eq!(
+            opening(json!({"type": "gap", "content": "PH"})),
+            Err(PrepareError::InvalidChange {
+                index: 0,
+                reason: "content changes may only delete blank lines at the document's edges",
+            })
+        );
+        assert_eq!(opening(json!({"type": "gap"})), Ok("a\n".to_string()));
+    }
+
+    /// Content after a gap of no width starts a line of V, whatever the
+    /// peer puts in the gap: its leading whitespace is deletable as any
+    /// line's.
+    #[test]
+    fn content_after_a_line_opening_gap_starts_a_line() {
+        let virtual_text = "a\n  b\n";
+        let layout = VirtualLayout::from_pieces(
+            virtual_text,
+            [
+                (SegmentKind::Content, 0..2, String::new()),
+                (SegmentKind::Gap, 2..2, "${x}".to_string()),
+                (SegmentKind::Content, 2..6, String::new()),
+            ],
+        );
+        for (gap, text) in [
+            (json!({"type": "gap"}), "a\nb\n"),
+            (json!({"type": "gap", "content": "PH"}), "a\nPHb\n"),
+        ] {
+            let prepared = apply_prepare_result(
+                virtual_text,
+                &layout,
+                result(json!({"segments": [
+                    {"type": "content"}, gap,
+                    {"type": "content", "changes": [delete((0, 0), (0, 2))]}
+                ]})),
+            )
+            .unwrap();
+            assert_eq!(prepared.text, text);
+            assert!(prepared.map.virtual_position_in_removed_indent(pos(1, 1)));
+        }
     }
 
     /// What a gap's host text stands as in the virtual document, read off
