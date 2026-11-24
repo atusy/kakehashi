@@ -383,17 +383,20 @@ fn build_prepared(
         let virtual_segment = &virtual_text[segment.virtual_range.clone()];
         match (segment.kind, answer) {
             (SegmentKind::Content, WireSegmentResult::Content { changes }) => {
-                let deletions = content_deletions(
-                    virtual_text,
-                    segment.virtual_range.start,
-                    virtual_segment,
-                    changes.unwrap_or_default(),
-                    DocumentEdges {
-                        start: index == 0,
-                        end: index == last_index,
-                    },
-                )
-                .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
+                let deletions = change_ranges(virtual_segment, changes.unwrap_or_default())
+                    .and_then(|ranges| {
+                        content_deletions(
+                            virtual_text,
+                            segment.virtual_range.start,
+                            virtual_segment,
+                            ranges,
+                            DocumentEdges {
+                                start: index == 0,
+                                end: index == last_index,
+                            },
+                        )
+                    })
+                    .map_err(|reason| PrepareError::InvalidChange { index, reason })?;
                 let mut cursor = segment.virtual_range.start;
                 let mut deleted: Vec<&str> = Vec::new();
                 // Indentation removed from whitespace-only lines: the
@@ -534,15 +537,12 @@ struct DocumentEdges {
     end: bool,
 }
 
-/// Validate a content segment's changes and return the byte ranges (in V)
-/// they delete, sorted, each with the kind of run it becomes.
-fn content_deletions(
-    virtual_text: &str,
-    segment_start: usize,
+/// The byte ranges a content segment's changes delete, relative to the
+/// segment as the peer read it, in the answer's order; empty ones left out.
+fn change_ranges(
     segment_text: &str,
     changes: Vec<TextEdit>,
-    edges: DocumentEdges,
-) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
+) -> Result<Vec<Range<usize>>, &'static str> {
     let segment_lines = LineMap::new(segment_text.to_string());
     let mut ranges = Vec::with_capacity(changes.len());
     for change in changes {
@@ -563,6 +563,19 @@ fn content_deletions(
         }
         ranges.push(start..end);
     }
+    Ok(ranges)
+}
+
+/// Validate the `ranges` a content segment's changes delete (relative to
+/// it, see [`change_ranges`]) and return the byte ranges (in V) they
+/// delete, sorted, each with the kind of run it becomes.
+fn content_deletions(
+    virtual_text: &str,
+    segment_start: usize,
+    segment_text: &str,
+    mut ranges: Vec<Range<usize>>,
+    edges: DocumentEdges,
+) -> Result<Vec<(Range<usize>, RunKind)>, &'static str> {
     ranges.sort_by_key(|range| range.start);
     if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
         return Err("content changes overlap");
