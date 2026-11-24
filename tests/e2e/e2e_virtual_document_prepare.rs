@@ -1812,6 +1812,42 @@ fn downstream_sees_gaps_replaced_and_lines_map_back() {
     );
 }
 
+/// Host text that opens a line before injected text on it — here the `> `
+/// before the second line of a quoted fence, as an interpolation written at
+/// column 0 is — stands as nothing in the virtual document, and is a gap
+/// all the same: the peer's placeholder for it reaches the server, and the
+/// rest of its line maps back past the host text.
+#[test]
+fn a_gap_opening_a_line_before_content_takes_a_placeholder() {
+    let (mut client, _dir) = Setup {
+        combined: true,
+        placeholder: "PH",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/line-start-gap.md";
+    let text = "> ```lua\n> local a = 1\n> print(a)\n> ```\n\n```lua\nprint(2)\n```\n";
+    open(&mut client, uri, text);
+
+    // Host (2, 5) sits in `print(a)`, three columns past its `> `.
+    let answer = hover_with_retry(&mut client, uri, 2, 5);
+    assert_eq!(hover_text(&answer), "local a = 1\nPHprint(a)\nPHprint(2)\n");
+    // The mock's whole-line range (1, 0)-(1, 10) starts in the placeholder,
+    // which has no host text to cover on that line: it starts where the
+    // content does, after the `> `.
+    assert_eq!(
+        answer["range"],
+        json!({
+            "start": { "line": 2, "character": 2 },
+            "end": { "line": 2, "character": 10 }
+        })
+    );
+    // Inside the `> ` itself no request is made.
+    let response = hover(&mut client, uri, 2, 1);
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null(), "{response}");
+}
+
 #[test]
 fn an_edit_is_prepared_before_requests_read_it() {
     let (mut client, _dir) = Setup::default().start();
