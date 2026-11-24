@@ -3374,9 +3374,24 @@ fn prepare_segments(segments: &[Value], placeholder: &str) -> Value {
             .unwrap_or_default()
     };
     let lines = |index: usize| text(index).split('\n').collect::<Vec<_>>();
-    // A content segment's first line starts a line when the document starts
-    // there or the host text before it (a gap) ended one.
-    let starts_line = |index: usize| index == 0 || text(index - 1).ends_with('\n');
+    // Whether the virtual document stands at a line start where each
+    // segment ends, spelled from the segments as the protocol tells a peer
+    // to: content as it is; a gap as its line breaks, with spaces for the
+    // text before the first only where it continues a line of content — so
+    // one without a line break that opens a line stands as nothing, and
+    // the content after it starts that line.
+    let mut line_start_after = Vec::with_capacity(segments.len());
+    for index in 0..segments.len() {
+        let opens_line = index == 0 || line_start_after[index - 1];
+        line_start_after.push(if text(index).contains('\n') {
+            kind(index) == Some("gap") || text(index).ends_with('\n')
+        } else {
+            opens_line && (kind(index) == Some("gap") || text(index).is_empty())
+        });
+    }
+    // A segment's first line starts a line when the document starts there
+    // or what stands before it ended one.
+    let starts_line = |index: usize| index == 0 || line_start_after[index - 1];
     let blank = |line: &str| line.trim().is_empty();
     // Lines whose leading whitespace counts: every non-blank line that
     // starts a line.

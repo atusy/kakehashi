@@ -1848,6 +1848,35 @@ fn a_gap_opening_a_line_before_content_takes_a_placeholder() {
     assert!(response["result"].is_null(), "{response}");
 }
 
+/// Content after a gap that opens a line starts that line of the virtual
+/// document, whatever the peer puts in the gap: its indentation is a
+/// line's leading whitespace, which the peer deletes as on any other line.
+#[test]
+fn content_after_a_gap_opening_a_line_is_dedented_as_a_line() {
+    let (mut client, _dir) = Setup {
+        combined: true,
+        placeholder: "PH",
+        ..Setup::default()
+    }
+    .start();
+    let uri = "file:///prepare/line-start-gap-dedent.md";
+    let text = "> ```lua\n>   local a = 1\n>   print(a)\n> ```\n\n```lua\n  print(2)\n```\n";
+    open(&mut client, uri, text);
+
+    // Host (2, 7) sits in `print(a)`, three columns past its indentation.
+    let answer = hover_with_retry(&mut client, uri, 2, 7);
+    assert_eq!(hover_text(&answer), "local a = 1\nPHprint(a)\nPHprint(2)\n");
+    // The line's range starts in the placeholder, which names where the
+    // host's line does after its `> `, and ends with `print(a)`.
+    assert_eq!(
+        answer["range"],
+        json!({
+            "start": { "line": 2, "character": 2 },
+            "end": { "line": 2, "character": 12 }
+        })
+    );
+}
+
 #[test]
 fn an_edit_is_prepared_before_requests_read_it() {
     let (mut client, _dir) = Setup::default().start();
